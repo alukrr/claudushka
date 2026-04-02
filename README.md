@@ -1,0 +1,2 @@
+# claudushka
+personal claude bot 
