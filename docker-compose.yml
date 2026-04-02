@@ -1,0 +1,12 @@
+version: "3.9"
+services:
+  claude_telegram_bot:
+    image: python:3.12-slim
+    container_name: claude_telegram_bot
+    working_dir: /app
+    volumes:
+      - ./:/app
+    env_file:
+      - .env
+    command: /bin/sh -c "pip install --no-cache-dir -r requirements.txt && python bot.py"
+    restart: unless-stopped
