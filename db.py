@@ -307,7 +307,7 @@ def remove_allowed_chat(chat_id: int):
 
 def get_allowed_chats() -> list[dict]:
     conn = get_conn()
-    rows = conn.execute("SELECT * FROM allowed_chats").fetchall()
+    rows = conn.execute("SELECT * FROM allowed_chats WHERE status = 'approved'").fetchall()
     conn.close()
     return [dict(r) for r in rows]
 

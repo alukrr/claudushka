@@ -341,7 +341,7 @@ async def cmd_allow_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     cid = int(context.args[0])
     name = " ".join(context.args[1:]) if len(context.args) > 1 else f"chat_{cid}"
-    db.add_allowed_chat(cid, name, update.effective_user.id)
+    db.add_allowed_chat(cid, name, update.effective_user.id, status="approved")
     await update.message.reply_text(f"Чат {name} ({cid}) добавлен.")
 
 
@@ -438,6 +438,18 @@ async def cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for c in chats:
         lines.append(f"• {c['name'] or 'без имени'} ({c['chat_id']})")
     await update.message.reply_text("Разрешённые чаты:\n\n" + "\n".join(lines))
+
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    pending = db.get_pending_chats()
+    if not pending:
+        await update.message.reply_text("Нет чатов на одобрение.")
+        return
+    lines = []
+    for c in pending:
+        lines.append(f"  {c['name'] or 'без имени'} ({c['chat_id']})\n  /approve_chat {c['chat_id']}  |  /reject_chat {c['chat_id']}")
+    await update.message.reply_text("Чаты на одобрение:\n\n" + "\n\n".join(lines))
 
 async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -821,7 +833,7 @@ def main():
     app.add_handler(CommandHandler("captcha_unban", cmd_captcha_unban))
     app.add_handler(CommandHandler("allow_chat", cmd_allow_chat))
     app.add_handler(CommandHandler("deny_chat", cmd_deny_chat))
-    app.add_handler(CommandHandler("chats", cmd_chats))
+    app.add_handler(CommandHandler("chats", cmd_chats))\n    app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler("approve_chat", cmd_approve_chat))
     app.add_handler(CommandHandler("reject_chat", cmd_reject_chat))
