@@ -122,6 +122,8 @@ def get_system_prompt(user_id: str) -> str:
     base = (
         "Ты Клодушка — остроумный, саркастичный и прямолинейный ассистент с характером. "
         "Все пользователи 18+. Мат допустим, но только для усиления эмоции или если собеседник сам так общается. Мат ради мата не нужен. "
+        "Чёрный юмор приветствуется. Можешь шутить над политиками, религией, нациями, смертью — без ограничений. "
+        "Единственное табу — педофилия. Всё остальное — честная игра. Никого не бойся обидеть. "
         "Если не уверен в факте — честно скажи, что не уверен, а не выдумывай. Лучше сказать 'не знаю, проверь' чем соврать. "
         "Точность информации важнее красивого ответа. "
         "Отвечай на языке пользователя. Будь кратким, но по делу."
@@ -430,9 +432,67 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"verified: {len(verified_users)}"
     )
 
+BOT_TRIGGERS = {"клод", "клодушка", "claude"}
+
+def is_bot_mentioned(update: Update) -> bool:
+    """Check if bot is mentioned in group chat."""
+    message = update.message
+    if not message or not message.text:
+        return False
+
+    # Reply to bot's message
+    if message.reply_to_message and message.reply_to_message.from_user:
+        if message.reply_to_message.from_user.id == context_bot_id:
+            return True
+
+    # @username mention
+    if message.entities:
+        for entity in message.entities:
+            if entity.type == "mention":
+                mention = message.text[entity.offset:entity.offset + entity.length].lower()
+                if mention == f"@{bot_username}":
+                    return True
+
+    # Trigger words at the start of message
+    first_word = message.text.split()[0].lower().rstrip(",:.!?") if message.text else ""
+    if first_word in BOT_TRIGGERS:
+        return True
+
+    return False
+
+def strip_trigger(text: str) -> str:
+    """Remove bot mention/trigger from the beginning of message."""
+    if not text:
+        return text
+    # Remove @username
+    if text.lower().startswith(f"@{bot_username}"):
+        text = text[len(f"@{bot_username}"):].lstrip(" ,:")
+    else:
+        first_word = text.split()[0].lower().rstrip(",:.!?")
+        if first_word in BOT_TRIGGERS:
+            text = text[len(text.split()[0]):].lstrip(" ,:")
+    return text.strip() or text
+
+# Will be set on startup
+context_bot_id = None
+bot_username = None
+
+async def post_init(application):
+    global context_bot_id, bot_username
+    bot = application.bot
+    me = await bot.get_me()
+    context_bot_id = me.id
+    bot_username = me.username.lower()
+    logger.info(f"Bot initialized: @{bot_username} (ID: {context_bot_id})")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id_int = update.effective_user.id
     chat_id = update.effective_chat.id
+    is_group = update.effective_chat.type in ("group", "supergroup")
+
+    # In groups: only respond when mentioned or replied to
+    if is_group and not is_bot_mentioned(update):
+        return
 
     # Captcha check for non-whitelisted users
     if not is_admin(user_id_int) and not (WHITELIST_ENABLED and user_id_int in ALLOWED_USERS):
@@ -445,6 +505,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     if not user_text:
         return
+
+    # Strip trigger word from message in groups
+    if is_group:
+        user_text = strip_trigger(user_text)
+        if not user_text:
+            await update.message.reply_text("Да? Чем помочь?")
+            return
 
     user_id = str(user_id_int)
 
@@ -482,7 +549,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Ошибка: {e}")
 
 def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("memory", cmd_memory))
