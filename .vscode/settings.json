@@ -1,0 +1,9 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python -m py_compile bot\\.py db\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "docker-compose": true
+    }
+}
