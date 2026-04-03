@@ -35,9 +35,6 @@ WHITELIST_ENABLED = True
 # Captcha state (in-memory, resets on restart)
 captcha_state: dict[str, dict] = {}
 
-# Pending chat approvals
-pending_chats: dict[int, dict] = {}
-
 # Token tracking
 token_usage = {"input": 0, "output": 0}
 
@@ -623,11 +620,7 @@ async def handle_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Notify admin
             for admin_id in ADMIN_IDS:
                 try:
-                    pending_chats[chat_id] = {
-                        "title": chat_title,
-                        "added_by": added_by.id,
-                        "added_by_name": adder_name
-                    }
+                    db.add_allowed_chat(chat_id, chat_title, added_by.id, status="pending")
                     await context.bot.send_message(
                         chat_id=admin_id,
                         text=(
@@ -661,9 +654,9 @@ async def cmd_approve_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Использование: /approve_chat <chat_id>")
         return
     chat_id = int(context.args[0])
-    info = pending_chats.pop(chat_id, {})
-    chat_name = info.get("title", f"chat_{chat_id}")
-    db.add_allowed_chat(chat_id, chat_name, update.effective_user.id)
+    db.set_chat_status(chat_id, "approved", update.effective_user.id)
+    chats = db.get_allowed_chats()
+    chat_name = next((c["name"] for c in chats if c["chat_id"] == chat_id), f"chat_{chat_id}")
     await update.message.reply_text(f"✅ Чат {chat_name} ({chat_id}) одобрен.")
     try:
         await context.bot.send_message(chat_id=chat_id, text="Админ подтвердил мой доступ. Готова к работе! 🤖")
@@ -678,7 +671,7 @@ async def cmd_reject_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Использование: /reject_chat <chat_id>")
         return
     chat_id = int(context.args[0])
-    pending_chats.pop(chat_id, None)
+    db.set_chat_status(chat_id, "rejected")
     await update.message.reply_text(f"❌ Чат {chat_id} отклонён. Выхожу.")
     try:
         await context.bot.send_message(chat_id=chat_id, text="Извините, мой админ не одобрил этот чат. Пока! 👋")

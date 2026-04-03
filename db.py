@@ -63,8 +63,11 @@ def init_db():
         CREATE TABLE IF NOT EXISTS allowed_chats (
             chat_id INTEGER PRIMARY KEY,
             name TEXT,
-            added_by INTEGER,
-            created_at INTEGER
+            status TEXT DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
+            requested_by INTEGER,
+            approved_by INTEGER,
+            created_at INTEGER,
+            approved_at INTEGER
         );
 
         CREATE INDEX IF NOT EXISTS idx_conv_user ON conversations(user_id);
@@ -266,12 +269,33 @@ def get_group_history(chat_id: int, limit: int = 30) -> list[str]:
 
 # --- Allowed chats ---
 
-def add_allowed_chat(chat_id: int, name: str = None, added_by: int = None):
+def add_allowed_chat(chat_id: int, name: str = None, added_by: int = None, status: str = "approved"):
     conn = get_conn()
-    conn.execute("INSERT OR REPLACE INTO allowed_chats (chat_id, name, added_by, created_at) VALUES (?, ?, ?, ?)",
-                 (chat_id, name, added_by, int(time.time())))
+    now = int(time.time())
+    conn.execute(
+        "INSERT OR REPLACE INTO allowed_chats (chat_id, name, status, requested_by, approved_by, created_at, approved_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (chat_id, name, status, added_by, added_by if status == "approved" else None, now, now if status == "approved" else None)
+    )
     conn.commit()
     conn.close()
+
+
+def set_chat_status(chat_id: int, status: str, approved_by: int = None):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE allowed_chats SET status = ?, approved_by = ?, approved_at = ? WHERE chat_id = ?",
+        (status, approved_by, int(time.time()) if status == "approved" else None, chat_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_pending_chats() -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM allowed_chats WHERE status = 'pending'").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def remove_allowed_chat(chat_id: int):
@@ -290,7 +314,7 @@ def get_allowed_chats() -> list[dict]:
 
 def is_chat_allowed(chat_id: int) -> bool:
     conn = get_conn()
-    row = conn.execute("SELECT 1 FROM allowed_chats WHERE chat_id = ?", (chat_id,)).fetchone()
+    row = conn.execute("SELECT 1 FROM allowed_chats WHERE chat_id = ? AND status = 'approved'", (chat_id,)).fetchone()
     conn.close()
     return row is not None
 
