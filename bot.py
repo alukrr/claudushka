@@ -63,6 +63,8 @@ verified_users: dict[str, dict] = load_json(VERIFIED_FILE)
 captcha_state: dict[str, dict] = {}
 
 MAX_HISTORY = 20
+GROUP_HISTORY_SIZE = 1000
+group_history: dict[str, list] = {}
 MEMORY_EXTRACT_EVERY = 5
 MAX_CAPTCHA_ATTEMPTS = 3
 BAN_DURATION = 3600
@@ -537,6 +539,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     is_group = update.effective_chat.type in ("group", "supergroup")
 
+    # Always store group messages for context
+    if is_group and update.message and update.message.text:
+        gcid = str(chat_id)
+        if gcid not in group_history:
+            group_history[gcid] = []
+        sender = update.effective_user.first_name or "Unknown"
+        group_history[gcid].append(f"{sender}: {update.message.text}")
+        if len(group_history[gcid]) > GROUP_HISTORY_SIZE:
+            group_history[gcid] = group_history[gcid][-GROUP_HISTORY_SIZE:]
+
     if is_group and not is_bot_mentioned(update):
         return
 
@@ -579,6 +591,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 search_context = f"\n\nРезультаты поиска по запросу '{search_query}':\n{search_results}"
 
         system = get_system_prompt(user_id)
+        if is_group:
+            gcid = str(chat_id)
+            recent_chat = group_history.get(gcid, [])
+            if recent_chat:
+                chat_log = "\n".join(recent_chat[-30:])
+                system += f"\n\nПоследние сообщения в этом групповом чате (используй как контекст, не пересказывай):\n{chat_log}"
         if search_context:
             system += f"\n\nИспользуй эти результаты поиска для ответа:{search_context}"
 
