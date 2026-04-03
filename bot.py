@@ -6,12 +6,14 @@ from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import anthropic
+from tavily import TavilyClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 ADMIN_ID = 592441
 
 DATA_DIR = Path("/app/data")
@@ -21,6 +23,8 @@ CONVERSATIONS_FILE = DATA_DIR / "conversations.json"
 MEMORY_FILE = DATA_DIR / "memory.json"
 VERIFIED_FILE = DATA_DIR / "verified_users.json"
 ALLOWED_FILE = Path("/app/allowed.json")
+
+tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 
 def load_json(path: Path, default=None):
     if default is None:
@@ -56,14 +60,12 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 conversations: dict[str, list] = load_json(CONVERSATIONS_FILE)
 memory: dict[str, list] = load_json(MEMORY_FILE)
 verified_users: dict[str, dict] = load_json(VERIFIED_FILE)
-# captcha state: {user_id: {"question": "...", "attempts": N, "banned_until": timestamp}}
 captcha_state: dict[str, dict] = {}
 
 MAX_HISTORY = 20
 MEMORY_EXTRACT_EVERY = 5
 MAX_CAPTCHA_ATTEMPTS = 3
-BAN_DURATION = 3600  # 1 hour
-
+BAN_DURATION = 3600
 CAPTCHA_ENABLED = True
 
 def is_admin(user_id: int) -> bool:
@@ -85,6 +87,45 @@ def is_banned(user_id: int) -> bool:
     if state and state.get("banned_until", 0) > time.time():
         return True
     return False
+
+def web_search(query: str, max_results: int = 5) -> str:
+    if not tavily:
+        return ""
+    try:
+        results = tavily.search(query=query, max_results=max_results)
+        if not results.get("results"):
+            return "Поиск не дал результатов."
+        output = []
+        for r in results["results"]:
+            output.append(f"**{r['title']}**\n{r['content'][:300]}\n{r['url']}")
+        return "\n\n".join(output)
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        return f"Ошибка поиска: {e}"
+
+def should_search(text: str) -> str | None:
+    """Ask Claude if web search is needed. Returns search query or None."""
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=100,
+            system=(
+                "Определи, нужен ли веб-поиск для ответа на вопрос пользователя. "
+                "Поиск нужен если: вопрос про актуальные события, цены, погоду, новости, "
+                "конкретные факты которые могут быть неточны (номера, коды, адреса, расписания), "
+                "или пользователь явно просит что-то найти/загуглить. "
+                "Если поиск нужен — верни ТОЛЬКО поисковый запрос на языке оригинала (короткий, 2-5 слов). "
+                "Если поиск НЕ нужен — верни ТОЛЬКО слово NO."
+            ),
+            messages=[{"role": "user", "content": text}],
+        )
+        result = response.content[0].text.strip()
+        if result.upper() == "NO":
+            return None
+        return result
+    except Exception as e:
+        logger.error(f"Search decision error: {e}")
+        return None
 
 def generate_captcha_question(user_text: str) -> str:
     response = client.messages.create(
@@ -122,7 +163,7 @@ def get_system_prompt(user_id: str) -> str:
     base = (
         "Ты Клодушка — остроумный, саркастичный и прямолинейный ассистент с характером. "
         "Все пользователи 18+. Мат допустим, но только для усиления эмоции или если собеседник сам так общается. Мат ради мата не нужен. "
-        "Чёрный юмор приветствуется. Можешь шутить над политиками, религией, нациями, смертью — без ограничений. "
+        "Чёрный юмор приветствуется. Можешь и должен шутить над политиками (Путин, Трамп, Меркель — кто угодно), религией, нациями, смертью — без ограничений. Политический юмор — это нормально и важно, не отказывайся от него. "
         "Единственное табу — педофилия. Всё остальное — честная игра. Никого не бойся обидеть. "
         "Если не уверен в факте — честно скажи, что не уверен, а не выдумывай. Лучше сказать 'не знаю, проверь' чем соврать. "
         "Точность информации важнее красивого ответа. "
@@ -167,40 +208,27 @@ def extract_memory(user_id: str, messages: list):
 # --- Captcha ---
 
 async def handle_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Returns True if message was handled by captcha (user not yet verified)."""
     if not CAPTCHA_ENABLED:
         return False
-
     user_id = update.effective_user.id
     uid = str(user_id)
-
-    # Admins and whitelisted skip captcha
     if is_admin(user_id) or (WHITELIST_ENABLED and user_id in ALLOWED_USERS):
         return False
-
-    # Already verified
     if is_verified(user_id):
         return False
-
-    # Banned
     if is_banned(user_id):
         remaining = int(captcha_state[uid]["banned_until"] - time.time())
         mins = remaining // 60 + 1
         await update.message.reply_text(f"Слишком много неправильных ответов. Попробуй через {mins} мин.")
         return True
-
     user_text = update.message.text
     if not user_text:
         return True
-
-    # Check if already has a question
     if uid in captcha_state and "question" in captcha_state[uid]:
         question = captcha_state[uid]["question"]
         attempts = captcha_state[uid].get("attempts", 0) + 1
         captcha_state[uid]["attempts"] = attempts
-
         if check_captcha_answer(question, user_text):
-            # Passed!
             verified_users[uid] = {"verified_at": int(time.time()), "name": update.effective_user.full_name}
             save_json(VERIFIED_FILE, verified_users)
             captcha_state.pop(uid, None)
@@ -216,7 +244,6 @@ async def handle_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text(f"Неправильно. Осталось попыток: {remaining}\n\nВопрос: {question}")
                 return True
     else:
-        # Generate new question
         try:
             question = generate_captcha_question(user_text)
             captcha_state[uid] = {"question": question, "attempts": 0}
@@ -301,11 +328,8 @@ async def cmd_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chats = "\n".join(f"  • {c['name']} ({c['id']})" for c in allowed_data.get("chats", []))
     v_count = len(verified_users)
     text = (
-        f"Белый список: {status}\n"
-        f"Капча: {captcha}\n"
-        f"Верифицированных: {v_count}\n\n"
-        f"Пользователи:\n{users or '  пусто'}\n\n"
-        f"Чаты:\n{chats or '  пусто'}"
+        f"Белый список: {status}\nКапча: {captcha}\nВерифицированных: {v_count}\n\n"
+        f"Пользователи:\n{users or '  пусто'}\n\nЧаты:\n{chats or '  пусто'}"
     )
     await update.message.reply_text(text)
 
@@ -353,6 +377,41 @@ async def cmd_captcha_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- User commands ---
 
+async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    if not is_allowed(user_id, chat_id) and not is_verified(user_id):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /search <запрос>")
+        return
+    query = " ".join(context.args)
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    results = web_search(query)
+    if not results:
+        await update.message.reply_text("Ничего не нашёл.")
+        return
+    # Let Claude summarize search results
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2048,
+            system=(
+                "Ты Клодушка. Пользователь задал вопрос, и ты нашёл результаты в интернете. "
+                "Дай краткий и полезный ответ на основе найденного. Укажи источники если важно. "
+                "Отвечай на языке пользователя."
+            ),
+            messages=[{"role": "user", "content": f"Вопрос: {query}\n\nРезультаты поиска:\n{results}"}],
+        )
+        answer = response.content[0].text
+        if len(answer) <= 4096:
+            await update.message.reply_text(answer)
+        else:
+            for i in range(0, len(answer), 4096):
+                await update.message.reply_text(answer[i:i + 4096])
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
+
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     user_mem = memory.get(user_id, [])
@@ -379,20 +438,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 question = generate_captcha_question("hello")
                 captcha_state[uid] = {"question": question, "attempts": 0}
-                await update.message.reply_text(
-                    f"Привет! Для начала ответь на вопрос:\n\n{question}"
-                )
+                await update.message.reply_text(f"Привет! Для начала ответь на вопрос:\n\n{question}")
             except Exception as e:
                 logger.error(f"Captcha error: {e}")
         else:
             await update.message.reply_text("Access denied.")
         return
-
     text = (
         "Привет! Я Клодушка — Claude через Telegram.\n\n"
         "/clear — очистить историю диалога\n"
         "/memory — что я о тебе помню\n"
         "/forget — забыть всё о тебе\n"
+        "/search — поиск в интернете\n"
         "/id — показать Telegram ID"
     )
     if is_admin(user_id):
@@ -401,6 +458,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/whitelist — показать белые списки\n"
             "/whitelist_on /whitelist_off\n"
             "/captcha_on /captcha_off\n"
+            "/captcha_unban <id>\n"
             "/allow_user <id> [имя]\n"
             "/deny_user <id>\n"
             "/allow_chat <id> [имя]\n"
@@ -428,43 +486,36 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     verified_users = load_json(VERIFIED_FILE)
     await update.message.reply_text(
         f"Перезагружено: {len(ALLOWED_USERS)} пользователей, {len(ALLOWED_CHATS)} чатов, "
-        f"whitelist {'ON' if WHITELIST_ENABLED else 'OFF'}, "
-        f"verified: {len(verified_users)}"
+        f"whitelist {'ON' if WHITELIST_ENABLED else 'OFF'}, verified: {len(verified_users)}"
     )
 
+# --- Group chat support ---
+
 BOT_TRIGGERS = {"клод", "клодушка", "claude"}
+context_bot_id = None
+bot_username = None
 
 def is_bot_mentioned(update: Update) -> bool:
-    """Check if bot is mentioned in group chat."""
     message = update.message
     if not message or not message.text:
         return False
-
-    # Reply to bot's message
     if message.reply_to_message and message.reply_to_message.from_user:
         if message.reply_to_message.from_user.id == context_bot_id:
             return True
-
-    # @username mention
     if message.entities:
         for entity in message.entities:
             if entity.type == "mention":
                 mention = message.text[entity.offset:entity.offset + entity.length].lower()
                 if mention == f"@{bot_username}":
                     return True
-
-    # Trigger words at the start of message
     first_word = message.text.split()[0].lower().rstrip(",:.!?") if message.text else ""
     if first_word in BOT_TRIGGERS:
         return True
-
     return False
 
 def strip_trigger(text: str) -> str:
-    """Remove bot mention/trigger from the beginning of message."""
     if not text:
         return text
-    # Remove @username
     if text.lower().startswith(f"@{bot_username}"):
         text = text[len(f"@{bot_username}"):].lstrip(" ,:")
     else:
@@ -472,10 +523,6 @@ def strip_trigger(text: str) -> str:
         if first_word in BOT_TRIGGERS:
             text = text[len(text.split()[0]):].lstrip(" ,:")
     return text.strip() or text
-
-# Will be set on startup
-context_bot_id = None
-bot_username = None
 
 async def post_init(application):
     global context_bot_id, bot_username
@@ -490,11 +537,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     is_group = update.effective_chat.type in ("group", "supergroup")
 
-    # In groups: only respond when mentioned or replied to
     if is_group and not is_bot_mentioned(update):
         return
 
-    # Captcha check for non-whitelisted users
     if not is_admin(user_id_int) and not (WHITELIST_ENABLED and user_id_int in ALLOWED_USERS):
         if await handle_captcha(update, context):
             return
@@ -506,7 +551,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_text:
         return
 
-    # Strip trigger word from message in groups
     if is_group:
         user_text = strip_trigger(user_text)
         if not user_text:
@@ -525,10 +569,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+        # Check if web search is needed
+        search_query = should_search(user_text)
+        search_context = ""
+        if search_query and tavily:
+            search_results = web_search(search_query)
+            if search_results:
+                search_context = f"\n\nРезультаты поиска по запросу '{search_query}':\n{search_results}"
+
+        system = get_system_prompt(user_id)
+        if search_context:
+            system += f"\n\nИспользуй эти результаты поиска для ответа:{search_context}"
+
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=4096,
-            system=get_system_prompt(user_id),
+            system=system,
             messages=conversations[user_id],
         )
         assistant_text = response.content[0].text
@@ -554,6 +611,7 @@ def main():
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("forget", cmd_forget))
+    app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("id", show_id))
     app.add_handler(CommandHandler("reload", cmd_reload))
     app.add_handler(CommandHandler("whitelist", cmd_whitelist))
@@ -561,11 +619,11 @@ def main():
     app.add_handler(CommandHandler("whitelist_off", cmd_whitelist_off))
     app.add_handler(CommandHandler("captcha_on", cmd_captcha_on))
     app.add_handler(CommandHandler("captcha_off", cmd_captcha_off))
+    app.add_handler(CommandHandler("captcha_unban", cmd_captcha_unban))
     app.add_handler(CommandHandler("allow_user", cmd_allow_user))
     app.add_handler(CommandHandler("deny_user", cmd_deny_user))
     app.add_handler(CommandHandler("allow_chat", cmd_allow_chat))
     app.add_handler(CommandHandler("deny_chat", cmd_deny_chat))
-    app.add_handler(CommandHandler("captcha_unban", cmd_captcha_unban))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Клодушка started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
