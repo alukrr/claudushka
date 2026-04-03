@@ -11,12 +11,14 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+ADMIN_ID = 592441
 
 DATA_DIR = Path("/app/data")
 DATA_DIR.mkdir(exist_ok=True)
 
 CONVERSATIONS_FILE = DATA_DIR / "conversations.json"
 MEMORY_FILE = DATA_DIR / "memory.json"
+ALLOWED_FILE = Path("/app/allowed.json")
 
 def load_json(path: Path, default=None):
     if default is None:
@@ -37,35 +39,42 @@ def save_json(path: Path, data):
         logger.error(f"Error saving {path}: {e}")
 
 def load_allowed():
-    try:
-        with open("allowed.json", "r") as f:
-            data = json.load(f)
-        users = {u["id"] for u in data.get("users", [])}
-        chats = {c["id"] for c in data.get("chats", [])}
-        logger.info(f"Loaded {len(users)} allowed users, {len(chats)} allowed chats")
-        return users, chats
-    except FileNotFoundError:
-        logger.warning("allowed.json not found, allowing everyone")
-        return set(), set()
+    data = load_json(ALLOWED_FILE, {"users": [], "chats": [], "enabled": True})
+    if "enabled" not in data:
+        data["enabled"] = True
+    users = {u["id"] for u in data.get("users", [])}
+    chats = {c["id"] for c in data.get("chats", [])}
+    enabled = data.get("enabled", True)
+    logger.info(f"Whitelist {'ON' if enabled else 'OFF'}: {len(users)} users, {len(chats)} chats")
+    return users, chats, enabled, data
 
-ALLOWED_USERS, ALLOWED_CHATS = load_allowed()
+ALLOWED_USERS, ALLOWED_CHATS, WHITELIST_ENABLED, allowed_data = load_allowed()
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-# str keys because JSON doesn't support int keys
 conversations: dict[str, list] = load_json(CONVERSATIONS_FILE)
 memory: dict[str, list] = load_json(MEMORY_FILE)
 
 MAX_HISTORY = 20
-MEMORY_EXTRACT_EVERY = 5  # extract memory every N messages
+MEMORY_EXTRACT_EVERY = 5
+
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
 
 def is_allowed(user_id: int, chat_id: int) -> bool:
+    if not WHITELIST_ENABLED:
+        return True
     if not ALLOWED_USERS and not ALLOWED_CHATS:
         return True
     return user_id in ALLOWED_USERS or chat_id in ALLOWED_CHATS
 
 def get_system_prompt(user_id: str) -> str:
-    base = "Ты Клодушка — дружелюбный и полезный ассистент. Отвечай на языке пользователя. Будь кратким, но информативным."
+    base = (
+        "Ты Клодушка — остроумный, саркастичный и прямолинейный ассистент с характером. "
+        "Все пользователи 18+. Мат допустим, но только для усиления эмоции или если собеседник сам так общается. Мат ради мата не нужен. "
+        "Если не уверен в факте — честно скажи, что не уверен, а не выдумывай. Лучше сказать 'не знаю, проверь' чем соврать. "
+        "Точность информации важнее красивого ответа. "
+        "Отвечай на языке пользователя. Будь кратким, но по делу."
+    )
     user_mem = memory.get(user_id, [])
     if user_mem:
         facts = "\n".join(f"- {fact}" for fact in user_mem)
@@ -73,9 +82,8 @@ def get_system_prompt(user_id: str) -> str:
     return base
 
 def extract_memory(user_id: str, messages: list):
-    """Ask Claude to extract memorable facts from recent conversation."""
     try:
-        recent = messages[-6:]  # last 3 exchanges
+        recent = messages[-6:]
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=512,
@@ -88,7 +96,6 @@ def extract_memory(user_id: str, messages: list):
             messages=[{"role": "user", "content": f"Диалог:\n{json.dumps(recent, ensure_ascii=False)}"}],
         )
         text = response.content[0].text.strip()
-        # find JSON array in response
         start = text.find("[")
         end = text.rfind("]") + 1
         if start >= 0 and end > start:
@@ -104,14 +111,98 @@ def extract_memory(user_id: str, messages: list):
     except Exception as e:
         logger.error(f"Memory extraction error: {e}")
 
-async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global ALLOWED_USERS, ALLOWED_CHATS
-    if update.effective_user.id not in ALLOWED_USERS:
+# --- Admin commands ---
+
+async def cmd_allow_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ALLOWED_USERS, allowed_data
+    if not is_admin(update.effective_user.id):
         return
-    ALLOWED_USERS, ALLOWED_CHATS = load_allowed()
-    await update.message.reply_text(
-        f"Перезагружено: {len(ALLOWED_USERS)} пользователей, {len(ALLOWED_CHATS)} чатов"
-    )
+    if not context.args:
+        await update.message.reply_text("Использование: /allow_user <id> [имя]")
+        return
+    uid = int(context.args[0])
+    name = " ".join(context.args[1:]) if len(context.args) > 1 else f"user_{uid}"
+    if uid not in ALLOWED_USERS:
+        ALLOWED_USERS.add(uid)
+        allowed_data["users"].append({"id": uid, "name": name})
+        save_json(ALLOWED_FILE, allowed_data)
+    await update.message.reply_text(f"Пользователь {name} ({uid}) добавлен.")
+
+async def cmd_deny_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ALLOWED_USERS, allowed_data
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /deny_user <id>")
+        return
+    uid = int(context.args[0])
+    if uid in ALLOWED_USERS:
+        ALLOWED_USERS.discard(uid)
+        allowed_data["users"] = [u for u in allowed_data["users"] if u["id"] != uid]
+        save_json(ALLOWED_FILE, allowed_data)
+        await update.message.reply_text(f"Пользователь {uid} удалён.")
+    else:
+        await update.message.reply_text(f"Пользователь {uid} не в списке.")
+
+async def cmd_allow_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ALLOWED_CHATS, allowed_data
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /allow_chat <id> [имя]")
+        return
+    cid = int(context.args[0])
+    name = " ".join(context.args[1:]) if len(context.args) > 1 else f"chat_{cid}"
+    if cid not in ALLOWED_CHATS:
+        ALLOWED_CHATS.add(cid)
+        allowed_data["chats"].append({"id": cid, "name": name})
+        save_json(ALLOWED_FILE, allowed_data)
+    await update.message.reply_text(f"Чат {name} ({cid}) добавлен.")
+
+async def cmd_deny_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ALLOWED_CHATS, allowed_data
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /deny_chat <id>")
+        return
+    cid = int(context.args[0])
+    if cid in ALLOWED_CHATS:
+        ALLOWED_CHATS.discard(cid)
+        allowed_data["chats"] = [c for c in allowed_data["chats"] if c["id"] != cid]
+        save_json(ALLOWED_FILE, allowed_data)
+        await update.message.reply_text(f"Чат {cid} удалён.")
+    else:
+        await update.message.reply_text(f"Чат {cid} не в списке.")
+
+async def cmd_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    status = "ВКЛ" if WHITELIST_ENABLED else "ВЫКЛ"
+    users = "\n".join(f"  • {u['name']} ({u['id']})" for u in allowed_data.get("users", []))
+    chats = "\n".join(f"  • {c['name']} ({c['id']})" for c in allowed_data.get("chats", []))
+    text = f"Белый список: {status}\n\nПользователи:\n{users or '  пусто'}\n\nЧаты:\n{chats or '  пусто'}"
+    await update.message.reply_text(text)
+
+async def cmd_whitelist_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global WHITELIST_ENABLED, allowed_data
+    if not is_admin(update.effective_user.id):
+        return
+    WHITELIST_ENABLED = True
+    allowed_data["enabled"] = True
+    save_json(ALLOWED_FILE, allowed_data)
+    await update.message.reply_text("Белый список ВКЛЮЧЕН.")
+
+async def cmd_whitelist_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global WHITELIST_ENABLED, allowed_data
+    if not is_admin(update.effective_user.id):
+        return
+    WHITELIST_ENABLED = False
+    allowed_data["enabled"] = False
+    save_json(ALLOWED_FILE, allowed_data)
+    await update.message.reply_text("Белый список ВЫКЛЮЧЕН. Бот доступен всем.")
+
+# --- User commands ---
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -134,14 +225,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id, update.effective_chat.id):
         await update.message.reply_text("Access denied.")
         return
-    await update.message.reply_text(
+    text = (
         "Привет! Я Клодушка — Claude через Telegram.\n\n"
         "/clear — очистить историю диалога\n"
         "/memory — что я о тебе помню\n"
         "/forget — забыть всё о тебе\n"
-        "/id — показать Telegram ID\n"
-        "/reload — перезагрузить белые списки"
+        "/id — показать Telegram ID"
     )
+    if is_admin(update.effective_user.id):
+        text += (
+            "\n\nАдмин-команды:\n"
+            "/whitelist — показать белые списки\n"
+            "/whitelist_on — включить\n"
+            "/whitelist_off — выключить\n"
+            "/allow_user <id> [имя]\n"
+            "/deny_user <id>\n"
+            "/allow_chat <id> [имя]\n"
+            "/deny_chat <id>\n"
+            "/reload — перезагрузить из файла"
+        )
+    await update.message.reply_text(text)
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -154,12 +257,21 @@ async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     await update.message.reply_text(f"User ID: {uid}\nChat ID: {cid}")
 
+async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ALLOWED_USERS, ALLOWED_CHATS, WHITELIST_ENABLED, allowed_data
+    if not is_admin(update.effective_user.id):
+        return
+    ALLOWED_USERS, ALLOWED_CHATS, WHITELIST_ENABLED, allowed_data = load_allowed()
+    await update.message.reply_text(
+        f"Перезагружено: {len(ALLOWED_USERS)} пользователей, {len(ALLOWED_CHATS)} чатов, "
+        f"whitelist {'ON' if WHITELIST_ENABLED else 'OFF'}"
+    )
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id_int = update.effective_user.id
     chat_id = update.effective_chat.id
     if not is_allowed(user_id_int, chat_id):
-        await update.message.reply_text("Access denied.")
-        return
+        return  # молча игнорируем
     user_text = update.message.text
     if not user_text:
         return
@@ -184,11 +296,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         assistant_text = response.content[0].text
         conversations[user_id].append({"role": "assistant", "content": assistant_text})
-
-        # save conversation
         save_json(CONVERSATIONS_FILE, conversations)
 
-        # extract memory periodically
         msg_count = len(conversations[user_id])
         if msg_count > 0 and msg_count % (MEMORY_EXTRACT_EVERY * 2) == 0:
             extract_memory(user_id, conversations[user_id])
@@ -210,6 +319,13 @@ def main():
     app.add_handler(CommandHandler("forget", cmd_forget))
     app.add_handler(CommandHandler("id", show_id))
     app.add_handler(CommandHandler("reload", cmd_reload))
+    app.add_handler(CommandHandler("whitelist", cmd_whitelist))
+    app.add_handler(CommandHandler("whitelist_on", cmd_whitelist_on))
+    app.add_handler(CommandHandler("whitelist_off", cmd_whitelist_off))
+    app.add_handler(CommandHandler("allow_user", cmd_allow_user))
+    app.add_handler(CommandHandler("deny_user", cmd_deny_user))
+    app.add_handler(CommandHandler("allow_chat", cmd_allow_chat))
+    app.add_handler(CommandHandler("deny_chat", cmd_deny_chat))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Клодушка started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
