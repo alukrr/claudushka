@@ -339,6 +339,26 @@ async def cmd_captcha_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     CAPTCHA_ENABLED = False
     await update.message.reply_text("Капча ВЫКЛЮЧЕНА.")
 
+async def cmd_captcha_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /captcha_unban <user_id>")
+        return
+    uid = context.args[0]
+    captcha_state.pop(uid, None)
+    await update.message.reply_text(f"Пользователь {uid} разбанен. Может пройти капчу заново.")
+
+async def cmd_captcha_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /captcha_unban <user_id>")
+        return
+    uid = context.args[0]
+    captcha_state.pop(uid, None)
+    await update.message.reply_text(f"Пользователь {uid} разбанен. Может пройти капчу заново.")
+
 # --- User commands ---
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -365,7 +385,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if CAPTCHA_ENABLED and not is_banned(user_id):
             uid = str(user_id)
             try:
-                question = generate_captcha_question(update.message.text or "hello")
+                question = generate_captcha_question("hello")
                 captcha_state[uid] = {"question": question, "attempts": 0}
                 await update.message.reply_text(
                     f"Привет! Для начала ответь на вопрос:\n\n{question}"
@@ -488,6 +508,8 @@ def main():
     app.add_handler(CommandHandler("deny_user", cmd_deny_user))
     app.add_handler(CommandHandler("allow_chat", cmd_allow_chat))
     app.add_handler(CommandHandler("deny_chat", cmd_deny_chat))
+    app.add_handler(CommandHandler("captcha_unban", cmd_captcha_unban))
+    app.add_handler(CommandHandler("captcha_unban", cmd_captcha_unban))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Клодушка started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
