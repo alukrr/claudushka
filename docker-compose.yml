@@ -7,6 +7,7 @@ services:
       - ./bot.py:/app/bot.py
       - ./requirements.txt:/app/requirements.txt
       - ./allowed.json:/app/allowed.json
+      - ./data:/app/data
     env_file:
       - .env
     command: /bin/sh -c "pip install --no-cache-dir -r requirements.txt && python bot.py"
