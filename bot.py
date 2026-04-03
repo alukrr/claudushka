@@ -65,6 +65,7 @@ captcha_state: dict[str, dict] = {}
 MAX_HISTORY = 20
 GROUP_HISTORY_SIZE = 1000
 group_history: dict[str, list] = {}
+token_usage = {"input": 0, "output": 0}
 MEMORY_EXTRACT_EVERY = 5
 MAX_CAPTCHA_ATTEMPTS = 3
 BAN_DURATION = 3600
@@ -379,6 +380,21 @@ async def cmd_captcha_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- User commands ---
 
+async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    inp = token_usage["input"]
+    out = token_usage["output"]
+    cost_in = inp / 1_000_000 * 3  # Sonnet input $3/M
+    cost_out = out / 1_000_000 * 15  # Sonnet output $15/M
+    total = cost_in + cost_out
+    await update.message.reply_text(
+        f"Токены с момента запуска:\n"
+        f"  Вход: {inp:,}\n"
+        f"  Выход: {out:,}\n"
+        f"  ~${total:.4f} (Sonnet)"
+    )
+
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
@@ -607,6 +623,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages=conversations[user_id],
         )
         assistant_text = response.content[0].text
+        token_usage["input"] += response.usage.input_tokens
+        token_usage["output"] += response.usage.output_tokens
         conversations[user_id].append({"role": "assistant", "content": assistant_text})
         save_json(CONVERSATIONS_FILE, conversations)
 
@@ -629,6 +647,7 @@ def main():
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("forget", cmd_forget))
+    app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("id", show_id))
     app.add_handler(CommandHandler("reload", cmd_reload))
