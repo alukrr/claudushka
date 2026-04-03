@@ -4,7 +4,7 @@ import logging
 import time
 from pathlib import Path
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, ChatMemberHandler, filters, ContextTypes
 import anthropic
 from tavily import TavilyClient
 import db
@@ -34,6 +34,9 @@ WHITELIST_ENABLED = True
 
 # Captcha state (in-memory, resets on restart)
 captcha_state: dict[str, dict] = {}
+
+# Pending chat approvals
+pending_chats: dict[int, dict] = {}
 
 # Token tracking
 token_usage = {"input": 0, "output": 0}
@@ -427,6 +430,18 @@ async def cmd_captcha_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Пользователь {uid} разбанен.")
 
 
+async def cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    chats = db.get_allowed_chats()
+    if not chats:
+        await update.message.reply_text("Нет разрешённых чатов.")
+        return
+    lines = []
+    for c in chats:
+        lines.append(f"• {c['name'] or 'без имени'} ({c['chat_id']})")
+    await update.message.reply_text("Разрешённые чаты:\n\n" + "\n".join(lines))
+
 async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -593,6 +608,85 @@ async def cmd_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Main message handler ---
 
+async def handle_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Track when bot is added to a new chat."""
+    if update.my_chat_member:
+        new_status = update.my_chat_member.new_chat_member.status
+        chat = update.my_chat_member.chat
+        added_by = update.my_chat_member.from_user
+
+        if new_status in ("member", "administrator"):
+            chat_id = chat.id
+            chat_title = chat.title or "Без названия"
+            adder_name = added_by.full_name or added_by.username or str(added_by.id)
+
+            # Notify admin
+            for admin_id in ADMIN_IDS:
+                try:
+                    pending_chats[chat_id] = {
+                        "title": chat_title,
+                        "added_by": added_by.id,
+                        "added_by_name": adder_name
+                    }
+                    await context.bot.send_message(
+                        chat_id=admin_id,
+                        text=(
+                            f"🆕 Меня добавили в чат!\n\n"
+                            f"Чат: {chat_title}\n"
+                            f"ID: {chat_id}\n"
+                            f"Добавил: {adder_name} ({added_by.id})\n\n"
+                            f"Подтвердить: /approve_chat {chat_id}\n"
+                            f"Отклонить: /reject_chat {chat_id}"
+                        )
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to notify admin {admin_id}: {e}")
+
+        elif new_status in ("left", "kicked"):
+            chat_title = chat.title or "Без названия"
+            for admin_id in ADMIN_IDS:
+                try:
+                    await context.bot.send_message(
+                        chat_id=admin_id,
+                        text=f"👋 Меня удалили из чата: {chat_title} ({chat.id})"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to notify admin: {e}")
+
+
+async def cmd_approve_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /approve_chat <chat_id>")
+        return
+    chat_id = int(context.args[0])
+    info = pending_chats.pop(chat_id, {})
+    chat_name = info.get("title", f"chat_{chat_id}")
+    db.add_allowed_chat(chat_id, chat_name, update.effective_user.id)
+    await update.message.reply_text(f"✅ Чат {chat_name} ({chat_id}) одобрен.")
+    try:
+        await context.bot.send_message(chat_id=chat_id, text="Админ подтвердил мой доступ. Готова к работе! 🤖")
+    except Exception:
+        pass
+
+
+async def cmd_reject_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /reject_chat <chat_id>")
+        return
+    chat_id = int(context.args[0])
+    pending_chats.pop(chat_id, None)
+    await update.message.reply_text(f"❌ Чат {chat_id} отклонён. Выхожу.")
+    try:
+        await context.bot.send_message(chat_id=chat_id, text="Извините, мой админ не одобрил этот чат. Пока! 👋")
+        await context.bot.leave_chat(chat_id)
+    except Exception as e:
+        logger.error(f"Failed to leave chat: {e}")
+
+
 async def post_init(application):
     global context_bot_id, bot_username
     me = await application.bot.get_me()
@@ -734,7 +828,11 @@ def main():
     app.add_handler(CommandHandler("captcha_unban", cmd_captcha_unban))
     app.add_handler(CommandHandler("allow_chat", cmd_allow_chat))
     app.add_handler(CommandHandler("deny_chat", cmd_deny_chat))
+    app.add_handler(CommandHandler("chats", cmd_chats))
     app.add_handler(CommandHandler("cost", cmd_cost))
+    app.add_handler(CommandHandler("approve_chat", cmd_approve_chat))
+    app.add_handler(CommandHandler("reject_chat", cmd_reject_chat))
+    app.add_handler(ChatMemberHandler(handle_new_chat, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CommandHandler("migrate", cmd_migrate))
 
     # Messages
