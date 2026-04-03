@@ -7,7 +7,6 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import anthropic
 from tavily import TavilyClient
-import db
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -15,75 +14,82 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
-ADMIN_IDS = {592441}
+ADMIN_ID = 592441
 
 DATA_DIR = Path("/app/data")
 DATA_DIR.mkdir(exist_ok=True)
 
-tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+CONVERSATIONS_FILE = DATA_DIR / "conversations.json"
+MEMORY_FILE = DATA_DIR / "memory.json"
+VERIFIED_FILE = DATA_DIR / "verified_users.json"
+ALLOWED_FILE = Path("/app/allowed.json")
 
-MAX_HISTORY = 40
+tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
+
+def load_json(path: Path, default=None):
+    if default is None:
+        default = {}
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error(f"Error loading {path}: {e}")
+    return default
+
+def save_json(path: Path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving {path}: {e}")
+
+def load_allowed():
+    data = load_json(ALLOWED_FILE, {"users": [], "chats": [], "enabled": True})
+    if "enabled" not in data:
+        data["enabled"] = True
+    users = {u["id"] for u in data.get("users", [])}
+    chats = {c["id"] for c in data.get("chats", [])}
+    enabled = data.get("enabled", True)
+    logger.info(f"Whitelist {'ON' if enabled else 'OFF'}: {len(users)} users, {len(chats)} chats")
+    return users, chats, enabled, data
+
+ALLOWED_USERS, ALLOWED_CHATS, WHITELIST_ENABLED, allowed_data = load_allowed()
+
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+conversations: dict[str, list] = load_json(CONVERSATIONS_FILE)
+memory: dict[str, list] = load_json(MEMORY_FILE)
+verified_users: dict[str, dict] = load_json(VERIFIED_FILE)
+captcha_state: dict[str, dict] = {}
+
+MAX_HISTORY = 20
+GROUP_HISTORY_SIZE = 1000
+group_history: dict[str, list] = {}
+token_usage = {"input": 0, "output": 0}
 MEMORY_EXTRACT_EVERY = 5
 MAX_CAPTCHA_ATTEMPTS = 3
 BAN_DURATION = 3600
-STREET_DAILY_LIMIT = 10
-
 CAPTCHA_ENABLED = True
-WHITELIST_ENABLED = True
-
-# Captcha state (in-memory, resets on restart)
-captcha_state: dict[str, dict] = {}
-
-# Token tracking
-token_usage = {"input": 0, "output": 0}
-
-# Bot info (set on startup)
-context_bot_id = None
-bot_username = None
-
-
-# --- Role checks ---
 
 def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    return user_id == ADMIN_ID
 
-
-def can_invite(user: dict) -> bool:
-    return user["role"] in ("admin", "premium")
-
-
-def can_search(user: dict) -> bool:
-    return user["role"] in ("admin", "premium", "referral")
-
-
-def needs_captcha(user: dict) -> bool:
-    if user["role"] in ("admin", "premium", "banned"):
-        return False
-    return not user["verified"]
-
-
-def is_allowed_in_chat(user: dict, chat_id: int) -> bool:
+def is_allowed(user_id: int, chat_id: int) -> bool:
     if not WHITELIST_ENABLED:
         return True
-    if user["role"] in ("admin", "premium", "referral"):
+    if not ALLOWED_USERS and not ALLOWED_CHATS:
         return True
-    if user["verified"]:
-        return True
-    if db.is_chat_allowed(chat_id):
+    return user_id in ALLOWED_USERS or chat_id in ALLOWED_CHATS
+
+def is_verified(user_id: int) -> bool:
+    return str(user_id) in verified_users
+
+def is_banned(user_id: int) -> bool:
+    uid = str(user_id)
+    state = captcha_state.get(uid)
+    if state and state.get("banned_until", 0) > time.time():
         return True
     return False
-
-
-def check_daily_limit(user: dict) -> bool:
-    """Returns True if user can send a message."""
-    if user["role"] in ("admin", "premium", "referral"):
-        return True
-    count = db.increment_daily_messages(user["telegram_id"])
-    return count <= STREET_DAILY_LIMIT
-
-
-# --- Web search ---
 
 def web_search(query: str, max_results: int = 5) -> str:
     if not tavily:
@@ -100,8 +106,8 @@ def web_search(query: str, max_results: int = 5) -> str:
         logger.error(f"Search error: {e}")
         return f"Ошибка поиска: {e}"
 
-
 def should_search(text: str) -> str | None:
+    """Ask Claude if web search is needed. Returns search query or None."""
     try:
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -124,9 +130,6 @@ def should_search(text: str) -> str | None:
         logger.error(f"Search decision error: {e}")
         return None
 
-
-# --- Captcha ---
-
 def generate_captcha_question(user_text: str) -> str:
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
@@ -145,14 +148,13 @@ def generate_captcha_question(user_text: str) -> str:
     )
     return response.content[0].text.strip()
 
-
 def check_captcha_answer(question: str, answer: str) -> bool:
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=50,
         system=(
             "Ты проверяешь ответ на вопрос-загадку. "
-            "Если ответ разумный и показывает что отвечает живой человек — ответь YES. "
+            "Если ответ разумный и показывает что отвечает живой человек (не обязательно идеально точный, но осмысленный) — ответь YES. "
             "Если ответ бессмысленный, пустой или явно от бота — ответь NO. "
             "Отвечай ТОЛЬКО YES или NO."
         ),
@@ -160,10 +162,7 @@ def check_captcha_answer(question: str, answer: str) -> bool:
     )
     return "YES" in response.content[0].text.strip().upper()
 
-
-# --- Memory ---
-
-def get_system_prompt(user_id: int) -> str:
+def get_system_prompt(user_id: str) -> str:
     base = (
         "Ты Клодушка — остроумный, саркастичный и прямолинейный ассистент с характером. "
         "Все пользователи 18+. Мат допустим, но только для усиления эмоции или если собеседник сам так общается. Мат ради мата не нужен. "
@@ -173,14 +172,13 @@ def get_system_prompt(user_id: int) -> str:
         "Точность информации важнее красивого ответа. "
         "Отвечай на языке пользователя. Будь кратким, но по делу."
     )
-    facts = db.get_memory(user_id)
-    if facts:
-        facts_str = "\n".join(f"- {f}" for f in facts)
-        base += f"\n\nВот что ты помнишь об этом пользователе:\n{facts_str}\nИспользуй эти знания естественно, не перечисляй их."
+    user_mem = memory.get(user_id, [])
+    if user_mem:
+        facts = "\n".join(f"- {fact}" for fact in user_mem)
+        base += f"\n\nВот что ты помнишь об этом пользователе:\n{facts}\nИспользуй эти знания естественно, не перечисляй их."
     return base
 
-
-def extract_memory(user_id: int, messages: list):
+def extract_memory(user_id: str, messages: list):
     try:
         recent = messages[-6:]
         response = client.messages.create(
@@ -188,6 +186,7 @@ def extract_memory(user_id: int, messages: list):
             max_tokens=512,
             system=(
                 "Извлеки важные факты о пользователе из диалога. "
+                "Факты должны быть полезны для будущих разговоров: имя, профессия, интересы, предпочтения, семья, местоположение и т.д. "
                 "Верни JSON-массив строк. Если новых фактов нет, верни пустой массив [].\n"
                 "Пример: [\"Зовут Алексей\", \"Живёт в Германии\", \"Работает DevOps-инженером\"]"
             ),
@@ -199,42 +198,42 @@ def extract_memory(user_id: int, messages: list):
         if start >= 0 and end > start:
             new_facts = json.loads(text[start:end])
             if new_facts:
-                db.add_memory_facts(user_id, new_facts)
-                logger.info(f"Memory updated for {user_id}")
+                existing = set(memory.get(user_id, []))
+                for fact in new_facts:
+                    if fact not in existing:
+                        existing.add(fact)
+                memory[user_id] = list(existing)
+                save_json(MEMORY_FILE, memory)
+                logger.info(f"Memory updated for {user_id}: {len(memory[user_id])} facts")
     except Exception as e:
         logger.error(f"Memory extraction error: {e}")
 
+# --- Captcha ---
 
-# --- Captcha handler ---
-
-async def handle_captcha(update: Update, user: dict) -> bool:
+async def handle_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not CAPTCHA_ENABLED:
         return False
-    if not needs_captcha(user):
-        return False
-
-    user_id = user["telegram_id"]
+    user_id = update.effective_user.id
     uid = str(user_id)
-
-    # Banned
-    state = captcha_state.get(uid)
-    if state and state.get("banned_until", 0) > time.time():
-        remaining = int(state["banned_until"] - time.time())
+    if is_admin(user_id) or (WHITELIST_ENABLED and user_id in ALLOWED_USERS):
+        return False
+    if is_verified(user_id):
+        return False
+    if is_banned(user_id):
+        remaining = int(captcha_state[uid]["banned_until"] - time.time())
         mins = remaining // 60 + 1
         await update.message.reply_text(f"Слишком много неправильных ответов. Попробуй через {mins} мин.")
         return True
-
     user_text = update.message.text
     if not user_text:
         return True
-
     if uid in captcha_state and "question" in captcha_state[uid]:
         question = captcha_state[uid]["question"]
         attempts = captcha_state[uid].get("attempts", 0) + 1
         captcha_state[uid]["attempts"] = attempts
-
         if check_captcha_answer(question, user_text):
-            db.set_verified(user_id, True)
+            verified_users[uid] = {"verified_at": int(time.time()), "name": update.effective_user.full_name}
+            save_json(VERIFIED_FILE, verified_users)
             captcha_state.pop(uid, None)
             await update.message.reply_text("Добро пожаловать! Теперь можешь общаться со мной свободно.")
             return True
@@ -243,9 +242,10 @@ async def handle_captcha(update: Update, user: dict) -> bool:
                 captcha_state[uid] = {"banned_until": time.time() + BAN_DURATION}
                 await update.message.reply_text("Неправильно. Слишком много попыток. Попробуй через час.")
                 return True
-            remaining = MAX_CAPTCHA_ATTEMPTS - attempts
-            await update.message.reply_text(f"Неправильно. Осталось попыток: {remaining}\n\nВопрос: {question}")
-            return True
+            else:
+                remaining = MAX_CAPTCHA_ATTEMPTS - attempts
+                await update.message.reply_text(f"Неправильно. Осталось попыток: {remaining}\n\nВопрос: {question}")
+                return True
     else:
         try:
             question = generate_captcha_question(user_text)
@@ -255,13 +255,263 @@ async def handle_captcha(update: Update, user: dict) -> bool:
             )
         except Exception as e:
             logger.error(f"Captcha generation error: {e}")
+            await update.message.reply_text("Ошибка генерации вопроса. Попробуй ещё раз.")
         return True
 
+# --- Admin commands ---
 
-# --- Group chat ---
+async def cmd_allow_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ALLOWED_USERS, allowed_data
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /allow_user <id> [имя]")
+        return
+    uid = int(context.args[0])
+    name = " ".join(context.args[1:]) if len(context.args) > 1 else f"user_{uid}"
+    if uid not in ALLOWED_USERS:
+        ALLOWED_USERS.add(uid)
+        allowed_data["users"].append({"id": uid, "name": name})
+        save_json(ALLOWED_FILE, allowed_data)
+    await update.message.reply_text(f"Пользователь {name} ({uid}) добавлен.")
+
+async def cmd_deny_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ALLOWED_USERS, allowed_data
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /deny_user <id>")
+        return
+    uid = int(context.args[0])
+    if uid in ALLOWED_USERS:
+        ALLOWED_USERS.discard(uid)
+        allowed_data["users"] = [u for u in allowed_data["users"] if u["id"] != uid]
+        save_json(ALLOWED_FILE, allowed_data)
+        await update.message.reply_text(f"Пользователь {uid} удалён.")
+    else:
+        await update.message.reply_text(f"Пользователь {uid} не в списке.")
+
+async def cmd_allow_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ALLOWED_CHATS, allowed_data
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /allow_chat <id> [имя]")
+        return
+    cid = int(context.args[0])
+    name = " ".join(context.args[1:]) if len(context.args) > 1 else f"chat_{cid}"
+    if cid not in ALLOWED_CHATS:
+        ALLOWED_CHATS.add(cid)
+        allowed_data["chats"].append({"id": cid, "name": name})
+        save_json(ALLOWED_FILE, allowed_data)
+    await update.message.reply_text(f"Чат {name} ({cid}) добавлен.")
+
+async def cmd_deny_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ALLOWED_CHATS, allowed_data
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /deny_chat <id>")
+        return
+    cid = int(context.args[0])
+    if cid in ALLOWED_CHATS:
+        ALLOWED_CHATS.discard(cid)
+        allowed_data["chats"] = [c for c in allowed_data["chats"] if c["id"] != cid]
+        save_json(ALLOWED_FILE, allowed_data)
+        await update.message.reply_text(f"Чат {cid} удалён.")
+    else:
+        await update.message.reply_text(f"Чат {cid} не в списке.")
+
+async def cmd_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    status = "ВКЛ" if WHITELIST_ENABLED else "ВЫКЛ"
+    captcha = "ВКЛ" if CAPTCHA_ENABLED else "ВЫКЛ"
+    users = "\n".join(f"  • {u['name']} ({u['id']})" for u in allowed_data.get("users", []))
+    chats = "\n".join(f"  • {c['name']} ({c['id']})" for c in allowed_data.get("chats", []))
+    v_count = len(verified_users)
+    text = (
+        f"Белый список: {status}\nКапча: {captcha}\nВерифицированных: {v_count}\n\n"
+        f"Пользователи:\n{users or '  пусто'}\n\nЧаты:\n{chats or '  пусто'}"
+    )
+    await update.message.reply_text(text)
+
+async def cmd_whitelist_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global WHITELIST_ENABLED, allowed_data
+    if not is_admin(update.effective_user.id):
+        return
+    WHITELIST_ENABLED = True
+    allowed_data["enabled"] = True
+    save_json(ALLOWED_FILE, allowed_data)
+    await update.message.reply_text("Белый список ВКЛЮЧЕН.")
+
+async def cmd_whitelist_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global WHITELIST_ENABLED, allowed_data
+    if not is_admin(update.effective_user.id):
+        return
+    WHITELIST_ENABLED = False
+    allowed_data["enabled"] = False
+    save_json(ALLOWED_FILE, allowed_data)
+    await update.message.reply_text("Белый список ВЫКЛЮЧЕН. Бот доступен всем.")
+
+async def cmd_captcha_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global CAPTCHA_ENABLED
+    if not is_admin(update.effective_user.id):
+        return
+    CAPTCHA_ENABLED = True
+    await update.message.reply_text("Капча ВКЛЮЧЕНА для новых пользователей.")
+
+async def cmd_captcha_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global CAPTCHA_ENABLED
+    if not is_admin(update.effective_user.id):
+        return
+    CAPTCHA_ENABLED = False
+    await update.message.reply_text("Капча ВЫКЛЮЧЕНА.")
+
+async def cmd_captcha_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /captcha_unban <user_id>")
+        return
+    uid = context.args[0]
+    captcha_state.pop(uid, None)
+    await update.message.reply_text(f"Пользователь {uid} разбанен. Может пройти капчу заново.")
+
+# --- User commands ---
+
+async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    inp = token_usage["input"]
+    out = token_usage["output"]
+    cost_in = inp / 1_000_000 * 3  # Sonnet input $3/M
+    cost_out = out / 1_000_000 * 15  # Sonnet output $15/M
+    total = cost_in + cost_out
+    await update.message.reply_text(
+        f"Токены с момента запуска:\n"
+        f"  Вход: {inp:,}\n"
+        f"  Выход: {out:,}\n"
+        f"  ~${total:.4f} (Sonnet)"
+    )
+
+async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    if not is_allowed(user_id, chat_id) and not is_verified(user_id):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /search <запрос>")
+        return
+    query = " ".join(context.args)
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    results = web_search(query)
+    if not results:
+        await update.message.reply_text("Ничего не нашёл.")
+        return
+    # Let Claude summarize search results
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2048,
+            system=(
+                "Ты Клодушка. Пользователь задал вопрос, и ты нашёл результаты в интернете. "
+                "Дай краткий и полезный ответ на основе найденного. Укажи источники если важно. "
+                "Отвечай на языке пользователя."
+            ),
+            messages=[{"role": "user", "content": f"Вопрос: {query}\n\nРезультаты поиска:\n{results}"}],
+        )
+        answer = response.content[0].text
+        if len(answer) <= 4096:
+            await update.message.reply_text(answer)
+        else:
+            for i in range(0, len(answer), 4096):
+                await update.message.reply_text(answer[i:i + 4096])
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
+
+async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    user_mem = memory.get(user_id, [])
+    if user_mem:
+        facts = "\n".join(f"• {fact}" for fact in user_mem)
+        await update.message.reply_text(f"Я помню о тебе:\n\n{facts}")
+    else:
+        await update.message.reply_text("Пока ничего не помню о тебе. Поговорим — запомню!")
+
+async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    memory.pop(user_id, None)
+    conversations.pop(user_id, None)
+    save_json(MEMORY_FILE, memory)
+    save_json(CONVERSATIONS_FILE, conversations)
+    await update.message.reply_text("Всё забыл. Начинаем с чистого листа.")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    if not is_allowed(user_id, chat_id) and not is_verified(user_id):
+        if CAPTCHA_ENABLED and not is_banned(user_id):
+            uid = str(user_id)
+            try:
+                question = generate_captcha_question("hello")
+                captcha_state[uid] = {"question": question, "attempts": 0}
+                await update.message.reply_text(f"Привет! Для начала ответь на вопрос:\n\n{question}")
+            except Exception as e:
+                logger.error(f"Captcha error: {e}")
+        else:
+            await update.message.reply_text("Access denied.")
+        return
+    text = (
+        "Привет! Я Клодушка — Claude через Telegram.\n\n"
+        "/clear — очистить историю диалога\n"
+        "/memory — что я о тебе помню\n"
+        "/forget — забыть всё о тебе\n"
+        "/search — поиск в интернете\n"
+        "/id — показать Telegram ID"
+    )
+    if is_admin(user_id):
+        text += (
+            "\n\nАдмин-команды:\n"
+            "/whitelist — показать белые списки\n"
+            "/whitelist_on /whitelist_off\n"
+            "/captcha_on /captcha_off\n"
+            "/captcha_unban <id>\n"
+            "/allow_user <id> [имя]\n"
+            "/deny_user <id>\n"
+            "/allow_chat <id> [имя]\n"
+            "/deny_chat <id>\n"
+            "/reload — перезагрузить из файла"
+        )
+    await update.message.reply_text(text)
+
+async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    conversations.pop(user_id, None)
+    save_json(CONVERSATIONS_FILE, conversations)
+    await update.message.reply_text("История диалога очищена. Память сохранена.")
+
+async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    cid = update.effective_chat.id
+    await update.message.reply_text(f"User ID: {uid}\nChat ID: {cid}")
+
+async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ALLOWED_USERS, ALLOWED_CHATS, WHITELIST_ENABLED, allowed_data, verified_users
+    if not is_admin(update.effective_user.id):
+        return
+    ALLOWED_USERS, ALLOWED_CHATS, WHITELIST_ENABLED, allowed_data = load_allowed()
+    verified_users = load_json(VERIFIED_FILE)
+    await update.message.reply_text(
+        f"Перезагружено: {len(ALLOWED_USERS)} пользователей, {len(ALLOWED_CHATS)} чатов, "
+        f"whitelist {'ON' if WHITELIST_ENABLED else 'OFF'}, verified: {len(verified_users)}"
+    )
+
+# --- Group chat support ---
 
 BOT_TRIGGERS = {"клод", "клодушка", "claude"}
-
+context_bot_id = None
+bot_username = None
 
 def is_bot_mentioned(update: Update) -> bool:
     message = update.message
@@ -281,7 +531,6 @@ def is_bot_mentioned(update: Update) -> bool:
         return True
     return False
 
-
 def strip_trigger(text: str) -> str:
     if not text:
         return text
@@ -293,347 +542,37 @@ def strip_trigger(text: str) -> str:
             text = text[len(text.split()[0]):].lstrip(" ,:")
     return text.strip() or text
 
-
-# --- Admin commands ---
-
-async def cmd_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "Использование: /role <user_id> <admin|premium|referral|street|banned>"
-        )
-        return
-    uid = int(context.args[0])
-    role = context.args[1].lower()
-    if role not in ("admin", "premium", "referral", "street", "banned"):
-        await update.message.reply_text("Роли: admin, premium, referral, street, banned")
-        return
-    user = db.get_or_create_user(uid)
-    db.set_role(uid, role)
-    if role == "admin":
-        ADMIN_IDS.add(uid)
-    await update.message.reply_text(f"Пользователь {uid} → {role}")
-
-
-async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    users = db.list_all_users()
-    if not users:
-        await update.message.reply_text("Пользователей нет.")
-        return
-    lines = []
-    role_emoji = {"admin": "👑", "premium": "⭐", "referral": "🔗", "street": "🚶", "banned": "🚫"}
-    for u in users:
-        emoji = role_emoji.get(u["role"], "?")
-        name = u["full_name"] or u["username"] or str(u["telegram_id"])
-        verified = "✓" if u["verified"] else "✗"
-        lines.append(f"{emoji} {name} ({u['telegram_id']}) [{verified}]")
-    await update.message.reply_text("Пользователи:\n\n" + "\n".join(lines))
-
-
-async def cmd_allow_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /allow_chat <id> [имя]")
-        return
-    cid = int(context.args[0])
-    name = " ".join(context.args[1:]) if len(context.args) > 1 else f"chat_{cid}"
-    db.add_allowed_chat(cid, name, update.effective_user.id)
-    await update.message.reply_text(f"Чат {name} ({cid}) добавлен.")
-
-
-async def cmd_deny_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /deny_chat <id>")
-        return
-    cid = int(context.args[0])
-    db.remove_allowed_chat(cid)
-    await update.message.reply_text(f"Чат {cid} удалён.")
-
-
-async def cmd_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    admins = db.list_users_by_role("admin")
-    premiums = db.list_users_by_role("premium")
-    referrals = db.list_users_by_role("referral")
-    streets = db.list_users_by_role("street")
-    banned = db.list_users_by_role("banned")
-    chats = db.get_allowed_chats()
-
-    def fmt(users):
-        if not users:
-            return "  пусто"
-        return "\n".join(f"  • {u['full_name'] or u['telegram_id']} ({u['telegram_id']})" for u in users)
-
-    text = (
-        f"Whitelist: {'ВКЛ' if WHITELIST_ENABLED else 'ВЫКЛ'}\n"
-        f"Капча: {'ВКЛ' if CAPTCHA_ENABLED else 'ВЫКЛ'}\n\n"
-        f"👑 Админы:\n{fmt(admins)}\n\n"
-        f"⭐ Премиум:\n{fmt(premiums)}\n\n"
-        f"🔗 По приглашению:\n{fmt(referrals)}\n\n"
-        f"🚶 С улицы:\n{fmt(streets)}\n\n"
-        f"🚫 Забанены:\n{fmt(banned)}\n\n"
-        f"Чаты: {len(chats)}"
-    )
-    await update.message.reply_text(text)
-
-
-async def cmd_whitelist_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global WHITELIST_ENABLED
-    if not is_admin(update.effective_user.id):
-        return
-    WHITELIST_ENABLED = True
-    await update.message.reply_text("Белый список ВКЛЮЧЕН.")
-
-
-async def cmd_whitelist_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global WHITELIST_ENABLED
-    if not is_admin(update.effective_user.id):
-        return
-    WHITELIST_ENABLED = False
-    await update.message.reply_text("Белый список ВЫКЛЮЧЕН.")
-
-
-async def cmd_captcha_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global CAPTCHA_ENABLED
-    if not is_admin(update.effective_user.id):
-        return
-    CAPTCHA_ENABLED = True
-    await update.message.reply_text("Капча ВКЛЮЧЕНА.")
-
-
-async def cmd_captcha_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global CAPTCHA_ENABLED
-    if not is_admin(update.effective_user.id):
-        return
-    CAPTCHA_ENABLED = False
-    await update.message.reply_text("Капча ВЫКЛЮЧЕНА.")
-
-
-async def cmd_captcha_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /captcha_unban <user_id>")
-        return
-    uid = context.args[0]
-    captcha_state.pop(uid, None)
-    await update.message.reply_text(f"Пользователь {uid} разбанен.")
-
-
-async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    inp = token_usage["input"]
-    out = token_usage["output"]
-    cost_in = inp / 1_000_000 * 3
-    cost_out = out / 1_000_000 * 15
-    total = cost_in + cost_out
-    await update.message.reply_text(
-        f"Токены диалогов (без поиска, капчи, памяти):\n"
-        f"  Вход: {inp:,}\n"
-        f"  Выход: {out:,}\n"
-        f"  ~${total:.4f} (Sonnet)"
-    )
-
-
-# --- User commands ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    username = update.effective_user.username
-    full_name = update.effective_user.full_name
-
-    # Handle referral link: /start ref_<code>
-    referral_role = None
-    if context.args and context.args[0].startswith("ref_"):
-        ref_code = context.args[0][4:]
-        referrer = db.get_user_by_referral(ref_code)
-        if referrer and can_invite(referrer):
-            referral_role = "referral"
-            user = db.get_or_create_user(user_id, username, full_name)
-            if user["role"] == "street":
-                db.set_role(user_id, "referral")
-                conn = db.get_conn()
-                conn.execute("UPDATE users SET referred_by = ? WHERE telegram_id = ?",
-                             (referrer["telegram_id"], user_id))
-                conn.commit()
-                conn.close()
-
-    user = db.get_or_create_user(user_id, username, full_name)
-
-    if user["role"] == "banned":
-        return
-
-    if needs_captcha(user):
-        if CAPTCHA_ENABLED:
-            try:
-                question = generate_captcha_question("hello")
-                captcha_state[str(user_id)] = {"question": question, "attempts": 0}
-                await update.message.reply_text(f"Привет! Для начала ответь на вопрос:\n\n{question}")
-            except Exception as e:
-                logger.error(f"Captcha error: {e}")
-        return
-
-    ref_code = db.get_referral_code(user_id)
-    ref_link = f"https://t.me/{bot_username}?start=ref_{ref_code}" if ref_code else ""
-
-    text = (
-        "Привет! Я Клодушка — Claude через Telegram.\n\n"
-        "/clear — очистить историю диалога\n"
-        "/memory — что я о тебе помню\n"
-        "/forget — забыть всё о тебе\n"
-        "/id — показать Telegram ID\n"
-    )
-
-    if can_search(user):
-        text += "/search — поиск в интернете\n"
-
-    if can_invite(user):
-        text += f"\n📨 Твоя реферальная ссылка:\n{ref_link}\n"
-
-    if is_admin(user_id):
-        text += (
-            "\nАдмин-команды:\n"
-            "/users — список пользователей\n"
-            "/role <id> <role> — изменить роль\n"
-            "/whitelist — показать списки\n"
-            "/whitelist_on /whitelist_off\n"
-            "/captcha_on /captcha_off\n"
-            "/captcha_unban <id>\n"
-            "/allow_chat <id> [имя]\n"
-            "/deny_chat <id>\n"
-            "/cost — расход токенов\n"
-            "/migrate — миграция из JSON\n"
-        )
-
-    if referral_role:
-        text = f"Ты пришёл по приглашению! Добро пожаловать.\n\n" + text
-
-    await update.message.reply_text(text)
-
-
-async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = db.get_or_create_user(user_id, update.effective_user.username, update.effective_user.full_name)
-    if not can_search(user):
-        await update.message.reply_text("Поиск доступен по приглашению. Попроси ссылку у друга!")
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /search <запрос>")
-        return
-    query = " ".join(context.args)
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    results = web_search(query)
-    if not results:
-        await update.message.reply_text("Ничего не нашёл.")
-        return
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2048,
-            system="Ты Клодушка. Дай краткий ответ на основе результатов поиска. Отвечай на языке пользователя.",
-            messages=[{"role": "user", "content": f"Вопрос: {query}\n\nРезультаты:\n{results}"}],
-        )
-        answer = response.content[0].text
-        if len(answer) <= 4096:
-            await update.message.reply_text(answer)
-        else:
-            for i in range(0, len(answer), 4096):
-                await update.message.reply_text(answer[i:i + 4096])
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
-
-
-async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    facts = db.get_memory(update.effective_user.id)
-    if facts:
-        text = "\n".join(f"• {f}" for f in facts)
-        await update.message.reply_text(f"Я помню о тебе:\n\n{text}")
-    else:
-        await update.message.reply_text("Пока ничего не помню. Поговорим — запомню!")
-
-
-async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    db.clear_memory(uid)
-    db.clear_conversation(uid)
-    await update.message.reply_text("Всё забыл. Начинаем с чистого листа.")
-
-
-async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db.clear_conversation(update.effective_user.id)
-    await update.message.reply_text("История очищена. Память сохранена.")
-
-
-async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    cid = update.effective_chat.id
-    user = db.get_user(uid)
-    role = user["role"] if user else "unknown"
-    await update.message.reply_text(f"User ID: {uid}\nChat ID: {cid}\nРоль: {role}")
-
-
-async def cmd_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    db.migrate_from_json("/app/allowed.json", DATA_DIR)
-    # Set admin
-    db.get_or_create_user(592441, full_name="Aleksei")
-    db.set_role(592441, "admin")
-    await update.message.reply_text("Миграция завершена.")
-
-
-# --- Main message handler ---
-
 async def post_init(application):
     global context_bot_id, bot_username
-    me = await application.bot.get_me()
+    bot = application.bot
+    me = await bot.get_me()
     context_bot_id = me.id
     bot_username = me.username.lower()
-    logger.info(f"Bot: @{bot_username} (ID: {context_bot_id})")
-
+    logger.info(f"Bot initialized: @{bot_username} (ID: {context_bot_id})")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user_id_int = update.effective_user.id
     chat_id = update.effective_chat.id
     is_group = update.effective_chat.type in ("group", "supergroup")
 
-    user = db.get_or_create_user(
-        user_id, update.effective_user.username, update.effective_user.full_name
-    )
-
-    if user["role"] == "banned":
-        return
-
-    # Store group messages for context
+    # Always store group messages for context
     if is_group and update.message and update.message.text:
+        gcid = str(chat_id)
+        if gcid not in group_history:
+            group_history[gcid] = []
         sender = update.effective_user.first_name or "Unknown"
-        db.save_group_message(chat_id, user_id, sender, update.message.text)
+        group_history[gcid].append(f"{sender}: {update.message.text}")
+        if len(group_history[gcid]) > GROUP_HISTORY_SIZE:
+            group_history[gcid] = group_history[gcid][-GROUP_HISTORY_SIZE:]
 
     if is_group and not is_bot_mentioned(update):
         return
 
-    # Captcha
-    if await handle_captcha(update, user):
-        return
+    if not is_admin(user_id_int) and not (WHITELIST_ENABLED and user_id_int in ALLOWED_USERS):
+        if await handle_captcha(update, context):
+            return
 
-    # Access check
-    if not is_allowed_in_chat(user, chat_id):
-        return
-
-    # Daily limit for street users
-    if not check_daily_limit(user):
-        await update.message.reply_text(
-            f"Лимит {STREET_DAILY_LIMIT} сообщений в день. Попроси реферальную ссылку для безлимита!"
-        )
+    if not is_allowed(user_id_int, chat_id) and not is_verified(user_id_int):
         return
 
     user_text = update.message.text
@@ -646,103 +585,85 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Да? Чем помочь?")
             return
 
-    # Get conversation history from DB
-    history = db.get_conversation(user_id, MAX_HISTORY)
-    history.append({"role": "user", "content": user_text})
+    user_id = str(user_id_int)
+
+    if user_id not in conversations:
+        conversations[user_id] = []
+
+    conversations[user_id].append({"role": "user", "content": user_text})
+
+    if len(conversations[user_id]) > MAX_HISTORY * 2:
+        conversations[user_id] = conversations[user_id][-MAX_HISTORY * 2:]
 
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-        # Web search (only for allowed roles)
+        # Check if web search is needed
+        search_query = should_search(user_text)
         search_context = ""
-        if can_search(user):
-            search_query = should_search(user_text) if tavily else None
-            if search_query:
-                search_results = web_search(search_query)
-                if search_results:
-                    search_context = f"\n\nРезультаты поиска '{search_query}':\n{search_results}"
+        if search_query and tavily:
+            search_results = web_search(search_query)
+            if search_results:
+                search_context = f"\n\nРезультаты поиска по запросу '{search_query}':\n{search_results}"
 
         system = get_system_prompt(user_id)
-
-        # Group context
         if is_group:
-            group_msgs = db.get_group_history(chat_id, 30)
-            if group_msgs:
-                chat_log = "\n".join(group_msgs)
-                system += f"\n\nПоследние сообщения в чате (контекст):\n{chat_log}"
-
+            gcid = str(chat_id)
+            recent_chat = group_history.get(gcid, [])
+            if recent_chat:
+                chat_log = "\n".join(recent_chat[-30:])
+                system += f"\n\nПоследние сообщения в этом групповом чате (используй как контекст, не пересказывай):\n{chat_log}"
         if search_context:
-            system += f"\n\nИспользуй результаты поиска:{search_context}"
+            system += f"\n\nИспользуй эти результаты поиска для ответа:{search_context}"
 
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=4096,
             system=system,
-            messages=history,
+            messages=conversations[user_id],
         )
-
         assistant_text = response.content[0].text
         token_usage["input"] += response.usage.input_tokens
         token_usage["output"] += response.usage.output_tokens
+        conversations[user_id].append({"role": "assistant", "content": assistant_text})
+        save_json(CONVERSATIONS_FILE, conversations)
 
-        # Save to DB
-        db.save_message(user_id, "user", user_text)
-        db.save_message(user_id, "assistant", assistant_text)
-
-        # Extract memory periodically
-        msg_count = len(history)
+        msg_count = len(conversations[user_id])
         if msg_count > 0 and msg_count % (MEMORY_EXTRACT_EVERY * 2) == 0:
-            extract_memory(user_id, history + [{"role": "assistant", "content": assistant_text}])
+            extract_memory(user_id, conversations[user_id])
 
         if len(assistant_text) <= 4096:
             await update.message.reply_text(assistant_text)
         else:
             for i in range(0, len(assistant_text), 4096):
                 await update.message.reply_text(assistant_text[i:i + 4096])
-
     except Exception as e:
         logger.error(f"Error: {e}")
         await update.message.reply_text(f"Ошибка: {e}")
 
-
 def main():
-    # Init database
-    db.init_db()
-
-    # Ensure admin exists
-    db.get_or_create_user(592441, full_name="Aleksei")
-    db.set_role(592441, "admin")
-
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
-
-    # User commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("forget", cmd_forget))
+    app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("id", show_id))
-
-    # Admin commands
-    app.add_handler(CommandHandler("role", cmd_role))
-    app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("reload", cmd_reload))
     app.add_handler(CommandHandler("whitelist", cmd_whitelist))
     app.add_handler(CommandHandler("whitelist_on", cmd_whitelist_on))
     app.add_handler(CommandHandler("whitelist_off", cmd_whitelist_off))
     app.add_handler(CommandHandler("captcha_on", cmd_captcha_on))
     app.add_handler(CommandHandler("captcha_off", cmd_captcha_off))
     app.add_handler(CommandHandler("captcha_unban", cmd_captcha_unban))
+    app.add_handler(CommandHandler("allow_user", cmd_allow_user))
+    app.add_handler(CommandHandler("deny_user", cmd_deny_user))
     app.add_handler(CommandHandler("allow_chat", cmd_allow_chat))
     app.add_handler(CommandHandler("deny_chat", cmd_deny_chat))
-    app.add_handler(CommandHandler("cost", cmd_cost))
-    app.add_handler(CommandHandler("migrate", cmd_migrate))
-
-    # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     logger.info("Клодушка started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()

@@ -5,7 +5,6 @@ services:
     working_dir: /app
     volumes:
       - ./bot.py:/app/bot.py
-      - ./db.py:/app/db.py
       - ./requirements.txt:/app/requirements.txt
       - ./allowed.json:/app/allowed.json
       - ./data:/app/data
