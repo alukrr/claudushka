@@ -1,0 +1,15 @@
+{
+  "users": [
+    {"id": 592441, "name": "Aleksei"},
+    {"id": 63014107, "name": "tester1"},
+    {"id": 115677407, "name": "tester2"},
+    {"id": 121237224, "name": "tester3"}
+  ],
+  "chats": [
+    {"id": -1242803542, "name": "chat1"},
+    {"id": -1079751651, "name": "chat2"},
+    {"id": -1115089752, "name": "chat3"},
+    {"id": -1032770549, "name": "chat4"},
+    {"id": -1031232765, "name": "chat5"}
+  ]
+}

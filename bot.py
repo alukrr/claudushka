@@ -1,138 +1,115 @@
 import os
+import json
 import logging
-import requests
-from collections import defaultdict
-from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-
-load_dotenv()
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
-ALLOWED_IDS_RAW = os.getenv("ALLOWED_TELEGRAM_USER_IDS", "")
-
-if not TELEGRAM_BOT_TOKEN or not CLAUDE_API_KEY:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN and CLAUDE_API_KEY must be set in environment")
-
-ALLOWED_TELEGRAM_USER_IDS = set()
-for p in [item.strip() for item in ALLOWED_IDS_RAW.split(",") if item.strip()]:
-    try:
-        ALLOWED_TELEGRAM_USER_IDS.add(int(p))
-    except ValueError:
-        raise ValueError(f"Invalid user id in ALLOWED_TELEGRAM_USER_IDS: '{p}'")
-
-HISTORY = defaultdict(list)
-MAX_HISTORY_ITEMS = 8
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import anthropic
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
-def is_authorized(user_id: int) -> bool:
-    if not ALLOWED_TELEGRAM_USER_IDS:
+def load_allowed():
+    try:
+        with open("allowed.json", "r") as f:
+            data = json.load(f)
+        users = {u["id"] for u in data.get("users", [])}
+        chats = {c["id"] for c in data.get("chats", [])}
+        logger.info(f"Loaded {len(users)} allowed users, {len(chats)} allowed chats")
+        return users, chats
+    except FileNotFoundError:
+        logger.warning("allowed.json not found, allowing everyone")
+        return set(), set()
+
+ALLOWED_USERS, ALLOWED_CHATS = load_allowed()
+
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+conversations: dict[int, list] = {}
+MAX_HISTORY = 20
+
+def is_allowed(user_id: int, chat_id: int) -> bool:
+    if not ALLOWED_USERS and not ALLOWED_CHATS:
         return True
-    return user_id in ALLOWED_TELEGRAM_USER_IDS
+    if user_id in ALLOWED_USERS:
+        return True
+    if chat_id in ALLOWED_CHATS:
+        return True
+    return False
 
-
-async def auth_guard(update: Update) -> bool:
-    if update.effective_user is None:
-        return False
-    if not is_authorized(update.effective_user.id):
-        await update.message.reply_text("❌ У вас нет доступа к этому боту. Свяжитесь с администратором.")
-        return False
-    return True
-
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await auth_guard(update):
+async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ALLOWED_USERS, ALLOWED_CHATS
+    if update.effective_user.id not in ALLOWED_USERS:
         return
+    ALLOWED_USERS, ALLOWED_CHATS = load_allowed()
     await update.message.reply_text(
-        "Привет! Я бот на Claude API.\n" "Команды: /start, /clear, /id. Отправьте любое сообщение для общения."
+        f"Перезагружено: {len(ALLOWED_USERS)} пользователей, {len(ALLOWED_CHATS)} чатов"
     )
 
-
-async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await auth_guard(update):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id, update.effective_chat.id):
+        await update.message.reply_text("Access denied.")
         return
+    await update.message.reply_text(
+        "Привет! Я Клодушка — Claude через Telegram.\n\n"
+        "/clear — очистить историю диалога\n"
+        "/id — показать твой Telegram ID\n"
+        "/reload — перезагрузить белые списки"
+    )
+
+async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    await update.message.reply_text(f"Ваш Telegram user_id: {user_id}")
+    conversations.pop(user_id, None)
+    await update.message.reply_text("История очищена.")
 
-
-async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await auth_guard(update):
-        return
-    user_id = update.effective_user.id
-    HISTORY.pop(user_id, None)
-    await update.message.reply_text("✅ История чата очищена.")
-
-
-def claude_complete_with_history(user_history):
-    url = "https://api.anthropic.com/v1/complete"
-    headers = {
-        "x-api-key": CLAUDE_API_KEY,
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": "claude-3.5",  # или другой доступный модельный тег
-        "messages": user_history,
-        "temperature": 0.7,
-        "max_tokens_to_sample": 1200,
-    }
-    resp = requests.post(url, json=payload, headers=headers, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    if "completion" in data:
-        return data["completion"]
-    if "output" in data and isinstance(data["output"], dict) and "text" in data["output"]:
-        return data["output"]["text"]
-    if "choices" in data and data["choices"]:
-        return data["choices"][0].get("message", {}).get("content", "")
-    raise ValueError(f"Unexpected response from Claude: {data}")
-
+async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    cid = update.effective_chat.id
+    await update.message.reply_text(f"User ID: {uid}\nChat ID: {cid}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await auth_guard(update):
-        return
-
-    if update.message is None or update.message.text is None:
-        return
-
     user_id = update.effective_user.id
-    user_text = update.message.text.strip()
-
-    if user_text.startswith("/"):
+    chat_id = update.effective_chat.id
+    if not is_allowed(user_id, chat_id):
+        await update.message.reply_text("Access denied.")
         return
-
-    history = HISTORY[user_id]
-    history.append({"role": "user", "content": user_text})
-    if len(history) > MAX_HISTORY_ITEMS * 2:
-        history = history[-MAX_HISTORY_ITEMS * 2 :]
-
+    user_text = update.message.text
+    if not user_text:
+        return
+    if user_id not in conversations:
+        conversations[user_id] = []
+    conversations[user_id].append({"role": "user", "content": user_text})
+    if len(conversations[user_id]) > MAX_HISTORY * 2:
+        conversations[user_id] = conversations[user_id][-MAX_HISTORY * 2:]
     try:
-        claude_resp = claude_complete_with_history(history)
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4096,
+            system="Ты Клодушка — дружелюбный и полезный ассистент. Отвечай на языке пользователя. Будь кратким, но информативным.",
+            messages=conversations[user_id],
+        )
+        assistant_text = response.content[0].text
+        conversations[user_id].append({"role": "assistant", "content": assistant_text})
+        if len(assistant_text) <= 4096:
+            await update.message.reply_text(assistant_text)
+        else:
+            for i in range(0, len(assistant_text), 4096):
+                await update.message.reply_text(assistant_text[i:i + 4096])
     except Exception as e:
-        logger.exception("Claude API error")
-        await update.message.reply_text(f"Ошибка Claude API: {e}")
-        return
-
-    history.append({"role": "assistant", "content": claude_resp})
-    HISTORY[user_id] = history
-
-    await update.message.reply_text(claude_resp)
-
+        logger.error(f"Error: {e}")
+        await update.message.reply_text(f"Ошибка: {e}")
 
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("id", id_command))
-    app.add_handler(CommandHandler("clear", clear_command))
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("clear", clear))
+    app.add_handler(CommandHandler("id", show_id))
+    app.add_handler(CommandHandler("reload", cmd_reload))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info("Bot started")
-    app.run_polling()
-
+    logger.info("Клодушка started")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
