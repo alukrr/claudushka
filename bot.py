@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from telegram import Update
 from datetime import time as dt_time, timezone, timedelta
+from datetime import time as dt_time, timezone, timedelta
 from telegram.ext import Application, CommandHandler, MessageHandler, ChatMemberHandler, filters, ContextTypes
 import anthropic
 from tavily import TavilyClient
@@ -268,6 +269,39 @@ async def handle_captcha(update: Update, user: dict) -> bool:
         except Exception as e:
             logger.error(f"Captcha generation error: {e}")
         return True
+
+
+# --- Daily review ---
+
+async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
+    """Generate ironic daily review for each active chat."""
+    chats = db.get_allowed_chats()
+    for chat in chats:
+        chat_id = chat["chat_id"]
+        messages = db.get_group_history(chat_id, 100)
+        if len(messages) < 5:
+            continue
+        try:
+            chat_log = "\n".join(messages)
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=1024,
+                system=(
+                    "Ты Клодушка. Напиши ироничный, саркастичный обзор дня в чате. "
+                    "Подмечай смешные моменты, кто что говорил, какие темы обсуждались. "
+                    "Будь остроумной, но не злой. Формат: короткий текст, 3-5 абзацев. "
+                    "Начни с приветствия типа 'Итоги дня, дорогие мои' или подобного. "
+                    "Пиши на языке чата."
+                ),
+                messages=[{"role": "user", "content": f"Вот сообщения за день:\n{chat_log}"}],
+            )
+            review = response.content[0].text
+            token_usage["input"] += response.usage.input_tokens
+            token_usage["output"] += response.usage.output_tokens
+            await context.bot.send_message(chat_id=chat_id, text=review)
+            logger.info(f"Daily review sent to {chat_id}")
+        except Exception as e:
+            logger.error(f"Daily review error for {chat_id}: {e}")
 
 
 # --- Daily review ---
@@ -891,6 +925,14 @@ def main():
     # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    # Daily review at 22:00 Berlin time (UTC+2)
+    berlin_tz = timezone(timedelta(hours=2))
+    app.job_queue.run_daily(
+        daily_chat_review,
+        time=dt_time(hour=22, minute=0, tzinfo=berlin_tz),
+        name="daily_review"
+    )
+    logger.info("Daily review scheduled at 22:00 Berlin time")
     # Daily review at 22:00 Berlin time (UTC+2)
     berlin_tz = timezone(timedelta(hours=2))
     app.job_queue.run_daily(
