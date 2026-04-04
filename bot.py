@@ -530,6 +530,36 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"  {c['name'] or 'без имени'} ({c['chat_id']})\n  /approve_chat {c['chat_id']}  |  /reject_chat {c['chat_id']}")
     await update.message.reply_text("Чаты на одобрение:\n\n" + "\n\n".join(lines))
 
+async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    messages = db.get_group_history(chat_id, 100)
+    if len(messages) < 5:
+        await update.message.reply_text("Маловато сообщений для обзора.")
+        return
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    try:
+        chat_log = "\n".join(messages)
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            system=(
+                "Ты Клодушка. Напиши ироничный, саркастичный обзор дня в чате. "
+                "Подмечай смешные моменты, кто что говорил, какие темы обсуждались. "
+                "Будь остроумной, но не злой. Формат: короткий текст, 3-5 абзацев. "
+                "Начни с приветствия типа 'Итоги дня, дорогие мои' или подобного. "
+                "Пиши на языке чата."
+            ),
+            messages=[{"role": "user", "content": f"Вот сообщения за день:\n{chat_log}"}],
+        )
+        review = response.content[0].text
+        token_usage["input"] += response.usage.input_tokens
+        token_usage["output"] += response.usage.output_tokens
+        await update.message.reply_text(review)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
+
 async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -916,6 +946,7 @@ def main():
     app.add_handler(CommandHandler("deny_chat", cmd_deny_chat))
     app.add_handler(CommandHandler("chats", cmd_chats))
     app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("review", cmd_review))
     app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler("approve_chat", cmd_approve_chat))
     app.add_handler(CommandHandler("reject_chat", cmd_reject_chat))
