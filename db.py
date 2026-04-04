@@ -47,6 +47,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             fact TEXT NOT NULL,
+            context TEXT NOT NULL DEFAULT 'private',
             created_at INTEGER NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(telegram_id)
         );
@@ -76,6 +77,13 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_group_chat ON group_messages(chat_id, timestamp);
     """)
     conn.commit()
+    # Add context column to existing databases (migration)
+    try:
+        conn.execute("ALTER TABLE memory ADD COLUMN context TEXT NOT NULL DEFAULT 'private'")
+        conn.commit()
+        logger.info("Migrated memory table: added context column")
+    except Exception:
+        pass  # Column already exists
     conn.close()
     logger.info("Database initialized")
 
@@ -213,28 +221,36 @@ def clear_conversation(user_id: int):
 
 # --- Memory ---
 
-def get_memory(user_id: int) -> list[str]:
+def get_memory(user_id: int, context: str = "private") -> list[str]:
     conn = get_conn()
-    rows = conn.execute("SELECT fact FROM memory WHERE user_id = ? ORDER BY created_at", (user_id,)).fetchall()
+    rows = conn.execute(
+        "SELECT fact FROM memory WHERE user_id = ? AND context = ? ORDER BY created_at",
+        (user_id, context)
+    ).fetchall()
     conn.close()
     return [r["fact"] for r in rows]
 
 
-def add_memory_facts(user_id: int, facts: list[str]):
+def add_memory_facts(user_id: int, facts: list[str], context: str = "private"):
     conn = get_conn()
-    existing = set(get_memory(user_id))
+    existing = set(get_memory(user_id, context))
     now = int(time.time())
     for fact in facts:
         if fact not in existing:
-            conn.execute("INSERT INTO memory (user_id, fact, created_at) VALUES (?, ?, ?)",
-                         (user_id, fact, now))
+            conn.execute(
+                "INSERT INTO memory (user_id, fact, context, created_at) VALUES (?, ?, ?, ?)",
+                (user_id, fact, context, now)
+            )
     conn.commit()
     conn.close()
 
 
-def clear_memory(user_id: int):
+def clear_memory(user_id: int, context: str = None):
     conn = get_conn()
-    conn.execute("DELETE FROM memory WHERE user_id = ?", (user_id,))
+    if context:
+        conn.execute("DELETE FROM memory WHERE user_id = ? AND context = ?", (user_id, context))
+    else:
+        conn.execute("DELETE FROM memory WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
 

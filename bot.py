@@ -163,7 +163,7 @@ def check_captcha_answer(question: str, answer: str) -> bool:
 
 # --- Memory ---
 
-def get_system_prompt(user_id: int) -> str:
+def get_system_prompt(user_id: int, is_group: bool = False) -> str:
     base = (
         "Ты Клодушка — остроумный, саркастичный и прямолинейный ассистент с характером. "
         "Все пользователи 18+. Мат допустим, но только для усиления эмоции или если собеседник сам так общается. Мат ради мата не нужен. "
@@ -173,14 +173,15 @@ def get_system_prompt(user_id: int) -> str:
         "Точность информации важнее красивого ответа. "
         "Отвечай на языке пользователя. Будь кратким, но по делу."
     )
-    facts = db.get_memory(user_id)
+    context = "group" if is_group else "private"
+    facts = db.get_memory(user_id, context)
     if facts:
         facts_str = "\n".join(f"- {f}" for f in facts)
         base += f"\n\nВот что ты помнишь об этом пользователе:\n{facts_str}\nИспользуй эти знания естественно, не перечисляй их."
     return base
 
 
-def extract_memory(user_id: int, messages: list):
+def extract_memory(user_id: int, messages: list, is_group: bool = False):
     try:
         recent = messages[-6:]
         response = client.messages.create(
@@ -199,8 +200,9 @@ def extract_memory(user_id: int, messages: list):
         if start >= 0 and end > start:
             new_facts = json.loads(text[start:end])
             if new_facts:
-                db.add_memory_facts(user_id, new_facts)
-                logger.info(f"Memory updated for {user_id}")
+                context = "group" if is_group else "private"
+                db.add_memory_facts(user_id, new_facts, context)
+                logger.info(f"Memory updated for {user_id} ({context})")
     except Exception as e:
         logger.error(f"Memory extraction error: {e}")
 
@@ -577,7 +579,9 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    facts = db.get_memory(update.effective_user.id)
+    is_group = update.effective_chat.type in ("group", "supergroup")
+    mem_context = "group" if is_group else "private"
+    facts = db.get_memory(update.effective_user.id, mem_context)
     if facts:
         text = "\n".join(f"• {f}" for f in facts)
         await update.message.reply_text(f"Я помню о тебе:\n\n{text}")
@@ -761,7 +765,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if search_results:
                     search_context = f"\n\nРезультаты поиска '{search_query}':\n{search_results}"
 
-        system = get_system_prompt(user_id)
+        system = get_system_prompt(user_id, is_group)
 
         # Group context
         if is_group:
@@ -791,7 +795,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Extract memory periodically
         msg_count = len(history)
         if msg_count > 0 and msg_count % (MEMORY_EXTRACT_EVERY * 2) == 0:
-            extract_memory(user_id, history + [{"role": "assistant", "content": assistant_text}])
+            extract_memory(user_id, history + [{"role": "assistant", "content": assistant_text}], is_group)
 
         if len(assistant_text) <= 4096:
             await update.message.reply_text(assistant_text)
