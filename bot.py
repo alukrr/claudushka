@@ -151,9 +151,23 @@ async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str 
     if not GEMINI_API_KEY:
         return None, None, None
 
+    # Gemini 3.1 Flash Image is a reasoning model — it can drift into conversation
+    # mode if the prompt looks ambiguous. Google's official examples always start
+    # with an explicit action verb ("Create a picture of...", "A photo of...").
+    # If the caller's prompt doesn't already start with one, prepend it.
+    normalized = prompt.strip()
+    lower = normalized.lower()
+    action_starters = (
+        "create ", "make ", "generate ", "draw ", "render ", "design ",
+        "a photo", "a picture", "a painting", "an image", "an illustration",
+        "photo of", "picture of", "illustration of", "painting of",
+    )
+    if not any(lower.startswith(s) for s in action_starters):
+        normalized = f"A picture of {normalized}"
+
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent?key={GEMINI_API_KEY}"
     payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
+        "contents": [{"parts": [{"text": normalized}]}],
         "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
     }
 
@@ -1150,7 +1164,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             translate_resp = client.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=200,
-                system="Translate the following image description to English. Return ONLY the translation, nothing else.",
+                system=(
+                    "Convert the user's image request to a direct English image-generation prompt. "
+                    "Rules: "
+                    "(1) Always start with 'Create a picture of ' or 'A photo of ' or 'An illustration of '. "
+                    "(2) Describe the scene as a static visual, not an action. "
+                    "(3) Be concise and concrete — describe what is SEEN in the image. "
+                    "(4) Never include meta-instructions like 'generate' or 'draw'. "
+                    "(5) Return ONLY the final prompt, no explanations."
+                ),
                 messages=[{"role": "user", "content": draw_prompt}],
             )
             en_prompt = translate_resp.content[0].text.strip()
