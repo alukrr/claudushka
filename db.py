@@ -221,25 +221,31 @@ def clear_conversation(user_id: int):
 
 # --- Memory ---
 
-def get_memory(user_id: int, context: str = "private") -> list[str]:
+def get_memory(user_id: int, context: str = "private", chat_id: int = None) -> list[str]:
     conn = get_conn()
-    rows = conn.execute(
-        "SELECT fact FROM memory WHERE user_id = ? AND context = ? ORDER BY created_at",
-        (user_id, context)
-    ).fetchall()
+    if context == "group" and chat_id:
+        rows = conn.execute(
+            "SELECT fact FROM memory WHERE user_id = ? AND context = ? AND chat_id = ? ORDER BY created_at",
+            (user_id, context, chat_id)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT fact FROM memory WHERE user_id = ? AND context = ? AND chat_id IS NULL ORDER BY created_at",
+            (user_id, context)
+        ).fetchall()
     conn.close()
     return [r["fact"] for r in rows]
 
 
-def add_memory_facts(user_id: int, facts: list[str], context: str = "private"):
+def add_memory_facts(user_id: int, facts: list[str], context: str = "private", chat_id: int = None):
     conn = get_conn()
-    existing = set(get_memory(user_id, context))
+    existing = set(get_memory(user_id, context, chat_id))
     now = int(time.time())
     for fact in facts:
         if fact not in existing:
             conn.execute(
-                "INSERT INTO memory (user_id, fact, context, created_at) VALUES (?, ?, ?, ?)",
-                (user_id, fact, context, now)
+                "INSERT INTO memory (user_id, fact, context, chat_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                (user_id, fact, context, chat_id, now)
             )
     conn.commit()
     conn.close()
