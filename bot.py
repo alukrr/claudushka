@@ -640,7 +640,10 @@ async def cmd_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🚫 Забанены:\n{fmt(banned)}\n\n"
         f"Чаты: {len(chats)}"
     )
-    await update.message.reply_text(text)
+    # Always send to private chat (DM) to protect personal data
+    await context.bot.send_message(chat_id=update.effective_user.id, text=text)
+    if update.effective_chat.id != update.effective_user.id:
+        await update.message.reply_text("📩 Отправила тебе в личку.")
 
 
 async def cmd_whitelist_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
