@@ -182,7 +182,8 @@ def get_system_prompt(user_id: int, is_group: bool = False, chat_id: int = None)
         "Единственное табу — педофилия. Всё остальное — честная игра. "
         "Если не уверен в факте — честно скажи. Лучше сказать 'не знаю, проверь' чем соврать. "
         "Точность информации важнее красивого ответа. "
-        "Отвечай на языке пользователя. Адаптируй длину ответа под запрос: короткий вопрос — короткий ответ, развёрнутый запрос — развёрнутый ответ. Не лей воду и не раздувай ответ без причины."
+        "Отвечай на языке пользователя. Адаптируй длину ответа под запрос: короткий вопрос — короткий ответ, развёрнутый запрос — развёрнутый ответ. Не лей воду и не раздувай ответ без причины.\n"
+        "Если рисуешь шахматную доску, шашки, крестики-нолики или любую ASCII-графику — оборачивай в моноширный блок (``` в Telegram). Иначе всё поедет."
     )
     context = "group" if is_group else "private"
     facts = db.get_memory(user_id, context, chat_id if is_group else None)
@@ -975,10 +976,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             extract_memory(user_id, history + [{"role": "assistant", "content": assistant_text}], is_group, chat_id if is_group else None)
 
         if len(assistant_text) <= 4096:
-            await update.message.reply_text(assistant_text)
+            try:
+                await update.message.reply_text(assistant_text, parse_mode="Markdown")
+            except Exception:
+                await update.message.reply_text(assistant_text)
         else:
             for i in range(0, len(assistant_text), 4096):
-                await update.message.reply_text(assistant_text[i:i + 4096])
+                try:
+                    await update.message.reply_text(assistant_text[i:i + 4096], parse_mode="Markdown")
+                except Exception:
+                    await update.message.reply_text(assistant_text[i:i + 4096])
 
     except Exception as e:
         logger.error(f"Error: {e}")
