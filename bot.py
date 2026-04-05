@@ -133,8 +133,8 @@ def should_search(text: str) -> str | None:
 
 # --- Image generation ---
 
-GEMINI_TIMEOUT = 60          # seconds per attempt (was 300 — too long)
-GEMINI_MAX_RETRIES = 3       # retry on 429/500/503
+GEMINI_TIMEOUT = 120         # Nano Banana 2 может честно молотить ~60s при нагрузке
+GEMINI_MAX_RETRIES = 2       # 2×120=240s worst case; больше — пользователь не дождётся
 GEMINI_RETRY_DELAY = 2       # seconds between retries
 FLUX_TIMEOUT = 90            # FLUX is slower, but still not 5 minutes
 FLUX_MODEL_NAME = "FLUX.1-schnell"
