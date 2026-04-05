@@ -48,6 +48,7 @@ def init_db():
             user_id INTEGER NOT NULL,
             fact TEXT NOT NULL,
             context TEXT NOT NULL DEFAULT 'private',
+            chat_id INTEGER,
             created_at INTEGER NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(telegram_id)
         );
@@ -71,19 +72,41 @@ def init_db():
             approved_at INTEGER
         );
 
+        CREATE TABLE IF NOT EXISTS wa_conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            timestamp INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS wa_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT NOT NULL,
+            fact TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_conv_user ON conversations(user_id);
         CREATE INDEX IF NOT EXISTS idx_conv_ts ON conversations(user_id, timestamp);
         CREATE INDEX IF NOT EXISTS idx_memory_user ON memory(user_id);
         CREATE INDEX IF NOT EXISTS idx_group_chat ON group_messages(chat_id, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_wa_conv_phone ON wa_conversations(phone, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_wa_memory_phone ON wa_memory(phone);
     """)
     conn.commit()
-    # Add context column to existing databases (migration)
-    try:
-        conn.execute("ALTER TABLE memory ADD COLUMN context TEXT NOT NULL DEFAULT 'private'")
-        conn.commit()
-        logger.info("Migrated memory table: added context column")
-    except Exception:
-        pass  # Column already exists
+
+    # Migrations for existing databases
+    for migration in [
+        "ALTER TABLE memory ADD COLUMN context TEXT NOT NULL DEFAULT 'private'",
+        "ALTER TABLE memory ADD COLUMN chat_id INTEGER",
+    ]:
+        try:
+            conn.execute(migration)
+            conn.commit()
+        except Exception:
+            pass  # Column already exists
+
     conn.close()
     logger.info("Database initialized")
 
@@ -109,7 +132,7 @@ def create_user(telegram_id: int, username: str = None, full_name: str = None,
         "INSERT OR IGNORE INTO users (telegram_id, username, full_name, role, referred_by, "
         "referral_code, verified, daily_messages, daily_reset, created_at, last_active) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
-        (telegram_id, username, full_name, role, referred_by, ref_code, 
+        (telegram_id, username, full_name, role, referred_by, ref_code,
          1 if role in ('admin', 'premium') else 0, today, now, now)
     )
     conn.commit()
@@ -341,6 +364,68 @@ def is_chat_allowed(chat_id: int) -> bool:
     return row is not None
 
 
+# --- WhatsApp: conversations ---
+
+def save_message_by_key(phone: str, role: str, content: str):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO wa_conversations (phone, role, content, timestamp) VALUES (?, ?, ?, ?)",
+        (phone, role, content, int(time.time()))
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_conversation_by_key(phone: str, limit: int = 40) -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT role, content FROM wa_conversations WHERE phone = ? ORDER BY timestamp DESC LIMIT ?",
+        (phone, limit)
+    ).fetchall()
+    conn.close()
+    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+
+def clear_conversation_by_key(phone: str):
+    conn = get_conn()
+    conn.execute("DELETE FROM wa_conversations WHERE phone = ?", (phone,))
+    conn.commit()
+    conn.close()
+
+
+# --- WhatsApp: memory ---
+
+def get_memory_by_key(phone: str, context: str = "whatsapp") -> list[str]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT fact FROM wa_memory WHERE phone = ? ORDER BY created_at",
+        (phone,)
+    ).fetchall()
+    conn.close()
+    return [r["fact"] for r in rows]
+
+
+def add_memory_facts_by_key(phone: str, facts: list[str], context: str = "whatsapp"):
+    conn = get_conn()
+    existing = set(get_memory_by_key(phone))
+    now = int(time.time())
+    for fact in facts:
+        if fact not in existing:
+            conn.execute(
+                "INSERT INTO wa_memory (phone, fact, created_at) VALUES (?, ?, ?)",
+                (phone, fact, now)
+            )
+    conn.commit()
+    conn.close()
+
+
+def clear_memory_by_key(phone: str):
+    conn = get_conn()
+    conn.execute("DELETE FROM wa_memory WHERE phone = ?", (phone,))
+    conn.commit()
+    conn.close()
+
+
 # --- Migration from JSON ---
 
 def migrate_from_json(allowed_file: str, data_dir: Path):
@@ -400,7 +485,7 @@ def migrate_from_json(allowed_file: str, data_dir: Path):
                 ver_data = json.load(f)
             for uid in ver_data:
                 tid = int(uid)
-                user = get_or_create_user(tid, full_name=ver_data[uid].get("name"))
+                get_or_create_user(tid, full_name=ver_data[uid].get("name"))
                 set_verified(tid, True)
             logger.info("Migrated verified_users.json")
     except Exception as e:
