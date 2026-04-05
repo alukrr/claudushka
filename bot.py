@@ -114,15 +114,19 @@ def should_search(text: str) -> str | None:
             max_tokens=100,
             system=(
                 "Определи, нужен ли веб-поиск для ответа на вопрос пользователя. "
-                "Поиск нужен если: вопрос про актуальные события, цены, погоду, новости, "
-                "конкретные факты которые могут быть неточны (номера, коды, адреса, расписания), "
-                "или пользователь явно просит что-то найти/загуглить. "
-                "Если поиск нужен — верни ТОЛЬКО поисковый запрос на языке оригинала (короткий, 2-5 слов). "
-                "Если поиск НЕ нужен — верни ТОЛЬКО слово NO."
+                "Поиск ОБЯЗАТЕЛЬНО нужен если в вопросе есть: цены, стоимость, курс, погода, новости, "
+                "текущие события, 'сейчас', 'сегодня', 'свежие данные', расписания, тарифы, "
+                "конкретные факты которые могут устареть (адреса, номера, коды). "
+                "Поиск нужен если пользователь явно просит найти/загуглить/проверить. "
+                "Если поиск нужен — верни ТОЛЬКО поисковый запрос на языке оригинала (2-5 слов, конкретный). "
+                "Если поиск НЕ нужен — верни ТОЛЬКО слово NO. "
+                "Примеры: 'цена бензина в Германии' → 'цена бензина Германия 2026', "
+                "'как дела?' → NO, 'курс евро' → 'курс евро сегодня'."
             ),
             messages=[{"role": "user", "content": text}],
         )
         result = response.content[0].text.strip()
+        logger.info(f"Search decision for '{text[:50]}': '{result}'")
         if result.upper() == "NO":
             return None
         return result
@@ -521,6 +525,58 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Daily review sent to {chat_id}")
         except Exception as e:
             logger.error(f"Daily review error for {chat_id}: {e}")
+
+
+# --- New member greeting ---
+
+async def greet_new_member(chat_id: int, user_id: int, user_name: str, bot):
+    """Generate a public greeting for a new chat member, using only safe memory facts."""
+    # Get private memory about the user
+    facts = db.get_memory(user_id, "private", None)
+
+    safe_facts = []
+    if facts:
+        try:
+            # Ask Claude to filter only public-safe facts
+            filter_resp = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=300,
+                system=(
+                    "Тебе дан список фактов о пользователе. "
+                    "Отбери ТОЛЬКО те, которые безопасно упомянуть публично в групповом чате. "
+                    "Публично безопасны: имя, город, страна, профессия, хобби, интересы, питомцы. "
+                    "НЕ упоминай: здоровье, болезни, зависимости, личные проблемы, финансы, отношения, политику. "
+                    "Верни JSON-массив строк с отобранными фактами. Если безопасных нет — верни []."
+                ),
+                messages=[{"role": "user", "content": f"Факты: {json.dumps(facts, ensure_ascii=False)}"}],
+            )
+            text = filter_resp.content[0].text.strip()
+            start = text.find("[")
+            end = text.rfind("]") + 1
+            if start >= 0 and end > start:
+                safe_facts = json.loads(text[start:end])
+        except Exception as e:
+            logger.error(f"Memory filter error: {e}")
+
+    # Generate greeting
+    try:
+        facts_hint = f"\nЧто ты знаешь об этом человеке (используй естественно, не перечисляй): {'; '.join(safe_facts)}" if safe_facts else ""
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
+            system=(
+                "Ты Клодушка — остроумный AI-бот в групповом чате. "
+                "Поприветствуй нового участника коротко и тепло, с лёгким юмором. "
+                "1-2 предложения максимум. Обращайся по имени. "
+                "Если знаешь что-то о человеке — намекни ненавязчиво, но не раскрывай личное."
+                + facts_hint
+            ),
+            messages=[{"role": "user", "content": f"Поприветствуй {user_name} в чате."}],
+        )
+        greeting = response.content[0].text.strip()
+        await bot.send_message(chat_id=chat_id, text=greeting)
+    except Exception as e:
+        logger.error(f"Greeting error: {e}")
 
 
 # --- Group chat ---
@@ -1071,7 +1127,7 @@ async def cmd_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Main message handler ---
 
 async def handle_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Track when bot is added to a new chat."""
+    """Track when bot is added to a new chat, or greet new members."""
     if update.my_chat_member:
         new_status = update.my_chat_member.new_chat_member.status
         chat = update.my_chat_member.chat
@@ -1110,6 +1166,31 @@ async def handle_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 except Exception as e:
                     logger.error(f"Failed to notify admin: {e}")
+
+
+async def handle_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Greet new members when they join a group."""
+    result = update.chat_member
+    if not result:
+        return
+
+    old_status = result.old_chat_member.status
+    new_status = result.new_chat_member.status
+
+    # Member just joined (wasn't in chat before)
+    if old_status in ("left", "kicked") and new_status == "member":
+        chat_id = result.chat.id
+
+        # Only greet in approved chats
+        if not db.is_chat_allowed(chat_id):
+            return
+
+        user = result.new_chat_member.user
+        if user.is_bot:
+            return
+
+        user_name = user.first_name or user.username or str(user.id)
+        asyncio.create_task(greet_new_member(chat_id, user.id, user_name, context.bot))
 
 
 async def cmd_approve_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1418,6 +1499,7 @@ def main():
     app.add_handler(CommandHandler("approve_chat", cmd_approve_chat))
     app.add_handler(CommandHandler("reject_chat", cmd_reject_chat))
     app.add_handler(ChatMemberHandler(handle_new_chat, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(handle_chat_member, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(CommandHandler("migrate", cmd_migrate))
 
     # Messages
