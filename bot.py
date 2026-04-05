@@ -135,7 +135,7 @@ async def generate_image(prompt: str) -> bytes | None:
     if not HF_API_TOKEN:
         return None
     try:
-        url = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+        url = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
         headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
         payload = {"inputs": prompt, "parameters": {"width": 512, "height": 512}}
         resp = http_requests.post(url, headers=headers, json=payload, timeout=120)
