@@ -251,24 +251,31 @@ async def _try_flux_image(prompt: str) -> tuple[bytes | None, str | None, str | 
         return None, f"FLUX сетевая ошибка: {e}", None
 
 
+GEMINI_REFUSAL_MARKER = "__gemini_refusal__"
+
+
 async def generate_image_with_error(prompt: str) -> tuple[bytes | None, str | None, str | None]:
     """
     Returns (image_bytes, error_message, provider_name).
     On success: (bytes, None, "Nano Banana 2" | "FLUX.1-schnell")
-    On failure: (None, human_readable_error, None)
+    On Gemini refusal (text instead of image): (None, GEMINI_REFUSAL_MARKER + text, None)
+    On technical failure: (None, human_readable_error, None)
     """
-    # Try Gemini Nano Banana first (with retries)
+    # Try Gemini first
     image, error, provider = await _try_gemini_image(prompt)
     if image:
         return image, None, provider
-    gemini_error = error  # keep for final message if FLUX also fails
 
-    # Fallback to FLUX
+    # If Gemini refused (returned text) — don't fall back to FLUX, ask user to rephrase
+    if error and error.startswith("Gemini ответил:"):
+        return None, GEMINI_REFUSAL_MARKER + error[len("Gemini ответил:"):].strip(), None
+
+    # Technical error — fallback to FLUX
+    gemini_error = error
     image, flux_error, provider = await _try_flux_image(prompt)
     if image:
         return image, None, provider
 
-    # Both failed — return the most informative error we have
     final_error = gemini_error or flux_error or "Все генераторы картинок недоступны. Попробуй позже."
     logger.error(f"All image providers failed. Gemini: {gemini_error}. FLUX: {flux_error}")
     return None, final_error, None
@@ -694,12 +701,17 @@ async def cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chats = db.get_allowed_chats()
     if not chats:
-        await update.message.reply_text("Нет разрешённых чатов.")
-        return
-    lines = []
-    for c in chats:
-        lines.append(f"• {c['name'] or 'без имени'} ({c['chat_id']})")
-    await update.message.reply_text("Разрешённые чаты:\n\n" + "\n".join(lines))
+        await context.bot.send_message(chat_id=update.effective_user.id, text="Нет разрешённых чатов.")
+    else:
+        lines = []
+        for c in chats:
+            lines.append(f"• {c['name'] or 'без имени'} ({c['chat_id']})")
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text="Разрешённые чаты:\n\n" + "\n".join(lines)
+        )
+    if update.effective_chat.id != update.effective_user.id:
+        await update.message.reply_text("📩 Отправила тебе в личку.")
 
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -970,6 +982,14 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption = f"\U0001f3a8 \"{prompt}\"\n\nАвтор запроса: {author}\nМодель: {provider}"
         await msg.delete()
         await update.message.reply_photo(photo=bio, caption=caption)
+    elif error_msg and error_msg.startswith(GEMINI_REFUSAL_MARKER):
+        refusal_text = error_msg[len(GEMINI_REFUSAL_MARKER):]
+        await msg.delete()
+        await update.message.reply_text(
+            f"🤔 Гемини не смогла нарисовать — она ответила текстом:\n\n"
+            f"„{refusal_text[:300]}“\n\n"
+            f"Попробуй переформулировать запрос — опиши картинку точнее или иначе."
+        )
     else:
         await msg.delete()
         await update.message.reply_text(f"Не смогла нарисовать: {error_msg}" if error_msg else "Не смогла нарисовать. Попробуй другой промпт.")
@@ -1250,6 +1270,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             author = update.effective_user.first_name or update.effective_user.username or "Unknown"
             caption = f"\U0001f3a8 \"{draw_prompt}\"\n\nАвтор запроса: {author}\nМодель: {provider}"
             await update.message.reply_photo(photo=bio, caption=caption)
+        elif error_msg and error_msg.startswith(GEMINI_REFUSAL_MARKER):
+            refusal_text = error_msg[len(GEMINI_REFUSAL_MARKER):]
+            await update.message.reply_text(
+                f"🤔 Гемини не смогла нарисовать — она ответила текстом:\n\n"
+                f"„{refusal_text[:300]}“\n\n"
+                f"Попробуй переформулировать запрос — опиши картинку точнее или иначе."
+            )
         else:
             await update.message.reply_text(f"Не смогла нарисовать: {error_msg}" if error_msg else "Не смогла нарисовать. Попробуй другое описание.")
         return
