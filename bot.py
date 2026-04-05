@@ -712,7 +712,8 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_group = update.effective_chat.type in ("group", "supergroup")
     mem_context = "group" if is_group else "private"
-    facts = db.get_memory(update.effective_user.id, mem_context)
+    cid = update.effective_chat.id if is_group else None
+    facts = db.get_memory(update.effective_user.id, mem_context, cid)
     if facts:
         text = "\n".join(f"• {f}" for f in facts)
         await update.message.reply_text(f"Я помню о тебе:\n\n{text}")
