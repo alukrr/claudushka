@@ -1047,7 +1047,8 @@ def main():
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("forget", cmd_forget))
-    app.add_handler(CommandHandler("imagine", cmd_imagine))\n    app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CommandHandler("imagine", cmd_imagine))
+    app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("id", show_id))
 
     # Admin commands
