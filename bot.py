@@ -209,7 +209,8 @@ async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str 
             if text_parts:
                 refusal = "\n".join(text_parts)
                 logger.warning(f"Gemini returned text instead of image: {refusal[:200]}")
-                return None, f"Gemini ответил: {refusal}", None
+                # Signal refusal with special marker so caller can rewrite the prompt
+                return None, "__REFUSAL__", None
             logger.warning("Gemini returned 200 with no image and no text")
             last_error_msg = "Gemini вернул пустой ответ"
             break
@@ -258,26 +259,50 @@ async def _try_flux_image(prompt: str) -> tuple[bytes | None, str | None, str | 
         return None, f"FLUX сетевая ошибка: {e}", None
 
 
-GEMINI_REFUSAL_MARKER = "__gemini_refusal__"
+async def _rewrite_prompt(prompt: str) -> str | None:
+    """Ask Haiku to rewrite the prompt more explicitly for image generation."""
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
+            system=(
+                "You are a prompt engineer for image generation models. "
+                "Rewrite the given prompt to be a clear, vivid, unambiguous image description "
+                "that starts with an explicit action like 'A detailed photo of...' or 'An illustration of...'. "
+                "Make it concrete and visual. Return ONLY the rewritten prompt, nothing else."
+            ),
+            messages=[{"role": "user", "content": prompt}],
+        )
+        rewritten = resp.content[0].text.strip()
+        logger.info(f"Prompt rewritten: '{prompt[:60]}' -> '{rewritten[:60]}'")
+        return rewritten
+    except Exception as e:
+        logger.warning(f"Prompt rewrite failed: {e}")
+        return None
 
 
 async def generate_image_with_error(prompt: str) -> tuple[bytes | None, str | None, str | None]:
     """
     Returns (image_bytes, error_message, provider_name).
-    On success: (bytes, None, "Nano Banana 2" | "FLUX.1-schnell")
-    On Gemini refusal (text instead of image): (None, GEMINI_REFUSAL_MARKER + text, None)
-    On technical failure: (None, human_readable_error, None)
+    Pipeline: Gemini → rewrite prompt → Gemini retry → FLUX → error
     """
-    # Try Gemini first
+    # 1. Try Gemini with original prompt
     image, error, provider = await _try_gemini_image(prompt)
     if image:
         return image, None, provider
 
-    # If Gemini refused (returned text) — don't fall back to FLUX, ask user to rephrase
-    if error and error.startswith("Gemini ответил:"):
-        return None, GEMINI_REFUSAL_MARKER + error[len("Gemini ответил:"):].strip(), None
+    # 2. Gemini refused with text → rewrite prompt and retry Gemini
+    if error == "__REFUSAL__":
+        logger.info("Gemini refused, rewriting prompt...")
+        rewritten = await _rewrite_prompt(prompt)
+        if rewritten:
+            image, error2, provider = await _try_gemini_image(rewritten)
+            if image:
+                return image, None, provider
+            # Still refused or failed → fall through to FLUX with rewritten prompt
+            prompt = rewritten  # use rewritten for FLUX too
 
-    # Technical error — fallback to FLUX
+    # 3. Technical error or second refusal → fallback to FLUX
     gemini_error = error
     image, flux_error, provider = await _try_flux_image(prompt)
     if image:
