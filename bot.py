@@ -33,6 +33,7 @@ MEMORY_EXTRACT_EVERY = 5
 MAX_CAPTCHA_ATTEMPTS = 3
 BAN_DURATION = 3600
 STREET_DAILY_LIMIT = 10
+CHAT_ACTIVITY_CHANCE = 0.03
 
 CAPTCHA_ENABLED = False
 WHITELIST_ENABLED = False
@@ -683,6 +684,24 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.set_role(uid, "banned")
     await update.message.reply_text(f"\U0001f6ab {uid} забанен.")
 
+async def cmd_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global CHAT_ACTIVITY_CHANCE
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        pct = int(CHAT_ACTIVITY_CHANCE * 100)
+        await update.message.reply_text(f"Активность в чатах: {pct}%\nИспользование: /activity <0-100>")
+        return
+    try:
+        val = int(context.args[0])
+        if 0 <= val <= 100:
+            CHAT_ACTIVITY_CHANCE = val / 100
+            await update.message.reply_text(f"Активность установлена: {val}%")
+        else:
+            await update.message.reply_text("Значение от 0 до 100")
+    except ValueError:
+        await update.message.reply_text("Укажи число от 0 до 100")
+
 async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -1153,6 +1172,7 @@ def main():
     app.add_handler(CommandHandler("review", cmd_review))
     app.add_handler(CommandHandler("approve", cmd_approve))
     app.add_handler(CommandHandler("ban", cmd_ban))
+    app.add_handler(CommandHandler("activity", cmd_activity))
     app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler("approve_chat", cmd_approve_chat))
     app.add_handler(CommandHandler("reject_chat", cmd_reject_chat))
