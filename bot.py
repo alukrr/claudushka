@@ -787,6 +787,7 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     prompt = " ".join(context.args)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
+    msg = await update.message.reply_text("Рисую... это может занять пару минут.")
     image_data, error_msg = await generate_image_with_error(prompt)
     if image_data:
         from io import BytesIO
@@ -794,6 +795,7 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bio.name = "claudushka.png"
         author = update.effective_user.first_name or update.effective_user.username or "Unknown"
         caption = f"\U0001f3a8 \"{prompt}\"\n\nАвтор запроса: {author}\nМодель: Nano Banana 2"
+        await msg.delete()
         await update.message.reply_photo(photo=bio, caption=caption)
     else:
         await update.message.reply_text(f"Не смогла нарисовать: {error_msg}" if error_msg else "Не смогла нарисовать. Попробуй другой промпт.")
