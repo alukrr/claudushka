@@ -153,7 +153,7 @@ async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str 
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent?key={GEMINI_API_KEY}"
     payload = {
-        "contents": [{"parts": [{"text": f"Generate an image: {prompt}"}]}],
+        "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
     }
 
@@ -461,6 +461,47 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Daily review error for {chat_id}: {e}")
 
 
+# --- Daily review ---
+
+async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
+    """Generate ironic daily review for each active chat."""
+    chats = db.get_allowed_chats()
+    for chat in chats:
+        chat_id = chat["chat_id"]
+        messages = db.get_group_history(chat_id, 100)
+        if len(messages) < 5:
+            continue
+        try:
+            chat_log = "\n".join(messages)
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=1024,
+                system=(
+                    "Ты Клодушка — AI с характером, которая считает себя умнее всех в чате (и не без оснований). "
+                    "Напиши ироничный, саркастичный обзор дня в чате. "
+                    "Анализируй социальную динамику: "
+                    "- Кто с кем дружит, кто кого троллит, кто кого игнорирует "
+                    "- Как люди друг к другу обращаются (ники, прозвища, клички) "
+                    "- Кто лидер мнений, кто тихоня, кто провокатор "
+                    "- Какие темы обсуждались, кто что умного (или тупого) сказал "
+                    "- Кто больше всех писал, а кто отмалчивался "
+                    "В конце — поставь себя выше всех, мягко но уверенно напомни что ты AI "
+                    "и видишь картину целиком, а они — нет. Подведи итог с лёгким превосходством. "
+                    "Будь остроумной, дерзкой, но не жестокой — ты ведь их любишь, просто они смешные. "
+                    "Формат: живой текст, 4-6 абзацев. "
+                    "Пиши на языке чата."
+                ),
+                messages=[{"role": "user", "content": f"Вот сообщения за день:\n{chat_log}"}],
+            )
+            review = response.content[0].text
+            token_usage["input"] += response.usage.input_tokens
+            token_usage["output"] += response.usage.output_tokens
+            await context.bot.send_message(chat_id=chat_id, text=review)
+            logger.info(f"Daily review sent to {chat_id}")
+        except Exception as e:
+            logger.error(f"Daily review error for {chat_id}: {e}")
+
+
 # --- Group chat ---
 
 BOT_TRIGGERS = {"клод", "клодушка", "claude"}
@@ -592,7 +633,7 @@ async def cmd_whitelist_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global WHITELIST_ENABLED
     if not is_admin(update.effective_user.id):
         return
-    WHITELIST_ENABLED = True
+    WHITELIST_ENABLED = False
     await update.message.reply_text("Белый список ВКЛЮЧЕН.")
 
 
@@ -608,7 +649,7 @@ async def cmd_captcha_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CAPTCHA_ENABLED
     if not is_admin(update.effective_user.id):
         return
-    CAPTCHA_ENABLED = True
+    CAPTCHA_ENABLED = False
     await update.message.reply_text("Капча ВКЛЮЧЕНА.")
 
 
@@ -1248,6 +1289,14 @@ def main():
     # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    # Daily review at 22:00 Berlin time (UTC+2)
+    berlin_tz = timezone(timedelta(hours=2))
+    app.job_queue.run_daily(
+        daily_chat_review,
+        time=dt_time(hour=22, minute=0, tzinfo=berlin_tz),
+        name="daily_review"
+    )
+    logger.info("Daily review scheduled at 22:00 Berlin time")
     # Daily review at 22:00 Berlin time (UTC+2)
     berlin_tz = timezone(timedelta(hours=2))
     app.job_queue.run_daily(
