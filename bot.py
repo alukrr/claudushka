@@ -31,7 +31,7 @@ MAX_CAPTCHA_ATTEMPTS = 3
 BAN_DURATION = 3600
 STREET_DAILY_LIMIT = 10
 
-CAPTCHA_ENABLED = True
+CAPTCHA_ENABLED = False
 WHITELIST_ENABLED = False
 
 # Captcha state (in-memory, resets on restart)
@@ -499,7 +499,7 @@ async def cmd_captcha_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CAPTCHA_ENABLED
     if not is_admin(update.effective_user.id):
         return
-    CAPTCHA_ENABLED = True
+    CAPTCHA_ENABLED = False
     await update.message.reply_text("Капча ВКЛЮЧЕНА.")
 
 
