@@ -167,6 +167,37 @@ async def generate_image(prompt: str) -> bytes | None:
     logger.error("All image providers failed")
     return None
 
+async def generate_image_with_error(prompt: str) -> tuple[bytes | None, str | None]:
+    """Returns (image_data, error_message)"""
+    import base64
+    if GEMINI_API_KEY:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent?key={GEMINI_API_KEY}"
+            payload = {
+                "contents": [{"parts": [{"text": f"Generate an image: {prompt}"}]}],
+                "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
+            }
+            resp = http_requests.post(url, json=payload, timeout=120)
+            if resp.status_code == 200:
+                data = resp.json()
+                text_parts = []
+                for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []):
+                    if "inlineData" in part:
+                        logger.info("Image generated via Nano Banana 2")
+                        return base64.b64decode(part["inlineData"]["data"]), None
+                    if "text" in part:
+                        text_parts.append(part["text"])
+                # Model responded with text only (refusal or error)
+                if text_parts:
+                    return None, "\n".join(text_parts)
+            else:
+                error_data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                error_msg = error_data.get("error", {}).get("message", f"HTTP {resp.status_code}")
+                return None, f"Gemini ответил: {error_msg}"
+        except Exception as e:
+            logger.warning(f"Gemini image error: {e}")
+    return None, "Все генераторы картинок недоступны. Попробуй позже."
+
 # --- Captcha ---
 
 def generate_captcha_question(user_text: str) -> str:
@@ -756,7 +787,7 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     prompt = " ".join(context.args)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
-    image_data = await generate_image(prompt)
+    image_data, error_msg = await generate_image_with_error(prompt)
     if image_data:
         from io import BytesIO
         bio = BytesIO(image_data)
@@ -765,7 +796,7 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption = f"\U0001f3a8 \"{prompt}\"\n\nАвтор запроса: {author}\nМодель: Nano Banana 2"
         await update.message.reply_photo(photo=bio, caption=caption)
     else:
-        await update.message.reply_text("Не смогла сгенерировать картинку. Попробуй другой промпт или позже.")
+        await update.message.reply_text(f"Не смогла нарисовать: {error_msg}" if error_msg else "Не смогла нарисовать. Попробуй другой промпт.")
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1008,7 +1039,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             en_prompt = translate_resp.content[0].text.strip()
         except Exception:
             en_prompt = draw_prompt
-        image_data = await generate_image(en_prompt)
+        image_data, error_msg = await generate_image_with_error(en_prompt)
         if image_data:
             from io import BytesIO
             bio = BytesIO(image_data)
@@ -1017,7 +1048,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption = f"\U0001f3a8 \"{draw_prompt}\"\n\nАвтор запроса: {author}\nМодель: Nano Banana 2"
             await update.message.reply_photo(photo=bio, caption=caption)
         else:
-            await update.message.reply_text("Не смогла нарисовать. Попробуй другое описание.")
+            await update.message.reply_text(f"Не смогла нарисовать: {error_msg}" if error_msg else "Не смогла нарисовать. Попробуй другое описание.")
         return
 
     # Get conversation history from DB
