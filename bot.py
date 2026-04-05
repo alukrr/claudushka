@@ -32,7 +32,7 @@ BAN_DURATION = 3600
 STREET_DAILY_LIMIT = 10
 
 CAPTCHA_ENABLED = True
-WHITELIST_ENABLED = True
+WHITELIST_ENABLED = False
 
 # Captcha state (in-memory, resets on restart)
 captcha_state: dict[str, dict] = {}
@@ -483,7 +483,7 @@ async def cmd_whitelist_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global WHITELIST_ENABLED
     if not is_admin(update.effective_user.id):
         return
-    WHITELIST_ENABLED = True
+    WHITELIST_ENABLED = False
     await update.message.reply_text("Белый список ВКЛЮЧЕН.")
 
 
@@ -673,6 +673,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/clear — очистить историю диалога\n"
         "/memory — что я о тебе помню\n"
         "/forget — забыть всё о тебе\n"
+        "/search — поиск в интернете\n"
         "/id — показать Telegram ID\n"
     )
 
