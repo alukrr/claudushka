@@ -19,6 +19,7 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 ADMIN_IDS = {592441}
 
 DATA_DIR = Path("/app/data")
