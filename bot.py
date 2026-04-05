@@ -142,7 +142,7 @@ async def generate_image(prompt: str) -> bytes | None:
                 "contents": [{"parts": [{"text": f"Generate an image: {prompt}"}]}],
                 "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
             }
-            resp = http_requests.post(url, json=payload, timeout=120)
+            resp = http_requests.post(url, json=payload, timeout=300)
             if resp.status_code == 200:
                 data = resp.json()
                 for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []):
@@ -158,7 +158,7 @@ async def generate_image(prompt: str) -> bytes | None:
             hf_url = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
             headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
             payload = {"inputs": prompt, "parameters": {"width": 768, "height": 768}}
-            resp = http_requests.post(hf_url, headers=headers, json=payload, timeout=120)
+            resp = http_requests.post(hf_url, headers=headers, json=payload, timeout=300)
             if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
                 logger.info("Image generated via FLUX.1-schnell")
                 return resp.content
@@ -177,7 +177,7 @@ async def generate_image_with_error(prompt: str) -> tuple[bytes | None, str | No
                 "contents": [{"parts": [{"text": f"Generate an image: {prompt}"}]}],
                 "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
             }
-            resp = http_requests.post(url, json=payload, timeout=120)
+            resp = http_requests.post(url, json=payload, timeout=300)
             if resp.status_code == 200:
                 data = resp.json()
                 text_parts = []
