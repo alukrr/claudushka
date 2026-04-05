@@ -764,6 +764,54 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+async def cmd_promote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Promote street user to referral."""
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /promote <user_id>")
+        return
+    uid = int(context.args[0])
+    user = db.get_user(uid)
+    if not user:
+        await update.message.reply_text(f"Пользователь {uid} не найден.")
+        return
+    db.set_role(uid, "referral")
+    name = user["full_name"] or user["username"] or str(uid)
+    await update.message.reply_text(f"🔗 {name} ({uid}) → referral")
+    try:
+        await context.bot.send_message(
+            chat_id=uid,
+            text="Хорошие новости! Админ открыл тебе доступ к поиску и другим функциям. Добро пожаловать!"
+        )
+    except Exception:
+        pass
+
+
+async def cmd_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Promote user to premium."""
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /premium <user_id>")
+        return
+    uid = int(context.args[0])
+    user = db.get_user(uid)
+    if not user:
+        await update.message.reply_text(f"Пользователь {uid} не найден.")
+        return
+    db.set_role(uid, "premium")
+    name = user["full_name"] or user["username"] or str(uid)
+    await update.message.reply_text(f"⭐ {name} ({uid}) → premium")
+    try:
+        await context.bot.send_message(
+            chat_id=uid,
+            text="Поздравляю! Тебе открыт полный доступ — поиск, картинки, без лимитов. Ты теперь премиум!"
+        )
+    except Exception:
+        pass
+
+
 async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -877,6 +925,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/allow_chat <id> [имя]\n"
             "/deny_chat <id>\n"
             "/cost — расход токенов\n"
+            "/promote <id> — дать referral\n"
+            "/premium <id> — дать premium\n"
             "/migrate — миграция из JSON\n"
         )
 
@@ -1244,6 +1294,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.save_message(user_id, "user", user_text)
         db.save_message(user_id, "assistant", assistant_text)
 
+        # Notify admins on first message from street user + hint to user
+        if user["role"] == "street":
+            msg_count = len(db.get_conversation(user_id, 2))
+            if msg_count <= 2:
+                uname = update.effective_user.full_name or update.effective_user.username or str(user_id)
+                username_str = f"@{update.effective_user.username}" if update.effective_user.username else "нет"
+                for admin_id in ADMIN_IDS:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=admin_id,
+                            text=(
+                                f"🚶 Новый пользователь с улицы написал первый раз:\n\n"
+                                f"Имя: {uname}\n"
+                                f"ID: {user_id}\n"
+                                f"Username: {username_str}\n\n"
+                                f"/promote {user_id} → referral (поиск)\n"
+                                f"/premium {user_id} → premium (всё)\n"
+                                f"/ban {user_id} → бан"
+                            )
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to notify admin about new street user: {e}")
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="ℹ️ У тебя базовый доступ — поиск и картинки недоступны. Напиши @alukr чтобы снять ограничения."
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send street hint: {e}")
+
         # Extract memory periodically
         msg_count = len(history)
         if msg_count > 0 and msg_count % (MEMORY_EXTRACT_EVERY * 2) == 0:
@@ -1300,6 +1380,8 @@ def main():
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("review", cmd_review))
     app.add_handler(CommandHandler("approve", cmd_approve))
+    app.add_handler(CommandHandler("promote", cmd_promote))
+    app.add_handler(CommandHandler("premium", cmd_premium))
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("activity", cmd_activity))
     app.add_handler(CommandHandler("cost", cmd_cost))
