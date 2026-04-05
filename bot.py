@@ -135,7 +135,7 @@ async def generate_image(prompt: str) -> bytes | None:
     if not HF_API_TOKEN:
         return None
     try:
-        url = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
+        url = "https://router.huggingface.co/hf-inference/models/stabilityai/stable-diffusion-xl-base-1.0"
         headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
         payload = {"inputs": prompt, "parameters": {"width": 512, "height": 512}}
         resp = http_requests.post(url, headers=headers, json=payload, timeout=120)
@@ -743,7 +743,7 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bio = BytesIO(image_data)
         bio.name = "claudushka.png"
         author = update.effective_user.first_name or update.effective_user.username or "Unknown"
-        caption = f"\U0001f3a8 \"{prompt}\"\n\nАвтор запроса: {author}\nМодель: FLUX.1-schnell"
+        caption = f"\U0001f3a8 \"{prompt}\"\n\nАвтор запроса: {author}\nМодель: Stable Diffusion XL"
         await update.message.reply_photo(photo=bio, caption=caption)
     else:
         await update.message.reply_text("Не смогла сгенерировать картинку. Попробуй другой промпт или позже.")
@@ -995,7 +995,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bio = BytesIO(image_data)
             bio.name = "claudushka.png"
             author = update.effective_user.first_name or update.effective_user.username or "Unknown"
-            caption = f"\U0001f3a8 \"{draw_prompt}\"\n\nАвтор запроса: {author}\nМодель: FLUX.1-schnell"
+            caption = f"\U0001f3a8 \"{draw_prompt}\"\n\nАвтор запроса: {author}\nМодель: Stable Diffusion XL"
             await update.message.reply_photo(photo=bio, caption=caption)
         else:
             await update.message.reply_text("Не смогла нарисовать. Попробуй другое описание.")
