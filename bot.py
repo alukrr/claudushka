@@ -584,6 +584,32 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
+async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /approve <user_id>")
+        return
+    uid = int(context.args[0])
+    db.set_verified(uid, True)
+    user = db.get_user(uid)
+    name = user["full_name"] if user else str(uid)
+    await update.message.reply_text(f"\u2705 {name} ({uid}) допущен.")
+    try:
+        await context.bot.send_message(chat_id=uid, text="Админ одобрил тебя! Можешь общаться свободно.")
+    except Exception:
+        pass
+
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /ban <user_id>")
+        return
+    uid = int(context.args[0])
+    db.set_role(uid, "banned")
+    await update.message.reply_text(f"\U0001f6ab {uid} забанен.")
+
 async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -856,8 +882,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group and not is_bot_mentioned(update):
         return
 
-    # Captcha
-    if await handle_captcha(update, user):
+    # Approval check for new users
+    if needs_captcha(user):
+        uid = user["telegram_id"]
+        uname = update.effective_user.full_name or update.effective_user.username or str(uid)
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=(
+                        f"\U0001f464 Новый пользователь хочет общаться:\n\n"
+                        f"Имя: {uname}\n"
+                        f"ID: {uid}\n"
+                        f"Username: @{update.effective_user.username or 'нет'}\n\n"
+                        f"/approve {uid} — допустить\n"
+                        f"/ban {uid} — забанить"
+                    )
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify admin: {e}")
+        await update.message.reply_text("Привет! Я отправила запрос админу. Подожди немного, скоро тебя допустят.")
         return
 
     # Access check
@@ -972,6 +1016,8 @@ def main():
     app.add_handler(CommandHandler("chats", cmd_chats))
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("review", cmd_review))
+    app.add_handler(CommandHandler("approve", cmd_approve))
+    app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler("approve_chat", cmd_approve_chat))
     app.add_handler(CommandHandler("reject_chat", cmd_reject_chat))
