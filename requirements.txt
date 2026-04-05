@@ -1,3 +1,4 @@
 python-telegram-bot[job-queue]==21.10
 anthropic==0.43.0
 tavily-python==0.5.0
+gradio_client==1.5.0
