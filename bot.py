@@ -378,6 +378,7 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
 # --- Group chat ---
 
 BOT_TRIGGERS = {"клод", "клодушка", "claude"}
+DRAW_TRIGGERS = {"нарисуй", "нарисуй-ка", "draw", "zeichne", "рисуй", "изобрази", "покажи"}
 
 
 def is_bot_mentioned(update: Update) -> bool:
@@ -968,6 +969,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not user_text:
             await update.message.reply_text("Да? Чем помочь?")
             return
+
+    # Check for draw request
+    first_word = user_text.split()[0].lower().rstrip(",:.!?") if user_text else ""
+    if first_word in DRAW_TRIGGERS:
+        draw_prompt = user_text[len(user_text.split()[0]):].strip()
+        if not draw_prompt:
+            await update.message.reply_text("Что нарисовать? Опиши картинку.")
+            return
+        await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
+        # Translate prompt to English via Haiku for better results
+        try:
+            translate_resp = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=200,
+                system="Translate the following image description to English. Return ONLY the translation, nothing else.",
+                messages=[{"role": "user", "content": draw_prompt}],
+            )
+            en_prompt = translate_resp.content[0].text.strip()
+        except Exception:
+            en_prompt = draw_prompt
+        image_data = await generate_image(en_prompt)
+        if image_data:
+            from io import BytesIO
+            bio = BytesIO(image_data)
+            bio.name = "claudushka.png"
+            author = update.effective_user.first_name or update.effective_user.username or "Unknown"
+            caption = f"\U0001f3a8 \"{draw_prompt}\"\n\nАвтор запроса: {author}\nМодель: FLUX.1-schnell"
+            await update.message.reply_photo(photo=bio, caption=caption)
+        else:
+            await update.message.reply_text("Не смогла нарисовать. Попробуй другое описание.")
+        return
 
     # Get conversation history from DB
     history = db.get_conversation(user_id, MAX_HISTORY)
