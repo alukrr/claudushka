@@ -2,9 +2,9 @@ import os
 import json
 import logging
 import time
+import asyncio
 from pathlib import Path
 from telegram import Update
-from datetime import time as dt_time, timezone, timedelta
 from datetime import time as dt_time, timezone, timedelta
 from telegram.ext import Application, CommandHandler, MessageHandler, ChatMemberHandler, filters, ContextTypes
 import anthropic
@@ -133,71 +133,147 @@ def should_search(text: str) -> str | None:
 
 # --- Image generation ---
 
-async def generate_image(prompt: str) -> bytes | None:
-    import base64
-    # Try Gemini Nano Banana first
-    if GEMINI_API_KEY:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent?key={GEMINI_API_KEY}"
-            payload = {
-                "contents": [{"parts": [{"text": f"Generate an image: {prompt}"}]}],
-                "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
-            }
-            resp = http_requests.post(url, json=payload, timeout=300)
-            if resp.status_code == 200:
-                data = resp.json()
-                for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []):
-                    if "inlineData" in part:
-                        logger.info("Image generated via Nano Banana 2")
-                        return base64.b64decode(part["inlineData"]["data"])
-            logger.warning(f"Gemini image error: {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"Gemini image error: {e}")
-    # Fallback to FLUX
-    if HF_API_TOKEN:
-        try:
-            hf_url = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
-            headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-            payload = {"inputs": prompt, "parameters": {"width": 768, "height": 768}}
-            resp = http_requests.post(hf_url, headers=headers, json=payload, timeout=300)
-            if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
-                logger.info("Image generated via FLUX.1-schnell")
-                return resp.content
-        except Exception as e:
-            logger.warning(f"FLUX image error: {e}")
-    logger.error("All image providers failed")
-    return None
+GEMINI_TIMEOUT = 60          # seconds per attempt (was 300 — too long)
+GEMINI_MAX_RETRIES = 3       # retry on 429/500/503
+GEMINI_RETRY_DELAY = 2       # seconds between retries
+FLUX_TIMEOUT = 90            # FLUX is slower, but still not 5 minutes
+FLUX_MODEL_NAME = "FLUX.1-schnell"
+GEMINI_MODEL_NAME = "Nano Banana 2"
 
-async def generate_image_with_error(prompt: str) -> tuple[bytes | None, str | None]:
-    """Returns (image_data, error_message)"""
+
+async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str | None]:
+    """
+    Returns (image_bytes, user_error_message, provider_name).
+    provider_name is set only on success.
+    user_error_message is a human-readable message to show if we give up.
+    """
     import base64
-    if GEMINI_API_KEY:
+    if not GEMINI_API_KEY:
+        return None, None, None
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{"parts": [{"text": f"Generate an image: {prompt}"}]}],
+        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
+    }
+
+    last_error_msg: str | None = None
+    for attempt in range(1, GEMINI_MAX_RETRIES + 1):
         try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent?key={GEMINI_API_KEY}"
-            payload = {
-                "contents": [{"parts": [{"text": f"Generate an image: {prompt}"}]}],
-                "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
-            }
-            resp = http_requests.post(url, json=payload, timeout=300)
-            if resp.status_code == 200:
-                data = resp.json()
-                text_parts = []
-                for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []):
-                    if "inlineData" in part:
-                        logger.info("Image generated via Nano Banana 2")
-                        return base64.b64decode(part["inlineData"]["data"]), None
-                    if "text" in part:
-                        text_parts.append(part["text"])
-                # Model responded with text only (refusal or error)
-                if text_parts:
-                    return None, "\n".join(text_parts)
-            else:
-                error_data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-                error_msg = error_data.get("error", {}).get("message", f"HTTP {resp.status_code}")
-                return None, f"Gemini ответил: {error_msg}"
+            resp = http_requests.post(url, json=payload, timeout=GEMINI_TIMEOUT)
         except Exception as e:
-            logger.warning(f"Gemini image error: {e}")
-    return None, "Все генераторы картинок недоступны. Попробуй позже."
+            logger.warning(f"Gemini image request failed (attempt {attempt}/{GEMINI_MAX_RETRIES}): {e}")
+            last_error_msg = f"Сетевая ошибка: {e}"
+            if attempt < GEMINI_MAX_RETRIES:
+                await asyncio.sleep(GEMINI_RETRY_DELAY)
+            continue
+
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+            except Exception as e:
+                logger.warning(f"Gemini returned 200 with unparseable JSON: {e}")
+                last_error_msg = "Gemini вернул некорректный ответ"
+                break
+
+            text_parts: list[str] = []
+            for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []):
+                if "inlineData" in part:
+                    logger.info(f"Image generated via {GEMINI_MODEL_NAME} (attempt {attempt})")
+                    return base64.b64decode(part["inlineData"]["data"]), None, GEMINI_MODEL_NAME
+                if "text" in part:
+                    text_parts.append(part["text"])
+
+            # 200 OK but no image — model refused or explained something instead
+            if text_parts:
+                refusal = "\n".join(text_parts)
+                logger.warning(f"Gemini returned text instead of image: {refusal[:200]}")
+                return None, f"Gemini ответил: {refusal}", None
+            logger.warning("Gemini returned 200 with no image and no text")
+            last_error_msg = "Gemini вернул пустой ответ"
+            break
+
+        # Retry on transient errors
+        if resp.status_code in (429, 500, 502, 503, 504):
+            try:
+                error_data = resp.json()
+                error_msg = error_data.get("error", {}).get("message", f"HTTP {resp.status_code}")
+            except Exception:
+                error_msg = f"HTTP {resp.status_code}"
+            logger.warning(f"Gemini transient error (attempt {attempt}/{GEMINI_MAX_RETRIES}): {error_msg}")
+            last_error_msg = f"Gemini ответил: {error_msg}"
+            if attempt < GEMINI_MAX_RETRIES:
+                await asyncio.sleep(GEMINI_RETRY_DELAY)
+            continue
+
+        # Non-retryable error
+        try:
+            error_data = resp.json()
+            error_msg = error_data.get("error", {}).get("message", f"HTTP {resp.status_code}")
+        except Exception:
+            error_msg = f"HTTP {resp.status_code}"
+        logger.warning(f"Gemini non-retryable error: {error_msg}")
+        return None, f"Gemini ответил: {error_msg}", None
+
+    return None, last_error_msg, None
+
+
+async def _try_flux_image(prompt: str) -> tuple[bytes | None, str | None, str | None]:
+    """Fallback provider: HuggingFace FLUX.1-schnell."""
+    if not HF_API_TOKEN:
+        return None, None, None
+    try:
+        hf_url = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
+        headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+        payload = {"inputs": prompt, "parameters": {"width": 768, "height": 768}}
+        resp = http_requests.post(hf_url, headers=headers, json=payload, timeout=FLUX_TIMEOUT)
+        if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
+            logger.info(f"Image generated via {FLUX_MODEL_NAME}")
+            return resp.content, None, FLUX_MODEL_NAME
+        logger.warning(f"FLUX error: {resp.status_code} {resp.text[:200]}")
+        return None, f"FLUX ответил: HTTP {resp.status_code}", None
+    except Exception as e:
+        logger.warning(f"FLUX image error: {e}")
+        return None, f"FLUX сетевая ошибка: {e}", None
+
+
+async def generate_image_with_error(prompt: str) -> tuple[bytes | None, str | None, str | None]:
+    """
+    Returns (image_bytes, error_message, provider_name).
+    On success: (bytes, None, "Nano Banana 2" | "FLUX.1-schnell")
+    On failure: (None, human_readable_error, None)
+    """
+    # Try Gemini Nano Banana first (with retries)
+    image, error, provider = await _try_gemini_image(prompt)
+    if image:
+        return image, None, provider
+    gemini_error = error  # keep for final message if FLUX also fails
+
+    # Fallback to FLUX
+    image, flux_error, provider = await _try_flux_image(prompt)
+    if image:
+        return image, None, provider
+
+    # Both failed — return the most informative error we have
+    final_error = gemini_error or flux_error or "Все генераторы картинок недоступны. Попробуй позже."
+    logger.error(f"All image providers failed. Gemini: {gemini_error}. FLUX: {flux_error}")
+    return None, final_error, None
+
+
+async def _keep_upload_photo_action(bot, chat_id: int, stop_event: asyncio.Event) -> None:
+    """Keep Telegram 'uploading photo' indicator alive while generation runs."""
+    try:
+        while not stop_event.is_set():
+            try:
+                await bot.send_chat_action(chat_id=chat_id, action="upload_photo")
+            except Exception as e:
+                logger.debug(f"chat_action refresh failed: {e}")
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=4.0)
+            except asyncio.TimeoutError:
+                pass
+    except asyncio.CancelledError:
+        pass
 
 # --- Captcha ---
 
@@ -805,18 +881,30 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Использование: /imagine <описание картинки на английском>")
         return
     prompt = " ".join(context.args)
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
+    chat_id = update.effective_chat.id
     msg = await update.message.reply_text("Рисую... это может занять пару минут.")
-    image_data, error_msg = await generate_image_with_error(prompt)
+
+    stop_event = asyncio.Event()
+    keepalive_task = asyncio.create_task(_keep_upload_photo_action(context.bot, chat_id, stop_event))
+    try:
+        image_data, error_msg, provider = await generate_image_with_error(prompt)
+    finally:
+        stop_event.set()
+        try:
+            await keepalive_task
+        except Exception:
+            pass
+
     if image_data:
         from io import BytesIO
         bio = BytesIO(image_data)
         bio.name = "claudushka.png"
         author = update.effective_user.first_name or update.effective_user.username or "Unknown"
-        caption = f"\U0001f3a8 \"{prompt}\"\n\nАвтор запроса: {author}\nМодель: Nano Banana 2"
+        caption = f"\U0001f3a8 \"{prompt}\"\n\nАвтор запроса: {author}\nМодель: {provider}"
         await msg.delete()
         await update.message.reply_photo(photo=bio, caption=caption)
     else:
+        await msg.delete()
         await update.message.reply_text(f"Не смогла нарисовать: {error_msg}" if error_msg else "Не смогла нарисовать. Попробуй другой промпт.")
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1057,7 +1145,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not draw_prompt:
             await update.message.reply_text("Что нарисовать? Опиши картинку или ответь на сообщение с текстом.")
             return
-        await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
         # Translate prompt to English via Haiku for better results
         try:
             translate_resp = client.messages.create(
@@ -1069,13 +1156,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             en_prompt = translate_resp.content[0].text.strip()
         except Exception:
             en_prompt = draw_prompt
-        image_data, error_msg = await generate_image_with_error(en_prompt)
+
+        stop_event = asyncio.Event()
+        keepalive_task = asyncio.create_task(_keep_upload_photo_action(context.bot, chat_id, stop_event))
+        try:
+            image_data, error_msg, provider = await generate_image_with_error(en_prompt)
+        finally:
+            stop_event.set()
+            try:
+                await keepalive_task
+            except Exception:
+                pass
+
         if image_data:
             from io import BytesIO
             bio = BytesIO(image_data)
             bio.name = "claudushka.png"
             author = update.effective_user.first_name or update.effective_user.username or "Unknown"
-            caption = f"\U0001f3a8 \"{draw_prompt}\"\n\nАвтор запроса: {author}\nМодель: Nano Banana 2"
+            caption = f"\U0001f3a8 \"{draw_prompt}\"\n\nАвтор запроса: {author}\nМодель: {provider}"
             await update.message.reply_photo(photo=bio, caption=caption)
         else:
             await update.message.reply_text(f"Не смогла нарисовать: {error_msg}" if error_msg else "Не смогла нарисовать. Попробуй другое описание.")
