@@ -741,7 +741,9 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from io import BytesIO
         bio = BytesIO(image_data)
         bio.name = "claudushka.png"
-        await update.message.reply_photo(photo=bio, caption=f"\U0001f3a8 {prompt}")
+        author = update.effective_user.first_name or update.effective_user.username or "Unknown"
+        caption = f"\U0001f3a8 \"{prompt}\"\n\nАвтор запроса: {author}\nМодель: FLUX.1-schnell"
+        await update.message.reply_photo(photo=bio, caption=caption)
     else:
         await update.message.reply_text("Не смогла сгенерировать картинку. Попробуй другой промпт или позже.")
 
