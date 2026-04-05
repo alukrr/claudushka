@@ -9,6 +9,7 @@ from datetime import time as dt_time, timezone, timedelta
 from telegram.ext import Application, CommandHandler, MessageHandler, ChatMemberHandler, filters, ContextTypes
 import anthropic
 from tavily import TavilyClient
+import requests as http_requests
 import db
 
 logging.basicConfig(level=logging.INFO)
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
+HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "")
 ADMIN_IDS = {592441}
 
 DATA_DIR = Path("/app/data")
@@ -126,6 +128,25 @@ def should_search(text: str) -> str | None:
         logger.error(f"Search decision error: {e}")
         return None
 
+
+# --- Image generation ---
+
+async def generate_image(prompt: str) -> bytes | None:
+    if not HF_API_TOKEN:
+        return None
+    try:
+        url = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+        headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+        payload = {"inputs": prompt, "parameters": {"width": 512, "height": 512}}
+        resp = http_requests.post(url, headers=headers, json=payload, timeout=120)
+        if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
+            return resp.content
+        else:
+            logger.error(f"Image gen error: {resp.status_code} {resp.text[:200]}")
+            return None
+    except Exception as e:
+        logger.error(f"Image gen error: {e}")
+        return None
 
 # --- Captcha ---
 
@@ -705,6 +726,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = db.get_or_create_user(user_id, update.effective_user.username, update.effective_user.full_name)
+    if user["role"] == "banned":
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /imagine <описание картинки на английском>")
+        return
+    prompt = " ".join(context.args)
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
+    image_data = await generate_image(prompt)
+    if image_data:
+        from io import BytesIO
+        bio = BytesIO(image_data)
+        bio.name = "claudushka.png"
+        await update.message.reply_photo(photo=bio, caption=f"\U0001f3a8 {prompt}")
+    else:
+        await update.message.reply_text("Не смогла сгенерировать картинку. Попробуй другой промпт или позже.")
+
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user = db.get_or_create_user(user_id, update.effective_user.username, update.effective_user.full_name)
@@ -1007,7 +1047,7 @@ def main():
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("forget", cmd_forget))
-    app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CommandHandler("imagine", cmd_imagine))\n    app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("id", show_id))
 
     # Admin commands
