@@ -1072,6 +1072,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Не смогла нарисовать: {error_msg}" if error_msg else "Не смогла нарисовать. Попробуй другое описание.")
         return
 
+    # Draw from reply - user replies to a message with "нарисуй" etc.
+    if update.message.reply_to_message and first_word in DRAW_TRIGGERS:
+        source_msg = update.message.reply_to_message
+        draw_text = None
+
+        # Get text from replied message
+        if source_msg.text:
+            draw_text = source_msg.text
+        elif source_msg.caption:
+            draw_text = source_msg.caption
+
+        if draw_text:
+            await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
+            msg = await update.message.reply_text("Рисую по тексту...")
+            try:
+                translate_resp = client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=200,
+                    system="Convert this text into a short image generation prompt in English. Keep it under 50 words. Return ONLY the prompt.",
+                    messages=[{"role": "user", "content": draw_text}],
+                )
+                en_prompt = translate_resp.content[0].text.strip()
+            except Exception:
+                en_prompt = draw_text
+
+            image_data, error_msg = await generate_image_with_error(en_prompt)
+            if image_data:
+                from io import BytesIO
+                bio = BytesIO(image_data)
+                bio.name = "claudushka.png"
+                author = update.effective_user.first_name or update.effective_user.username or "Unknown"
+                caption = f"\U0001f3a8 По тексту: \"{draw_text[:100]}\"\n\nАвтор запроса: {author}\nМодель: Nano Banana 2"
+                await msg.delete()
+                await update.message.reply_photo(photo=bio, caption=caption)
+            else:
+                await msg.delete()
+                await update.message.reply_text(f"Не смогла нарисовать: {error_msg}" if error_msg else "Не смогла нарисовать.")
+            return
+
     # Get conversation history from DB
     history = db.get_conversation(user_id, MAX_HISTORY)
     history.append({"role": "user", "content": user_text})
