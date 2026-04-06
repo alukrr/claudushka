@@ -1220,6 +1220,72 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Да? Чем помочь?")
             return
 
+    # --- Handle document/file ---
+    has_document = bool(update.message.document)
+    if has_document:
+        doc = update.message.document
+        mime = doc.mime_type or ""
+        filename = doc.file_name or "file"
+
+        text_mimes = ("text/", "application/json", "application/xml",
+                      "application/javascript", "application/x-yaml",
+                      "application/x-sh", "application/x-python")
+        is_text = any(mime.startswith(m) for m in text_mimes)
+        text_exts = (".txt", ".json", ".yaml", ".yml", ".py", ".js", ".ts",
+                     ".sh", ".md", ".toml", ".ini", ".env", ".conf",
+                     ".xml", ".html", ".css", ".csv", ".log", ".rs", ".go")
+        if not is_text:
+            is_text = any(filename.lower().endswith(ext) for ext in text_exts)
+
+        if not is_text:
+            await update.message.reply_text(
+                f"Файл \u00ab{filename}\u00bb \u2014 бинарный или неизвестного типа. Умею читать: код, JSON, YAML, текст и т.п."
+            )
+            return
+
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        try:
+            file = await context.bot.get_file(doc.file_id)
+            file_bytes = await file.download_as_bytearray()
+            file_text = file_bytes.decode("utf-8", errors="replace")
+
+            question = user_text if user_text else f"Проанализируй этот файл."
+            if is_group:
+                question = strip_trigger(question) or f"Проанализируй этот файл."
+
+            full_prompt = f"Пользователь прислал файл \u00ab{filename}\u00bb:\n\n```\n{file_text[:8000]}\n```\n\n{question}"
+            if len(file_text) > 8000:
+                full_prompt += f"\n\n[Файл обрезан: показано 8000 из {len(file_text)} символов]"
+
+            system = get_system_prompt(user_id, is_group, chat_id if is_group else None)
+            doc_history = [{"role": "user", "content": full_prompt}]
+
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=4096,
+                system=system,
+                messages=doc_history,
+            )
+            answer = response.content[0].text
+            token_usage["input"] += response.usage.input_tokens
+            token_usage["output"] += response.usage.output_tokens
+
+            db.save_message(user_id, "user", f"[Файл: {filename}] {question}")
+            db.save_message(user_id, "assistant", answer)
+
+            if len(answer) <= 4096:
+                try:
+                    await update.message.reply_text(answer, parse_mode="Markdown")
+                except Exception:
+                    await update.message.reply_text(answer)
+            else:
+                for i in range(0, len(answer), 4096):
+                    await update.message.reply_text(answer[i:i + 4096])
+        except Exception as e:
+            logger.error(f"Document handling error: {e}")
+            await update.message.reply_text(f"Не смогла прочитать файл: {e}")
+        return
+
     # --- Handle photo/image ---
     if has_photo:
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -1451,6 +1517,7 @@ def main():
     app.add_handler(ChatMemberHandler(handle_chat_member, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(CommandHandler("migrate", cmd_migrate))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_message))
 
     berlin_tz = timezone(timedelta(hours=2))
