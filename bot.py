@@ -960,6 +960,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    await update.message.reply_text("Обновляюсь...")
+    try:
+        pull = await asyncio.create_subprocess_exec(
+            "git", "-C", "/repo", "pull",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await pull.communicate()
+        git_out = (stdout + stderr).decode().strip()
+
+        restart = await asyncio.create_subprocess_exec(
+            "docker", "restart", "claudushka",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await restart.communicate()
+
+        await update.message.reply_text(f"git pull:\n{git_out}\n\nПерезапускаюсь...")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка обновления: {e}")
+
+
 async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user = db.get_or_create_user(user_id, update.effective_user.username, update.effective_user.full_name)
@@ -1525,6 +1550,7 @@ def main():
     app.add_handler(ChatMemberHandler(handle_new_chat, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(handle_chat_member, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(CommandHandler("migrate", cmd_migrate))
+    app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_message))
