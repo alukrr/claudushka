@@ -560,18 +560,28 @@ DRAW_TRIGGERS = {"нарисуй", "нарисуй-ка", "draw", "zeichne", "р
 
 def is_bot_mentioned(update: Update) -> bool:
     message = update.message
-    if not message or not message.text:
+    if not message:
+        return False
+    # Photo without caption replying to bot — always process
+    if message.photo and not message.caption:
+        if message.reply_to_message and message.reply_to_message.from_user:
+            if message.reply_to_message.from_user.id == context_bot_id:
+                return True
+        # In private chat — always process photos
+        return True
+    text = message.text or message.caption or ""
+    if not text and not message.photo:
         return False
     if message.reply_to_message and message.reply_to_message.from_user:
         if message.reply_to_message.from_user.id == context_bot_id:
             return True
-    if message.entities:
-        for entity in message.entities:
-            if entity.type == "mention":
-                mention = message.text[entity.offset:entity.offset + entity.length].lower()
-                if mention == f"@{bot_username}":
-                    return True
-    first_word = message.text.split()[0].lower().rstrip(",:.!?") if message.text else ""
+    entities = message.entities or message.caption_entities or []
+    for entity in entities:
+        if entity.type == "mention":
+            mention = text[entity.offset:entity.offset + entity.length].lower()
+            if mention == f"@{bot_username}":
+                return True
+    first_word = text.split()[0].lower().rstrip(",:.!?") if text else ""
     if first_word in BOT_TRIGGERS:
         return True
     return False
@@ -1162,9 +1172,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user["role"] == "banned":
         return
 
-    if is_group and update.message and update.message.text:
+    if is_group and update.message:
         sender = update.effective_user.first_name or "Unknown"
-        db.save_group_message(chat_id, user_id, sender, update.message.text)
+        if update.message.text:
+            db.save_group_message(chat_id, user_id, sender, update.message.text)
+        elif update.message.photo:
+            caption = update.message.caption or ""
+            db.save_group_message(chat_id, user_id, sender, f"[Фото] {caption}".strip())
 
     if is_group and not is_bot_mentioned(update):
         return
@@ -1194,15 +1208,76 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Лимит {STREET_DAILY_LIMIT} сообщений в день. Попроси реферальную ссылку для безлимита!")
         return
 
-    user_text = update.message.text
-    if not user_text:
+    user_text = update.message.text or update.message.caption or ""
+    has_photo = bool(update.message.photo)
+
+    if not user_text and not has_photo:
         return
 
     if is_group:
         user_text = strip_trigger(user_text)
-        if not user_text:
+        if not user_text and not has_photo:
             await update.message.reply_text("Да? Чем помочь?")
             return
+
+    # --- Handle photo/image ---
+    if has_photo:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        try:
+            photo = update.message.photo[-1]  # largest size
+            photo_file = await context.bot.get_file(photo.file_id)
+            import io
+            photo_bytes = await photo_file.download_as_bytearray()
+            image_b64 = __import__('base64').b64encode(bytes(photo_bytes)).decode()
+
+            question = user_text if user_text else "Что на этом изображении? Опиши подробно."
+            if is_group:
+                question = strip_trigger(question) or "Что на этом изображении? Опиши подробно."
+
+            vision_messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_b64,
+                            },
+                        },
+                        {"type": "text", "text": question},
+                    ],
+                }
+            ]
+
+            system = get_system_prompt(user_id, is_group, chat_id if is_group else None)
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=2048,
+                system=system,
+                messages=vision_messages,
+            )
+            answer = response.content[0].text
+            token_usage["input"] += response.usage.input_tokens
+            token_usage["output"] += response.usage.output_tokens
+
+            # Save to history as text
+            db.save_message(user_id, "user", f"[Фото] {question}")
+            db.save_message(user_id, "assistant", answer)
+
+            if len(answer) <= 4096:
+                try:
+                    await update.message.reply_text(answer, parse_mode="Markdown")
+                except Exception:
+                    await update.message.reply_text(answer)
+            else:
+                for i in range(0, len(answer), 4096):
+                    await update.message.reply_text(answer[i:i + 4096])
+        except Exception as e:
+            logger.error(f"Photo handling error: {e}")
+            await update.message.reply_text(f"Не смогла обработать фото: {e}")
+        return
 
     # Check for draw request
     first_word = user_text.split()[0].lower().rstrip(",:.!?") if user_text else ""
@@ -1376,6 +1451,7 @@ def main():
     app.add_handler(ChatMemberHandler(handle_chat_member, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(CommandHandler("migrate", cmd_migrate))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_message))
 
     berlin_tz = timezone(timedelta(hours=2))
     app.job_queue.run_daily(

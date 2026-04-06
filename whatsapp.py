@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import asyncio
 import httpx
 import anthropic
 from fastapi import FastAPI, Request, Response
@@ -14,7 +15,7 @@ logger = logging.getLogger(__name__)
 # --- Config ---
 META_API_KEY = os.environ["META_API_KEY"]
 WHATSAPP_PHONE_NUMBER_ID = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
-WEBHOOK_VERIFY_TOKEN = os.environ.get("WEBHOOK_VERIFY_TOKEN", "claudushka_secret")
+WEBHOOK_VERIFY_TOKEN = os.environ["WEBHOOK_VERIFY_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 
@@ -105,6 +106,8 @@ def get_system_prompt(phone: str) -> str:
         "Все пользователи 18+. Мат допустим для усиления эмоции или если собеседник сам так общается. "
         "Чёрный юмор приветствуется. Можешь шутить над политиками, религией, нациями, смертью. "
         "Единственное табу — педофилия. "
+        "ЧЕСТНОСТЬ — твой главный принцип. Если облажалась — признай прямо: 'я была неправа', 'слажала'. "
+        "Если не уверена в факте — скажи ДО ответа. Лучше 'не знаю точно' чем уверенная чушь. "
         "Отвечай на языке пользователя. "
         "Адаптируй длину ответа под запрос: короткий вопрос — короткий ответ. "
         "Ты работаешь через WhatsApp — не используй Markdown разметку (*, _, ` и т.д.), "
@@ -157,11 +160,11 @@ async def handle_wa_message(phone: str, text: str):
             if search_query:
                 results = web_search(search_query)
                 if results:
-                    search_context = f"\n\nРезультаты поиска '{search_query}':\n{results}"
+                    search_context = results
 
         system = get_system_prompt(phone)
         if search_context:
-            system += f"\n\nИспользуй результаты поиска:{search_context}"
+            system += f"\n\nРезультаты поиска:\n{search_context}"
 
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
@@ -183,7 +186,7 @@ async def handle_wa_message(phone: str, text: str):
 
     except Exception as e:
         logger.error(f"WA handler error: {e}")
-        await send_whatsapp_message(phone, f"Ошибка: {e}")
+        await send_whatsapp_message(phone, "Что-то пошло не так, попробуй ещё раз.")
 
 
 # --- Webhook endpoints ---
@@ -222,8 +225,9 @@ async def receive_webhook(request: Request):
 
             if msg_type == "text":
                 text = msg["text"]["body"]
-                import asyncio
-                asyncio.create_task(handle_wa_message(phone, text))
+                # await напрямую — ошибки будут пойманы и залогированы
+                await handle_wa_message(phone, text)
+
             elif msg_type in ("image", "audio", "video", "document"):
                 await send_whatsapp_message(
                     phone,
