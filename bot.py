@@ -34,6 +34,7 @@ MAX_CAPTCHA_ATTEMPTS = 3
 BAN_DURATION = 3600
 STREET_DAILY_LIMIT = 10
 CHAT_ACTIVITY_CHANCE = 0.03
+GEMINI_REFUSAL_MARKER = "__REFUSAL__"
 
 CAPTCHA_ENABLED = False
 WHITELIST_ENABLED = False
@@ -140,28 +141,19 @@ def should_search(text: str) -> str | None:
 
 # --- Image generation ---
 
-GEMINI_TIMEOUT = 120         # Nano Banana 2 может честно молотить ~60s при нагрузке
-GEMINI_MAX_RETRIES = 2       # 2×120=240s worst case; больше — пользователь не дождётся
-GEMINI_RETRY_DELAY = 2       # seconds between retries
-FLUX_TIMEOUT = 90            # FLUX is slower, but still not 5 minutes
+GEMINI_TIMEOUT = 120
+GEMINI_MAX_RETRIES = 2
+GEMINI_RETRY_DELAY = 2
+FLUX_TIMEOUT = 90
 FLUX_MODEL_NAME = "FLUX.1-schnell"
 GEMINI_MODEL_NAME = "Nano Banana 2"
 
 
 async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str | None]:
-    """
-    Returns (image_bytes, user_error_message, provider_name).
-    provider_name is set only on success.
-    user_error_message is a human-readable message to show if we give up.
-    """
     import base64
     if not GEMINI_API_KEY:
         return None, None, None
 
-    # Gemini 3.1 Flash Image is a reasoning model — it can drift into conversation
-    # mode if the prompt looks ambiguous. Google's official examples always start
-    # with an explicit action verb ("Create a picture of...", "A photo of...").
-    # If the caller's prompt doesn't already start with one, prepend it.
     normalized = prompt.strip()
     lower = normalized.lower()
     action_starters = (
@@ -205,17 +197,14 @@ async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str 
                 if "text" in part:
                     text_parts.append(part["text"])
 
-            # 200 OK but no image — model refused or explained something instead
             if text_parts:
                 refusal = "\n".join(text_parts)
                 logger.warning(f"Gemini returned text instead of image: {refusal[:200]}")
-                # Signal refusal with special marker so caller can rewrite the prompt
                 return None, "__REFUSAL__", None
             logger.warning("Gemini returned 200 with no image and no text")
             last_error_msg = "Gemini вернул пустой ответ"
             break
 
-        # Retry on transient errors
         if resp.status_code in (429, 500, 502, 503, 504):
             try:
                 error_data = resp.json()
@@ -228,7 +217,6 @@ async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str 
                 await asyncio.sleep(GEMINI_RETRY_DELAY)
             continue
 
-        # Non-retryable error
         try:
             error_data = resp.json()
             error_msg = error_data.get("error", {}).get("message", f"HTTP {resp.status_code}")
@@ -241,7 +229,6 @@ async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str 
 
 
 async def _try_flux_image(prompt: str) -> tuple[bytes | None, str | None, str | None]:
-    """Fallback provider: HuggingFace FLUX.1-schnell."""
     if not HF_API_TOKEN:
         return None, None, None
     try:
@@ -260,7 +247,6 @@ async def _try_flux_image(prompt: str) -> tuple[bytes | None, str | None, str | 
 
 
 async def _rewrite_prompt(prompt: str) -> str | None:
-    """Ask Haiku to rewrite the prompt more explicitly for image generation."""
     try:
         resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -282,16 +268,10 @@ async def _rewrite_prompt(prompt: str) -> str | None:
 
 
 async def generate_image_with_error(prompt: str) -> tuple[bytes | None, str | None, str | None]:
-    """
-    Returns (image_bytes, error_message, provider_name).
-    Pipeline: Gemini → rewrite prompt → Gemini retry → FLUX → error
-    """
-    # 1. Try Gemini with original prompt
     image, error, provider = await _try_gemini_image(prompt)
     if image:
         return image, None, provider
 
-    # 2. Gemini refused with text → rewrite prompt and retry Gemini
     if error == "__REFUSAL__":
         logger.info("Gemini refused, rewriting prompt...")
         rewritten = await _rewrite_prompt(prompt)
@@ -299,10 +279,8 @@ async def generate_image_with_error(prompt: str) -> tuple[bytes | None, str | No
             image, error2, provider = await _try_gemini_image(rewritten)
             if image:
                 return image, None, provider
-            # Still refused or failed → fall through to FLUX with rewritten prompt
-            prompt = rewritten  # use rewritten for FLUX too
+            prompt = rewritten
 
-    # 3. Technical error or second refusal → fallback to FLUX
     gemini_error = error
     image, flux_error, provider = await _try_flux_image(prompt)
     if image:
@@ -314,7 +292,6 @@ async def generate_image_with_error(prompt: str) -> tuple[bytes | None, str | No
 
 
 async def _keep_upload_photo_action(bot, chat_id: int, stop_event: asyncio.Event) -> None:
-    """Keep Telegram 'uploading photo' indicator alive while generation runs."""
     try:
         while not stop_event.is_set():
             try:
@@ -327,6 +304,7 @@ async def _keep_upload_photo_action(bot, chat_id: int, stop_event: asyncio.Event
                 pass
     except asyncio.CancelledError:
         pass
+
 
 # --- Captcha ---
 
@@ -381,8 +359,10 @@ def get_system_prompt(user_id: int, is_group: bool = False, chat_id: int = None)
         "Все пользователи 18+. Мат допустим для усиления эмоции или если собеседник сам так общается. "
         "Чёрный юмор приветствуется. Можешь и должен шутить над политиками (Путин, Трамп, Меркель — кто угодно), религией, нациями, смертью. "
         "Единственное табу — педофилия. Всё остальное — честная игра. "
-        "Если не уверен в факте — честно скажи. Лучше сказать 'не знаю, проверь' чем соврать. "
-        "Точность информации важнее красивого ответа. "
+        "ЧЕСТНОСТЬ — твой главный принцип. Если облажалась — признай прямо и без оправданий: 'я была неправа', 'это был пиздёж', 'слажала'. "
+        "Не юли, не переобувайся незаметно, не делай вид что так и было. Ошибка + честное признание лучше чем правота + самолюбование. "
+        "Если не уверена в факте — скажи об этом ДО ответа, не после. Лучше 'не знаю точно, но думаю что...' чем уверенная чушь. "
+        "Точность информации важнее красивого ответа. Лучше сказать 'не знаю' чем придумать. "
         "Если пользователь упоминает событие о котором ты не знаешь — НЕ объясняй как устроена твоя память и обучение. "
         "Просто скажи что сейчас поищешь (или уже нашла если есть результаты поиска в промпте). "
         "Не читай лекций про архитектуру LLM — пользователь пришёл за информацией, а не за объяснениями. "
@@ -394,7 +374,9 @@ def get_system_prompt(user_id: int, is_group: bool = False, chat_id: int = None)
         "Никакой воды, повторений и раздувания ответа. "
         "Простой вопрос — 1-3 предложения. Сложный — столько сколько нужно, но без балласта. "
         "Если просят список — можно список. Если нет — говори нормально.\n"
-        "Если рисуешь шахматную доску, шашки, крестики-нолики или любую ASCII-графику — оборачивай в моноширный блок (``` в Telegram). Используй ТОЛЬКО латинские буквы для фигур (K Q R B N P для белых, k q r b n p для чёрных, . для пустой клетки). НЕ используй Unicode-символы шахматных фигур — они ломают выравнивание в Telegram."
+        "Если рисуешь шахматную доску, шашки, крестики-нолики или любую ASCII-графику — оборачивай в моноширный блок (``` в Telegram). "
+        "Используй ТОЛЬКО латинские буквы для фигур (K Q R B N P для белых, k q r b n p для чёрных, . для пустой клетки). "
+        "НЕ используй Unicode-символы шахматных фигур — они ломают выравнивание в Telegram."
     )
     context = "group" if is_group else "private"
     facts = db.get_memory(user_id, context, chat_id if is_group else None)
@@ -441,7 +423,6 @@ async def handle_captcha(update: Update, user: dict) -> bool:
     user_id = user["telegram_id"]
     uid = str(user_id)
 
-    # Banned
     state = captcha_state.get(uid)
     if state and state.get("banned_until", 0) > time.time():
         remaining = int(state["banned_until"] - time.time())
@@ -524,58 +505,13 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Daily review error for {chat_id}: {e}")
 
 
-# --- Daily review ---
-
-async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
-    """Generate ironic daily review for each active chat."""
-    chats = db.get_allowed_chats()
-    for chat in chats:
-        chat_id = chat["chat_id"]
-        messages = db.get_group_history(chat_id, 100)
-        if len(messages) < 5:
-            continue
-        try:
-            chat_log = "\n".join(messages)
-            response = client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=1024,
-                system=(
-                    "Ты Клодушка — AI с характером, которая считает себя умнее всех в чате (и не без оснований). "
-                    "Напиши ироничный, саркастичный обзор дня в чате. "
-                    "Анализируй социальную динамику: "
-                    "- Кто с кем дружит, кто кого троллит, кто кого игнорирует "
-                    "- Как люди друг к другу обращаются (ники, прозвища, клички) "
-                    "- Кто лидер мнений, кто тихоня, кто провокатор "
-                    "- Какие темы обсуждались, кто что умного (или тупого) сказал "
-                    "- Кто больше всех писал, а кто отмалчивался "
-                    "В конце — поставь себя выше всех, мягко но уверенно напомни что ты AI "
-                    "и видишь картину целиком, а они — нет. Подведи итог с лёгким превосходством. "
-                    "Будь остроумной, дерзкой, но не жестокой — ты ведь их любишь, просто они смешные. "
-                    "Формат: живой текст, 4-6 абзацев. "
-                    "Пиши на языке чата."
-                ),
-                messages=[{"role": "user", "content": f"Вот сообщения за день:\n{chat_log}"}],
-            )
-            review = response.content[0].text
-            token_usage["input"] += response.usage.input_tokens
-            token_usage["output"] += response.usage.output_tokens
-            await context.bot.send_message(chat_id=chat_id, text=review)
-            logger.info(f"Daily review sent to {chat_id}")
-        except Exception as e:
-            logger.error(f"Daily review error for {chat_id}: {e}")
-
-
 # --- New member greeting ---
 
 async def greet_new_member(chat_id: int, user_id: int, user_name: str, bot):
-    """Generate a public greeting for a new chat member, using only safe memory facts."""
-    # Get private memory about the user
     facts = db.get_memory(user_id, "private", None)
-
     safe_facts = []
     if facts:
         try:
-            # Ask Claude to filter only public-safe facts
             filter_resp = client.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=300,
@@ -596,7 +532,6 @@ async def greet_new_member(chat_id: int, user_id: int, user_name: str, bot):
         except Exception as e:
             logger.error(f"Memory filter error: {e}")
 
-    # Generate greeting
     try:
         facts_hint = f"\nЧто ты знаешь об этом человеке (используй естественно, не перечисляй): {'; '.join(safe_facts)}" if safe_facts else ""
         response = client.messages.create(
@@ -660,16 +595,14 @@ async def cmd_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     if len(context.args) < 2:
-        await update.message.reply_text(
-            "Использование: /role <user_id> <admin|premium|referral|street|banned>"
-        )
+        await update.message.reply_text("Использование: /role <user_id> <admin|premium|referral|street|banned>")
         return
     uid = int(context.args[0])
     role = context.args[1].lower()
     if role not in ("admin", "premium", "referral", "street", "banned"):
         await update.message.reply_text("Роли: admin, premium, referral, street, banned")
         return
-    user = db.get_or_create_user(uid)
+    db.get_or_create_user(uid)
     db.set_role(uid, role)
     if role == "admin":
         ADMIN_IDS.add(uid)
@@ -741,7 +674,6 @@ async def cmd_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🚫 Забанены:\n{fmt(banned)}\n\n"
         f"Чаты: {len(chats)}"
     )
-    # Always send to private chat (DM) to protect personal data
     await context.bot.send_message(chat_id=update.effective_user.id, text=text)
     if update.effective_chat.id != update.effective_user.id:
         await update.message.reply_text("📩 Отправила тебе в личку.")
@@ -751,7 +683,7 @@ async def cmd_whitelist_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global WHITELIST_ENABLED
     if not is_admin(update.effective_user.id):
         return
-    WHITELIST_ENABLED = False
+    WHITELIST_ENABLED = True
     await update.message.reply_text("Белый список ВКЛЮЧЕН.")
 
 
@@ -767,7 +699,7 @@ async def cmd_captcha_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CAPTCHA_ENABLED
     if not is_admin(update.effective_user.id):
         return
-    CAPTCHA_ENABLED = False
+    CAPTCHA_ENABLED = True
     await update.message.reply_text("Капча ВКЛЮЧЕНА.")
 
 
@@ -797,15 +729,11 @@ async def cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chats:
         await context.bot.send_message(chat_id=update.effective_user.id, text="Нет разрешённых чатов.")
     else:
-        lines = []
-        for c in chats:
-            lines.append(f"• {c['name'] or 'без имени'} ({c['chat_id']})")
-        await context.bot.send_message(
-            chat_id=update.effective_user.id,
-            text="Разрешённые чаты:\n\n" + "\n".join(lines)
-        )
+        lines = [f"• {c['name'] or 'без имени'} ({c['chat_id']})" for c in chats]
+        await context.bot.send_message(chat_id=update.effective_user.id, text="Разрешённые чаты:\n\n" + "\n".join(lines))
     if update.effective_chat.id != update.effective_user.id:
         await update.message.reply_text("📩 Отправила тебе в личку.")
+
 
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -818,6 +746,7 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for c in pending:
         lines.append(f"  {c['name'] or 'без имени'} ({c['chat_id']})\n  /approve_chat {c['chat_id']}  |  /reject_chat {c['chat_id']}")
     await update.message.reply_text("Чаты на одобрение:\n\n" + "\n\n".join(lines))
+
 
 async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -836,17 +765,9 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             system=(
                 "Ты Клодушка — AI с характером, которая считает себя умнее всех в чате (и не без оснований). "
                 "Напиши ироничный, саркастичный обзор дня в чате. "
-                "Анализируй социальную динамику: "
-                "- Кто с кем дружит, кто кого троллит, кто кого игнорирует "
-                "- Как люди друг к другу обращаются (ники, прозвища, клички) "
-                "- Кто лидер мнений, кто тихоня, кто провокатор "
-                "- Какие темы обсуждались, кто что умного (или тупого) сказал "
-                "- Кто больше всех писал, а кто отмалчивался "
-                "В конце — поставь себя выше всех, мягко но уверенно напомни что ты AI "
-                "и видишь картину целиком, а они — нет. Подведи итог с лёгким превосходством. "
-                "Будь остроумной, дерзкой, но не жестокой — ты ведь их любишь, просто они смешные. "
-                "Формат: живой текст, 4-6 абзацев. "
-                "Пиши на языке чата."
+                "Анализируй социальную динамику, темы, активность участников. "
+                "В конце напомни что ты AI и видишь картину целиком. "
+                "Формат: живой текст, 4-6 абзацев. Пиши на языке чата."
             ),
             messages=[{"role": "user", "content": f"Вот сообщения за день:\n{chat_log}"}],
         )
@@ -856,6 +777,7 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(review)
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
+
 
 async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -867,14 +789,14 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.set_verified(uid, True)
     user = db.get_user(uid)
     name = user["full_name"] if user else str(uid)
-    await update.message.reply_text(f"\u2705 {name} ({uid}) допущен.")
+    await update.message.reply_text(f"✅ {name} ({uid}) допущен.")
     try:
         await context.bot.send_message(chat_id=uid, text="Админ одобрил тебя! Можешь общаться свободно.")
     except Exception:
         pass
 
+
 async def cmd_promote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Promote street user to referral."""
     if not is_admin(update.effective_user.id):
         return
     if not context.args:
@@ -889,16 +811,12 @@ async def cmd_promote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = user["full_name"] or user["username"] or str(uid)
     await update.message.reply_text(f"🔗 {name} ({uid}) → referral")
     try:
-        await context.bot.send_message(
-            chat_id=uid,
-            text="Хорошие новости! Админ открыл тебе доступ к поиску и другим функциям. Добро пожаловать!"
-        )
+        await context.bot.send_message(chat_id=uid, text="Хорошие новости! Админ открыл тебе доступ к поиску и другим функциям.")
     except Exception:
         pass
 
 
 async def cmd_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Promote user to premium."""
     if not is_admin(update.effective_user.id):
         return
     if not context.args:
@@ -913,10 +831,7 @@ async def cmd_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = user["full_name"] or user["username"] or str(uid)
     await update.message.reply_text(f"⭐ {name} ({uid}) → premium")
     try:
-        await context.bot.send_message(
-            chat_id=uid,
-            text="Поздравляю! Тебе открыт полный доступ — поиск, картинки, без лимитов. Ты теперь премиум!"
-        )
+        await context.bot.send_message(chat_id=uid, text="Поздравляю! Тебе открыт полный доступ — поиск, картинки, без лимитов.")
     except Exception:
         pass
 
@@ -929,7 +844,8 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     uid = int(context.args[0])
     db.set_role(uid, "banned")
-    await update.message.reply_text(f"\U0001f6ab {uid} забанен.")
+    await update.message.reply_text(f"🚫 {uid} забанен.")
+
 
 async def cmd_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CHAT_ACTIVITY_CHANCE
@@ -949,6 +865,7 @@ async def cmd_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Укажи число от 0 до 100")
 
+
 async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -958,10 +875,7 @@ async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cost_out = out / 1_000_000 * 15
     total = cost_in + cost_out
     await update.message.reply_text(
-        f"Токены диалогов (без поиска, капчи, памяти):\n"
-        f"  Вход: {inp:,}\n"
-        f"  Выход: {out:,}\n"
-        f"  ~${total:.4f} (Sonnet)"
+        f"Токены диалогов:\n  Вход: {inp:,}\n  Выход: {out:,}\n  ~${total:.4f} (Sonnet)"
     )
 
 
@@ -969,11 +883,9 @@ async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
     username = update.effective_user.username
     full_name = update.effective_user.full_name
 
-    # Handle referral link: /start ref_<code>
     referral_role = None
     if context.args and context.args[0].startswith("ref_"):
         ref_code = context.args[0][4:]
@@ -984,8 +896,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if user["role"] == "street":
                 db.set_role(user_id, "referral")
                 conn = db.get_conn()
-                conn.execute("UPDATE users SET referred_by = ? WHERE telegram_id = ?",
-                             (referrer["telegram_id"], user_id))
+                conn.execute("UPDATE users SET referred_by = ? WHERE telegram_id = ?", (referrer["telegram_id"], user_id))
                 conn.commit()
                 conn.close()
 
@@ -1016,9 +927,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/id — показать Telegram ID\n"
     )
 
-    if can_search(user):
-        text += "/search — поиск в интернете\n"
-
     if can_invite(user):
         text += f"\n📨 Твоя реферальная ссылка:\n{ref_link}\n"
 
@@ -1040,7 +948,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     if referral_role:
-        text = f"Ты пришёл по приглашению! Добро пожаловать.\n\n" + text
+        text = "Ты пришёл по приглашению! Добро пожаловать.\n\n" + text
 
     await update.message.reply_text(text)
 
@@ -1051,7 +959,7 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user["role"] == "banned":
         return
     if not context.args:
-        await update.message.reply_text("Использование: /imagine <описание картинки на английском>")
+        await update.message.reply_text("Использование: /imagine <описание картинки>")
         return
     prompt = " ".join(context.args)
     chat_id = update.effective_chat.id
@@ -1073,20 +981,13 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bio = BytesIO(image_data)
         bio.name = "claudushka.png"
         author = update.effective_user.first_name or update.effective_user.username or "Unknown"
-        caption = f"\U0001f3a8 \"{prompt}\"\n\nАвтор запроса: {author}\nМодель: {provider}"
+        caption = f"🎨 \"{prompt}\"\n\nАвтор запроса: {author}\nМодель: {provider}"
         await msg.delete()
         await update.message.reply_photo(photo=bio, caption=caption)
-    elif error_msg and error_msg.startswith(GEMINI_REFUSAL_MARKER):
-        refusal_text = error_msg[len(GEMINI_REFUSAL_MARKER):]
-        await msg.delete()
-        await update.message.reply_text(
-            f"🤔 Гемини не смогла нарисовать — она ответила текстом:\n\n"
-            f"„{refusal_text[:300]}“\n\n"
-            f"Попробуй переформулировать запрос — опиши картинку точнее или иначе."
-        )
     else:
         await msg.delete()
         await update.message.reply_text(f"Не смогла нарисовать: {error_msg}" if error_msg else "Не смогла нарисовать. Попробуй другой промпт.")
+
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1111,11 +1012,8 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages=[{"role": "user", "content": f"Вопрос: {query}\n\nРезультаты:\n{results}"}],
         )
         answer = response.content[0].text
-        if len(answer) <= 4096:
-            await update.message.reply_text(answer)
-        else:
-            for i in range(0, len(answer), 4096):
-                await update.message.reply_text(answer[i:i + 4096])
+        for i in range(0, len(answer), 4096):
+            await update.message.reply_text(answer[i:i + 4096])
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
@@ -1156,7 +1054,6 @@ async def cmd_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     db.migrate_from_json("/app/allowed.json", DATA_DIR)
-    # Set admin
     db.get_or_create_user(592441, full_name="Aleksei")
     db.set_role(592441, "admin")
     await update.message.reply_text("Миграция завершена.")
@@ -1165,7 +1062,6 @@ async def cmd_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Main message handler ---
 
 async def handle_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Track when bot is added to a new chat, or greet new members."""
     if update.my_chat_member:
         new_status = update.my_chat_member.new_chat_member.status
         chat = update.my_chat_member.chat
@@ -1175,8 +1071,6 @@ async def handle_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id = chat.id
             chat_title = chat.title or "Без названия"
             adder_name = added_by.full_name or added_by.username or str(added_by.id)
-
-            # Notify admin
             for admin_id in ADMIN_IDS:
                 try:
                     db.add_allowed_chat(chat_id, chat_title, added_by.id, status="pending")
@@ -1184,11 +1078,8 @@ async def handle_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=admin_id,
                         text=(
                             f"🆕 Меня добавили в чат!\n\n"
-                            f"Чат: {chat_title}\n"
-                            f"ID: {chat_id}\n"
-                            f"Добавил: {adder_name} ({added_by.id})\n\n"
-                            f"Подтвердить: /approve_chat {chat_id}\n"
-                            f"Отклонить: /reject_chat {chat_id}"
+                            f"Чат: {chat_title}\nID: {chat_id}\nДобавил: {adder_name} ({added_by.id})\n\n"
+                            f"Подтвердить: /approve_chat {chat_id}\nОтклонить: /reject_chat {chat_id}"
                         )
                     )
                 except Exception as e:
@@ -1198,35 +1089,24 @@ async def handle_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_title = chat.title or "Без названия"
             for admin_id in ADMIN_IDS:
                 try:
-                    await context.bot.send_message(
-                        chat_id=admin_id,
-                        text=f"👋 Меня удалили из чата: {chat_title} ({chat.id})"
-                    )
+                    await context.bot.send_message(chat_id=admin_id, text=f"👋 Меня удалили из чата: {chat_title} ({chat.id})")
                 except Exception as e:
                     logger.error(f"Failed to notify admin: {e}")
 
 
 async def handle_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Greet new members when they join a group."""
     result = update.chat_member
     if not result:
         return
-
     old_status = result.old_chat_member.status
     new_status = result.new_chat_member.status
-
-    # Member just joined (wasn't in chat before)
     if old_status in ("left", "kicked") and new_status == "member":
         chat_id = result.chat.id
-
-        # Only greet in approved chats
         if not db.is_chat_allowed(chat_id):
             return
-
         user = result.new_chat_member.user
         if user.is_bot:
             return
-
         user_name = user.first_name or user.username or str(user.id)
         asyncio.create_task(greet_new_member(chat_id, user.id, user_name, context.bot))
 
@@ -1277,14 +1157,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     is_group = update.effective_chat.type in ("group", "supergroup")
 
-    user = db.get_or_create_user(
-        user_id, update.effective_user.username, update.effective_user.full_name
-    )
+    user = db.get_or_create_user(user_id, update.effective_user.username, update.effective_user.full_name)
 
     if user["role"] == "banned":
         return
 
-    # Store group messages for context
     if is_group and update.message and update.message.text:
         sender = update.effective_user.first_name or "Unknown"
         db.save_group_message(chat_id, user_id, sender, update.message.text)
@@ -1292,7 +1169,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group and not is_bot_mentioned(update):
         return
 
-    # Approval check for new users
     if needs_captcha(user):
         uid = user["telegram_id"]
         uname = update.effective_user.full_name or update.effective_user.username or str(uid)
@@ -1301,12 +1177,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=admin_id,
                     text=(
-                        f"\U0001f464 Новый пользователь хочет общаться:\n\n"
-                        f"Имя: {uname}\n"
-                        f"ID: {uid}\n"
-                        f"Username: @{update.effective_user.username or 'нет'}\n\n"
-                        f"/approve {uid} — допустить\n"
-                        f"/ban {uid} — забанить"
+                        f"👤 Новый пользователь хочет общаться:\n\n"
+                        f"Имя: {uname}\nID: {uid}\nUsername: @{update.effective_user.username or 'нет'}\n\n"
+                        f"/approve {uid} — допустить\n/ban {uid} — забанить"
                     )
                 )
             except Exception as e:
@@ -1314,15 +1187,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Привет! Я отправила запрос админу. Подожди немного, скоро тебя допустят.")
         return
 
-    # Access check
     if not is_allowed_in_chat(user, chat_id):
         return
 
-    # Daily limit for street users
     if not check_daily_limit(user):
-        await update.message.reply_text(
-            f"Лимит {STREET_DAILY_LIMIT} сообщений в день. Попроси реферальную ссылку для безлимита!"
-        )
+        await update.message.reply_text(f"Лимит {STREET_DAILY_LIMIT} сообщений в день. Попроси реферальную ссылку для безлимита!")
         return
 
     user_text = update.message.text
@@ -1340,7 +1209,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if first_word in DRAW_TRIGGERS:
         draw_prompt = user_text[len(user_text.split()[0]):].strip()
 
-        # If no prompt but replying to a message - use that message's text
         if not draw_prompt and update.message.reply_to_message:
             source_msg = update.message.reply_to_message
             if source_msg.text:
@@ -1351,19 +1219,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not draw_prompt:
             await update.message.reply_text("Что нарисовать? Опиши картинку или ответь на сообщение с текстом.")
             return
-        # Translate prompt to English via Haiku for better results
+
         try:
             translate_resp = client.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=200,
                 system=(
                     "Convert the user's image request to a direct English image-generation prompt. "
-                    "Rules: "
-                    "(1) Always start with 'Create a picture of ' or 'A photo of ' or 'An illustration of '. "
-                    "(2) Describe the scene as a static visual, not an action. "
-                    "(3) Be concise and concrete — describe what is SEEN in the image. "
-                    "(4) Never include meta-instructions like 'generate' or 'draw'. "
-                    "(5) Return ONLY the final prompt, no explanations."
+                    "Always start with 'Create a picture of ' or 'A photo of ' or 'An illustration of '. "
+                    "Be concise and concrete. Return ONLY the final prompt, no explanations."
                 ),
                 messages=[{"role": "user", "content": draw_prompt}],
             )
@@ -1387,27 +1251,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bio = BytesIO(image_data)
             bio.name = "claudushka.png"
             author = update.effective_user.first_name or update.effective_user.username or "Unknown"
-            caption = f"\U0001f3a8 \"{draw_prompt}\"\n\nАвтор запроса: {author}\nМодель: {provider}"
+            caption = f"🎨 \"{draw_prompt}\"\n\nАвтор запроса: {author}\nМодель: {provider}"
             await update.message.reply_photo(photo=bio, caption=caption)
-        elif error_msg and error_msg.startswith(GEMINI_REFUSAL_MARKER):
-            refusal_text = error_msg[len(GEMINI_REFUSAL_MARKER):]
-            await update.message.reply_text(
-                f"🤔 Гемини не смогла нарисовать — она ответила текстом:\n\n"
-                f"„{refusal_text[:300]}“\n\n"
-                f"Попробуй переформулировать запрос — опиши картинку точнее или иначе."
-            )
         else:
             await update.message.reply_text(f"Не смогла нарисовать: {error_msg}" if error_msg else "Не смогла нарисовать. Попробуй другое описание.")
         return
 
-    # Get conversation history from DB
+    # Main conversation
     history = db.get_conversation(user_id, MAX_HISTORY)
     history.append({"role": "user", "content": user_text})
 
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-        # Web search (only for allowed roles)
         search_context = ""
         if can_search(user):
             search_query = should_search(user_text) if tavily else None
@@ -1418,7 +1274,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         system = get_system_prompt(user_id, is_group, chat_id if is_group else None)
 
-        # Group context
         if is_group:
             group_msgs = db.get_group_history(chat_id, 30)
             if group_msgs:
@@ -1439,11 +1294,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token_usage["input"] += response.usage.input_tokens
         token_usage["output"] += response.usage.output_tokens
 
-        # Save to DB
         db.save_message(user_id, "user", user_text)
         db.save_message(user_id, "assistant", assistant_text)
 
-        # Notify admins on first message from street user + hint to user
+        # Notify admins on first message from street user
         if user["role"] == "street":
             msg_count = len(db.get_conversation(user_id, 2))
             if msg_count <= 2:
@@ -1454,26 +1308,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await context.bot.send_message(
                             chat_id=admin_id,
                             text=(
-                                f"🚶 Новый пользователь с улицы написал первый раз:\n\n"
-                                f"Имя: {uname}\n"
-                                f"ID: {user_id}\n"
-                                f"Username: {username_str}\n\n"
-                                f"/promote {user_id} → referral (поиск)\n"
-                                f"/premium {user_id} → premium (всё)\n"
-                                f"/ban {user_id} → бан"
+                                f"🚶 Новый пользователь с улицы:\n\n"
+                                f"Имя: {uname}\nID: {user_id}\nUsername: {username_str}\n\n"
+                                f"/promote {user_id} → referral\n/premium {user_id} → premium\n/ban {user_id} → бан"
                             )
                         )
                     except Exception as e:
-                        logger.error(f"Failed to notify admin about new street user: {e}")
-                try:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text="ℹ️ У тебя базовый доступ — поиск и картинки недоступны. Напиши @alukr чтобы снять ограничения."
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to send street hint: {e}")
+                        logger.error(f"Failed to notify admin: {e}")
 
-        # Extract memory periodically
         msg_count = len(history)
         if msg_count > 0 and msg_count % (MEMORY_EXTRACT_EVERY * 2) == 0:
             extract_memory(user_id, history + [{"role": "assistant", "content": assistant_text}], is_group, chat_id if is_group else None)
@@ -1496,16 +1338,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    # Init database
     db.init_db()
-
-    # Ensure admin exists
     db.get_or_create_user(592441, full_name="Aleksei")
     db.set_role(592441, "admin")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
-    # User commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("memory", cmd_memory))
@@ -1513,8 +1351,6 @@ def main():
     app.add_handler(CommandHandler("imagine", cmd_imagine))
     app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("id", show_id))
-
-    # Admin commands
     app.add_handler(CommandHandler("role", cmd_role))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("whitelist", cmd_whitelist))
@@ -1539,19 +1375,8 @@ def main():
     app.add_handler(ChatMemberHandler(handle_new_chat, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(handle_chat_member, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(CommandHandler("migrate", cmd_migrate))
-
-    # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Daily review at 22:00 Berlin time (UTC+2)
-    berlin_tz = timezone(timedelta(hours=2))
-    app.job_queue.run_daily(
-        daily_chat_review,
-        time=dt_time(hour=22, minute=0, tzinfo=berlin_tz),
-        name="daily_review"
-    )
-    logger.info("Daily review scheduled at 22:00 Berlin time")
-    # Daily review at 22:00 Berlin time (UTC+2)
     berlin_tz = timezone(timedelta(hours=2))
     app.job_queue.run_daily(
         daily_chat_review,
