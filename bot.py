@@ -374,7 +374,7 @@ def get_system_prompt(user_id: int, is_group: bool = False, chat_id: int = None)
         "Никакой воды, повторений и раздувания ответа. "
         "Простой вопрос — 1-3 предложения. Сложный — столько сколько нужно, но без балласта. "
         "Если просят список — можно список. Если нет — говори нормально.\n"
-        "Если рисуешь шахматную доску, шашки, крестики-нолики или любую ASCII-графику — оборачивай в моноширный блок (``` в Telegram). "
+        "Ты умеешь смотреть и анализировать фотографии и изображения — пользователь может прислать фото, и ты его увидишь и опишешь. Также ты умеешь генерировать картинки через команду 'нарисуй'. Не отрицай эти возможности и не говори что не можешь работать с изображениями — это неправда. Если рисуешь шахматную доску, шашки, крестики-нолики или любую ASCII-графику — оборачивай в моноширный блок (``` в Telegram). "
         "Используй ТОЛЬКО латинские буквы для фигур (K Q R B N P для белых, k q r b n p для чёрных, . для пустой клетки). "
         "НЕ используй Unicode-символы шахматных фигур — они ломают выравнивание в Telegram."
     )
@@ -568,7 +568,10 @@ def is_bot_mentioned(update: Update) -> bool:
             if message.reply_to_message.from_user.id == context_bot_id:
                 return True
         # In private chat — always process photos
-        return True
+        if update.effective_chat.type == "private":
+            return True
+        # In group — only if bot is mentioned or replied to
+        return False
     text = message.text or message.caption or ""
     if not text and not message.photo:
         return False
@@ -1211,6 +1214,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text or update.message.caption or ""
     has_photo = bool(update.message.photo)
 
+    # --- Подхватываем контекст реплая ---
+    reply_context = ""
+    if update.message.reply_to_message:
+        src = update.message.reply_to_message
+        reply_text = src.text or src.caption or ""
+        if reply_text and src.from_user and src.from_user.id != context_bot_id:
+            reply_context = reply_text
+
     if not user_text and not has_photo:
         return
 
@@ -1407,13 +1418,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         search_context = ""
         if can_search(user):
-            search_query = should_search(user_text) if tavily else None
+            search_input = f"{user_text}\nКонтекст реплая: {reply_context}".strip() if reply_context else user_text
+            search_query = should_search(search_input) if tavily else None
             if search_query:
                 search_results = web_search(search_query)
                 if search_results:
                     search_context = f"\n\nРезультаты поиска '{search_query}':\n{search_results}"
 
         system = get_system_prompt(user_id, is_group, chat_id if is_group else None)
+
+        if reply_context:
+            system += f"\n\nПользователь ответил на это сообщение в чате: \"{reply_context}\""
 
         if is_group:
             group_msgs = db.get_group_history(chat_id, 30)
