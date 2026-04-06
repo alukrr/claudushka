@@ -816,10 +816,7 @@ async def cmd_promote(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Использование: /promote <user_id>")
         return
     uid = int(context.args[0])
-    user = db.get_user(uid)
-    if not user:
-        await update.message.reply_text(f"Пользователь {uid} не найден.")
-        return
+    user = db.get_or_create_user(uid)
     db.set_role(uid, "referral")
     name = user["full_name"] or user["username"] or str(uid)
     await update.message.reply_text(f"🔗 {name} ({uid}) → referral")
@@ -836,10 +833,7 @@ async def cmd_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Использование: /premium <user_id>")
         return
     uid = int(context.args[0])
-    user = db.get_user(uid)
-    if not user:
-        await update.message.reply_text(f"Пользователь {uid} не найден.")
-        return
+    user = db.get_or_create_user(uid)
     db.set_role(uid, "premium")
     name = user["full_name"] or user["username"] or str(uid)
     await update.message.reply_text(f"⭐ {name} ({uid}) → premium")
