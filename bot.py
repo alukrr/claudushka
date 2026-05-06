@@ -962,30 +962,92 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+async def _git(*args: str, cwd: str = "/repo") -> tuple[int, str]:
+    """Run git command in /repo, return (returncode, combined_output)."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", "-C", cwd, *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    return proc.returncode, (stdout + stderr).decode().strip()
+ 
+ 
+async def _get_version() -> str:
+    """git describe with fallback to short hash. Returns 'unknown' on total failure."""
+    rc, out = await _git("describe", "--tags", "--always", "--dirty")
+    if rc == 0 and out:
+        return out
+    rc, out = await _git("rev-parse", "--short", "HEAD")
+    return out if rc == 0 and out else "unknown"
+ 
+ 
+async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current running version. Available to all users."""
+    user_id = update.effective_user.id
+    user = db.get_or_create_user(
+        user_id, update.effective_user.username, update.effective_user.full_name
+    )
+    if user["role"] == "banned":
+        return
+ 
+    version = await _get_version()
+    rc, last_commit = await _git("log", "-1", "--pretty=format:%h %s (%ar)")
+ 
+    text = f"Версия: {version}"
+    if rc == 0 and last_commit:
+        text += f"\nПоследний коммит: {last_commit}"
+    await update.message.reply_text(text)
+ 
+ 
 async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pull latest code and restart container. Admin only."""
     if not is_admin(update.effective_user.id):
         return
-    await update.message.reply_text("Обновляюсь...")
-    try:
-        pull = await asyncio.create_subprocess_exec(
-            "git", "-C", "/repo", "pull",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+ 
+    old_version = await _get_version()
+    rc, old_head = await _git("rev-parse", "HEAD")
+    if rc != 0:
+        await update.message.reply_text(f"Не могу прочитать HEAD: {old_head}")
+        return
+ 
+    await update.message.reply_text(
+        f"Текущая версия: {old_version}\nПроверяю обновления..."
+    )
+ 
+    rc, pull_out = await _git("pull")
+    if rc != 0:
+        await update.message.reply_text(f"git pull упал:\n{pull_out}")
+        return
+ 
+    rc, new_head = await _git("rev-parse", "HEAD")
+    if rc != 0:
+        await update.message.reply_text(f"Не могу прочитать новый HEAD: {new_head}")
+        return
+ 
+    if old_head == new_head:
+        await update.message.reply_text(
+            f"Уже актуально, версия {old_version}. Перезапуск не нужен."
         )
-        stdout, stderr = await pull.communicate()
-        git_out = (stdout + stderr).decode().strip()
-
-        restart = await asyncio.create_subprocess_exec(
-            "docker", "restart", "claudushka",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await restart.communicate()
-
-        await update.message.reply_text(f"git pull:\n{git_out}\n\nПерезапускаюсь...")
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка обновления: {e}")
-
+        return
+ 
+    new_version = await _get_version()
+    rc, log_out = await _git("log", f"{old_head}..{new_head}", "--oneline")
+    changes = log_out if rc == 0 and log_out else "(список изменений недоступен)"
+ 
+    await update.message.reply_text(
+        f"Обновление: {old_version} → {new_version}\n\n"
+        f"Изменения:\n{changes}\n\n"
+        f"Перезапускаюсь..."
+    )
+ 
+    restart = await asyncio.create_subprocess_exec(
+        "docker", "restart", "claudushka",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await restart.communicate()
+ 
 
 async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1528,6 +1590,7 @@ def main():
     app.add_handler(CommandHandler("imagine", cmd_imagine))
     app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("id", show_id))
+    app.add_handler(CommandHandler("version", cmd_version))
     app.add_handler(CommandHandler("role", cmd_role))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("whitelist", cmd_whitelist))
