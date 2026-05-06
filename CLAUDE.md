@@ -3,7 +3,7 @@
 ## Стек
 - Python 3.12 (python:3.12-slim Docker image)
 - python-telegram-bot 21.10
-- anthropic 0.43.0
+- anthropic 0.43.0 (модели: claude-sonnet-4-6 для диалогов, claude-haiku-4-5-20251001 для капчи/вспомогательных задач)
 - tavily-python 0.5.0 — веб-поиск
 - gradio_client 1.5.0 — FLUX (HuggingFace) для генерации изображений
 - fastapi 0.115.0 + uvicorn 0.30.0 — WhatsApp webhook
