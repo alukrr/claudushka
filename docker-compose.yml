@@ -13,6 +13,10 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     env_file:
       - .env
+    environment:
+      - GIT_CONFIG_COUNT=1
+      - GIT_CONFIG_KEY_0=safe.directory
+      - GIT_CONFIG_VALUE_0=/repo
     command: /bin/sh -c "pip install --no-cache-dir -r requirements.txt && apt-get update -qq && apt-get install -y -qq docker.io git && python bot.py"
     restart: unless-stopped
 
