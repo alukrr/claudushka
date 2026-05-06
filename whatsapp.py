@@ -167,7 +167,7 @@ async def handle_wa_message(phone: str, text: str):
             system += f"\n\nРезультаты поиска:\n{search_context}"
 
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=2048,
             system=system,
             messages=history,

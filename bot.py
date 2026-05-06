@@ -392,7 +392,7 @@ def extract_memory(user_id: int, messages: list, is_group: bool = False, chat_id
     try:
         recent = messages[-6:]
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=512,
             system=(
                 "Извлеки важные факты о пользователе из диалога. "
@@ -479,7 +479,7 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
         try:
             chat_log = "\n".join(messages)
             response = client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-sonnet-4-6",
                 max_tokens=1024,
                 system=(
                     "Ты Клодушка — AI с характером, которая считает себя умнее всех в чате (и не без оснований). "
@@ -775,7 +775,7 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_log = "\n".join(messages)
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=1024,
             system=(
                 "Ты Клодушка — AI с характером, которая считает себя умнее всех в чате (и не без оснований). "
@@ -1040,7 +1040,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=2048,
             system="Ты Клодушка. Дай краткий ответ на основе результатов поиска. Отвечай на языке пользователя.",
             messages=[{"role": "user", "content": f"Вопрос: {query}\n\nРезультаты:\n{results}"}],
@@ -1293,7 +1293,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             doc_history = [{"role": "user", "content": full_prompt}]
 
             response = client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-sonnet-4-6",
                 max_tokens=4096,
                 system=system,
                 messages=doc_history,
@@ -1351,7 +1351,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             system = get_system_prompt(user_id, is_group, chat_id if is_group else None)
             response = client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-sonnet-4-6",
                 max_tokens=2048,
                 system=system,
                 messages=vision_messages,
@@ -1461,7 +1461,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             system += f"\n\nИспользуй результаты поиска:{search_context}"
 
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=4096,
             system=system,
             messages=history,
