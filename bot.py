@@ -141,10 +141,10 @@ def should_search(text: str) -> str | None:
 
 # --- Image generation ---
 
-GEMINI_TIMEOUT = 120
-GEMINI_MAX_RETRIES = 2
+GEMINI_TIMEOUT = 60
+GEMINI_MAX_RETRIES = 1
 GEMINI_RETRY_DELAY = 2
-FLUX_TIMEOUT = 90
+FLUX_TIMEOUT = 60
 FLUX_MODEL_NAME = "FLUX.1-schnell"
 GEMINI_MODEL_NAME = "Nano Banana 2"
 
