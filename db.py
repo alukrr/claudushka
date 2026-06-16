@@ -59,6 +59,7 @@ def init_db():
             user_id INTEGER,
             sender_name TEXT,
             content TEXT NOT NULL,
+            is_bot INTEGER NOT NULL DEFAULT 0,
             timestamp INTEGER NOT NULL
         );
 
@@ -100,6 +101,7 @@ def init_db():
     for migration in [
         "ALTER TABLE memory ADD COLUMN context TEXT NOT NULL DEFAULT 'private'",
         "ALTER TABLE memory ADD COLUMN chat_id INTEGER",
+        "ALTER TABLE group_messages ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0",
     ]:
         try:
             conn.execute(migration)
@@ -286,11 +288,12 @@ def clear_memory(user_id: int, context: str = None):
 
 # --- Group messages ---
 
-def save_group_message(chat_id: int, user_id: int, sender_name: str, content: str):
+def save_group_message(chat_id: int, user_id: int, sender_name: str, content: str, is_bot: bool = False):
     conn = get_conn()
     conn.execute(
-        "INSERT INTO group_messages (chat_id, user_id, sender_name, content, timestamp) VALUES (?, ?, ?, ?, ?)",
-        (chat_id, user_id, sender_name, content, int(time.time()))
+        "INSERT INTO group_messages (chat_id, user_id, sender_name, content, is_bot, timestamp) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (chat_id, user_id, sender_name, content, 1 if is_bot else 0, int(time.time()))
     )
     # Keep only last 1000 per chat
     conn.execute("""
@@ -310,6 +313,22 @@ def get_group_history(chat_id: int, limit: int = 30) -> list[str]:
     ).fetchall()
     conn.close()
     return [f"{r['sender_name']}: {r['content']}" for r in reversed(rows)]
+
+
+def get_group_transcript(chat_id: int, limit: int = 40) -> list[dict]:
+    """Групповая история для многоголосого messages-контекста.
+    Возвращает старые->новые: [{"sender", "text", "is_bot"}]."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT sender_name, content, is_bot FROM group_messages "
+        "WHERE chat_id = ? ORDER BY timestamp DESC, id DESC LIMIT ?",
+        (chat_id, limit)
+    ).fetchall()
+    conn.close()
+    return [
+        {"sender": r["sender_name"], "text": r["content"], "is_bot": bool(r["is_bot"])}
+        for r in reversed(rows)
+    ]
 
 
 # --- Allowed chats ---
