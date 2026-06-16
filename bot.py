@@ -42,6 +42,9 @@ WHITELIST_ENABLED = False
 # Captcha state (in-memory, resets on restart)
 captcha_state: dict[str, dict] = {}
 
+# Chats temporarily switched to Opus 4.8
+opus_chats: set[int] = set()
+
 # Token tracking
 token_usage = {"input": 0, "output": 0}
 
@@ -412,6 +415,10 @@ def extract_memory(user_id: int, messages: list, is_group: bool = False, chat_id
                 logger.info(f"Memory updated for {user_id} ({context})")
     except Exception as e:
         logger.error(f"Memory extraction error: {e}")
+
+
+def get_chat_model(chat_id: int) -> str:
+    return "claude-opus-4-8" if chat_id in opus_chats else "claude-sonnet-4-6"
 
 
 # --- Captcha handler ---
@@ -888,6 +895,22 @@ async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_opus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    opus_chats.add(chat_id)
+    await update.message.reply_text("Переключила на Opus 4.8 для этого чата.")
+
+
+async def cmd_sonnet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    opus_chats.discard(chat_id)
+    await update.message.reply_text("Вернула на Sonnet 4.6 для этого чата.")
+
+
 # --- User commands ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1355,7 +1378,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             doc_history = [{"role": "user", "content": full_prompt}]
 
             response = client.messages.create(
-                model="claude-sonnet-4-6",
+                model=get_chat_model(chat_id),
                 max_tokens=4096,
                 system=system,
                 messages=doc_history,
@@ -1413,7 +1436,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             system = get_system_prompt(user_id, is_group, chat_id if is_group else None)
             response = client.messages.create(
-                model="claude-sonnet-4-6",
+                model=get_chat_model(chat_id),
                 max_tokens=2048,
                 system=system,
                 messages=vision_messages,
@@ -1523,7 +1546,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             system += f"\n\nИспользуй результаты поиска:{search_context}"
 
         response = client.messages.create(
-            model="claude-sonnet-4-6",
+            model=get_chat_model(chat_id),
             max_tokens=4096,
             system=system,
             messages=history,
@@ -1610,6 +1633,8 @@ def main():
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("activity", cmd_activity))
     app.add_handler(CommandHandler("cost", cmd_cost))
+    app.add_handler(CommandHandler("opus", cmd_opus))
+    app.add_handler(CommandHandler("sonnet", cmd_sonnet))
     app.add_handler(CommandHandler("approve_chat", cmd_approve_chat))
     app.add_handler(CommandHandler("reject_chat", cmd_reject_chat))
     app.add_handler(ChatMemberHandler(handle_new_chat, ChatMemberHandler.MY_CHAT_MEMBER))
