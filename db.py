@@ -286,6 +286,28 @@ def clear_memory(user_id: int, context: str = None):
     conn.close()
 
 
+def get_memory_for_private(user_id: int) -> list[str]:
+    """Чтение памяти для ЛИЧКИ (асимметрия секретности).
+
+    Возвращает личные факты про человека ПЛЮС все групповые факты про него
+    (узнанное в группах течёт вверх в личку). Обратного потока нет: групповое
+    чтение (get_memory(context='group', chat_id)) личку не видит.
+    Дедуп с сохранением порядка — один и тот же факт мог осесть и в личке, и в группе.
+    """
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT fact FROM memory WHERE user_id = ? AND context IN ('private','group') ORDER BY created_at",
+        (user_id,)
+    ).fetchall()
+    conn.close()
+    seen, out = set(), []
+    for r in rows:
+        if r["fact"] not in seen:
+            seen.add(r["fact"])
+            out.append(r["fact"])
+    return out
+
+
 # --- Group messages ---
 
 def save_group_message(chat_id: int, user_id: int, sender_name: str, content: str, is_bot: bool = False):
@@ -329,6 +351,17 @@ def get_group_transcript(chat_id: int, limit: int = 40) -> list[dict]:
         {"sender": r["sender_name"], "text": r["content"], "is_bot": bool(r["is_bot"])}
         for r in reversed(rows)
     ]
+
+
+def count_user_messages_in_chat(chat_id: int, user_id: int) -> int:
+    """Сколько собственных (не-бот) сообщений написал юзер в чате — для каденса извлечения памяти."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM group_messages WHERE chat_id = ? AND user_id = ? AND is_bot = 0",
+        (chat_id, user_id)
+    ).fetchone()
+    conn.close()
+    return row["c"] if row else 0
 
 
 # --- Allowed chats ---

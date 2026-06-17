@@ -148,8 +148,6 @@ def should_search(text: str) -> str | None:
 GEMINI_TIMEOUT = 60
 GEMINI_MAX_RETRIES = 1
 GEMINI_RETRY_DELAY = 2
-FLUX_TIMEOUT = 60
-FLUX_MODEL_NAME = "FLUX.1-schnell"
 GEMINI_MODEL_NAME = "Nano Banana 2"
 
 
@@ -232,24 +230,6 @@ async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str 
     return None, last_error_msg, None
 
 
-async def _try_flux_image(prompt: str) -> tuple[bytes | None, str | None, str | None]:
-    if not HF_API_TOKEN:
-        return None, None, None
-    try:
-        hf_url = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
-        headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-        payload = {"inputs": prompt, "parameters": {"width": 768, "height": 768}}
-        resp = http_requests.post(hf_url, headers=headers, json=payload, timeout=FLUX_TIMEOUT)
-        if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
-            logger.info(f"Image generated via {FLUX_MODEL_NAME}")
-            return resp.content, None, FLUX_MODEL_NAME
-        logger.warning(f"FLUX error: {resp.status_code} {resp.text[:200]}")
-        return None, f"FLUX ответил: HTTP {resp.status_code}", None
-    except Exception as e:
-        logger.warning(f"FLUX image error: {e}")
-        return None, f"FLUX сетевая ошибка: {e}", None
-
-
 async def _rewrite_prompt(prompt: str) -> str | None:
     try:
         resp = client.messages.create(
@@ -280,18 +260,16 @@ async def generate_image_with_error(prompt: str) -> tuple[bytes | None, str | No
         logger.info("Gemini refused, rewriting prompt...")
         rewritten = await _rewrite_prompt(prompt)
         if rewritten:
-            image, error2, provider = await _try_gemini_image(rewritten)
+            image, error, provider = await _try_gemini_image(rewritten)
             if image:
                 return image, None, provider
-            prompt = rewritten
 
-    gemini_error = error
-    image, flux_error, provider = await _try_flux_image(prompt)
-    if image:
-        return image, None, provider
-
-    final_error = gemini_error or flux_error or "Все генераторы картинок недоступны. Попробуй позже."
-    logger.error(f"All image providers failed. Gemini: {gemini_error}. FLUX: {flux_error}")
+    # Фоллбека нет — банан единственный провайдер (FLUX выпилен: качество и gated-лицензия).
+    if error == "__REFUSAL__":
+        final_error = "Банан отказался это рисовать, даже после переформулировки."
+    else:
+        final_error = error or "Генератор картинок сейчас недоступен. Попробуй позже."
+    logger.error(f"Image generation failed (Gemini only): {error}")
     return None, final_error, None
 
 
@@ -392,8 +370,12 @@ def get_system_prompt(user_id: int, is_group: bool = False, chat_id: int = None)
             "Твои собственные прошлые реплики идут как assistant-сообщения — это то, что ты УЖЕ сказала, "
             "не повторяйся и не приписывай свои слова другим."
         )
-    context = "group" if is_group else "private"
-    facts = db.get_memory(user_id, context, chat_id if is_group else None)
+    if is_group:
+        # Группа: только факты этого чата про этого человека (изоляция по chat_id).
+        facts = db.get_memory(user_id, "group", chat_id)
+    else:
+        # Личка: личные факты + все групповые факты про человека (группа течёт вверх).
+        facts = db.get_memory_for_private(user_id)
     if facts:
         facts_str = "\n".join(f"- {f}" for f in facts)
         base += f"\n\nВот что ты помнишь об этом пользователе:\n{facts_str}\nИспользуй эти знания естественно, не перечисляй их."
@@ -424,6 +406,44 @@ def extract_memory(user_id: int, messages: list, is_group: bool = False, chat_id
                 logger.info(f"Memory updated for {user_id} ({context})")
     except Exception as e:
         logger.error(f"Memory extraction error: {e}")
+
+
+def extract_group_memory(user_id: int, sender_name: str, chat_id: int, limit: int = 12):
+    """Извлекает факты ТОЛЬКО про текущего автора из недавнего группового транскрипта.
+
+    Атрибуция по известному user_id того, кто сейчас написал — чужие факты не приписываются.
+    Хранит как групповые факты (context='group', chat_id) — изолированы по чату.
+    Личку не трогает (личное в группу не течёт).
+    """
+    try:
+        transcript = db.get_group_transcript(chat_id, limit)
+        if not transcript:
+            return
+        lines = [("Клодушка" if e["is_bot"] else e["sender"]) + f": {e['text']}" for e in transcript]
+        dialog = "\n".join(lines)
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=512,
+            system=(
+                f"Это групповой чат. Извлеки устойчивые факты ТОЛЬКО про участника по имени «{sender_name}». "
+                "Факты про других участников и про саму Клодушку — полностью игнорируй. "
+                "Бери только то, что характеризует человека (кто он, чем занимается, где живёт, "
+                "что любит/не любит, важные обстоятельства жизни), а не сиюминутные реплики и шутки. "
+                "Верни JSON-массив строк. Если новых фактов про этого человека нет — верни []. "
+                "Пример: [\"Болеет за Спартак\", \"Работает дальнобойщиком\"]"
+            ),
+            messages=[{"role": "user", "content": f"Чат:\n{dialog}"}],
+        )
+        text = response.content[0].text.strip()
+        start = text.find("[")
+        end = text.rfind("]") + 1
+        if start >= 0 and end > start:
+            new_facts = json.loads(text[start:end])
+            if new_facts:
+                db.add_memory_facts(user_id, new_facts, "group", chat_id)
+                logger.info(f"Group memory updated for {user_id} in chat {chat_id}: +{len(new_facts)}")
+    except Exception as e:
+        logger.error(f"Group memory extraction error: {e}")
 
 
 def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GROUP_TRANSCRIPT_LIMIT) -> list[dict]:
@@ -1192,9 +1212,10 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_group = update.effective_chat.type in ("group", "supergroup")
-    mem_context = "group" if is_group else "private"
-    cid = update.effective_chat.id if is_group else None
-    facts = db.get_memory(update.effective_user.id, mem_context, cid)
+    if is_group:
+        facts = db.get_memory(update.effective_user.id, "group", update.effective_chat.id)
+    else:
+        facts = db.get_memory_for_private(update.effective_user.id)
     if facts:
         text = "\n".join(f"• {f}" for f in facts)
         await update.message.reply_text(f"Я помню о тебе:\n\n{text}")
@@ -1646,11 +1667,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception as e:
                         logger.error(f"Failed to notify admin: {e}")
 
-        # Память: только личка. Групповая память (chat-level) — отдельная подзадача.
+        # Память по слоям: личка — личный тред; группа — факты про текущего автора (изоляция по chat_id).
         if not is_group:
             msg_count = len(messages)
             if msg_count > 0 and msg_count % (MEMORY_EXTRACT_EVERY * 2) == 0:
                 extract_memory(user_id, messages + [{"role": "assistant", "content": assistant_text}], False, None)
+        else:
+            sender_name = update.effective_user.first_name or update.effective_user.username or str(user_id)
+            user_msg_count = db.count_user_messages_in_chat(chat_id, user_id)
+            if user_msg_count > 0 and user_msg_count % MEMORY_EXTRACT_EVERY == 0:
+                extract_group_memory(user_id, sender_name, chat_id)
 
         if len(assistant_text) <= 4096:
             try:
