@@ -29,6 +29,7 @@ tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 MAX_HISTORY = 40
+GROUP_TRANSCRIPT_LIMIT = 50   # сколько реплик группового транскрипта тащить в messages
 MEMORY_EXTRACT_EVERY = 5
 MAX_CAPTCHA_ATTEMPTS = 3
 BAN_DURATION = 3600
@@ -383,6 +384,14 @@ def get_system_prompt(user_id: int, is_group: bool = False, chat_id: int = None)
         "Используй ТОЛЬКО латинские буквы для фигур (K Q R B N P для белых, k q r b n p для чёрных, . для пустой клетки). "
         "НЕ используй Unicode-символы шахматных фигур — они ломают выравнивание в Telegram."
     )
+    if is_group:
+        base += (
+            "\n\nСЕЙЧАС ТЫ В ГРУППОВОМ ЧАТЕ, а не в личном диалоге 1:1. "
+            "В истории несколько разных людей — каждая их реплика подписана «Имя: текст». "
+            "Не путай собеседников и не сливай их в одного, обращайся к тому, кто пишет сейчас. "
+            "Твои собственные прошлые реплики идут как assistant-сообщения — это то, что ты УЖЕ сказала, "
+            "не повторяйся и не приписывай свои слова другим."
+        )
     context = "group" if is_group else "private"
     facts = db.get_memory(user_id, context, chat_id if is_group else None)
     if facts:
@@ -415,6 +424,50 @@ def extract_memory(user_id: int, messages: list, is_group: bool = False, chat_id
                 logger.info(f"Memory updated for {user_id} ({context})")
     except Exception as e:
         logger.error(f"Memory extraction error: {e}")
+
+
+def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GROUP_TRANSCRIPT_LIMIT) -> list[dict]:
+    """Многоголосый групповой контекст для Anthropic messages.
+
+    Берёт транскрипт чата (старые->новые), склеивает подряд идущие реплики людей
+    в один user-блок с подписями «Имя: текст», реплики Клодушки -> assistant-блоки.
+    Гарантирует чередование ролей и user первым. Текущее сообщение-триггер уже лежит
+    в group_messages последней записью — оно становится финальным user-turn, повторно
+    НЕ добавляется (иначе вернётся баг «ты уже говорила»). reply_context, если есть,
+    привязывается inline к последнему user-блоку.
+    """
+    transcript = db.get_group_transcript(chat_id, limit)  # [{"sender","text","is_bot"}]
+    messages: list[dict] = []
+    buffer: list[str] = []
+
+    def flush_human():
+        if buffer:
+            messages.append({"role": "user", "content": "\n".join(buffer)})
+            buffer.clear()
+
+    for entry in transcript:
+        if entry["is_bot"]:
+            flush_human()
+            if messages and messages[-1]["role"] == "assistant":
+                messages[-1]["content"] += "\n" + entry["text"]
+            elif messages:  # нельзя начинать с assistant — ведущие реплики бота отбрасываем
+                messages.append({"role": "assistant", "content": entry["text"]})
+        else:
+            buffer.append(f"{entry['sender']}: {entry['text']}")
+    flush_human()
+
+    # ведущие assistant-блоки (если транскрипт начался с бота) — срезаем
+    while messages and messages[0]["role"] != "user":
+        messages.pop(0)
+
+    if reply_context and messages and messages[-1]["role"] == "user":
+        messages[-1]["content"] += f"\n[в ответ на сообщение: «{reply_context}»]"
+
+    # подстраховка: API требует непустой список, заканчивающийся user-turn
+    if not messages or messages[-1]["role"] != "user":
+        messages.append({"role": "user", "content": "(…)"})
+
+    return messages
 
 
 def get_chat_model(chat_id: int) -> str:
@@ -1288,6 +1341,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif update.message.photo:
             caption = update.message.caption or ""
             db.save_group_message(chat_id, user_id, sender, f"[Фото] {caption}".strip())
+        elif update.message.document:
+            fn = update.message.document.file_name or "файл"
+            cap = update.message.caption or ""
+            db.save_group_message(chat_id, user_id, sender, f"[Файл: {fn}] {cap}".strip())
 
     if is_group and not is_bot_mentioned(update):
         return
@@ -1387,8 +1444,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             token_usage["input"] += response.usage.input_tokens
             token_usage["output"] += response.usage.output_tokens
 
-            db.save_message(user_id, "user", f"[Файл: {filename}] {question}")
-            db.save_message(user_id, "assistant", answer)
+            if is_group:
+                db.save_group_message(chat_id, context_bot_id, "Клодушка", answer, is_bot=True)
+            else:
+                db.save_message(user_id, "user", f"[Файл: {filename}] {question}")
+                db.save_message(user_id, "assistant", answer)
 
             if len(answer) <= 4096:
                 try:
@@ -1446,8 +1506,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             token_usage["output"] += response.usage.output_tokens
 
             # Save to history as text
-            db.save_message(user_id, "user", f"[Фото] {question}")
-            db.save_message(user_id, "assistant", answer)
+            if is_group:
+                db.save_group_message(chat_id, context_bot_id, "Клодушка", answer, is_bot=True)
+            else:
+                db.save_message(user_id, "user", f"[Фото] {question}")
+                db.save_message(user_id, "assistant", answer)
 
             if len(answer) <= 4096:
                 try:
@@ -1511,14 +1574,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             author = update.effective_user.first_name or update.effective_user.username or "Unknown"
             caption = f"🎨 \"{draw_prompt}\"\n\nАвтор запроса: {author}\nМодель: {provider}"
             await update.message.reply_photo(photo=bio, caption=caption)
+            if is_group:
+                db.save_group_message(chat_id, context_bot_id, "Клодушка", f"[Нарисовала картинку: {draw_prompt}]", is_bot=True)
         else:
             await update.message.reply_text(f"Не смогла нарисовать: {error_msg}" if error_msg else "Не смогла нарисовать. Попробуй другое описание.")
         return
 
     # Main conversation
-    history = db.get_conversation(user_id, MAX_HISTORY)
-    history.append({"role": "user", "content": user_text})
-
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
@@ -1533,14 +1595,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         system = get_system_prompt(user_id, is_group, chat_id if is_group else None)
 
-        if reply_context:
-            system += f"\n\nПользователь ответил на это сообщение в чате: \"{reply_context}\""
-
         if is_group:
-            group_msgs = db.get_group_history(chat_id, 30)
-            if group_msgs:
-                chat_log = "\n".join(group_msgs)
-                system += f"\n\nПоследние сообщения в чате (контекст):\n{chat_log}"
+            # Группа: контекст — многоголосый транскрипт в messages, НЕ в system.
+            # Текущая реплика уже последней в транскрипте; reply_context идёт inline.
+            messages = build_group_messages(chat_id, reply_context, GROUP_TRANSCRIPT_LIMIT)
+        else:
+            # Личка: личный тред 1:1.
+            if reply_context:
+                system += f"\n\nПользователь ответил на это сообщение в чате: \"{reply_context}\""
+            messages = db.get_conversation(user_id, MAX_HISTORY)
+            messages.append({"role": "user", "content": user_text})
 
         if search_context:
             system += f"\n\nИспользуй результаты поиска:{search_context}"
@@ -1549,18 +1613,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             model=get_chat_model(chat_id),
             max_tokens=4096,
             system=system,
-            messages=history,
+            messages=messages,
         )
 
         assistant_text = response.content[0].text
         token_usage["input"] += response.usage.input_tokens
         token_usage["output"] += response.usage.output_tokens
 
-        db.save_message(user_id, "user", user_text)
-        db.save_message(user_id, "assistant", assistant_text)
+        if is_group:
+            # Ответ Клодушки — в групповой транскрипт, чтобы видела свои реплики
+            db.save_group_message(chat_id, context_bot_id, "Клодушка", assistant_text, is_bot=True)
+        else:
+            db.save_message(user_id, "user", user_text)
+            db.save_message(user_id, "assistant", assistant_text)
 
-        # Notify admins on first message from street user
-        if user["role"] == "street":
+        # Notify admins on first message from street user (только личка)
+        if user["role"] == "street" and not is_group:
             msg_count = len(db.get_conversation(user_id, 2))
             if msg_count <= 2:
                 uname = update.effective_user.full_name or update.effective_user.username or str(user_id)
@@ -1578,9 +1646,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception as e:
                         logger.error(f"Failed to notify admin: {e}")
 
-        msg_count = len(history)
-        if msg_count > 0 and msg_count % (MEMORY_EXTRACT_EVERY * 2) == 0:
-            extract_memory(user_id, history + [{"role": "assistant", "content": assistant_text}], is_group, chat_id if is_group else None)
+        # Память: только личка. Групповая память (chat-level) — отдельная подзадача.
+        if not is_group:
+            msg_count = len(messages)
+            if msg_count > 0 and msg_count % (MEMORY_EXTRACT_EVERY * 2) == 0:
+                extract_memory(user_id, messages + [{"role": "assistant", "content": assistant_text}], False, None)
 
         if len(assistant_text) <= 4096:
             try:
