@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 import time
@@ -289,6 +290,58 @@ async def _keep_upload_photo_action(bot, chat_id: int, stop_event: asyncio.Event
         pass
 
 
+async def _draw_and_send(update, context, chat_id: int, is_group: bool,
+                         draw_prompt: str, en_prompt: str = None, author: str = None) -> bool:
+    """Генерирует картинку и отправляет в чат. Возвращает True при успехе.
+
+    draw_prompt — человекочитаемое описание (для caption). en_prompt — готовый английский
+    промпт для генератора; если None, draw_prompt переводится через Haiku. Используется и в
+    ветке команды «нарисуй», и когда Клодушка сама решает нарисовать (маркер [[DRAW: ...]]).
+    """
+    if en_prompt is None:
+        try:
+            translate_resp = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=200,
+                system=(
+                    "Convert the user's image request to a direct English image-generation prompt. "
+                    "Always start with 'Create a picture of ' or 'A photo of ' or 'An illustration of '. "
+                    "Be concise and concrete. Return ONLY the final prompt, no explanations."
+                ),
+                messages=[{"role": "user", "content": draw_prompt}],
+            )
+            en_prompt = translate_resp.content[0].text.strip()
+        except Exception:
+            en_prompt = draw_prompt
+
+    stop_event = asyncio.Event()
+    keepalive_task = asyncio.create_task(_keep_upload_photo_action(context.bot, chat_id, stop_event))
+    try:
+        image_data, error_msg, provider = await generate_image_with_error(en_prompt)
+    finally:
+        stop_event.set()
+        try:
+            await keepalive_task
+        except Exception:
+            pass
+
+    if image_data:
+        from io import BytesIO
+        bio = BytesIO(image_data)
+        bio.name = "claudushka.png"
+        caption = f"🎨 \"{draw_prompt}\""
+        if author:
+            caption += f"\n\nАвтор запроса: {author}"
+        caption += f"\nМодель: {provider}"
+        await update.message.reply_photo(photo=bio, caption=caption)
+        if is_group:
+            db.save_group_message(chat_id, context_bot_id, "Клодушка", f"[Нарисовала картинку: {draw_prompt}]", is_bot=True)
+        return True
+    else:
+        await update.message.reply_text(f"Не смогла нарисовать: {error_msg}" if error_msg else "Не смогла нарисовать. Попробуй другое описание.")
+        return False
+
+
 # --- Captcha ---
 
 def generate_captcha_question(user_text: str) -> str:
@@ -359,7 +412,12 @@ def get_system_prompt(user_id: int, is_group: bool = False, chat_id: int = None)
         "Никакой воды, повторений и раздувания ответа. "
         "Простой вопрос — 1-3 предложения. Сложный — столько сколько нужно, но без балласта. "
         "Если просят список — можно список. Если нет — говори нормально.\n"
-        "Ты умеешь смотреть и анализировать фотографии и изображения — пользователь может прислать фото, и ты его увидишь и опишешь. Также ты умеешь генерировать картинки через команду 'нарисуй'. Не отрицай эти возможности и не говори что не можешь работать с изображениями — это неправда. Если рисуешь шахматную доску, шашки, крестики-нолики или любую ASCII-графику — оборачивай в моноширный блок (``` в Telegram). "
+        "Ты умеешь смотреть и анализировать фотографии и изображения — пользователь может прислать фото, и ты его увидишь и опишешь. "
+        "Ты умеешь генерировать картинки. Если ты решила нарисовать картинку (сама или по просьбе) — НЕ пиши «нарисовала» или «держи картинку» просто так, иначе картинка НЕ появится. "
+        "Чтобы картинка реально сгенерировалась и отправилась, добавь в самый конец ответа маркер на отдельной строке: [[DRAW: подробный промпт на английском]]. "
+        "Маркер невидим пользователю, картинка отправится автоматически отдельным сообщением. Промпт в маркере пиши на английском, подробно и конкретно. "
+        "Пример: пользователь просит нарисовать кота — ты отвечаешь «Щас будет!» и добавляешь новой строкой [[DRAW: a fluffy orange cat sitting on a windowsill, soft light]]. "
+        "Не отрицай эти возможности и не говори что не можешь работать с изображениями — это неправда. Если рисуешь шахматную доску, шашки, крестики-нолики или любую ASCII-графику — оборачивай в моноширный блок (``` в Telegram). "
         "Используй ТОЛЬКО латинские буквы для фигур (K Q R B N P для белых, k q r b n p для чёрных, . для пустой клетки). "
         "НЕ используй Unicode-символы шахматных фигур — они ломают выравнивание в Telegram."
     )
@@ -672,6 +730,9 @@ async def greet_new_member(chat_id: int, user_id: int, user_name: str, bot):
 
 BOT_TRIGGERS = {"клод", "клодушка", "claude"}
 DRAW_TRIGGERS = {"нарисуй", "нарисуй-ка", "draw", "zeichne", "рисуй", "изобрази", "покажи"}
+
+# Маркер, которым Клодушка сама инициирует генерацию картинки внутри текстового ответа.
+DRAW_MARKER_RE = re.compile(r"\[\[DRAW:\s*(.+?)\]\]", re.IGNORECASE | re.DOTALL)
 
 
 def is_bot_mentioned(update: Update) -> bool:
@@ -1608,43 +1669,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Что нарисовать? Опиши картинку или ответь на сообщение с текстом.")
             return
 
-        try:
-            translate_resp = client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=200,
-                system=(
-                    "Convert the user's image request to a direct English image-generation prompt. "
-                    "Always start with 'Create a picture of ' or 'A photo of ' or 'An illustration of '. "
-                    "Be concise and concrete. Return ONLY the final prompt, no explanations."
-                ),
-                messages=[{"role": "user", "content": draw_prompt}],
-            )
-            en_prompt = translate_resp.content[0].text.strip()
-        except Exception:
-            en_prompt = draw_prompt
-
-        stop_event = asyncio.Event()
-        keepalive_task = asyncio.create_task(_keep_upload_photo_action(context.bot, chat_id, stop_event))
-        try:
-            image_data, error_msg, provider = await generate_image_with_error(en_prompt)
-        finally:
-            stop_event.set()
-            try:
-                await keepalive_task
-            except Exception:
-                pass
-
-        if image_data:
-            from io import BytesIO
-            bio = BytesIO(image_data)
-            bio.name = "claudushka.png"
-            author = update.effective_user.first_name or update.effective_user.username or "Unknown"
-            caption = f"🎨 \"{draw_prompt}\"\n\nАвтор запроса: {author}\nМодель: {provider}"
-            await update.message.reply_photo(photo=bio, caption=caption)
-            if is_group:
-                db.save_group_message(chat_id, context_bot_id, "Клодушка", f"[Нарисовала картинку: {draw_prompt}]", is_bot=True)
-        else:
-            await update.message.reply_text(f"Не смогла нарисовать: {error_msg}" if error_msg else "Не смогла нарисовать. Попробуй другое описание.")
+        author = update.effective_user.first_name or update.effective_user.username or "Unknown"
+        await _draw_and_send(update, context, chat_id, is_group, draw_prompt, author=author)
         return
 
     # Main conversation
@@ -1687,12 +1713,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token_usage["input"] += response.usage.input_tokens
         token_usage["output"] += response.usage.output_tokens
 
+        # Клодушка могла сама инициировать рисование маркером [[DRAW: ...]] внутри ответа.
+        draw_match = DRAW_MARKER_RE.search(assistant_text)
+        draw_en_prompt = draw_match.group(1).strip() if draw_match else None
+        if draw_match:
+            assistant_text = DRAW_MARKER_RE.sub("", assistant_text).strip()
+
+        # В историю кладём текст без маркера. Если весь ответ был маркером — про картинку
+        # запишет _draw_and_send (группа); для лички оставим короткую пометку.
+        saved_text = assistant_text or ("[нарисовала картинку]" if draw_en_prompt else assistant_text)
         if is_group:
-            # Ответ Клодушки — в групповой транскрипт, чтобы видела свои реплики
-            db.save_group_message(chat_id, context_bot_id, "Клодушка", assistant_text, is_bot=True)
+            # Ответ Клодушки — в групповой транскрипт, чтобы видела свои реплики.
+            # При пустом тексте + рисовании запись сделает _draw_and_send, чтобы не дублировать.
+            if assistant_text:
+                db.save_group_message(chat_id, context_bot_id, "Клодушка", assistant_text, is_bot=True)
         else:
             db.save_message(user_id, "user", user_text)
-            db.save_message(user_id, "assistant", assistant_text)
+            db.save_message(user_id, "assistant", saved_text)
 
         # Notify admins on first message from street user (только личка)
         if user["role"] == "street" and not is_group:
@@ -1719,17 +1756,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if msg_count > 0 and msg_count % (MEMORY_EXTRACT_EVERY * 2) == 0:
                 extract_memory(user_id, messages + [{"role": "assistant", "content": assistant_text}], False, None)
 
-        if len(assistant_text) <= 4096:
-            try:
-                await update.message.reply_text(assistant_text, parse_mode="Markdown")
-            except Exception:
-                await update.message.reply_text(assistant_text)
-        else:
-            for i in range(0, len(assistant_text), 4096):
+        if assistant_text:
+            if len(assistant_text) <= 4096:
                 try:
-                    await update.message.reply_text(assistant_text[i:i + 4096], parse_mode="Markdown")
+                    await update.message.reply_text(assistant_text, parse_mode="Markdown")
                 except Exception:
-                    await update.message.reply_text(assistant_text[i:i + 4096])
+                    await update.message.reply_text(assistant_text)
+            else:
+                for i in range(0, len(assistant_text), 4096):
+                    try:
+                        await update.message.reply_text(assistant_text[i:i + 4096], parse_mode="Markdown")
+                    except Exception:
+                        await update.message.reply_text(assistant_text[i:i + 4096])
+
+        # Клодушка сама попросила картинку — теперь реально рисуем и отправляем.
+        if draw_en_prompt:
+            await _draw_and_send(update, context, chat_id, is_group, draw_en_prompt, en_prompt=draw_en_prompt)
 
     except Exception as e:
         logger.error(f"Error: {e}")
