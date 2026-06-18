@@ -31,6 +31,7 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 MAX_HISTORY = 40
 GROUP_TRANSCRIPT_LIMIT = 50   # сколько реплик группового транскрипта тащить в messages
 MEMORY_EXTRACT_EVERY = 5
+MEMORY_EXTRACT_EVERY_CHAT = 10  # чат-уровневый каденс извлечения групповой памяти
 MAX_CAPTCHA_ATTEMPTS = 3
 BAN_DURATION = 3600
 STREET_DAILY_LIMIT = 10
@@ -371,14 +372,24 @@ def get_system_prompt(user_id: int, is_group: bool = False, chat_id: int = None)
             "не повторяйся и не приписывай свои слова другим."
         )
     if is_group:
-        # Группа: только факты этого чата про этого человека (изоляция по chat_id).
-        facts = db.get_memory(user_id, "group", chat_id)
+        # Группа: факты про ВСЕХ участников этого чата (долго- и среднесрочные).
+        all_memory = db.get_all_chat_memory(chat_id)
+        if all_memory:
+            parts = []
+            for p in all_memory:
+                line = p["name"] + ": " + "; ".join(p["long"]) if p["long"] else p["name"] + ":"
+                if p["medium"]:
+                    line += " | Недавно: " + "; ".join(p["medium"])
+                if p["long"] or p["medium"]:
+                    parts.append(line)
+            if parts:
+                base += "\n\nЧто ты знаешь об участниках этого чата:\n" + "\n".join(parts) + "\nИспользуй эти знания естественно, не перечисляй их."
     else:
         # Личка: личные факты + все групповые факты про человека (группа течёт вверх).
         facts = db.get_memory_for_private(user_id)
-    if facts:
-        facts_str = "\n".join(f"- {f}" for f in facts)
-        base += f"\n\nВот что ты помнишь об этом пользователе:\n{facts_str}\nИспользуй эти знания естественно, не перечисляй их."
+        if facts:
+            facts_str = "\n".join(f"- {f}" for f in facts)
+            base += f"\n\nВот что ты помнишь об этом пользователе:\n{facts_str}\nИспользуй эти знания естественно, не перечисляй их."
     return base
 
 
@@ -408,40 +419,63 @@ def extract_memory(user_id: int, messages: list, is_group: bool = False, chat_id
         logger.error(f"Memory extraction error: {e}")
 
 
-def extract_group_memory(user_id: int, sender_name: str, chat_id: int, limit: int = 12):
-    """Извлекает факты ТОЛЬКО про текущего автора из недавнего группового транскрипта.
+def extract_all_participants_memory(chat_id: int):
+    """Извлекает долго- и среднесрочную память для ВСЕХ участников из транскрипта чата.
 
-    Атрибуция по известному user_id того, кто сейчас написал — чужие факты не приписываются.
-    Хранит как групповые факты (context='group', chat_id) — изолированы по чату.
-    Личку не трогает (личное в группу не течёт).
+    Долгосрочные (tier='long'): устойчивые факты — кто человек, где живёт, чем занимается,
+    интересы, возраст, взгляды. Без TTL.
+    Среднесрочные (tier='medium'): временные события этой недели — что случилось, купил,
+    с кем поругался, что болит. TTL 7 дней.
+    Атрибуция по sender_name → user_id через group_messages. Изоляция по chat_id.
+    Запускается каждые MEMORY_EXTRACT_EVERY_CHAT сообщений в чате, независимо от упоминания бота.
     """
     try:
-        transcript = db.get_group_transcript(chat_id, limit)
+        transcript = db.get_group_transcript(chat_id, GROUP_TRANSCRIPT_LIMIT)
         if not transcript:
+            return
+        participants = list({e["sender"] for e in transcript if not e["is_bot"]})
+        if not participants:
             return
         lines = [("Клодушка" if e["is_bot"] else e["sender"]) + f": {e['text']}" for e in transcript]
         dialog = "\n".join(lines)
         response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=512,
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
             system=(
-                f"Это групповой чат. Извлеки устойчивые факты ТОЛЬКО про участника по имени «{sender_name}». "
-                "Факты про других участников и про саму Клодушку — полностью игнорируй. "
-                "Бери только то, что характеризует человека (кто он, чем занимается, где живёт, "
-                "что любит/не любит, важные обстоятельства жизни), а не сиюминутные реплики и шутки. "
-                "Верни JSON-массив строк. Если новых фактов про этого человека нет — верни []. "
-                "Пример: [\"Болеет за Спартак\", \"Работает дальнобойщиком\"]"
+                "Ты анализируешь групповой чат. Для каждого из указанных участников извлеки два типа фактов.\n"
+                "long_term — устойчивые факты: кто человек, где живёт/работает, чем занимается, "
+                "интересы, возраст, взгляды, характер. Только то, что вряд ли изменится за неделю.\n"
+                "medium_term — временные события и состояния: что случилось, что купил, куда пошёл, "
+                "с кем поссорился, что болит, что планирует на этой неделе. Конкретные события.\n"
+                "Верни JSON: {\"participants\": [{\"name\": \"Имя\", \"long_term\": [...], \"medium_term\": [...]}]}\n"
+                "Если фактов нет — пустые массивы []. Клодушку не включай. Только факты прямо из чата."
             ),
-            messages=[{"role": "user", "content": f"Чат:\n{dialog}"}],
+            messages=[{"role": "user", "content": f"Участники: {', '.join(participants)}\n\nЧат:\n{dialog}"}],
         )
         text = response.content[0].text.strip()
-        start = text.find("[")
-        end = text.rfind("]") + 1
-        if start >= 0 and end > start:
-            new_facts = json.loads(text[start:end])
-            if new_facts:
-                db.add_memory_facts(user_id, new_facts, "group", chat_id)
-                logger.info(f"Group memory updated for {user_id} in chat {chat_id}: +{len(new_facts)}")
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start < 0 or end <= start:
+            return
+        data = json.loads(text[start:end])
+        medium_expiry = int(time.time()) + 7 * 86400
+        saved = 0
+        for p in data.get("participants", []):
+            name = p.get("name", "")
+            if not name:
+                continue
+            uid = db.get_user_id_by_name_in_chat(chat_id, name)
+            if not uid:
+                continue
+            long_facts = [f for f in p.get("long_term", []) if isinstance(f, str)]
+            medium_facts = [f for f in p.get("medium_term", []) if isinstance(f, str)]
+            if long_facts:
+                db.add_memory_facts(uid, long_facts, "group", chat_id, tier="long")
+                saved += len(long_facts)
+            if medium_facts:
+                db.add_memory_facts(uid, medium_facts, "group", chat_id, tier="medium", expires_at=medium_expiry)
+                saved += len(medium_facts)
+        logger.info(f"Group memory extracted for chat {chat_id}: {len(data.get('participants', []))} participants, +{saved} facts")
     except Exception as e:
         logger.error(f"Group memory extraction error: {e}")
 
@@ -1366,6 +1400,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fn = update.message.document.file_name or "файл"
             cap = update.message.caption or ""
             db.save_group_message(chat_id, user_id, sender, f"[Файл: {fn}] {cap}".strip())
+        # Извлечение памяти для всех участников — каждые MEMORY_EXTRACT_EVERY_CHAT сообщений,
+        # независимо от того, упомянут бот или нет.
+        chat_msg_count = db.count_chat_messages(chat_id)
+        if chat_msg_count > 0 and chat_msg_count % MEMORY_EXTRACT_EVERY_CHAT == 0:
+            extract_all_participants_memory(chat_id)
 
     if is_group and not is_bot_mentioned(update):
         return
@@ -1674,16 +1713,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception as e:
                         logger.error(f"Failed to notify admin: {e}")
 
-        # Память по слоям: личка — личный тред; группа — факты про текущего автора (изоляция по chat_id).
+        # Память: личка — из личного треда по каденсу; группа — уже извлечена до is_bot_mentioned.
         if not is_group:
             msg_count = len(messages)
             if msg_count > 0 and msg_count % (MEMORY_EXTRACT_EVERY * 2) == 0:
                 extract_memory(user_id, messages + [{"role": "assistant", "content": assistant_text}], False, None)
-        else:
-            sender_name = update.effective_user.first_name or update.effective_user.username or str(user_id)
-            user_msg_count = db.count_user_messages_in_chat(chat_id, user_id)
-            if user_msg_count > 0 and user_msg_count % MEMORY_EXTRACT_EVERY == 0:
-                extract_group_memory(user_id, sender_name, chat_id)
 
         if len(assistant_text) <= 4096:
             try:

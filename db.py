@@ -102,6 +102,8 @@ def init_db():
         "ALTER TABLE memory ADD COLUMN context TEXT NOT NULL DEFAULT 'private'",
         "ALTER TABLE memory ADD COLUMN chat_id INTEGER",
         "ALTER TABLE group_messages ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE memory ADD COLUMN tier TEXT NOT NULL DEFAULT 'long'",
+        "ALTER TABLE memory ADD COLUMN expires_at INTEGER",
     ]:
         try:
             conn.execute(migration)
@@ -248,29 +250,34 @@ def clear_conversation(user_id: int):
 
 def get_memory(user_id: int, context: str = "private", chat_id: int = None) -> list[str]:
     conn = get_conn()
+    now = int(time.time())
     if context == "group" and chat_id:
         rows = conn.execute(
-            "SELECT fact FROM memory WHERE user_id = ? AND context = ? AND chat_id = ? ORDER BY created_at",
-            (user_id, context, chat_id)
+            "SELECT fact FROM memory WHERE user_id = ? AND context = ? AND chat_id = ? "
+            "AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at",
+            (user_id, context, chat_id, now)
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT fact FROM memory WHERE user_id = ? AND context = ? AND chat_id IS NULL ORDER BY created_at",
-            (user_id, context)
+            "SELECT fact FROM memory WHERE user_id = ? AND context = ? AND chat_id IS NULL "
+            "AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at",
+            (user_id, context, now)
         ).fetchall()
     conn.close()
     return [r["fact"] for r in rows]
 
 
-def add_memory_facts(user_id: int, facts: list[str], context: str = "private", chat_id: int = None):
+def add_memory_facts(user_id: int, facts: list[str], context: str = "private", chat_id: int = None,
+                     tier: str = "long", expires_at: int = None):
     conn = get_conn()
     existing = set(get_memory(user_id, context, chat_id))
     now = int(time.time())
     for fact in facts:
         if fact not in existing:
             conn.execute(
-                "INSERT INTO memory (user_id, fact, context, chat_id, created_at) VALUES (?, ?, ?, ?, ?)",
-                (user_id, fact, context, chat_id, now)
+                "INSERT INTO memory (user_id, fact, context, chat_id, created_at, tier, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (user_id, fact, context, chat_id, now, tier, expires_at)
             )
     conn.commit()
     conn.close()
@@ -293,11 +300,14 @@ def get_memory_for_private(user_id: int) -> list[str]:
     (узнанное в группах течёт вверх в личку). Обратного потока нет: групповое
     чтение (get_memory(context='group', chat_id)) личку не видит.
     Дедуп с сохранением порядка — один и тот же факт мог осесть и в личке, и в группе.
+    Просроченные среднесрочные факты не включаются.
     """
     conn = get_conn()
+    now = int(time.time())
     rows = conn.execute(
-        "SELECT fact FROM memory WHERE user_id = ? AND context IN ('private','group') ORDER BY created_at",
-        (user_id,)
+        "SELECT fact FROM memory WHERE user_id = ? AND context IN ('private','group') "
+        "AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at",
+        (user_id, now)
     ).fetchall()
     conn.close()
     seen, out = set(), []
@@ -362,6 +372,61 @@ def count_user_messages_in_chat(chat_id: int, user_id: int) -> int:
     ).fetchone()
     conn.close()
     return row["c"] if row else 0
+
+
+def count_chat_messages(chat_id: int) -> int:
+    """Сколько не-бот сообщений в чате — для чат-уровневого каденса извлечения памяти."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM group_messages WHERE chat_id = ? AND is_bot = 0",
+        (chat_id,)
+    ).fetchone()
+    conn.close()
+    return row["c"] if row else 0
+
+
+def get_user_id_by_name_in_chat(chat_id: int, sender_name: str) -> int | None:
+    """Ищет user_id по sender_name в group_messages — для атрибуции фактов при извлечении памяти."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT user_id FROM group_messages WHERE chat_id = ? AND sender_name = ? "
+        "AND user_id IS NOT NULL ORDER BY timestamp DESC LIMIT 1",
+        (chat_id, sender_name)
+    ).fetchone()
+    conn.close()
+    return row["user_id"] if row else None
+
+
+def get_all_chat_memory(chat_id: int) -> list[dict]:
+    """Все актуальные факты обо всех участниках чата, сгруппированные по людям.
+
+    Возвращает [{"name": str, "long": [str, ...], "medium": [str, ...]}].
+    Просроченные среднесрочные факты не включаются. Изоляция по chat_id.
+    """
+    now = int(time.time())
+    conn = get_conn()
+    rows = conn.execute(
+        """
+        SELECT m.user_id, m.fact, COALESCE(m.tier, 'long') AS tier,
+               (SELECT gm.sender_name FROM group_messages gm
+                WHERE gm.chat_id = ? AND gm.user_id = m.user_id AND gm.sender_name IS NOT NULL
+                ORDER BY gm.timestamp DESC LIMIT 1) AS sender_name
+        FROM memory m
+        WHERE m.context = 'group' AND m.chat_id = ?
+          AND (m.expires_at IS NULL OR m.expires_at > ?)
+        ORDER BY m.user_id, m.tier, m.created_at
+        """,
+        (chat_id, chat_id, now)
+    ).fetchall()
+    conn.close()
+    by_user: dict[int, dict] = {}
+    for r in rows:
+        uid = r["user_id"]
+        if uid not in by_user:
+            by_user[uid] = {"name": r["sender_name"] or str(uid), "long": [], "medium": []}
+        tier = r["tier"] if r["tier"] in ("long", "medium") else "long"
+        by_user[uid][tier].append(r["fact"])
+    return list(by_user.values())
 
 
 # --- Allowed chats ---
