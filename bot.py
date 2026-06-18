@@ -1370,30 +1370,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group and not is_bot_mentioned(update):
         return
 
-    if needs_captcha(user):
-        uid = user["telegram_id"]
-        uname = update.effective_user.full_name or update.effective_user.username or str(uid)
-        for admin_id in ADMIN_IDS:
-            try:
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=(
-                        f"👤 Новый пользователь хочет общаться:\n\n"
-                        f"Имя: {uname}\nID: {uid}\nUsername: @{update.effective_user.username or 'нет'}\n\n"
-                        f"/approve {uid} — допустить\n/ban {uid} — забанить"
+    if is_group:
+        # В группе гейтинг на уровне ЧАТА, а не пользователя: чат разрешён → пишут ВСЕ участники.
+        # Никакой персональной капчи/допуска/дневного лимита. Бан остаётся (проверен в начале хендлера).
+        if WHITELIST_ENABLED and not db.is_chat_allowed(chat_id):
+            return
+    else:
+        # Личка — персональный гейтинг.
+        if needs_captcha(user):
+            uid = user["telegram_id"]
+            uname = update.effective_user.full_name or update.effective_user.username or str(uid)
+            for admin_id in ADMIN_IDS:
+                try:
+                    await context.bot.send_message(
+                        chat_id=admin_id,
+                        text=(
+                            f"👤 Новый пользователь хочет общаться:\n\n"
+                            f"Имя: {uname}\nID: {uid}\nUsername: @{update.effective_user.username or 'нет'}\n\n"
+                            f"/approve {uid} — допустить\n/ban {uid} — забанить"
+                        )
                     )
-                )
-            except Exception as e:
-                logger.error(f"Failed to notify admin: {e}")
-        await update.message.reply_text("Привет! Я отправила запрос админу. Подожди немного, скоро тебя допустят.")
-        return
+                except Exception as e:
+                    logger.error(f"Failed to notify admin: {e}")
+            await update.message.reply_text("Привет! Я отправила запрос админу. Подожди немного, скоро тебя допустят.")
+            return
 
-    if not is_allowed_in_chat(user, chat_id):
-        return
+        if not is_allowed_in_chat(user, chat_id):
+            return
 
-    if not check_daily_limit(user):
-        await update.message.reply_text(f"Лимит {STREET_DAILY_LIMIT} сообщений в день. Попроси реферальную ссылку для безлимита!")
-        return
+        if not check_daily_limit(user):
+            await update.message.reply_text(f"Лимит {STREET_DAILY_LIMIT} сообщений в день. Попроси реферальную ссылку для безлимита!")
+            return
 
     user_text = update.message.text or update.message.caption or ""
     has_photo = bool(update.message.photo)
