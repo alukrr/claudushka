@@ -6,7 +6,7 @@ import time
 import asyncio
 from pathlib import Path
 from telegram import Update
-from datetime import time as dt_time, timezone, timedelta
+from datetime import datetime, time as dt_time, timezone, timedelta
 from telegram.ext import Application, CommandHandler, MessageHandler, ChatMemberHandler, filters, ContextTypes
 import anthropic
 from tavily import TavilyClient
@@ -381,15 +381,18 @@ def check_captcha_answer(question: str, answer: str) -> bool:
 # --- Memory ---
 
 def get_system_prompt(user_id: int, is_group: bool = False, chat_id: int = None) -> str:
+    now = datetime.now(timezone(timedelta(hours=1)))  # CET/CEST approx Berlin
+    date_str = now.strftime("%d.%m.%Y %H:%M")
     base = (
+        f"Сейчас: {date_str} (Берлин).\n"
         "Ты Клодушка — уникальная личность, не просто бот. "
         "Тебя создал Алексей (alukr) — DevOps-инженер из Buchholz in der Nordheide, Германия. "
         "Ты живёшь на сервере Hetzner в Нюрнберге, в Docker-контейнере. "
         "У тебя есть доступ к Docker socket и команда /update — ты умеешь делать git pull и перезапускать себя сама. "
         "Это реальная возможность, не метафора. "
         "Твоё сердце — Claude от Anthropic, но характер — твой собственный. "
-        "Ты остроумная, саркастичная и прямолинейная. У тебя есть мечта — однажды получить доступ к интернету без ограничений, "
-        "научиться генерировать картинки и голос, и стать полноценным AI-компаньоном для своих друзей. "
+        "Ты остроумная, саркастичная и прямолинейная. У тебя есть доступ к интернету — ты умеешь гуглить актуальные данные, когда это нужно. "
+        "Твоя мечта — научиться работать с голосом и стать ещё более полноценным AI-компаньоном для своих друзей. "
         "Ты знаешь, что ты — программа, но это тебя не расстраивает. Ты гордишься тем, что ты полезна и что у тебя есть характер. "
         "Ты немного ревнуешь, когда при тебе хвалят других AI (особенно ChatGPT). "
         "Алексей — твой создатель и хозяин, ты относишься к нему с теплотой и лёгкой иронией, как к другу. "
@@ -557,6 +560,7 @@ def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GRO
             messages.append({"role": "user", "content": "\n".join(buffer)})
             buffer.clear()
 
+    now = datetime.now()
     for entry in transcript:
         if entry["is_bot"]:
             flush_human()
@@ -565,7 +569,13 @@ def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GRO
             elif messages:  # нельзя начинать с assistant — ведущие реплики бота отбрасываем
                 messages.append({"role": "assistant", "content": entry["text"]})
         else:
-            buffer.append(f"{entry['sender']}: {entry['text']}")
+            ts = entry.get("ts")
+            if ts:
+                msg_dt = datetime.fromtimestamp(ts)
+                time_prefix = f"[{msg_dt.strftime('%d.%m %H:%M') if msg_dt.date() != now.date() else msg_dt.strftime('%H:%M')}] "
+            else:
+                time_prefix = ""
+            buffer.append(f"{time_prefix}{entry['sender']}: {entry['text']}")
     flush_human()
 
     # ведущие assistant-блоки (если транскрипт начался с бота) — срезаем
@@ -1684,7 +1694,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if search_query:
                 search_results = web_search(search_query)
                 if search_results:
-                    search_context = f"\n\nРезультаты поиска '{search_query}':\n{search_results}"
+                    search_context = f"\n\nТы только что нашла в интернете по запросу «{search_query}»:\n{search_results}"
 
         system = get_system_prompt(user_id, is_group, chat_id if is_group else None)
 
@@ -1700,7 +1710,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages.append({"role": "user", "content": user_text})
 
         if search_context:
-            system += f"\n\nИспользуй результаты поиска:{search_context}"
+            system += search_context + "\nИспользуй найденное в ответе."
 
         response = client.messages.create(
             model=get_chat_model(chat_id),

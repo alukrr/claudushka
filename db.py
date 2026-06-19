@@ -349,16 +349,16 @@ def get_group_history(chat_id: int, limit: int = 30) -> list[str]:
 
 def get_group_transcript(chat_id: int, limit: int = 40) -> list[dict]:
     """Групповая история для многоголосого messages-контекста.
-    Возвращает старые->новые: [{"sender", "text", "is_bot"}]."""
+    Возвращает старые->новые: [{"sender", "text", "is_bot", "ts"}]."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT sender_name, content, is_bot FROM group_messages "
+        "SELECT sender_name, content, is_bot, timestamp FROM group_messages "
         "WHERE chat_id = ? ORDER BY timestamp DESC, id DESC LIMIT ?",
         (chat_id, limit)
     ).fetchall()
     conn.close()
     return [
-        {"sender": r["sender_name"], "text": r["content"], "is_bot": bool(r["is_bot"])}
+        {"sender": r["sender_name"], "text": r["content"], "is_bot": bool(r["is_bot"]), "ts": r["timestamp"]}
         for r in reversed(rows)
     ]
 
