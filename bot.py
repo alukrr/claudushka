@@ -1145,6 +1145,62 @@ async def cmd_opus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- User commands ---
 
+USER_HELP = """\
+Команды:
+  /start         — начало работы, реферальная ссылка
+  /help          — этот список
+  /clear         — очистить историю диалога
+  /memory        — что бот помнит о тебе
+  /forget        — забыть всё о тебе
+  /id            — показать Telegram ID и роль
+  /version       — версия бота
+  /search <q>    — веб-поиск (referral+)
+  /imagine <q>   — генерация изображения (referral+)\
+"""
+
+ADMIN_HELP = """\
+Пользователи:
+  /users                   — все пользователи
+  /role <id> <роль>        — изменить роль (admin/premium/referral/street/banned)
+  /promote <id>            — → referral
+  /premium <id>            — → premium
+  /ban <id>                — забанить
+  /approve <id>            — вручную допустить (set verified)
+
+Чаты:
+  /chats                   — группы (статус+модель) + пользователи
+  /pending                 — чаты на одобрение
+  /approve_chat <id>       — одобрить чат
+  /reject_chat <id>        — отклонить и выйти
+  /allow_chat <id> [имя]   — добавить чат вручную
+  /deny_chat <id>          — удалить чат
+
+Модель (в чате — без аргумента; из лички — с chat_id):
+  /haiku [chat_id]         — Haiku 4.5 (дефолт, дёшево)
+  /sonnet [chat_id]        — Sonnet 4.6
+  /opus [chat_id]          — Opus 4.8 (дорого)
+
+Прочее:
+  /whitelist               — показать белые списки
+  /whitelist_on/off        — включить/выключить белый список
+  /captcha_on/off          — включить/выключить капчу
+  /captcha_unban <id>      — разбанить после капчи
+  /activity [0-100]        — вероятность авто-реплаев в группе (%)
+  /cost                    — расход токенов по моделям
+  /review                  — AI-обзор чата прямо сейчас
+  /migrate                 — миграция JSON → SQLite
+  /update                  — git pull + рестарт контейнера\
+"""
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = USER_HELP
+    if is_admin(user_id):
+        text += "\n\nАдмин-команды:\n" + ADMIN_HELP
+    await update.message.reply_text(text)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username
@@ -1850,6 +1906,7 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("forget", cmd_forget))

@@ -3,7 +3,7 @@
 ## Стек
 - Python 3.12 (python:3.12-slim Docker image)
 - python-telegram-bot 21.10
-- anthropic 0.43.0 (модели: claude-sonnet-4-6 для диалогов, claude-haiku-4-5-20251001 для капчи/вспомогательных задач)
+- anthropic 0.43.0 (модели: claude-haiku-4-5-20251001 по умолчанию для всех диалогов; per-chat переключение через /haiku /sonnet /opus; вспомогательные вызовы — всегда Haiku)
 - tavily-python 0.5.0 — веб-поиск
 - генерация изображений: Gemini «Nano Banana 2» (`gemini-3.1-flash-image-preview`) через `requests`, ЕДИНСТВЕННЫЙ провайдер. При отказе банана промпт переписывается через Haiku и банан пробуется снова; фоллбека на FLUX больше нет (выпилен: качество + FLUX.1-schnell стал gated, а годные модели 2026 ушли с бесплатного hf-inference на платные провайдеры). При неудаче — честная ошибка пользователю.
 
@@ -17,7 +17,7 @@
 - Docker Compose (без Dockerfile)
 
 ## Структура
-- bot.py — основной код Telegram-бота (~1600 строк)
+- bot.py — основной код Telegram-бота (~1960 строк)
 - db.py — слой данных SQLite (пользователи, история, память, чаты)
 - whatsapp.py — WhatsApp-бот (FastAPI webhook, отдельный сервис)
 - allowed.json — белые списки пользователей и чатов (legacy, основной источник — SQLite)
@@ -42,8 +42,21 @@
 - Схема: `group_messages.is_bot INTEGER NOT NULL DEFAULT 0`, миграция идемпотентная в `init_db()`. Сигнатура `save_group_message(chat_id, user_id, sender_name, content, is_bot=False)`.
 - `db.get_group_history()` (строки «Имя: текст») оставлена специально — её используют `daily_chat_review` и `cmd_review`. Не удалять и не путать с `get_group_transcript()`.
 
+## Модели per-chat
+Дефолт всех чатов — `claude-haiku-4-5-20251001`. Выбор хранится в таблице `chat_models` (SQLite), переживает рестарты.
+- `db.get_chat_model_db(chat_id)` → возвращает модель (дефолт haiku если записи нет)
+- `db.set_chat_model_db(chat_id, model)` → сохраняет выбор
+- `get_chat_model(chat_id)` в bot.py — обёртка над db
+- Команды `/haiku [chat_id]`, `/sonnet [chat_id]`, `/opus [chat_id]` — в чате без аргумента, из лички с ID
+- Вспомогательные вызовы (капча, should_search, translate, greet, extract_memory группы) — всегда Haiku, не зависят от chat_model
+- Token tracking: `_track_tokens(model, inp, out)` + словарь `token_usage: dict[str, dict]`. Цены: Haiku $0.80/$4, Sonnet $3/$15, Opus $15/$75 за MTok (in/out)
+- `daily_chat_review` и `cmd_review` используют модель чата (не хардкод)
+
+## Команды (актуальный список)
+`/help` показывает всем пользователям базовые команды, adminам — полный список из двух блоков (`USER_HELP` + `ADMIN_HELP` в bot.py). При добавлении новой команды обновлять оба константы.
+
 ## Версионность
-Текущая версия: v0.6.0. Теги ставит Алексей вручную: `git tag -a vX.Y.Z`. Не создавай теги самостоятельно.
+Текущая версия: v0.7.0. Теги ставит Алексей вручную: `git tag -a vX.Y.Z`. Не создавай теги самостоятельно.
 Версия доступна через `/version` в боте. Команды `cmd_update` и `cmd_version` используют хелпер `_git()` — не переписывай их без необходимости.
 
 ## Правила
@@ -80,7 +93,7 @@ Remote на сервере переключён на HTTPS (`https://github.com/
 3. **Долгосрочная** (`tier='long'`) — устойчивые факты о людях: кто они, где живут, чем занимаются, интересы, возраст, взгляды. Без TTL.
 
 ### Извлечение
-- **Личка** — `extract_memory()` по личному треду (каденс: `len(messages) % (MEMORY_EXTRACT_EVERY*2) == 0`). Модель Sonnet.
+- **Личка** — `extract_memory()` по личному треду (каденс: `len(messages) % (MEMORY_EXTRACT_EVERY*2) == 0`). Модель Sonnet (hardcoded — осознанно, это аналитическая задача).
 - **Группа** — `extract_all_participants_memory(chat_id)`: один вызов Haiku на весь 50-реплик транскрипт, извлекает **оба уровня** сразу для **ВСЕХ видимых участников**. Атрибуция: по `sender_name` → `user_id` через `db.get_user_id_by_name_in_chat()`. Каденс: `db.count_chat_messages(chat_id) % MEMORY_EXTRACT_EVERY_CHAT == 0` (каждые 10 сообщений в чате). Вызывается **до** проверки `is_bot_mentioned` — работает даже когда бота не упоминают.
 
 ### Асимметрия чтения (намеренная, не баг)
