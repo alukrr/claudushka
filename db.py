@@ -88,6 +88,11 @@ def init_db():
             created_at INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS chat_models (
+            chat_id INTEGER PRIMARY KEY,
+            model TEXT NOT NULL DEFAULT 'claude-haiku-4-5-20251001'
+        );
+
         CREATE INDEX IF NOT EXISTS idx_conv_user ON conversations(user_id);
         CREATE INDEX IF NOT EXISTS idx_conv_ts ON conversations(user_id, timestamp);
         CREATE INDEX IF NOT EXISTS idx_memory_user ON memory(user_id);
@@ -479,6 +484,39 @@ def is_chat_allowed(chat_id: int) -> bool:
     row = conn.execute("SELECT 1 FROM allowed_chats WHERE chat_id = ? AND status = 'approved'", (chat_id,)).fetchone()
     conn.close()
     return row is not None
+
+
+# --- Chat model settings ---
+
+def get_chat_model_db(chat_id: int) -> str:
+    conn = get_conn()
+    row = conn.execute("SELECT model FROM chat_models WHERE chat_id = ?", (chat_id,)).fetchone()
+    conn.close()
+    return row["model"] if row else "claude-haiku-4-5-20251001"
+
+
+def set_chat_model_db(chat_id: int, model: str):
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO chat_models (chat_id, model) VALUES (?, ?)",
+        (chat_id, model)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_all_chats_for_status() -> list[dict]:
+    """Все чаты из allowed_chats с их моделью — для команды /chats."""
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT ac.chat_id, ac.name, ac.status,
+               COALESCE(cm.model, 'claude-haiku-4-5-20251001') AS model
+        FROM allowed_chats ac
+        LEFT JOIN chat_models cm ON cm.chat_id = ac.chat_id
+        ORDER BY ac.status, ac.name
+    """).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 # --- WhatsApp: conversations ---

@@ -45,11 +45,27 @@ WHITELIST_ENABLED = False
 # Captcha state (in-memory, resets on restart)
 captcha_state: dict[str, dict] = {}
 
-# Chats temporarily switched to Opus 4.8
-opus_chats: set[int] = set()
+MODEL_NAMES = {
+    "claude-haiku-4-5-20251001": "Haiku 4.5",
+    "claude-sonnet-4-6": "Sonnet 4.6",
+    "claude-opus-4-8": "Opus 4.8",
+}
+# $/MTok: (input, output)
+MODEL_PRICING = {
+    "claude-haiku-4-5-20251001": (0.80, 4.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-opus-4-8": (15.00, 75.00),
+}
 
-# Token tracking
-token_usage = {"input": 0, "output": 0}
+# Per-model token tracking
+token_usage: dict[str, dict[str, int]] = {}
+
+
+def _track_tokens(model: str, inp: int, out: int):
+    if model not in token_usage:
+        token_usage[model] = {"input": 0, "output": 0}
+    token_usage[model]["input"] += inp
+    token_usage[model]["output"] += out
 
 # Bot info (set on startup)
 context_bot_id = None
@@ -593,7 +609,7 @@ def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GRO
 
 
 def get_chat_model(chat_id: int) -> str:
-    return "claude-opus-4-8" if chat_id in opus_chats else "claude-sonnet-4-6"
+    return db.get_chat_model_db(chat_id)
 
 
 # --- Captcha handler ---
@@ -660,8 +676,9 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
             continue
         try:
             chat_log = "\n".join(messages)
+            _model = get_chat_model(chat_id)
             response = client.messages.create(
-                model="claude-sonnet-4-6",
+                model=_model,
                 max_tokens=1024,
                 system=(
                     "Ты Клодушка — AI с характером, которая считает себя умнее всех в чате (и не без оснований). "
@@ -681,8 +698,7 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
                 messages=[{"role": "user", "content": f"Вот сообщения за день:\n{chat_log}"}],
             )
             review = response.content[0].text
-            token_usage["input"] += response.usage.input_tokens
-            token_usage["output"] += response.usage.output_tokens
+            _track_tokens(_model, response.usage.input_tokens, response.usage.output_tokens)
             await context.bot.send_message(chat_id=chat_id, text=review)
             logger.info(f"Daily review sent to {chat_id}")
         except Exception as e:
@@ -925,14 +941,30 @@ async def cmd_captcha_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    chats = db.get_allowed_chats()
+    chats = db.get_all_chats_for_status()
+    users = db.list_all_users()
+
+    lines = ["Группы:"]
+    STATUS_ICON = {"approved": "✅", "pending": "⏳", "rejected": "❌"}
+    for c in chats:
+        icon = STATUS_ICON.get(c["status"], "?")
+        name = c["name"] or str(c["chat_id"])
+        model = MODEL_NAMES.get(c["model"], c["model"])
+        lines.append(f"  {icon} {name} ({c['chat_id']}) — {model}")
     if not chats:
-        await context.bot.send_message(chat_id=update.effective_user.id, text="Нет разрешённых чатов.")
-    else:
-        lines = [f"• {c['name'] or 'без имени'} ({c['chat_id']})" for c in chats]
-        await context.bot.send_message(chat_id=update.effective_user.id, text="Разрешённые чаты:\n\n" + "\n".join(lines))
+        lines.append("  нет чатов")
+
+    lines.append("")
+    lines.append("Пользователи:")
+    for u in users:
+        name = u["full_name"] or u["username"] or str(u["telegram_id"])
+        model = MODEL_NAMES.get(db.get_chat_model_db(u["telegram_id"]), "Haiku 4.5")
+        lines.append(f"  {u['role']:8} {name} ({u['telegram_id']}) — {model}")
+
+    text = "\n".join(lines)
+    await context.bot.send_message(chat_id=update.effective_user.id, text=text)
     if update.effective_chat.id != update.effective_user.id:
-        await update.message.reply_text("📩 Отправила тебе в личку.")
+        await update.message.reply_text("Отправила в личку.")
 
 
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -959,8 +991,9 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     try:
         chat_log = "\n".join(messages)
+        _model = get_chat_model(chat_id)
         response = client.messages.create(
-            model="claude-sonnet-4-6",
+            model=_model,
             max_tokens=1024,
             system=(
                 "Ты Клодушка — AI с характером, которая считает себя умнее всех в чате (и не без оснований). "
@@ -972,8 +1005,7 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages=[{"role": "user", "content": f"Вот сообщения за день:\n{chat_log}"}],
         )
         review = response.content[0].text
-        token_usage["input"] += response.usage.input_tokens
-        token_usage["output"] += response.usage.output_tokens
+        _track_tokens(_model, response.usage.input_tokens, response.usage.output_tokens)
         await update.message.reply_text(review)
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
@@ -1063,30 +1095,52 @@ async def cmd_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    inp = token_usage["input"]
-    out = token_usage["output"]
-    cost_in = inp / 1_000_000 * 3
-    cost_out = out / 1_000_000 * 15
-    total = cost_in + cost_out
-    await update.message.reply_text(
-        f"Токены диалогов:\n  Вход: {inp:,}\n  Выход: {out:,}\n  ~${total:.4f} (Sonnet)"
-    )
+    lines = ["Токены по моделям:"]
+    grand_total = 0.0
+    for model, usage in sorted(token_usage.items()):
+        inp = usage["input"]
+        out = usage["output"]
+        price_in, price_out = MODEL_PRICING.get(model, (3.00, 15.00))
+        cost = (inp / 1_000_000 * price_in) + (out / 1_000_000 * price_out)
+        grand_total += cost
+        name = MODEL_NAMES.get(model, model)
+        lines.append(f"  {name}: вх {inp:,} / вых {out:,} — ~${cost:.4f}")
+    lines.append(f"Итого: ~${grand_total:.4f}")
+    await update.message.reply_text("\n".join(lines))
 
 
-async def cmd_opus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _resolve_model_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    """В чате — текущий chat_id; в личке — берём из аргумента."""
+    if update.effective_chat.type == "private" and context.args:
+        try:
+            return int(context.args[0])
+        except ValueError:
+            return None
+    return update.effective_chat.id
+
+
+async def _set_chat_model(update: Update, context: ContextTypes.DEFAULT_TYPE, model: str):
     if not is_admin(update.effective_user.id):
         return
-    chat_id = update.effective_chat.id
-    opus_chats.add(chat_id)
-    await update.message.reply_text("Переключила на Opus 4.8 для этого чата.")
+    chat_id = _resolve_model_chat_id(update, context)
+    if chat_id is None:
+        await update.message.reply_text(f"В личке укажи ID чата: /{model.split('-')[1]} <chat_id>")
+        return
+    db.set_chat_model_db(chat_id, model)
+    name = MODEL_NAMES.get(model, model)
+    await update.message.reply_text(f"Чат {chat_id} → {name}.")
+
+
+async def cmd_haiku(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _set_chat_model(update, context, "claude-haiku-4-5-20251001")
 
 
 async def cmd_sonnet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    chat_id = update.effective_chat.id
-    opus_chats.discard(chat_id)
-    await update.message.reply_text("Вернула на Sonnet 4.6 для этого чата.")
+    await _set_chat_model(update, context, "claude-sonnet-4-6")
+
+
+async def cmd_opus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _set_chat_model(update, context, "claude-opus-4-8")
 
 
 # --- User commands ---
@@ -1572,15 +1626,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             system = get_system_prompt(user_id, is_group, chat_id if is_group else None)
             doc_history = [{"role": "user", "content": full_prompt}]
 
+            _model = get_chat_model(chat_id)
             response = client.messages.create(
-                model=get_chat_model(chat_id),
+                model=_model,
                 max_tokens=4096,
                 system=system,
                 messages=doc_history,
             )
             answer = response.content[0].text
-            token_usage["input"] += response.usage.input_tokens
-            token_usage["output"] += response.usage.output_tokens
+            _track_tokens(_model, response.usage.input_tokens, response.usage.output_tokens)
 
             if is_group:
                 db.save_group_message(chat_id, context_bot_id, "Клодушка", answer, is_bot=True)
@@ -1633,15 +1687,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
 
             system = get_system_prompt(user_id, is_group, chat_id if is_group else None)
+            _model = get_chat_model(chat_id)
             response = client.messages.create(
-                model=get_chat_model(chat_id),
+                model=_model,
                 max_tokens=2048,
                 system=system,
                 messages=vision_messages,
             )
             answer = response.content[0].text
-            token_usage["input"] += response.usage.input_tokens
-            token_usage["output"] += response.usage.output_tokens
+            _track_tokens(_model, response.usage.input_tokens, response.usage.output_tokens)
 
             # Save to history as text
             if is_group:
@@ -1712,16 +1766,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if search_context:
             system += search_context + "\nИспользуй найденное в ответе."
 
+        _model = get_chat_model(chat_id)
         response = client.messages.create(
-            model=get_chat_model(chat_id),
+            model=_model,
             max_tokens=4096,
             system=system,
             messages=messages,
         )
 
         assistant_text = response.content[0].text
-        token_usage["input"] += response.usage.input_tokens
-        token_usage["output"] += response.usage.output_tokens
+        _track_tokens(_model, response.usage.input_tokens, response.usage.output_tokens)
 
         # Клодушка могла сама инициировать рисование маркером [[DRAW: ...]] внутри ответа.
         draw_match = DRAW_MARKER_RE.search(assistant_text)
@@ -1822,8 +1876,9 @@ def main():
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("activity", cmd_activity))
     app.add_handler(CommandHandler("cost", cmd_cost))
-    app.add_handler(CommandHandler("opus", cmd_opus))
+    app.add_handler(CommandHandler("haiku", cmd_haiku))
     app.add_handler(CommandHandler("sonnet", cmd_sonnet))
+    app.add_handler(CommandHandler("opus", cmd_opus))
     app.add_handler(CommandHandler("approve_chat", cmd_approve_chat))
     app.add_handler(CommandHandler("reject_chat", cmd_reject_chat))
     app.add_handler(ChatMemberHandler(handle_new_chat, ChatMemberHandler.MY_CHAT_MEMBER))
