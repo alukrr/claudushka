@@ -828,18 +828,23 @@ async def cmd_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    users = db.list_all_users()
-    if not users:
-        await update.message.reply_text("Пользователей нет.")
-        return
-    lines = []
-    role_emoji = {"admin": "👑", "premium": "⭐", "referral": "🔗", "street": "🚶", "banned": "🚫"}
-    for u in users:
-        emoji = role_emoji.get(u["role"], "?")
-        name = u["full_name"] or u["username"] or str(u["telegram_id"])
-        verified = "✓" if u["verified"] else "✗"
-        lines.append(f"{emoji} {name} ({u['telegram_id']}) [{verified}]")
-    await update.message.reply_text("Пользователи:\n\n" + "\n".join(lines))
+    try:
+        users = db.list_all_users()
+        if not users:
+            await update.effective_message.reply_text("Пользователей нет.")
+            return
+        role_emoji = {"admin": "👑", "premium": "⭐", "referral": "🔗", "street": "🚶", "banned": "🚫"}
+        lines = []
+        for u in users:
+            emoji = role_emoji.get(u["role"], "?")
+            name = u["full_name"] or u["username"] or str(u["telegram_id"])
+            verified = "✓" if u["verified"] else "✗"
+            lines.append(f"{emoji} {name} ({u['telegram_id']}) [{verified}]")
+        text = "Пользователи:\n\n" + "\n".join(lines)
+        for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
+            await update.effective_message.reply_text(chunk)
+    except Exception as e:
+        await update.effective_message.reply_text(f"Ошибка: {e}")
 
 
 async def cmd_allow_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -868,31 +873,42 @@ async def cmd_deny_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    admins = db.list_users_by_role("admin")
-    premiums = db.list_users_by_role("premium")
-    referrals = db.list_users_by_role("referral")
-    streets = db.list_users_by_role("street")
-    banned = db.list_users_by_role("banned")
-    chats = db.get_allowed_chats()
+    try:
+        admins = db.list_users_by_role("admin")
+        premiums = db.list_users_by_role("premium")
+        referrals = db.list_users_by_role("referral")
+        streets = db.list_users_by_role("street")
+        banned = db.list_users_by_role("banned")
+        chats = db.get_allowed_chats()
 
-    def fmt(users):
-        if not users:
-            return "  пусто"
-        return "\n".join(f"  • {u['full_name'] or u['telegram_id']} ({u['telegram_id']})" for u in users)
+        def fmt(users):
+            if not users:
+                return "  пусто"
+            return "\n".join(f"  • {u['full_name'] or u['telegram_id']} ({u['telegram_id']})" for u in users)
 
-    text = (
-        f"Whitelist: {'ВКЛ' if WHITELIST_ENABLED else 'ВЫКЛ'}\n"
-        f"Капча: {'ВКЛ' if CAPTCHA_ENABLED else 'ВЫКЛ'}\n\n"
-        f"👑 Админы:\n{fmt(admins)}\n\n"
-        f"⭐ Премиум:\n{fmt(premiums)}\n\n"
-        f"🔗 По приглашению:\n{fmt(referrals)}\n\n"
-        f"🚶 С улицы:\n{fmt(streets)}\n\n"
-        f"🚫 Забанены:\n{fmt(banned)}\n\n"
-        f"Чаты: {len(chats)}"
-    )
-    await context.bot.send_message(chat_id=update.effective_user.id, text=text)
-    if update.effective_chat.id != update.effective_user.id:
-        await update.message.reply_text("📩 Отправила тебе в личку.")
+        text = (
+            f"Whitelist: {'ВКЛ' if WHITELIST_ENABLED else 'ВЫКЛ'}\n"
+            f"Капча: {'ВКЛ' if CAPTCHA_ENABLED else 'ВЫКЛ'}\n\n"
+            f"👑 Админы:\n{fmt(admins)}\n\n"
+            f"⭐ Премиум:\n{fmt(premiums)}\n\n"
+            f"🔗 По приглашению:\n{fmt(referrals)}\n\n"
+            f"🚶 С улицы:\n{fmt(streets)}\n\n"
+            f"🚫 Забанены:\n{fmt(banned)}\n\n"
+            f"Чаты: {len(chats)}"
+        )
+        sent_pm = False
+        if update.effective_user:
+            try:
+                await context.bot.send_message(chat_id=update.effective_user.id, text=text)
+                sent_pm = True
+            except Exception:
+                pass
+        if not sent_pm or update.effective_chat.id == update.effective_user.id:
+            await update.effective_message.reply_text(text)
+        elif update.effective_chat.id != update.effective_user.id:
+            await update.effective_message.reply_text("Отправила в личку.")
+    except Exception as e:
+        await update.effective_message.reply_text(f"Ошибка: {e}")
 
 
 async def cmd_whitelist_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -941,30 +957,42 @@ async def cmd_captcha_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    chats = db.get_all_chats_for_status()
-    users = db.list_all_users()
+    try:
+        chats = db.get_all_chats_for_status()
+        users = db.list_all_users()
 
-    lines = ["Группы:"]
-    STATUS_ICON = {"approved": "✅", "pending": "⏳", "rejected": "❌"}
-    for c in chats:
-        icon = STATUS_ICON.get(c["status"], "?")
-        name = c["name"] or str(c["chat_id"])
-        model = MODEL_NAMES.get(c["model"], c["model"])
-        lines.append(f"  {icon} {name} ({c['chat_id']}) — {model}")
-    if not chats:
-        lines.append("  нет чатов")
+        STATUS_ICON = {"approved": "✅", "pending": "⏳", "rejected": "❌"}
+        lines = ["Группы:"]
+        for c in chats:
+            icon = STATUS_ICON.get(c["status"], "?")
+            name = c["name"] or str(c["chat_id"])
+            model = MODEL_NAMES.get(c["model"], c["model"])
+            lines.append(f"  {icon} {name} ({c['chat_id']}) — {model}")
+        if not chats:
+            lines.append("  нет чатов")
 
-    lines.append("")
-    lines.append("Пользователи:")
-    for u in users:
-        name = u["full_name"] or u["username"] or str(u["telegram_id"])
-        model = MODEL_NAMES.get(db.get_chat_model_db(u["telegram_id"]), "Haiku 4.5")
-        lines.append(f"  {u['role']:8} {name} ({u['telegram_id']}) — {model}")
+        lines.append("")
+        lines.append("Пользователи:")
+        for u in users:
+            name = u["full_name"] or u["username"] or str(u["telegram_id"])
+            model = MODEL_NAMES.get(db.get_chat_model_db(u["telegram_id"]), "Haiku 4.5")
+            lines.append(f"  {u['role']:8} {name} ({u['telegram_id']}) — {model}")
 
-    text = "\n".join(lines)
-    await context.bot.send_message(chat_id=update.effective_user.id, text=text)
-    if update.effective_chat.id != update.effective_user.id:
-        await update.message.reply_text("Отправила в личку.")
+        text = "\n".join(lines)
+        sent_pm = False
+        if update.effective_user:
+            try:
+                await context.bot.send_message(chat_id=update.effective_user.id, text=text)
+                sent_pm = True
+            except Exception:
+                pass
+        if not sent_pm or update.effective_chat.id == update.effective_user.id:
+            for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
+                await update.effective_message.reply_text(chunk)
+        elif update.effective_chat.id != update.effective_user.id:
+            await update.effective_message.reply_text("Отправила в личку.")
+    except Exception as e:
+        await update.effective_message.reply_text(f"Ошибка: {e}")
 
 
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1077,36 +1105,44 @@ async def cmd_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CHAT_ACTIVITY_CHANCE
     if not is_admin(update.effective_user.id):
         return
-    if not context.args:
-        pct = int(CHAT_ACTIVITY_CHANCE * 100)
-        await update.message.reply_text(f"Активность в чатах: {pct}%\nИспользование: /activity <0-100>")
-        return
     try:
+        if not context.args:
+            pct = int(CHAT_ACTIVITY_CHANCE * 100)
+            await update.effective_message.reply_text(f"Активность в чатах: {pct}%\nИспользование: /activity <0-100>")
+            return
         val = int(context.args[0])
         if 0 <= val <= 100:
             CHAT_ACTIVITY_CHANCE = val / 100
-            await update.message.reply_text(f"Активность установлена: {val}%")
+            await update.effective_message.reply_text(f"Активность установлена: {val}%")
         else:
-            await update.message.reply_text("Значение от 0 до 100")
+            await update.effective_message.reply_text("Значение от 0 до 100")
     except ValueError:
-        await update.message.reply_text("Укажи число от 0 до 100")
+        await update.effective_message.reply_text("Укажи число от 0 до 100")
+    except Exception as e:
+        await update.effective_message.reply_text(f"Ошибка: {e}")
 
 
 async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    lines = ["Токены по моделям:"]
-    grand_total = 0.0
-    for model, usage in sorted(token_usage.items()):
-        inp = usage["input"]
-        out = usage["output"]
-        price_in, price_out = MODEL_PRICING.get(model, (3.00, 15.00))
-        cost = (inp / 1_000_000 * price_in) + (out / 1_000_000 * price_out)
-        grand_total += cost
-        name = MODEL_NAMES.get(model, model)
-        lines.append(f"  {name}: вх {inp:,} / вых {out:,} — ~${cost:.4f}")
-    lines.append(f"Итого: ~${grand_total:.4f}")
-    await update.message.reply_text("\n".join(lines))
+    try:
+        if not token_usage:
+            await update.effective_message.reply_text("Токенов пока нет (счётчик сбрасывается при рестарте).")
+            return
+        lines = ["Токены по моделям:"]
+        grand_total = 0.0
+        for model, usage in sorted(token_usage.items()):
+            inp = usage["input"]
+            out = usage["output"]
+            price_in, price_out = MODEL_PRICING.get(model, (3.00, 15.00))
+            cost = (inp / 1_000_000 * price_in) + (out / 1_000_000 * price_out)
+            grand_total += cost
+            name = MODEL_NAMES.get(model, model)
+            lines.append(f"  {name}: вх {inp:,} / вых {out:,} — ~${cost:.4f}")
+        lines.append(f"Итого: ~${grand_total:.4f}")
+        await update.effective_message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.effective_message.reply_text(f"Ошибка: {e}")
 
 
 def _resolve_model_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
@@ -1426,16 +1462,19 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    is_group = update.effective_chat.type in ("group", "supergroup")
-    if is_group:
-        facts = db.get_memory(update.effective_user.id, "group", update.effective_chat.id)
-    else:
-        facts = db.get_memory_for_private(update.effective_user.id)
-    if facts:
-        text = "\n".join(f"• {f}" for f in facts)
-        await update.message.reply_text(f"Я помню о тебе:\n\n{text}")
-    else:
-        await update.message.reply_text("Пока ничего не помню. Поговорим — запомню!")
+    try:
+        is_group = update.effective_chat.type in ("group", "supergroup")
+        if is_group:
+            facts = db.get_memory(update.effective_user.id, "group", update.effective_chat.id)
+        else:
+            facts = db.get_memory_for_private(update.effective_user.id)
+        if facts:
+            text = "\n".join(f"• {f}" for f in facts)
+            await update.effective_message.reply_text(f"Я помню о тебе:\n\n{text}")
+        else:
+            await update.effective_message.reply_text("Пока ничего не помню. Поговорим — запомню!")
+    except Exception as e:
+        await update.effective_message.reply_text(f"Ошибка: {e}")
 
 
 async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
