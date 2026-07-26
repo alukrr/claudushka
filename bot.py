@@ -32,7 +32,7 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 MAX_HISTORY = 40
 GROUP_TRANSCRIPT_LIMIT = 50   # сколько реплик группового транскрипта тащить в messages
 MEMORY_EXTRACT_EVERY = 5
-MEMORY_EXTRACT_EVERY_CHAT = 10  # чат-уровневый каденс извлечения групповой памяти
+MEMORY_EXTRACT_EVERY_CHAT = 15  # чат-уровневый каденс извлечения памяти; считает и реплики бота
 MAX_CAPTCHA_ATTEMPTS = 3
 BAN_DURATION = 3600
 STREET_DAILY_LIMIT = 10
@@ -1621,10 +1621,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cap = update.message.caption or ""
             db.save_group_message(chat_id, user_id, sender, f"[Файл: {fn}] {cap}".strip())
         # Извлечение памяти для всех участников — каждые MEMORY_EXTRACT_EVERY_CHAT сообщений,
-        # независимо от того, упомянут бот или нет.
-        chat_msg_count = db.count_chat_messages(chat_id)
-        if chat_msg_count > 0 and chat_msg_count % MEMORY_EXTRACT_EVERY_CHAT == 0:
-            extract_all_participants_memory(chat_id)
+        # независимо от того, упомянут бот или нет. Каденс считается по дельте
+        # group_messages.id, а не по COUNT(*) — см. db.should_extract_chat_memory.
+        if db.should_extract_chat_memory(chat_id, MEMORY_EXTRACT_EVERY_CHAT):
+            asyncio.create_task(asyncio.to_thread(extract_all_participants_memory, chat_id))
 
     if is_group and not is_bot_mentioned(update):
         return

@@ -93,6 +93,11 @@ def init_db():
             model TEXT NOT NULL DEFAULT 'claude-haiku-4-5-20251001'
         );
 
+        CREATE TABLE IF NOT EXISTS chat_extract_state (
+            chat_id INTEGER PRIMARY KEY,
+            last_extract_id INTEGER NOT NULL DEFAULT 0
+        );
+
         CREATE INDEX IF NOT EXISTS idx_conv_user ON conversations(user_id);
         CREATE INDEX IF NOT EXISTS idx_conv_ts ON conversations(user_id, timestamp);
         CREATE INDEX IF NOT EXISTS idx_memory_user ON memory(user_id);
@@ -390,6 +395,41 @@ def count_chat_messages(chat_id: int) -> int:
     return row["c"] if row else 0
 
 
+def should_extract_chat_memory(chat_id: int, every: int) -> bool:
+    """True, если в ЭТОМ чате с прошлого извлечения накопилось >= every сообщений.
+
+    Считает строки чата новее last_extract_id, а не COUNT(*) по всему чату: подрезка
+    до 1000 в save_group_message делает общий счётчик немонотонным, и проверка по
+    модулю от него залипает.
+    Дельту MAX(id) брать нельзя — id это глобальный AUTOINCREMENT на все чаты сразу,
+    поэтому болтовня в соседней группе продвигала бы счётчик тихому чату и извлечение
+    (вызов Haiku на 50 реплик) запускалось бы почти на каждом его сообщении.
+    Побочный эффект: при True сразу двигает last_extract_id — повторного вызова не будет.
+    """
+    conn = get_conn()
+    cur = conn.execute(
+        "SELECT MAX(id) FROM group_messages WHERE chat_id = ?", (chat_id,)
+    ).fetchone()[0] or 0
+    row = conn.execute(
+        "SELECT last_extract_id FROM chat_extract_state WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    last_id = row[0] if row else 0
+    fresh = conn.execute(
+        "SELECT COUNT(*) FROM group_messages WHERE chat_id = ? AND id > ?", (chat_id, last_id)
+    ).fetchone()[0]
+    if fresh < every:
+        conn.close()
+        return False
+    conn.execute(
+        "INSERT INTO chat_extract_state (chat_id, last_extract_id) VALUES (?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET last_extract_id = excluded.last_extract_id",
+        (chat_id, cur)
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
 def get_user_id_by_name_in_chat(chat_id: int, sender_name: str) -> int | None:
     """Ищет user_id по sender_name в group_messages — для атрибуции фактов при извлечении памяти."""
     conn = get_conn()
@@ -402,26 +442,42 @@ def get_user_id_by_name_in_chat(chat_id: int, sender_name: str) -> int | None:
     return row["user_id"] if row else None
 
 
+MEMORY_LONG_PER_USER = 12
+MEMORY_MEDIUM_PER_USER = 8
+
+
 def get_all_chat_memory(chat_id: int) -> list[dict]:
-    """Все актуальные факты обо всех участниках чата, сгруппированные по людям.
+    """Актуальные факты об участниках чата, не более N на человека по каждому tier.
 
     Возвращает [{"name": str, "long": [str, ...], "medium": [str, ...]}].
-    Просроченные среднесрочные факты не включаются. Изоляция по chat_id.
+    Берутся самые свежие. Просроченные среднесрочные не включаются. Изоляция по chat_id.
+    Потолок на человека обязателен: без него старые чаты раздували system-prompt
+    до сотен тысяч токенов, и Клодушка переставала отвечать.
     """
     now = int(time.time())
     conn = get_conn()
     rows = conn.execute(
         """
-        SELECT m.user_id, m.fact, COALESCE(m.tier, 'long') AS tier,
+        WITH ranked AS (
+            SELECT m.user_id, m.fact, m.created_at,
+                   COALESCE(m.tier, 'long') AS tier,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY m.user_id, COALESCE(m.tier, 'long')
+                       ORDER BY m.created_at DESC
+                   ) AS rn
+            FROM memory m
+            WHERE m.context = 'group' AND m.chat_id = ?
+              AND (m.expires_at IS NULL OR m.expires_at > ?)
+        )
+        SELECT r.user_id, r.fact, r.tier,
                (SELECT gm.sender_name FROM group_messages gm
-                WHERE gm.chat_id = ? AND gm.user_id = m.user_id AND gm.sender_name IS NOT NULL
+                WHERE gm.chat_id = ? AND gm.user_id = r.user_id AND gm.sender_name IS NOT NULL
                 ORDER BY gm.timestamp DESC LIMIT 1) AS sender_name
-        FROM memory m
-        WHERE m.context = 'group' AND m.chat_id = ?
-          AND (m.expires_at IS NULL OR m.expires_at > ?)
-        ORDER BY m.user_id, m.tier, m.created_at
+        FROM ranked r
+        WHERE (r.tier = 'medium' AND r.rn <= ?) OR (r.tier != 'medium' AND r.rn <= ?)
+        ORDER BY r.user_id, r.tier, r.created_at
         """,
-        (chat_id, chat_id, now)
+        (chat_id, now, chat_id, MEMORY_MEDIUM_PER_USER, MEMORY_LONG_PER_USER)
     ).fetchall()
     conn.close()
     by_user: dict[int, dict] = {}
