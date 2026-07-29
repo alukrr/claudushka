@@ -79,25 +79,63 @@ def _track_tokens(model: str, inp: int, out: int):
 
 # --- Вызов Anthropic API из async-хендлеров ---
 
+async def _keep_chat_action(bot, chat_id: int, action: str, stop_event: asyncio.Event) -> None:
+    """Держит индикатор («печатает…», «отправляет фото…») живым, пока не выставлен stop_event.
+
+    Telegram гасит индикатор примерно через 5 секунд, поэтому обновляем каждые 4.
+    """
+    try:
+        while not stop_event.is_set():
+            try:
+                await bot.send_chat_action(chat_id=chat_id, action=action)
+            except Exception as e:
+                logger.debug(f"chat_action refresh failed: {e}")
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=4.0)
+            except asyncio.TimeoutError:
+                pass
+    except asyncio.CancelledError:
+        pass
+
+
 async def call_claude(context, chat_id: int | None, *, label: str, **kwargs):
     """messages.create из хендлера: не блокирует event loop, переживает 529/429/сеть.
 
-    Между попытками обновляет «печатает…», чтобы ожидание не выглядело зависанием.
-    Исключение после всех попыток пробрасывается наверх — там его ловит reply_api_error.
+    Всю паузу между попытками держит «печатает…», чтобы ожидание (до 15с) не выглядело
+    зависанием. Исключение после всех попыток пробрасывается наверх — его ловит
+    reply_api_error.
     """
-    on_retry = None
+    keepalive = None
     if context is not None and chat_id is not None:
-        async def on_retry():
-            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        keepalive = functools.partial(_keep_chat_action, context.bot, chat_id, "typing")
 
     return await api_errors.call_with_retry(
         functools.partial(client_noretry.messages.create, **kwargs),
         label=label,
-        on_retry=on_retry,
+        keepalive=keepalive,
     )
 
 
-_history_chars = api_errors.history_chars
+async def call_claude_aux(fn, *args, label: str = "aux"):
+    """Вспомогательная СИНХРОННАЯ функция (should_search, капча, web_search) — в поток.
+
+    Ретраи здесь SDK-шные (max_retries на клиенте): они дешевле и им не нужен индикатор,
+    но выполняться должны вне event loop, иначе лестница бэкоффа (0.5+1+2+4 ≈ 8с) вешает
+    бота ещё ДО основного запроса.
+    """
+    return await asyncio.to_thread(fn, *args)
+
+
+async def aux_create(**kwargs):
+    """Вспомогательный messages.create прямо из async-кода — тоже в поток.
+
+    Именно `await aux_create(...)` вместо `client.messages.create(...)` во всех
+    служебных путях: перевод промпта, капча, приветствие, дневной обзор, фильтр фактов.
+    """
+    return await asyncio.to_thread(functools.partial(client.messages.create, **kwargs))
+
+
+_history_stats = api_errors.history_stats
 _halve_history = api_errors.halve_history
 
 
@@ -285,7 +323,7 @@ async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str 
 
 async def _rewrite_prompt(prompt: str) -> str | None:
     try:
-        resp = client.messages.create(
+        resp = await aux_create(
             model="claude-haiku-4-5-20251001",
             max_tokens=150,
             system=(
@@ -326,21 +364,6 @@ async def generate_image_with_error(prompt: str) -> tuple[bytes | None, str | No
     return None, final_error, None
 
 
-async def _keep_upload_photo_action(bot, chat_id: int, stop_event: asyncio.Event) -> None:
-    try:
-        while not stop_event.is_set():
-            try:
-                await bot.send_chat_action(chat_id=chat_id, action="upload_photo")
-            except Exception as e:
-                logger.debug(f"chat_action refresh failed: {e}")
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=4.0)
-            except asyncio.TimeoutError:
-                pass
-    except asyncio.CancelledError:
-        pass
-
-
 async def _draw_and_send(update, context, chat_id: int, is_group: bool,
                          draw_prompt: str, en_prompt: str = None, author: str = None) -> bool:
     """Генерирует картинку и отправляет в чат. Возвращает True при успехе.
@@ -351,7 +374,7 @@ async def _draw_and_send(update, context, chat_id: int, is_group: bool,
     """
     if en_prompt is None:
         try:
-            translate_resp = client.messages.create(
+            translate_resp = await aux_create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=200,
                 system=(
@@ -366,7 +389,7 @@ async def _draw_and_send(update, context, chat_id: int, is_group: bool,
             en_prompt = draw_prompt
 
     stop_event = asyncio.Event()
-    keepalive_task = asyncio.create_task(_keep_upload_photo_action(context.bot, chat_id, stop_event))
+    keepalive_task = asyncio.create_task(_keep_chat_action(context.bot, chat_id, "upload_photo", stop_event))
     try:
         image_data, error_msg, provider = await generate_image_with_error(en_prompt)
     finally:
@@ -431,7 +454,14 @@ def check_captcha_answer(question: str, answer: str) -> bool:
 
 # --- Memory ---
 
-def get_system_prompt(user_id: int, is_group: bool = False, chat_id: int = None) -> str:
+def get_system_prompt(user_id: int, is_group: bool = False, chat_id: int = None,
+                      include_memory: bool = True) -> str:
+    """include_memory=False — аварийная пересборка без блока памяти.
+
+    Память (особенно групповая, по всем участникам) — самый жирный и самый выбрасываемый
+    компонент system-prompt: в инциденте 2026-07-26 она весила 236k токенов против ~7k
+    истории. Используется веткой восстановления при 400 prompt is too long.
+    """
     now = datetime.now(timezone(timedelta(hours=1)))  # CET/CEST approx Berlin
     date_str = now.strftime("%d.%m.%Y %H:%M")
     base = (
@@ -483,6 +513,8 @@ def get_system_prompt(user_id: int, is_group: bool = False, chat_id: int = None)
             "Твои собственные прошлые реплики идут как assistant-сообщения — это то, что ты УЖЕ сказала, "
             "не повторяйся и не приписывай свои слова другим."
         )
+    if not include_memory:
+        return base
     if is_group:
         # Группа: факты про ВСЕХ участников этого чата (долго- и среднесрочные).
         all_memory = db.get_all_chat_memory(chat_id)
@@ -674,7 +706,7 @@ async def handle_captcha(update: Update, user: dict) -> bool:
         attempts = captcha_state[uid].get("attempts", 0) + 1
         captcha_state[uid]["attempts"] = attempts
 
-        if check_captcha_answer(question, user_text):
+        if await call_claude_aux(check_captcha_answer, question, user_text, label="captcha_check"):
             db.set_verified(user_id, True)
             captcha_state.pop(uid, None)
             await update.message.reply_text("Добро пожаловать! Теперь можешь общаться со мной свободно.")
@@ -689,7 +721,7 @@ async def handle_captcha(update: Update, user: dict) -> bool:
             return True
     else:
         try:
-            question = generate_captcha_question(user_text)
+            question = await call_claude_aux(generate_captcha_question, user_text, label="captcha_gen")
             captcha_state[uid] = {"question": question, "attempts": 0}
             await update.message.reply_text(
                 f"Привет! Для начала ответь на вопрос, чтобы я убедился что ты человек:\n\n{question}"
@@ -712,7 +744,7 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
         try:
             chat_log = "\n".join(messages)
             _model = get_chat_model(chat_id)
-            response = client.messages.create(
+            response = await aux_create(
                 model=_model,
                 max_tokens=1024,
                 system=(
@@ -747,7 +779,7 @@ async def greet_new_member(chat_id: int, user_id: int, user_name: str, bot):
     safe_facts = []
     if facts:
         try:
-            filter_resp = client.messages.create(
+            filter_resp = await aux_create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=300,
                 system=(
@@ -769,7 +801,7 @@ async def greet_new_member(chat_id: int, user_id: int, user_name: str, bot):
 
     try:
         facts_hint = f"\nЧто ты знаешь об этом человеке (используй естественно, не перечисляй): {'; '.join(safe_facts)}" if safe_facts else ""
-        response = client.messages.create(
+        response = await aux_create(
             model="claude-haiku-4-5-20251001",
             max_tokens=150,
             system=(
@@ -1312,7 +1344,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if needs_captcha(user):
         if CAPTCHA_ENABLED:
             try:
-                question = generate_captcha_question("hello")
+                question = await call_claude_aux(generate_captcha_question, "hello", label="captcha_gen")
                 captcha_state[str(user_id)] = {"question": question, "attempts": 0}
                 await update.message.reply_text(f"Привет! Для начала ответь на вопрос:\n\n{question}")
             except Exception as e:
@@ -1457,7 +1489,7 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("Рисую... это может занять пару минут.")
 
     stop_event = asyncio.Event()
-    keepalive_task = asyncio.create_task(_keep_upload_photo_action(context.bot, chat_id, stop_event))
+    keepalive_task = asyncio.create_task(_keep_chat_action(context.bot, chat_id, "upload_photo", stop_event))
     try:
         image_data, error_msg, provider = await generate_image_with_error(prompt)
     finally:
@@ -1777,7 +1809,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _model = get_chat_model(chat_id)
             logger.info(
                 f"PROMPT uid={user_id} chat={chat_id} model={_model} kind=document "
-                f"system={len(system)} history_chars={_history_chars(doc_history)} msgs={len(doc_history)}"
+                f"system={len(system)} history_chars={_history_stats(doc_history)[0]} msgs={len(doc_history)}"
             )
             response = await call_claude(
                 context, chat_id, label=f"файл chat={chat_id}",
@@ -1902,9 +1934,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         search_context = ""
         if can_search(user):
             search_input = f"{user_text}\nКонтекст реплая: {reply_context}".strip() if reply_context else user_text
-            search_query = should_search(search_input) if tavily else None
+            search_query = await call_claude_aux(should_search, search_input, label="should_search") if tavily else None
             if search_query:
-                search_results = web_search(search_query)
+                search_results = await call_claude_aux(web_search, search_query, label="web_search")
                 if search_results:
                     search_context = f"\n\nТы только что нашла в интернете по запросу «{search_query}»:\n{search_results}"
 
@@ -1925,10 +1957,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             system += search_context + "\nИспользуй найденное в ответе."
 
         _model = get_chat_model(chat_id)
-        hist_chars = _history_chars(messages)
+        hist_chars, hist_imgs = _history_stats(messages)
         logger.info(
             f"PROMPT uid={user_id} chat={chat_id} model={_model} "
-            f"system={len(system)} history_chars={hist_chars} msgs={len(messages)}"
+            f"system={len(system)} history_chars={hist_chars} msgs={len(messages)} imgs={hist_imgs}"
         )
         try:
             response = await call_claude(
@@ -1937,21 +1969,58 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except anthropic.BadRequestError as e:
             # 400 prompt is too long: история не сохранится, следующее сообщение соберёт
-            # тот же промпт и упадёт снова — чат заклинит навсегда. Режем историю вдвое
-            # и пробуем один раз; если и это мимо — исключение уйдёт наверх, пользователь
-            # получит честное «сделай /clear».
+            # тот же промпт и упадёт снова — чат заклинит навсегда (инцидент 2026-07-26).
+            # Режем ТОТ компонент, который реально доминирует: в том инциденте это была
+            # групповая память в system (236k токенов против ~7k истории), и обрезка
+            # истории не спасла бы, а совет «/clear» был бы бесполезен — память чистит
+            # /forget. Одна попытка восстановления, дальше — честное сообщение.
             if not api_errors.is_prompt_too_long(e):
                 raise
-            trimmed = _halve_history(messages)
+            retry_system, retry_messages, cut_hint = system, messages, None
+            if len(system) > hist_chars:
+                without_memory = get_system_prompt(
+                    user_id, is_group, chat_id if is_group else None, include_memory=False
+                )
+                if search_context:
+                    without_memory += search_context + "\nИспользуй найденное в ответе."
+                if len(without_memory) < len(system):
+                    retry_system = without_memory
+                    cut_hint = "Память распухла — почисти её через /forget."
+            else:
+                trimmed = _halve_history(messages)
+                if trimmed is not None:
+                    retry_messages = trimmed
+                    cut_hint = "История слишком длинная — сделай /clear."
+
+            new_hist_chars, _ = _history_stats(retry_messages)
             logger.warning(
-                f"PROMPT TOO LONG uid={user_id} chat={chat_id} model={_model} "
-                f"system={len(system)} history_chars={hist_chars} msgs={len(messages)} "
-                f"→ повтор с msgs={len(trimmed)} history_chars={_history_chars(trimmed)}"
+                f"PROMPT TOO LONG uid={user_id} chat={chat_id} model={_model} | было: "
+                f"system={len(system)} history_chars={hist_chars} msgs={len(messages)} | стало: "
+                f"system={len(retry_system)} history_chars={new_hist_chars} msgs={len(retry_messages)} | "
+                f"{'повтор' if cut_hint else 'резать нечего, повтора не будет'}"
             )
-            response = await call_claude(
-                context, chat_id, label=f"диалог chat={chat_id} (обрезанная история)",
-                model=_model, max_tokens=4096, system=system, messages=trimmed,
-            )
+            if cut_hint is None:
+                # Обрезка ничего не изменила — повтор соберёт тот же промпт и тот же 400.
+                await api_errors.reply_api_error(
+                    update.message.reply_text, e,
+                    context_label=f"диалог chat={chat_id} uid={user_id}",
+                )
+                return
+            try:
+                response = await call_claude(
+                    context, chat_id, label=f"диалог chat={chat_id} (аварийная обрезка)",
+                    model=_model, max_tokens=4096, system=retry_system, messages=retry_messages,
+                )
+            except anthropic.BadRequestError as e2:
+                if not api_errors.is_prompt_too_long(e2):
+                    raise
+                # Не помогло — подсказка должна соответствовать тому, что резали.
+                await api_errors.reply_api_error(
+                    update.message.reply_text, e2,
+                    context_label=f"диалог chat={chat_id} uid={user_id} (после обрезки)",
+                    clear_hint=cut_hint,
+                )
+                return
 
         assistant_text = response.content[0].text
         _track_tokens(_model, response.usage.input_tokens, response.usage.output_tokens)
@@ -1997,7 +2066,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_group:
             msg_count = len(messages)
             if msg_count > 0 and msg_count % (MEMORY_EXTRACT_EVERY * 2) == 0:
-                extract_memory(user_id, messages + [{"role": "assistant", "content": assistant_text}], False, None)
+                asyncio.create_task(asyncio.to_thread(
+                    extract_memory, user_id,
+                    messages + [{"role": "assistant", "content": assistant_text}], False, None))
 
         if assistant_text:
             if len(assistant_text) <= 4096:

@@ -99,7 +99,8 @@ def should_search(text: str) -> str | None:
 
 # --- System prompt & memory ---
 
-def get_system_prompt(phone: str) -> str:
+def get_system_prompt(phone: str, include_memory: bool = True) -> str:
+    """include_memory=False — аварийная пересборка без памяти при 400 prompt is too long."""
     base = (
         "Ты Клодушка — уникальная личность, не просто бот. "
         "Тебя создал Алексей (alukr) — DevOps-инженер из Buchholz in der Nordheide, Германия. "
@@ -119,7 +120,7 @@ def get_system_prompt(phone: str) -> str:
         "Ты работаешь через WhatsApp — не используй Markdown разметку (*, _, ` и т.д.), "
         "пиши обычным текстом без форматирования."
     )
-    facts = db.get_memory_by_key(phone, "whatsapp")
+    facts = db.get_memory_by_key(phone, "whatsapp") if include_memory else None
     if facts:
         facts_str = "\n".join(f"- {f}" for f in facts)
         base += f"\n\nВот что ты помнишь об этом пользователе:\n{facts_str}\nИспользуй эти знания естественно."
@@ -162,9 +163,9 @@ async def handle_wa_message(phone: str, text: str):
     try:
         search_context = ""
         if tavily:
-            search_query = should_search(text)
+            search_query = await asyncio.to_thread(should_search, text)
             if search_query:
-                results = web_search(search_query)
+                results = await asyncio.to_thread(web_search, search_query)
                 if results:
                     search_context = results
 
@@ -173,10 +174,10 @@ async def handle_wa_message(phone: str, text: str):
             system += f"\n\nРезультаты поиска:\n{search_context}"
 
         _model = "claude-sonnet-4-6"
-        hist_chars = api_errors.history_chars(history)
+        hist_chars, hist_imgs = api_errors.history_stats(history)
         logger.info(
             f"PROMPT wa={phone} model={_model} "
-            f"system={len(system)} history_chars={hist_chars} msgs={len(history)}"
+            f"system={len(system)} history_chars={hist_chars} msgs={len(history)} imgs={hist_imgs}"
         )
         try:
             response = await api_errors.call_with_retry(
@@ -188,21 +189,49 @@ async def handle_wa_message(phone: str, text: str):
             )
         except anthropic.BadRequestError as e:
             # 400 prompt is too long: без обрезки история не сохранится и тред заклинит
-            # навсегда. Режем вдвое и пробуем один раз.
+            # навсегда. Режем ТОТ компонент, который доминирует (как в bot.py).
             if not api_errors.is_prompt_too_long(e):
                 raise
-            trimmed = api_errors.halve_history(history)
+            retry_system, retry_messages, cut_hint = system, history, None
+            if len(system) > hist_chars:
+                without_memory = get_system_prompt(phone, include_memory=False)
+                if search_context:
+                    without_memory += f"\n\nРезультаты поиска:\n{search_context}"
+                if len(without_memory) < len(system):
+                    retry_system = without_memory
+                    cut_hint = "Память распухла — напиши Алексею, почистит."
+            else:
+                trimmed = api_errors.halve_history(history)
+                if trimmed is not None:
+                    retry_messages = trimmed
+                    cut_hint = "История слишком длинная — напиши Алексею, почистит."
+
+            new_hist_chars, _ = api_errors.history_stats(retry_messages)
             logger.warning(
-                f"PROMPT TOO LONG wa={phone} system={len(system)} history_chars={hist_chars} "
-                f"msgs={len(history)} → повтор с msgs={len(trimmed)}"
+                f"PROMPT TOO LONG wa={phone} | было: system={len(system)} "
+                f"history_chars={hist_chars} msgs={len(history)} | стало: system={len(retry_system)} "
+                f"history_chars={new_hist_chars} msgs={len(retry_messages)} | "
+                f"{'повтор' if cut_hint else 'резать нечего, повтора не будет'}"
             )
-            response = await api_errors.call_with_retry(
-                functools.partial(
-                    client_noretry.messages.create,
-                    model=_model, max_tokens=2048, system=system, messages=trimmed,
-                ),
-                label=f"WA {phone} (обрезанная история)",
-            )
+            if cut_hint is None:
+                raise
+            try:
+                response = await api_errors.call_with_retry(
+                    functools.partial(
+                        client_noretry.messages.create,
+                        model=_model, max_tokens=2048, system=retry_system, messages=retry_messages,
+                    ),
+                    label=f"WA {phone} (аварийная обрезка)",
+                )
+            except anthropic.BadRequestError as e2:
+                if not api_errors.is_prompt_too_long(e2):
+                    raise
+                await api_errors.reply_api_error(
+                    functools.partial(send_whatsapp_message, phone), e2,
+                    context_label=f"WA {phone} (после обрезки)",
+                    clear_hint=cut_hint,
+                )
+                return
 
         reply = response.content[0].text
 
@@ -211,7 +240,8 @@ async def handle_wa_message(phone: str, text: str):
 
         msg_count = len(history)
         if msg_count > 0 and msg_count % (MEMORY_EXTRACT_EVERY * 2) == 0:
-            extract_memory(phone, history + [{"role": "assistant", "content": reply}])
+            asyncio.create_task(asyncio.to_thread(
+                extract_memory, phone, history + [{"role": "assistant", "content": reply}]))
 
         await send_whatsapp_message(phone, reply)
 

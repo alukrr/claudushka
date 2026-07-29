@@ -24,10 +24,28 @@ RETRY_DELAYS = (2, 6, 15)
 
 PROMPT_TOO_LONG_MARKER = "prompt is too long"
 
+# Нейтральная подсказка: /clear чистит историю диалога, /forget — память.
+# Вес промпта бывает и там и там (инцидент 2026-07-26 — память), поэтому по умолчанию
+# называем оба. Ветки восстановления подставляют свою, более точную.
+CLEAR_HINT_DEFAULT = "Напиши /clear, а если не поможет — /forget."
+
 
 def is_prompt_too_long(exc: BaseException) -> bool:
-    """400 с 'prompt is too long' — особый случай: лечится обрезкой истории, не ретраем."""
-    return isinstance(exc, anthropic.BadRequestError) and PROMPT_TOO_LONG_MARKER in str(exc).lower()
+    """400 с 'prompt is too long' — особый случай: лечится обрезкой промпта, не ретраем.
+
+    Смотрим и на текст исключения, и на exc.body: SDK обычно кладёт тело ответа в
+    сообщение (`Error code: 400 - {...}`), но в ветке «ответ закрыт до чтения» строит
+    голое `Error code: 400` с body=None. Проверять только str(exc) — терять восстановление.
+    """
+    if not isinstance(exc, anthropic.BadRequestError):
+        return False
+    if PROMPT_TOO_LONG_MARKER in str(exc).lower():
+        return True
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        message = body.get("error", {}).get("message", "") if isinstance(body.get("error"), dict) else ""
+        return PROMPT_TOO_LONG_MARKER in str(message).lower()
+    return False
 
 
 def is_retryable(exc: BaseException) -> bool:
@@ -42,7 +60,7 @@ def is_retryable(exc: BaseException) -> bool:
     )
 
 
-def user_message(exc: BaseException, default: str | None = None, clear_hint: str = "Сделай /clear.") -> str:
+def user_message(exc: BaseException, default: str | None = None, clear_hint: str = CLEAR_HINT_DEFAULT) -> str:
     """Что показать пользователю. В характере Клодушки, коротко, без JSON и traceback.
 
     clear_hint — как пользователю сбросить историю. В Telegram это /clear,
@@ -57,7 +75,7 @@ def user_message(exc: BaseException, default: str | None = None, clear_hint: str
     if is_prompt_too_long(exc):
         return f"Контекст переполнен — я больше не влезаю в собственную память. {clear_hint}"
     if isinstance(exc, anthropic.BadRequestError):
-        return "Запрос не прошёл: API он не понравился. Попробуй переформулировать."
+        return "Запрос не прошёл: он API не понравился. Попробуй переформулировать."
     if isinstance(exc, anthropic.APIConnectionError):
         return "Не достучалась до сервиса. Попробуй ещё раз."
     if isinstance(exc, anthropic.APIStatusError):
@@ -65,22 +83,56 @@ def user_message(exc: BaseException, default: str | None = None, clear_hint: str
     return default or "Что-то сломалось на моей стороне. Попробуй ещё раз."
 
 
-def history_chars(messages: list) -> int:
-    """Размер истории в символах. content бывает списком блоков (фото) — считаем как есть."""
-    return sum(len(str(m.get("content", ""))) for m in messages)
+def history_stats(messages: list) -> tuple[int, int]:
+    """(символы ТЕКСТА, число картинок).
 
-
-def halve_history(messages: list) -> list:
-    """Оставить свежую половину истории (лечение 400 prompt is too long).
-
-    Первым обязан идти user — иначе API вернёт уже другой 400 про чередование ролей.
+    base64 изображений в символы НЕ включаем: одна картинка — сотни килобайт,
+    метрика распухает и перестаёт соотноситься с токенами. Именно эта цифра нужна
+    при разборе инцидентов, поэтому она должна быть честной.
     """
-    if len(messages) <= 2:
-        return messages
+    chars = 0
+    imgs = 0
+    for m in messages:
+        content = m.get("content", "")
+        if isinstance(content, str):
+            chars += len(content)
+            continue
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    chars += len(str(block))
+                elif block.get("type") == "text":
+                    chars += len(block.get("text", ""))
+                elif block.get("type") == "image":
+                    imgs += 1
+                else:
+                    chars += len(str(block.get("content", "")))
+        else:
+            chars += len(str(content))
+    return chars, imgs
+
+
+def halve_history(messages: list) -> list | None:
+    """Свежая половина истории (лечение 400 prompt is too long).
+
+    Возвращает None, если обрезать нечего — вызывающая сторона НЕ должна повторять
+    запрос: он соберётся идентичным и гарантированно получит тот же 400.
+
+    Первым обязан идти user, иначе API вернёт уже другой 400 про чередование ролей.
+    Если в свежей половине user-реплики не осталось (хвост из одних assistant) —
+    откатываемся к ПОСЛЕДНЕМУ user-сообщению, а не к последнему вообще.
+    """
     trimmed = messages[len(messages) // 2:]
     while trimmed and trimmed[0].get("role") != "user":
         trimmed = trimmed[1:]
-    return trimmed or messages[-1:]
+    if not trimmed:
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                trimmed = messages[i:]
+                break
+    if not trimmed or len(trimmed) >= len(messages):
+        return None
+    return trimmed
 
 
 def log_api_error(exc: BaseException, *, context_label: str) -> None:
@@ -102,7 +154,7 @@ async def reply_api_error(
     *,
     context_label: str,
     default: str | None = None,
-    clear_hint: str = "Сделай /clear.",
+    clear_hint: str = CLEAR_HINT_DEFAULT,
 ) -> None:
     """Залогировать ошибку и отправить пользователю человеческое сообщение.
 
@@ -118,7 +170,29 @@ async def reply_api_error(
         logger.error(f"[{context_label}] не смогла отправить сообщение об ошибке: {send_exc}")
 
 
-async def call_with_retry(fn, *, label: str, on_retry=None):
+async def _sleep_with_keepalive(delay: float, keepalive, label: str) -> None:
+    """Пауза между попытками, в течение которой работает keepalive.
+
+    keepalive — корутина, принимающая asyncio.Event и тикающая, пока он не выставлен
+    (в боте — обновление «печатает…» каждые 4с). Индикатор Telegram живёт ~5 секунд,
+    а пауза бывает 15 — поэтому его надо держать ВО ВРЕМЯ сна, а не дёргать после.
+    """
+    if keepalive is None:
+        await asyncio.sleep(delay)
+        return
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(keepalive(stop_event))
+    try:
+        await asyncio.sleep(delay)
+    finally:
+        stop_event.set()
+        try:
+            await task
+        except Exception as keepalive_exc:
+            logger.debug(f"[{label}] keepalive failed: {keepalive_exc}")
+
+
+async def call_with_retry(fn, *, label: str, keepalive=None):
     """Выполнить синхронный вызов API в отдельном потоке, переживая транзиентные ошибки.
 
     fn — функция без аргументов (обычно functools.partial(client.messages.create, ...)).
@@ -127,7 +201,8 @@ async def call_with_retry(fn, *, label: str, on_retry=None):
     между попытками некому обновить «печатает…» и задержки перемножились бы с нашими.
     Поэтому здесь fn обязан быть построен на клиенте с max_retries=0.
 
-    on_retry — необязательная корутина без аргументов, вызывается перед каждым повтором.
+    keepalive — необязательная корутина, принимающая asyncio.Event; работает всю паузу
+    между попытками (см. _sleep_with_keepalive).
     """
     attempts = len(RETRY_DELAYS) + 1
     for attempt in range(1, attempts + 1):
@@ -141,9 +216,4 @@ async def call_with_retry(fn, *, label: str, on_retry=None):
                 f"[{label}] {type(exc).__name__}: повтор через {delay}с "
                 f"(попытка {attempt}/{attempts})"
             )
-            await asyncio.sleep(delay)
-            if on_retry is not None:
-                try:
-                    await on_retry()
-                except Exception as keepalive_exc:
-                    logger.debug(f"[{label}] on_retry failed: {keepalive_exc}")
+            await _sleep_with_keepalive(delay, keepalive, label)
