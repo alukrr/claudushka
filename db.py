@@ -114,6 +114,11 @@ def init_db():
         "ALTER TABLE group_messages ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE memory ADD COLUMN tier TEXT NOT NULL DEFAULT 'long'",
         "ALTER TABLE memory ADD COLUMN expires_at INTEGER",
+        # v0.9.0: чаты, залипшие на четвёртом поколении, переезжают на пятое.
+        # Идемпотентно: после первого прогона строк под условие не остаётся.
+        # Haiku не трогаем — claude-haiku-4-5-20251001 остаётся дефолтом.
+        "UPDATE chat_models SET model='claude-sonnet-5' WHERE model LIKE 'claude-sonnet-4-%'",
+        "UPDATE chat_models SET model='claude-opus-5'   WHERE model LIKE 'claude-opus-4-%'",
     ]:
         try:
             conn.execute(migration)

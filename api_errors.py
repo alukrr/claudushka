@@ -76,6 +76,9 @@ def user_message(exc: BaseException, default: str | None = None, clear_hint: str
         return f"Контекст переполнен — я больше не влезаю в собственную память. {clear_hint}"
     if isinstance(exc, anthropic.BadRequestError):
         return "Запрос не прошёл: он API не понравился. Попробуй переформулировать."
+    if isinstance(exc, anthropic.NotFoundError):
+        # Важно не путать с 529: «модели нет» и «сервис перегружен» требуют разных действий.
+        return "Такой модели нет — пул её не знает."
     if isinstance(exc, anthropic.APIConnectionError):
         return "Не достучалась до сервиса. Попробуй ещё раз."
     if isinstance(exc, anthropic.APIStatusError):

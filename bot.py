@@ -54,17 +54,37 @@ WHITELIST_ENABLED = False
 # Captcha state (in-memory, resets on restart)
 captcha_state: dict[str, dict] = {}
 
-MODEL_NAMES = {
-    "claude-haiku-4-5-20251001": "Haiku 4.5",
-    "claude-sonnet-4-6": "Sonnet 4.6",
-    "claude-opus-4-8": "Opus 4.8",
+# Единственный источник правды по моделям: команды, цены, гейтинг, /models — отсюда.
+# Пул api.apitoken.sale принимает эти строки (проверено живым запросом 29.07.2026).
+# Цены — официальный прайс Anthropic в $/MTok (in/out), прокси даёт скидку сверху.
+# Sonnet 5: до 31.08.2026 действует вводная цена $2/$10 — ставим постоянные $3/$15,
+# после окончания акции значение станет верным само, до тех пор /cost слегка завышает.
+# Окна контекста: у Haiku 200k, у пятого поколения 1M. Лимиты памяти и истории
+# калиброваны под МИНИМАЛЬНОЕ (200k) — не поднимать их, ссылаясь на 1M у Opus.
+MODELS = {
+    "haiku":  {"id": "claude-haiku-4-5-20251001", "label": "Haiku 4.5",
+               "in": 1.0,  "out": 5.0,  "context":   200_000, "admin_only": False},
+    "sonnet": {"id": "claude-sonnet-5",           "label": "Sonnet 5",
+               "in": 3.0,  "out": 15.0, "context": 1_000_000, "admin_only": False},
+    "opus":   {"id": "claude-opus-5",             "label": "Opus 5",
+               "in": 5.0,  "out": 25.0, "context": 1_000_000, "admin_only": True},
+    "fable":  {"id": "claude-fable-5",            "label": "Fable 5",
+               "in": 10.0, "out": 50.0, "context": 1_000_000, "admin_only": True},
 }
-# $/MTok: (input, output)
-MODEL_PRICING = {
-    "claude-haiku-4-5-20251001": (0.80, 4.00),
-    "claude-sonnet-4-6": (3.00, 15.00),
-    "claude-opus-4-8": (15.00, 75.00),
-}
+DEFAULT_MODEL_KEY = "haiku"
+DEFAULT_MODEL_ID = MODELS[DEFAULT_MODEL_KEY]["id"]
+
+_MODELS_BY_ID = {m["id"]: m for m in MODELS.values()}
+
+
+def model_meta(model_id: str) -> dict:
+    """Метаданные по API-строке. Неизвестная модель → дефолт, без исключения.
+
+    В chat_models могут лежать строки прошлых поколений (мигрируются в init_db),
+    поэтому падать здесь нельзя: чат просто поедет на дефолтных метаданных.
+    """
+    return _MODELS_BY_ID.get(model_id, MODELS[DEFAULT_MODEL_KEY])
+
 
 # Per-model token tracking
 token_usage: dict[str, dict[str, int]] = {}
@@ -75,6 +95,18 @@ def _track_tokens(model: str, inp: int, out: int):
         token_usage[model] = {"input": 0, "output": 0}
     token_usage[model]["input"] += inp
     token_usage[model]["output"] += out
+
+
+def _track_response(model: str, response) -> None:
+    """Учёт токенов по ответу API.
+
+    Зовётся из обёрток (sync_create / call_claude), а НЕ по месту: раньше половина
+    путей — should_search, перевод, капча, extract_*, /search — не считалась вовсе,
+    и /cost занижал расход. Новый вызов API автоматически попадает в учёт.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        _track_tokens(model, usage.input_tokens, usage.output_tokens)
 
 
 # --- Вызов Anthropic API из async-хендлеров ---
@@ -109,11 +141,13 @@ async def call_claude(context, chat_id: int | None, *, label: str, **kwargs):
     if context is not None and chat_id is not None:
         keepalive = functools.partial(_keep_chat_action, context.bot, chat_id, "typing")
 
-    return await api_errors.call_with_retry(
+    response = await api_errors.call_with_retry(
         functools.partial(client_noretry.messages.create, **kwargs),
         label=label,
         keepalive=keepalive,
     )
+    _track_response(kwargs.get("model", ""), response)
+    return response
 
 
 async def call_claude_aux(fn, *args, label: str = "aux"):
@@ -126,13 +160,24 @@ async def call_claude_aux(fn, *args, label: str = "aux"):
     return await asyncio.to_thread(fn, *args)
 
 
+def sync_create(**kwargs):
+    """Синхронный messages.create с учётом токенов. Звать ТОЛЬКО из потока.
+
+    Единственная точка входа для служебных вызовов внутри sync-функций
+    (should_search, капча, extract_*): считает токены и берёт SDK-ретраи.
+    """
+    response = client.messages.create(**kwargs)
+    _track_response(kwargs.get("model", ""), response)
+    return response
+
+
 async def aux_create(**kwargs):
-    """Вспомогательный messages.create прямо из async-кода — тоже в поток.
+    """Служебный messages.create из async-кода — тот же sync_create, но в потоке.
 
     Именно `await aux_create(...)` вместо `client.messages.create(...)` во всех
-    служебных путях: перевод промпта, капча, приветствие, дневной обзор, фильтр фактов.
+    служебных путях: перевод промпта, приветствие, дневной обзор, фильтр фактов.
     """
-    return await asyncio.to_thread(functools.partial(client.messages.create, **kwargs))
+    return await asyncio.to_thread(functools.partial(sync_create, **kwargs))
 
 
 _history_stats = api_errors.history_stats
@@ -204,8 +249,8 @@ def web_search(query: str, max_results: int = 5) -> str:
 
 def should_search(text: str) -> str | None:
     try:
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+        response = sync_create(
+            model=DEFAULT_MODEL_ID,
             max_tokens=100,
             system=(
                 "Определи, нужен ли веб-поиск для ответа на вопрос пользователя. "
@@ -324,7 +369,7 @@ async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str 
 async def _rewrite_prompt(prompt: str) -> str | None:
     try:
         resp = await aux_create(
-            model="claude-haiku-4-5-20251001",
+            model=DEFAULT_MODEL_ID,
             max_tokens=150,
             system=(
                 "You are a prompt engineer for image generation models. "
@@ -375,7 +420,7 @@ async def _draw_and_send(update, context, chat_id: int, is_group: bool,
     if en_prompt is None:
         try:
             translate_resp = await aux_create(
-                model="claude-haiku-4-5-20251001",
+                model=DEFAULT_MODEL_ID,
                 max_tokens=200,
                 system=(
                     "Convert the user's image request to a direct English image-generation prompt. "
@@ -419,8 +464,8 @@ async def _draw_and_send(update, context, chat_id: int, is_group: bool,
 # --- Captcha ---
 
 def generate_captcha_question(user_text: str) -> str:
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+    response = sync_create(
+        model=DEFAULT_MODEL_ID,
         max_tokens=200,
         system=(
             "Определи язык сообщения пользователя и сгенерируй один короткий вопрос-загадку НА ЭТОМ ЖЕ ЯЗЫКЕ. "
@@ -438,8 +483,8 @@ def generate_captcha_question(user_text: str) -> str:
 
 
 def check_captcha_answer(question: str, answer: str) -> bool:
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+    response = sync_create(
+        model=DEFAULT_MODEL_ID,
         max_tokens=50,
         system=(
             "Ты проверяешь ответ на вопрос-загадку. "
@@ -540,8 +585,8 @@ def get_system_prompt(user_id: int, is_group: bool = False, chat_id: int = None,
 def extract_memory(user_id: int, messages: list, is_group: bool = False, chat_id: int = None):
     try:
         recent = messages[-6:]
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
+        response = sync_create(
+            model=MODELS["sonnet"]["id"],
             max_tokens=512,
             system=(
                 "Извлеки важные факты о пользователе из диалога. "
@@ -582,8 +627,8 @@ def extract_all_participants_memory(chat_id: int):
             return
         lines = [("Клодушка" if e["is_bot"] else e["sender"]) + f": {e['text']}" for e in transcript]
         dialog = "\n".join(lines)
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+        response = sync_create(
+            model=DEFAULT_MODEL_ID,
             max_tokens=1024,
             system=(
                 "Ты анализируешь групповой чат. Для каждого из указанных участников извлеки два типа фактов.\n"
@@ -765,7 +810,6 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
                 messages=[{"role": "user", "content": f"Вот сообщения за день:\n{chat_log}"}],
             )
             review = response.content[0].text
-            _track_tokens(_model, response.usage.input_tokens, response.usage.output_tokens)
             await context.bot.send_message(chat_id=chat_id, text=review)
             logger.info(f"Daily review sent to {chat_id}")
         except Exception as e:
@@ -780,7 +824,7 @@ async def greet_new_member(chat_id: int, user_id: int, user_name: str, bot):
     if facts:
         try:
             filter_resp = await aux_create(
-                model="claude-haiku-4-5-20251001",
+                model=DEFAULT_MODEL_ID,
                 max_tokens=300,
                 system=(
                     "Тебе дан список фактов о пользователе. "
@@ -802,7 +846,7 @@ async def greet_new_member(chat_id: int, user_id: int, user_name: str, bot):
     try:
         facts_hint = f"\nЧто ты знаешь об этом человеке (используй естественно, не перечисляй): {'; '.join(safe_facts)}" if safe_facts else ""
         response = await aux_create(
-            model="claude-haiku-4-5-20251001",
+            model=DEFAULT_MODEL_ID,
             max_tokens=150,
             system=(
                 "Ты Клодушка — остроумный AI-бот в групповом чате. "
@@ -1037,7 +1081,7 @@ async def cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for c in chats:
             icon = STATUS_ICON.get(c["status"], "?")
             name = c["name"] or str(c["chat_id"])
-            model = MODEL_NAMES.get(c["model"], c["model"])
+            model = model_meta(c["model"])["label"]
             lines.append(f"  {icon} {name} ({c['chat_id']}) — {model}")
         if not chats:
             lines.append("  нет чатов")
@@ -1046,7 +1090,7 @@ async def cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("Пользователи:")
         for u in users:
             name = u["full_name"] or u["username"] or str(u["telegram_id"])
-            model = MODEL_NAMES.get(db.get_chat_model_db(u["telegram_id"]), "Haiku 4.5")
+            model = model_meta(db.get_chat_model_db(u["telegram_id"]))["label"]
             lines.append(f"  {u['role']:8} {name} ({u['telegram_id']}) — {model}")
 
         text = "\n".join(lines)
@@ -1107,7 +1151,6 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages=[{"role": "user", "content": f"Вот сообщения за день:\n{chat_log}"}],
         )
         review = response.content[0].text
-        _track_tokens(_model, response.usage.input_tokens, response.usage.output_tokens)
         await update.message.reply_text(review)
     except Exception as e:
         await api_errors.reply_api_error(
@@ -1212,10 +1255,13 @@ async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for model, usage in sorted(token_usage.items()):
             inp = usage["input"]
             out = usage["output"]
-            price_in, price_out = MODEL_PRICING.get(model, (3.00, 15.00))
+            meta = model_meta(model)
+            price_in, price_out = meta["in"], meta["out"]
             cost = (inp / 1_000_000 * price_in) + (out / 1_000_000 * price_out)
             grand_total += cost
-            name = MODEL_NAMES.get(model, model)
+            # Модель вне реестра считается по дефолтным ценам — говорим об этом прямо,
+            # иначе цифра выглядит точной, не будучи ею.
+            name = meta["label"] if model in _MODELS_BY_ID else f"{model} (нет в реестре, цена по {meta['label']})"
             lines.append(f"  {name}: вх {inp:,} / вых {out:,} — ~${cost:.4f}")
         lines.append(f"Итого: ~${grand_total:.4f}")
         await update.effective_message.reply_text("\n".join(lines))
@@ -1225,38 +1271,139 @@ async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-def _resolve_model_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
-    """В чате — текущий chat_id; в личке — берём из аргумента."""
-    if update.effective_chat.type == "private" and context.args:
+def _chat_info(chat_id: int) -> tuple[bool, str]:
+    """(есть ли чат в allowed_chats, «Имя (ID)» для ответа).
+
+    Имя в ответе обязательно: без него админ не увидит, что переключил не тот чат.
+    """
+    for c in db.get_all_chats_for_status():
+        if c["chat_id"] == chat_id:
+            return True, f"«{c['name'] or 'без имени'}» ({chat_id})"
+    return False, f"чат {chat_id}"
+
+
+def _chat_display(update: Update, chat_id: int) -> tuple[bool, str]:
+    known, label = _chat_info(chat_id)
+    if chat_id == update.effective_chat.id and update.effective_chat.type == "private":
+        return known, "этот диалог"
+    return known, label
+
+
+async def _probe_model(context, chat_id: int, model_id: str) -> None:
+    """Пробный запрос перед записью в chat_models: жив ли пул для этой модели.
+
+    Стоит доли цента и спасает от залипания чата на модели, которую прокси не знает.
+    Идёт через call_claude → call_with_retry: 529 при переключении — это «сервис
+    перегружен», а не «модели не существует», и различать их пользователю важно.
+    Бросает исключение — вызывающая сторона решает, что сказать.
+    """
+    await call_claude(
+        context, chat_id, label=f"проверка модели {model_id}",
+        model=model_id, max_tokens=1,
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+
+async def _set_chat_model(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str):
+    """Переключение модели чата. key — ключ реестра MODELS, не API-строка."""
+    meta = MODELS[key]
+    user_id = update.effective_user.id
+    admin = is_admin(user_id)
+
+    # Гейтинг по роли: дорогие модели — только админам, и с объяснением, а не молчанием.
+    if meta["admin_only"] and not admin:
+        await update.effective_message.reply_text(
+            f"{meta['label']} — только для админов, она дорогая "
+            f"(${meta['in']:.0f}/${meta['out']:.0f} за миллион токенов). "
+            f"Доступны /haiku и /sonnet, список — /models."
+        )
+        return
+
+    # Аргумент = чужой чат. Без этой проверки любой участник переключал бы модель
+    # в чужом чате, зная только его ID.
+    if context.args:
+        if not admin:
+            await update.effective_message.reply_text(
+                "Менять модель в другом чате может только админ. "
+                f"Без аргумента команда переключит текущий чат."
+            )
+            return
         try:
-            return int(context.args[0])
+            chat_id = int(context.args[0])
         except ValueError:
-            return None
-    return update.effective_chat.id
+            await update.effective_message.reply_text(
+                f"ID чата — это число (обычно с минусом). Формат: /{key} -1001234567890"
+            )
+            return
+    else:
+        chat_id = update.effective_chat.id
 
+    known, label = _chat_display(update, chat_id)
+    # Чат мог ещё не попасть в allowed_chats — предупреждаем, но запись разрешаем.
+    warn = "" if known or not context.args else \
+        "\n⚠️ Такого чата нет среди разрешённых — записала, но проверь ID."
 
-async def _set_chat_model(update: Update, context: ContextTypes.DEFAULT_TYPE, model: str):
-    if not is_admin(update.effective_user.id):
+    try:
+        await _probe_model(context, update.effective_chat.id, meta["id"])
+    except Exception as e:
+        api_errors.log_api_error(e, context_label=f"проверка модели {meta['id']}")
+        await update.effective_message.reply_text(
+            f"{meta['label']} сейчас недоступна — модель не меняю. {api_errors.user_message(e)}"
+        )
         return
-    chat_id = _resolve_model_chat_id(update, context)
-    if chat_id is None:
-        await update.message.reply_text(f"В личке укажи ID чата: /{model.split('-')[1]} <chat_id>")
-        return
-    db.set_chat_model_db(chat_id, model)
-    name = MODEL_NAMES.get(model, model)
-    await update.message.reply_text(f"Чат {chat_id} → {name}.")
+
+    db.set_chat_model_db(chat_id, meta["id"])
+    await update.effective_message.reply_text(f"{label} → {meta['label']}.{warn}")
 
 
 async def cmd_haiku(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _set_chat_model(update, context, "claude-haiku-4-5-20251001")
+    await _set_chat_model(update, context, "haiku")
 
 
 async def cmd_sonnet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _set_chat_model(update, context, "claude-sonnet-4-6")
+    await _set_chat_model(update, context, "sonnet")
 
 
 async def cmd_opus(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _set_chat_model(update, context, "claude-opus-4-8")
+    await _set_chat_model(update, context, "opus")
+
+
+async def cmd_fable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _set_chat_model(update, context, "fable")
+
+
+async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список моделей с ценами и окном; текущая модель чата помечена."""
+    admin = is_admin(update.effective_user.id)
+
+    chat_id = update.effective_chat.id
+    if context.args:
+        if not admin:
+            await update.effective_message.reply_text("Смотреть чужие чаты может только админ.")
+            return
+        try:
+            chat_id = int(context.args[0])
+        except ValueError:
+            await update.effective_message.reply_text("ID чата — это число. Формат: /models -1001234567890")
+            return
+
+    current = db.get_chat_model_db(chat_id)
+    _, label = _chat_display(update, chat_id)
+    lines = [f"Модель для {label}: {model_meta(current)['label']}", "", "Доступно:"]
+    for key, meta in MODELS.items():
+        if meta["admin_only"] and not admin:
+            continue
+        mark = "▸" if meta["id"] == current else " "
+        window = f"{meta['context'] // 1000}k" if meta["context"] < 1_000_000 else "1M"
+        tail = "  (только админ)" if meta["admin_only"] else ""
+        lines.append(
+            f"{mark} /{key:6} {meta['label']:10} ${meta['in']:g}/${meta['out']:g} за MTok, окно {window}{tail}"
+        )
+    lines.append("")
+    lines.append("Цены — прайс Anthropic за миллион токенов (вход/выход), у прокси дешевле.")
+    if admin:
+        lines.append("Переключить чужой чат: /sonnet <chat_id>")
+    await update.effective_message.reply_text("\n".join(lines))
 
 
 # --- User commands ---
@@ -1271,7 +1418,10 @@ USER_HELP = """\
   /id            — показать Telegram ID и роль
   /version       — версия бота
   /search <q>    — веб-поиск (referral+)
-  /imagine <q>   — генерация изображения (referral+)\
+  /imagine <q>   — генерация изображения (referral+)
+  /models        — какие модели доступны и что сейчас у чата
+  /haiku         — переключить чат на Haiku 4.5 (дёшево и быстро)
+  /sonnet        — переключить чат на Sonnet 5 (умнее, дороже)\
 """
 
 ADMIN_HELP = """\
@@ -1291,10 +1441,15 @@ ADMIN_HELP = """\
   /allow_chat <id> [имя]   — добавить чат вручную
   /deny_chat <id>          — удалить чат
 
-Модель (в чате — без аргумента; из лички — с chat_id):
-  /haiku [chat_id]         — Haiku 4.5 (дефолт, дёшево)
-  /sonnet [chat_id]        — Sonnet 4.6
-  /opus [chat_id]          — Opus 4.8 (дорого)
+Модели (без аргумента — текущий чат; с chat_id — любой, только админу):
+  /models [chat_id]        — список моделей, цены, окно; ▸ = текущая
+  /haiku [chat_id]         — Haiku 4.5 — $1/$5, окно 200k (дефолт)
+  /sonnet [chat_id]        — Sonnet 5 — $3/$15, окно 1M
+  /opus [chat_id]          — Opus 5 — $5/$25, окно 1M (только админ)
+  /fable [chat_id]         — Fable 5 — $10/$50, окно 1M (только админ)
+  chat_id — число с минусом, например: /opus -1001109809707
+  Выбор постоянный: пишется в chat_models и переживает рестарт.
+  Перед записью бот делает пробный запрос — нерабочая модель не сохранится.
 
 Прочее:
   /whitelist               — показать белые списки
@@ -1530,7 +1685,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         response = await call_claude(
             context, update.effective_chat.id, label=f"/search uid={user_id}",
-            model="claude-sonnet-4-6",
+            model=MODELS["sonnet"]["id"],
             max_tokens=2048,
             system="Ты Клодушка. Дай краткий ответ на основе результатов поиска. Отвечай на языке пользователя.",
             messages=[{"role": "user", "content": f"Вопрос: {query}\n\nРезультаты:\n{results}"}],
@@ -1816,7 +1971,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 model=_model, max_tokens=4096, system=system, messages=doc_history,
             )
             answer = response.content[0].text
-            _track_tokens(_model, response.usage.input_tokens, response.usage.output_tokens)
 
             if is_group:
                 db.save_group_message(chat_id, context_bot_id, "Клодушка", answer, is_bot=True)
@@ -1882,7 +2036,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 model=_model, max_tokens=2048, system=system, messages=vision_messages,
             )
             answer = response.content[0].text
-            _track_tokens(_model, response.usage.input_tokens, response.usage.output_tokens)
 
             # Save to history as text
             if is_group:
@@ -2023,7 +2176,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         assistant_text = response.content[0].text
-        _track_tokens(_model, response.usage.input_tokens, response.usage.output_tokens)
 
         # Клодушка могла сама инициировать рисование маркером [[DRAW: ...]] внутри ответа.
         draw_match = DRAW_MARKER_RE.search(assistant_text)
@@ -2132,6 +2284,8 @@ def main():
     app.add_handler(CommandHandler("haiku", cmd_haiku))
     app.add_handler(CommandHandler("sonnet", cmd_sonnet))
     app.add_handler(CommandHandler("opus", cmd_opus))
+    app.add_handler(CommandHandler("fable", cmd_fable))
+    app.add_handler(CommandHandler("models", cmd_models))
     app.add_handler(CommandHandler("approve_chat", cmd_approve_chat))
     app.add_handler(CommandHandler("reject_chat", cmd_reject_chat))
     app.add_handler(ChatMemberHandler(handle_new_chat, ChatMemberHandler.MY_CHAT_MEMBER))
