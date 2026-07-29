@@ -4,6 +4,7 @@ import json
 import logging
 import time
 import asyncio
+import functools
 from pathlib import Path
 from telegram import Update
 from datetime import datetime, time as dt_time, timezone, timedelta
@@ -12,6 +13,7 @@ import anthropic
 from tavily import TavilyClient
 import requests as http_requests
 import db
+import api_errors
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,7 +29,14 @@ DATA_DIR = Path("/app/data")
 DATA_DIR.mkdir(exist_ok=True)
 
 tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# ANTHROPIC_SDK_RETRIES работает для СИНХРОННЫХ вспомогательных вызовов (should_search,
+# перевод промпта, капча, extract_memory, дневной обзор): SDK сам ретраит 408/409/429/5xx
+# с бэкоффом 0.5→8с. Пользовательские вызовы идут через call_claude() на client_noretry —
+# там ретраи наши, с «печатает…» между попытками (см. api_errors.call_with_retry).
+ANTHROPIC_SDK_RETRIES = 3
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, max_retries=ANTHROPIC_SDK_RETRIES)
+client_noretry = client.with_options(max_retries=0)  # переиспользует тот же httpx-пул
 
 MAX_HISTORY = 40
 GROUP_TRANSCRIPT_LIMIT = 50   # сколько реплик группового транскрипта тащить в messages
@@ -66,6 +75,31 @@ def _track_tokens(model: str, inp: int, out: int):
         token_usage[model] = {"input": 0, "output": 0}
     token_usage[model]["input"] += inp
     token_usage[model]["output"] += out
+
+
+# --- Вызов Anthropic API из async-хендлеров ---
+
+async def call_claude(context, chat_id: int | None, *, label: str, **kwargs):
+    """messages.create из хендлера: не блокирует event loop, переживает 529/429/сеть.
+
+    Между попытками обновляет «печатает…», чтобы ожидание не выглядело зависанием.
+    Исключение после всех попыток пробрасывается наверх — там его ловит reply_api_error.
+    """
+    on_retry = None
+    if context is not None and chat_id is not None:
+        async def on_retry():
+            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    return await api_errors.call_with_retry(
+        functools.partial(client_noretry.messages.create, **kwargs),
+        label=label,
+        on_retry=on_retry,
+    )
+
+
+_history_chars = api_errors.history_chars
+_halve_history = api_errors.halve_history
+
 
 # Bot info (set on startup)
 context_bot_id = None
@@ -196,7 +230,8 @@ async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str 
             resp = http_requests.post(url, json=payload, timeout=GEMINI_TIMEOUT)
         except Exception as e:
             logger.warning(f"Gemini image request failed (attempt {attempt}/{GEMINI_MAX_RETRIES}): {e}")
-            last_error_msg = f"Сетевая ошибка: {e}"
+            # Текст исключения requests содержит URL, а в URL — ключ Gemini. Наружу не отдаём.
+            last_error_msg = "Сетевая ошибка при обращении к генератору картинок"
             if attempt < GEMINI_MAX_RETRIES:
                 await asyncio.sleep(GEMINI_RETRY_DELAY)
             continue
@@ -844,7 +879,9 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
             await update.effective_message.reply_text(chunk)
     except Exception as e:
-        await update.effective_message.reply_text(f"Ошибка: {e}")
+        await api_errors.reply_api_error(
+            update.effective_message.reply_text, e, context_label="/users",
+        )
 
 
 async def cmd_allow_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -908,7 +945,9 @@ async def cmd_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif update.effective_chat.id != update.effective_user.id:
             await update.effective_message.reply_text("Отправила в личку.")
     except Exception as e:
-        await update.effective_message.reply_text(f"Ошибка: {e}")
+        await api_errors.reply_api_error(
+            update.effective_message.reply_text, e, context_label="/whitelist",
+        )
 
 
 async def cmd_whitelist_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -992,7 +1031,9 @@ async def cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif update.effective_chat.id != update.effective_user.id:
             await update.effective_message.reply_text("Отправила в личку.")
     except Exception as e:
-        await update.effective_message.reply_text(f"Ошибка: {e}")
+        await api_errors.reply_api_error(
+            update.effective_message.reply_text, e, context_label="/chats",
+        )
 
 
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1020,7 +1061,8 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_log = "\n".join(messages)
         _model = get_chat_model(chat_id)
-        response = client.messages.create(
+        response = await call_claude(
+            context, chat_id, label=f"/review chat={chat_id}",
             model=_model,
             max_tokens=1024,
             system=(
@@ -1036,7 +1078,9 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _track_tokens(_model, response.usage.input_tokens, response.usage.output_tokens)
         await update.message.reply_text(review)
     except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+        await api_errors.reply_api_error(
+            update.message.reply_text, e, context_label=f"/review chat={chat_id}",
+        )
 
 
 async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1119,7 +1163,9 @@ async def cmd_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.effective_message.reply_text("Укажи число от 0 до 100")
     except Exception as e:
-        await update.effective_message.reply_text(f"Ошибка: {e}")
+        await api_errors.reply_api_error(
+            update.effective_message.reply_text, e, context_label="/activity",
+        )
 
 
 async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1142,7 +1188,9 @@ async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"Итого: ~${grand_total:.4f}")
         await update.effective_message.reply_text("\n".join(lines))
     except Exception as e:
-        await update.effective_message.reply_text(f"Ошибка: {e}")
+        await api_errors.reply_api_error(
+            update.effective_message.reply_text, e, context_label="/cost",
+        )
 
 
 def _resolve_model_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
@@ -1448,7 +1496,8 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ничего не нашёл.")
         return
     try:
-        response = client.messages.create(
+        response = await call_claude(
+            context, update.effective_chat.id, label=f"/search uid={user_id}",
             model="claude-sonnet-4-6",
             max_tokens=2048,
             system="Ты Клодушка. Дай краткий ответ на основе результатов поиска. Отвечай на языке пользователя.",
@@ -1458,7 +1507,9 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i in range(0, len(answer), 4096):
             await update.message.reply_text(answer[i:i + 4096])
     except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+        await api_errors.reply_api_error(
+            update.message.reply_text, e, context_label=f"/search uid={user_id}",
+        )
 
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1474,7 +1525,9 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.effective_message.reply_text("Пока ничего не помню. Поговорим — запомню!")
     except Exception as e:
-        await update.effective_message.reply_text(f"Ошибка: {e}")
+        await api_errors.reply_api_error(
+            update.effective_message.reply_text, e, context_label="/memory",
+        )
 
 
 async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1722,11 +1775,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             doc_history = [{"role": "user", "content": full_prompt}]
 
             _model = get_chat_model(chat_id)
-            response = client.messages.create(
-                model=_model,
-                max_tokens=4096,
-                system=system,
-                messages=doc_history,
+            logger.info(
+                f"PROMPT uid={user_id} chat={chat_id} model={_model} kind=document "
+                f"system={len(system)} history_chars={_history_chars(doc_history)} msgs={len(doc_history)}"
+            )
+            response = await call_claude(
+                context, chat_id, label=f"файл chat={chat_id}",
+                model=_model, max_tokens=4096, system=system, messages=doc_history,
             )
             answer = response.content[0].text
             _track_tokens(_model, response.usage.input_tokens, response.usage.output_tokens)
@@ -1746,8 +1801,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for i in range(0, len(answer), 4096):
                     await update.message.reply_text(answer[i:i + 4096])
         except Exception as e:
-            logger.error(f"Document handling error: {e}")
-            await update.message.reply_text(f"Не смогла прочитать файл: {e}")
+            await api_errors.reply_api_error(
+                update.message.reply_text, e,
+                context_label=f"файл chat={chat_id} uid={user_id}",
+                default="Не смогла прочитать файл.",
+            )
         return
 
     # --- Handle photo/image ---
@@ -1783,11 +1841,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             system = get_system_prompt(user_id, is_group, chat_id if is_group else None)
             _model = get_chat_model(chat_id)
-            response = client.messages.create(
-                model=_model,
-                max_tokens=2048,
-                system=system,
-                messages=vision_messages,
+            logger.info(
+                f"PROMPT uid={user_id} chat={chat_id} model={_model} kind=photo "
+                f"system={len(system)} image_b64={len(image_b64)}"
+            )
+            response = await call_claude(
+                context, chat_id, label=f"фото chat={chat_id}",
+                model=_model, max_tokens=2048, system=system, messages=vision_messages,
             )
             answer = response.content[0].text
             _track_tokens(_model, response.usage.input_tokens, response.usage.output_tokens)
@@ -1808,8 +1868,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for i in range(0, len(answer), 4096):
                     await update.message.reply_text(answer[i:i + 4096])
         except Exception as e:
-            logger.error(f"Photo handling error: {e}")
-            await update.message.reply_text(f"Не смогла обработать фото: {e}")
+            await api_errors.reply_api_error(
+                update.message.reply_text, e,
+                context_label=f"фото chat={chat_id} uid={user_id}",
+                default="Не смогла обработать фото.",
+            )
         return
 
     # Check for draw request
@@ -1862,12 +1925,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             system += search_context + "\nИспользуй найденное в ответе."
 
         _model = get_chat_model(chat_id)
-        response = client.messages.create(
-            model=_model,
-            max_tokens=4096,
-            system=system,
-            messages=messages,
+        hist_chars = _history_chars(messages)
+        logger.info(
+            f"PROMPT uid={user_id} chat={chat_id} model={_model} "
+            f"system={len(system)} history_chars={hist_chars} msgs={len(messages)}"
         )
+        try:
+            response = await call_claude(
+                context, chat_id, label=f"диалог chat={chat_id}",
+                model=_model, max_tokens=4096, system=system, messages=messages,
+            )
+        except anthropic.BadRequestError as e:
+            # 400 prompt is too long: история не сохранится, следующее сообщение соберёт
+            # тот же промпт и упадёт снова — чат заклинит навсегда. Режем историю вдвое
+            # и пробуем один раз; если и это мимо — исключение уйдёт наверх, пользователь
+            # получит честное «сделай /clear».
+            if not api_errors.is_prompt_too_long(e):
+                raise
+            trimmed = _halve_history(messages)
+            logger.warning(
+                f"PROMPT TOO LONG uid={user_id} chat={chat_id} model={_model} "
+                f"system={len(system)} history_chars={hist_chars} msgs={len(messages)} "
+                f"→ повтор с msgs={len(trimmed)} history_chars={_history_chars(trimmed)}"
+            )
+            response = await call_claude(
+                context, chat_id, label=f"диалог chat={chat_id} (обрезанная история)",
+                model=_model, max_tokens=4096, system=system, messages=trimmed,
+            )
 
         assistant_text = response.content[0].text
         _track_tokens(_model, response.usage.input_tokens, response.usage.output_tokens)
@@ -1933,8 +2017,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _draw_and_send(update, context, chat_id, is_group, draw_en_prompt, en_prompt=draw_en_prompt)
 
     except Exception as e:
-        logger.error(f"Error: {e}")
-        await update.message.reply_text(f"Ошибка: {e}")
+        await api_errors.reply_api_error(
+            update.message.reply_text, e,
+            context_label=f"диалог chat={chat_id} uid={user_id}",
+        )
 
 
 def main():

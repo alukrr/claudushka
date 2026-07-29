@@ -18,6 +18,7 @@
 - Обработка файлов и документов (JSON, YAML, код, txt)
 - WhatsApp-бот (отдельный сервис, Meta API webhook)
 - Самообновление через `/update` (git pull + docker restart)
+- Переживает сбои API: перегрузку сервиса (529) и рейт-лимиты повторяет сама, окончательные ошибки объясняет по-человечески — сырых traceback'ов в чате больше нет
 - Чёрный юмор, без лишних фильтров (18+)
 
 ## Статус
@@ -110,6 +111,7 @@
 - Tavily API (веб-поиск)
 - Gemini Imagen API — «Nano Banana 2» (`gemini-3.1-flash-image-preview`), генерация изображений
 - SQLite (пользователи, история, память, модели чатов) через `db.py`
+- Общая обработка ошибок API в `api_errors.py` (ретраи + сообщения пользователю)
 - FastAPI + uvicorn (WhatsApp webhook, порт 8080)
 - Docker Compose (два сервиса: `claudushka` + `claudushka-wa`)
 - Hetzner Cloud (CX23, Nürnberg)

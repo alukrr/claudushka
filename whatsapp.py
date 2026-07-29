@@ -2,12 +2,14 @@ import os
 import json
 import logging
 import asyncio
+import functools
 import httpx
 import anthropic
 from fastapi import FastAPI, Request, Response
 from tavily import TavilyClient
 
 import db
+import api_errors
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,7 +23,11 @@ TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 
 WHATSAPP_API_URL = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# SDK-ретраи — для синхронных вспомогательных вызовов (should_search, extract_memory).
+# Основной диалог идёт через api_errors.call_with_retry на client_noretry.
+ANTHROPIC_SDK_RETRIES = 3
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, max_retries=ANTHROPIC_SDK_RETRIES)
+client_noretry = client.with_options(max_retries=0)
 tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 
 MAX_HISTORY = 40
@@ -166,12 +172,37 @@ async def handle_wa_message(phone: str, text: str):
         if search_context:
             system += f"\n\nРезультаты поиска:\n{search_context}"
 
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2048,
-            system=system,
-            messages=history,
+        _model = "claude-sonnet-4-6"
+        hist_chars = api_errors.history_chars(history)
+        logger.info(
+            f"PROMPT wa={phone} model={_model} "
+            f"system={len(system)} history_chars={hist_chars} msgs={len(history)}"
         )
+        try:
+            response = await api_errors.call_with_retry(
+                functools.partial(
+                    client_noretry.messages.create,
+                    model=_model, max_tokens=2048, system=system, messages=history,
+                ),
+                label=f"WA {phone}",
+            )
+        except anthropic.BadRequestError as e:
+            # 400 prompt is too long: без обрезки история не сохранится и тред заклинит
+            # навсегда. Режем вдвое и пробуем один раз.
+            if not api_errors.is_prompt_too_long(e):
+                raise
+            trimmed = api_errors.halve_history(history)
+            logger.warning(
+                f"PROMPT TOO LONG wa={phone} system={len(system)} history_chars={hist_chars} "
+                f"msgs={len(history)} → повтор с msgs={len(trimmed)}"
+            )
+            response = await api_errors.call_with_retry(
+                functools.partial(
+                    client_noretry.messages.create,
+                    model=_model, max_tokens=2048, system=system, messages=trimmed,
+                ),
+                label=f"WA {phone} (обрезанная история)",
+            )
 
         reply = response.content[0].text
 
@@ -185,8 +216,12 @@ async def handle_wa_message(phone: str, text: str):
         await send_whatsapp_message(phone, reply)
 
     except Exception as e:
-        logger.error(f"WA handler error: {e}")
-        await send_whatsapp_message(phone, "Что-то пошло не так, попробуй ещё раз.")
+        await api_errors.reply_api_error(
+            functools.partial(send_whatsapp_message, phone), e,
+            context_label=f"WA {phone}",
+            default="Что-то пошло не так, попробуй ещё раз.",
+            clear_hint="Напиши Алексею — почистит историю.",  # в WhatsApp команд нет
+        )
 
 
 # --- Webhook endpoints ---
