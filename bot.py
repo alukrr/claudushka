@@ -180,6 +180,7 @@ async def aux_create(**kwargs):
     return await asyncio.to_thread(functools.partial(sync_create, **kwargs))
 
 
+response_text = api_errors.response_text
 _history_stats = api_errors.history_stats
 _halve_history = api_errors.halve_history
 
@@ -268,7 +269,7 @@ def should_search(text: str) -> str | None:
             ),
             messages=[{"role": "user", "content": text}],
         )
-        result = response.content[0].text.strip()
+        result = response_text(response)
         logger.info(f"Search decision for '{text[:50]}': '{result}'")
         if result.upper() == "NO":
             return None
@@ -379,7 +380,7 @@ async def _rewrite_prompt(prompt: str) -> str | None:
             ),
             messages=[{"role": "user", "content": prompt}],
         )
-        rewritten = resp.content[0].text.strip()
+        rewritten = response_text(resp)
         logger.info(f"Prompt rewritten: '{prompt[:60]}' -> '{rewritten[:60]}'")
         return rewritten
     except Exception as e:
@@ -429,7 +430,7 @@ async def _draw_and_send(update, context, chat_id: int, is_group: bool,
                 ),
                 messages=[{"role": "user", "content": draw_prompt}],
             )
-            en_prompt = translate_resp.content[0].text.strip()
+            en_prompt = response_text(translate_resp)
         except Exception:
             en_prompt = draw_prompt
 
@@ -479,7 +480,7 @@ def generate_captcha_question(user_text: str) -> str:
         ),
         messages=[{"role": "user", "content": f"Язык пользователя определи по этому сообщению: '{user_text}'\nСгенерируй вопрос."}],
     )
-    return response.content[0].text.strip()
+    return response_text(response)
 
 
 def check_captcha_answer(question: str, answer: str) -> bool:
@@ -494,7 +495,7 @@ def check_captcha_answer(question: str, answer: str) -> bool:
         ),
         messages=[{"role": "user", "content": f"Вопрос: {question}\nОтвет пользователя: {answer}"}],
     )
-    return "YES" in response.content[0].text.strip().upper()
+    return "YES" in response_text(response).upper()
 
 
 # --- Memory ---
@@ -595,7 +596,7 @@ def extract_memory(user_id: int, messages: list, is_group: bool = False, chat_id
             ),
             messages=[{"role": "user", "content": f"Диалог:\n{json.dumps(recent, ensure_ascii=False)}"}],
         )
-        text = response.content[0].text.strip()
+        text = response_text(response)
         start = text.find("[")
         end = text.rfind("]") + 1
         if start >= 0 and end > start:
@@ -641,7 +642,7 @@ def extract_all_participants_memory(chat_id: int):
             ),
             messages=[{"role": "user", "content": f"Участники: {', '.join(participants)}\n\nЧат:\n{dialog}"}],
         )
-        text = response.content[0].text.strip()
+        text = response_text(response)
         start = text.find("{")
         end = text.rfind("}") + 1
         if start < 0 or end <= start:
@@ -809,7 +810,10 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
                 ),
                 messages=[{"role": "user", "content": f"Вот сообщения за день:\n{chat_log}"}],
             )
-            review = response.content[0].text
+            review = response_text(response)
+            if not review:
+                logger.warning(f"Дневной обзор пуст: {api_errors.response_debug(response)}")
+                continue
             await context.bot.send_message(chat_id=chat_id, text=review)
             logger.info(f"Daily review sent to {chat_id}")
         except Exception as e:
@@ -835,7 +839,7 @@ async def greet_new_member(chat_id: int, user_id: int, user_name: str, bot):
                 ),
                 messages=[{"role": "user", "content": f"Факты: {json.dumps(facts, ensure_ascii=False)}"}],
             )
-            text = filter_resp.content[0].text.strip()
+            text = response_text(filter_resp)
             start = text.find("[")
             end = text.rfind("]") + 1
             if start >= 0 and end > start:
@@ -857,7 +861,7 @@ async def greet_new_member(chat_id: int, user_id: int, user_name: str, bot):
             ),
             messages=[{"role": "user", "content": f"Поприветствуй {user_name} в чате."}],
         )
-        greeting = response.content[0].text.strip()
+        greeting = response_text(response)
         await bot.send_message(chat_id=chat_id, text=greeting)
     except Exception as e:
         logger.error(f"Greeting error: {e}")
@@ -1150,7 +1154,10 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
             messages=[{"role": "user", "content": f"Вот сообщения за день:\n{chat_log}"}],
         )
-        review = response.content[0].text
+        review = response_text(response)
+        if not review:
+            logger.warning(f"/review пуст: {api_errors.response_debug(response)}")
+            review = "Модель вернула пустой ответ. Попробуй ещё раз или смени модель через /models."
         await update.message.reply_text(review)
     except Exception as e:
         await api_errors.reply_api_error(
@@ -1690,7 +1697,10 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
             system="Ты Клодушка. Дай краткий ответ на основе результатов поиска. Отвечай на языке пользователя.",
             messages=[{"role": "user", "content": f"Вопрос: {query}\n\nРезультаты:\n{results}"}],
         )
-        answer = response.content[0].text
+        answer = response_text(response)
+        if not answer:
+            logger.warning(f"/search пуст: {api_errors.response_debug(response)}")
+            answer = "Модель вернула пустой ответ. Попробуй ещё раз или смени модель через /models."
         for i in range(0, len(answer), 4096):
             await update.message.reply_text(answer[i:i + 4096])
     except Exception as e:
@@ -1970,7 +1980,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context, chat_id, label=f"файл chat={chat_id}",
                 model=_model, max_tokens=4096, system=system, messages=doc_history,
             )
-            answer = response.content[0].text
+            answer = response_text(response)
+            if not answer:
+                logger.warning(f"Пустой ответ модели (файл): {api_errors.response_debug(response)}")
+                answer = "Модель вернула пустой ответ. Попробуй ещё раз или смени модель через /models."
 
             if is_group:
                 db.save_group_message(chat_id, context_bot_id, "Клодушка", answer, is_bot=True)
@@ -2035,7 +2048,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context, chat_id, label=f"фото chat={chat_id}",
                 model=_model, max_tokens=2048, system=system, messages=vision_messages,
             )
-            answer = response.content[0].text
+            answer = response_text(response)
+            if not answer:
+                logger.warning(f"Пустой ответ модели (фото): {api_errors.response_debug(response)}")
+                answer = "Модель вернула пустой ответ. Попробуй ещё раз или смени модель через /models."
 
             # Save to history as text
             if is_group:
@@ -2175,7 +2191,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-        assistant_text = response.content[0].text
+        assistant_text = response_text(response)
+        if not assistant_text:
+            # Запрос прошёл, но текста нет: отказ модели, только thinking, или упёрлись
+            # в max_tokens. Молчать нельзя — пользователь решит, что бот сломался.
+            logger.warning(
+                f"Пустой ответ модели: uid={user_id} chat={chat_id} "
+                f"{api_errors.response_debug(response)}"
+            )
+            if getattr(response, "stop_reason", None) == "refusal":
+                await update.message.reply_text(
+                    "Отказалась отвечать — это фильтры на стороне модели, не мои. "
+                    "Попробуй спросить иначе."
+                )
+            else:
+                await update.message.reply_text(
+                    "Модель вернула пустой ответ. Попробуй переформулировать "
+                    "или сменить модель через /models."
+                )
+            return
 
         # Клодушка могла сама инициировать рисование маркером [[DRAW: ...]] внутри ответа.
         draw_match = DRAW_MARKER_RE.search(assistant_text)

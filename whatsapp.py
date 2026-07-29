@@ -90,7 +90,7 @@ def should_search(text: str) -> str | None:
             ),
             messages=[{"role": "user", "content": text}],
         )
-        result = response.content[0].text.strip()
+        result = api_errors.response_text(response)
         return None if result.upper() == "NO" else result
     except Exception as e:
         logger.error(f"Search decision error: {e}")
@@ -140,7 +140,7 @@ def extract_memory(phone: str, messages: list):
             ),
             messages=[{"role": "user", "content": f"Диалог:\n{json.dumps(recent, ensure_ascii=False)}"}],
         )
-        text = response.content[0].text.strip()
+        text = api_errors.response_text(response)
         start = text.find("[")
         end = text.rfind("]") + 1
         if start >= 0 and end > start:
@@ -233,7 +233,10 @@ async def handle_wa_message(phone: str, text: str):
                 )
                 return
 
-        reply = response.content[0].text
+        reply = api_errors.response_text(response)
+        if not reply:
+            logger.warning(f"Пустой ответ модели для {phone}: {api_errors.response_debug(response)}")
+            reply = "Модель вернула пустой ответ. Попробуй переформулировать."
 
         db.save_message_by_key(phone, "user", text)
         db.save_message_by_key(phone, "assistant", reply)

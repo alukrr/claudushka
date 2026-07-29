@@ -86,6 +86,36 @@ def user_message(exc: BaseException, default: str | None = None, clear_hint: str
     return default or "Что-то сломалось на моей стороне. Попробуй ещё раз."
 
 
+def response_text(response) -> str:
+    """Текст из ответа API — перебором блоков, а НЕ `response.content[0].text`.
+
+    `content` — список блоков, и первым может идти не текст. У пятого поколения
+    адаптивное мышление включено по умолчанию, поэтому `content[0]` — thinking-блок
+    (при `display="omitted"` вообще с пустым текстом), и обращение к `.text` падало
+    с AttributeError. Для пользователя это выглядело как «что-то сломалось на моей
+    стороне», хотя запрос прошёл успешно.
+
+    Пустая строка — легальный результат: отказ модели (`stop_reason="refusal"`),
+    только thinking, или упёрлись в max_tokens. Вызывающая сторона обязана это проверить.
+    """
+    parts = []
+    for block in getattr(response, "content", None) or []:
+        if getattr(block, "type", None) == "text":
+            text = getattr(block, "text", "")
+            if text:
+                parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def response_debug(response) -> str:
+    """Компактная диагностика ответа для лога, когда текста не оказалось."""
+    blocks = [getattr(b, "type", "?") for b in getattr(response, "content", None) or []]
+    usage = getattr(response, "usage", None)
+    out = getattr(usage, "output_tokens", "?") if usage else "?"
+    return (f"stop_reason={getattr(response, 'stop_reason', None)} "
+            f"blocks={blocks} output_tokens={out} model={getattr(response, 'model', '?')}")
+
+
 def history_stats(messages: list) -> tuple[int, int]:
     """(символы ТЕКСТА, число картинок).
 
