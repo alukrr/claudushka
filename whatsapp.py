@@ -140,16 +140,15 @@ def extract_memory(phone: str, messages: list):
             ),
             messages=[{"role": "user", "content": f"Диалог:\n{json.dumps(recent, ensure_ascii=False)}"}],
         )
+        if api_errors.was_truncated(response):
+            logger.warning(f"WA memory extraction: ответ обрезан по max_tokens для {phone}")
         text = api_errors.response_text(response)
-        start = text.find("[")
-        end = text.rfind("]") + 1
-        if start >= 0 and end > start:
-            new_facts = json.loads(text[start:end])
-            if new_facts:
-                db.add_memory_facts_by_key(phone, new_facts, "whatsapp")
-                logger.info(f"WA memory updated for {phone}")
+        new_facts = api_errors.parse_json_lenient(text, "[", label=f"WA memory {phone}")
+        if new_facts:
+            db.add_memory_facts_by_key(phone, new_facts, "whatsapp")
+            logger.info(f"WA memory updated for {phone}")
     except Exception as e:
-        logger.error(f"WA memory extraction error: {e}")
+        logger.error(f"WA memory extraction error ({phone}): {e}", exc_info=True)
 
 
 # --- Main message handler ---

@@ -13,6 +13,7 @@
 """
 
 import asyncio
+import json
 import logging
 
 import anthropic
@@ -48,6 +49,18 @@ def is_prompt_too_long(exc: BaseException) -> bool:
     return False
 
 
+def is_insufficient_balance(exc: BaseException) -> bool:
+    """402 — на прокси кончились деньги или упёрлись в лимит трат по ключу.
+
+    Своего класса в SDK нет (402 не входит в маппинг), прилетает голый APIStatusError,
+    поэтому смотрим на status_code. Отличать важно: ретраить бессмысленно, а пользователю
+    «что-то сломалось на моей стороне» — враньё, чинит это только пополнение баланса.
+    """
+    return getattr(exc, "status_code", None) == 402 or (
+        isinstance(exc, anthropic.APIStatusError) and "insufficient balance" in str(exc).lower()
+    )
+
+
 def is_retryable(exc: BaseException) -> bool:
     """Переживаемые сами по себе: перегруз сервиса, рейт-лимит, сетевой обрыв/таймаут."""
     return isinstance(
@@ -81,6 +94,8 @@ def user_message(exc: BaseException, default: str | None = None, clear_hint: str
         return "Такой модели нет — пул её не знает."
     if isinstance(exc, anthropic.APIConnectionError):
         return "Не достучалась до сервиса. Попробуй ещё раз."
+    if is_insufficient_balance(exc):
+        return "У меня закончились деньги на счету. Алексей в курсе, ждём пополнения."
     if isinstance(exc, anthropic.APIStatusError):
         return "Сервис ответил ошибкой. Попробуй позже."
     return default or "Что-то сломалось на моей стороне. Попробуй ещё раз."
@@ -114,6 +129,98 @@ def response_debug(response) -> str:
     out = getattr(usage, "output_tokens", "?") if usage else "?"
     return (f"stop_reason={getattr(response, 'stop_reason', None)} "
             f"blocks={blocks} output_tokens={out} model={getattr(response, 'model', '?')}")
+
+
+def was_truncated(response) -> bool:
+    """Ответ обрезан по max_tokens — значит JSON в нём почти наверняка недописан.
+
+    Факт обрезки надо логировать явно: без него ошибка разбора выглядит загадочной
+    (инцидент 2026-08-03 — 11% групповых извлечений памяти терялись пять суток молча).
+    """
+    return getattr(response, "stop_reason", None) == "max_tokens"
+
+
+def _repair_truncated_json(text: str, start: int) -> str | None:
+    """Дописать закрывающие скобки, отбросив последний недописанный элемент.
+
+    Идём по строке от `start`, следя за стеком скобок и за тем, находимся ли внутри
+    строкового литерала (иначе скобка или запятая в тексте факта собьёт разбор).
+    Запоминаем последнюю позицию, на которой значение ЗАВЕРШЕНО, — конец закрытого
+    контейнера или позицию перед запятой. Оттуда режем и закрываем оставшийся стек.
+
+    None — если ни одного завершённого значения не встретилось (резать не из чего).
+    """
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    cut: int | None = None
+    cut_stack: list[str] = []
+
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if not stack:
+                break
+            stack.pop()
+            if not stack:
+                return text[start:i + 1]  # JSON оказался целым
+            cut, cut_stack = i + 1, list(stack)
+        elif ch == "," and stack:
+            cut, cut_stack = i, list(stack)  # режем ДО запятой, иначе висячая запятая
+
+    if cut is None:
+        return None
+    return text[start:cut] + "".join(reversed(cut_stack))
+
+
+def parse_json_lenient(text: str, opener: str = "{", *, label: str = "json"):
+    """Разобрать JSON из ответа модели, переживая обрыв по max_tokens.
+
+    `text.find(opener)` + `text.rfind(closer)` в чистом виде — мина: на обрезанном
+    ответе rfind находит ВНУТРЕННЮЮ скобку последнего целого элемента, срез выходит
+    вида `{"participants": [{...}, {...}` и json.loads падает с «Expecting ',' delimiter».
+    Так пять суток молча терялась групповая память (2026-08-03).
+
+    Сначала строгий разбор, при неудаче — досборка через _repair_truncated_json:
+    часть фактов лучше, чем ноль. None — разобрать не удалось вообще.
+    """
+    closer = "}" if opener == "{" else "]"
+    start = text.find(opener)
+    if start < 0:
+        return None
+
+    end = text.rfind(closer) + 1
+    if end > start:
+        try:
+            return json.loads(text[start:end])
+        except ValueError:
+            pass
+
+    repaired = _repair_truncated_json(text, start)
+    if repaired is None:
+        logger.warning(f"[{label}] JSON не разобрать даже частично ({len(text)} симв.)")
+        return None
+    try:
+        data = json.loads(repaired)
+    except ValueError as exc:
+        logger.warning(f"[{label}] досборка JSON не помогла: {exc}")
+        return None
+    logger.warning(
+        f"[{label}] JSON был обрезан, восстановлено {len(repaired)} из {len(text)} симв. "
+        f"(последний элемент отброшен)"
+    )
+    return data
 
 
 def history_stats(messages: list) -> tuple[int, int]:
@@ -177,6 +284,8 @@ def log_api_error(exc: BaseException, *, context_label: str) -> None:
             f"{where} ПРОВЕРЬ ANTHROPIC_API_KEY (ключ невалиден, отозван или нет прав): {exc}",
             exc_info=True,
         )
+    elif is_insufficient_balance(exc):
+        logger.error(f"{where} ПОПОЛНИ БАЛАНС на прокси — запросы не проходят: {exc}", exc_info=True)
     else:
         logger.error(f"{where} {type(exc).__name__}: {exc}", exc_info=True)
 

@@ -16,6 +16,10 @@ import db
 import api_errors
 
 logging.basicConfig(level=logging.INFO)
+# httpx на INFO печатает полный URL каждого запроса, а в URL Telegram API лежит токен
+# бота — 89% строк лога были такими. Не снимать: это и утечка токена в docker logs,
+# и шум, в котором тонут настоящие ошибки.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -596,17 +600,16 @@ def extract_memory(user_id: int, messages: list, is_group: bool = False, chat_id
             ),
             messages=[{"role": "user", "content": f"Диалог:\n{json.dumps(recent, ensure_ascii=False)}"}],
         )
+        if api_errors.was_truncated(response):
+            logger.warning(f"Memory extraction: ответ обрезан по max_tokens для {user_id}")
         text = response_text(response)
-        start = text.find("[")
-        end = text.rfind("]") + 1
-        if start >= 0 and end > start:
-            new_facts = json.loads(text[start:end])
-            if new_facts:
-                context = "group" if is_group else "private"
-                db.add_memory_facts(user_id, new_facts, context, chat_id if is_group else None)
-                logger.info(f"Memory updated for {user_id} ({context})")
+        new_facts = api_errors.parse_json_lenient(text, "[", label=f"memory uid={user_id}")
+        if new_facts:
+            context = "group" if is_group else "private"
+            db.add_memory_facts(user_id, new_facts, context, chat_id if is_group else None)
+            logger.info(f"Memory updated for {user_id} ({context})")
     except Exception as e:
-        logger.error(f"Memory extraction error: {e}")
+        logger.error(f"Memory extraction error (uid={user_id}): {e}", exc_info=True)
 
 
 def extract_all_participants_memory(chat_id: int):
@@ -630,24 +633,35 @@ def extract_all_participants_memory(chat_id: int):
         dialog = "\n".join(lines)
         response = sync_create(
             model=DEFAULT_MODEL_ID,
-            max_tokens=1024,
+            # 4096, а не 1024: на 12 участников с двумя массивами фактов на каждого
+            # 1024 не хватало, ответ обрывался на полуслове и разбор терял ВСЁ окно
+            # памяти по всем участникам сразу (11% извлечений, инцидент 2026-08-03).
+            max_tokens=4096,
             system=(
                 "Ты анализируешь групповой чат. Для каждого из указанных участников извлеки два типа фактов.\n"
                 "long_term — устойчивые факты: кто человек, где живёт/работает, чем занимается, "
                 "интересы, возраст, взгляды, характер. Только то, что вряд ли изменится за неделю.\n"
                 "medium_term — временные события и состояния: что случилось, что купил, куда пошёл, "
                 "с кем поссорился, что болит, что планирует на этой неделе. Конкретные события.\n"
+                "Не больше 3 фактов каждого типа на человека — только самые важные.\n"
                 "Верни JSON: {\"participants\": [{\"name\": \"Имя\", \"long_term\": [...], \"medium_term\": [...]}]}\n"
                 "Если фактов нет — пустые массивы []. Клодушку не включай. Только факты прямо из чата."
             ),
             messages=[{"role": "user", "content": f"Участники: {', '.join(participants)}\n\nЧат:\n{dialog}"}],
         )
+        if api_errors.was_truncated(response):
+            logger.warning(
+                f"Group memory extraction: ответ обрезан по max_tokens в чате {chat_id}, "
+                f"{len(participants)} участников — {api_errors.response_debug(response)}"
+            )
         text = response_text(response)
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start < 0 or end <= start:
+        data = api_errors.parse_json_lenient(text, "{", label=f"group memory chat={chat_id}")
+        if not data:
+            logger.warning(
+                f"Group memory extraction: пустой разбор в чате {chat_id} — "
+                f"{api_errors.response_debug(response)}"
+            )
             return
-        data = json.loads(text[start:end])
         medium_expiry = int(time.time()) + 7 * 86400
         saved = 0
         for p in data.get("participants", []):
@@ -667,7 +681,7 @@ def extract_all_participants_memory(chat_id: int):
                 saved += len(medium_facts)
         logger.info(f"Group memory extracted for chat {chat_id}: {len(data.get('participants', []))} participants, +{saved} facts")
     except Exception as e:
-        logger.error(f"Group memory extraction error: {e}")
+        logger.error(f"Group memory extraction error (chat {chat_id}): {e}", exc_info=True)
 
 
 def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GROUP_TRANSCRIPT_LIMIT) -> list[dict]:
@@ -840,12 +854,9 @@ async def greet_new_member(chat_id: int, user_id: int, user_name: str, bot):
                 messages=[{"role": "user", "content": f"Факты: {json.dumps(facts, ensure_ascii=False)}"}],
             )
             text = response_text(filter_resp)
-            start = text.find("[")
-            end = text.rfind("]") + 1
-            if start >= 0 and end > start:
-                safe_facts = json.loads(text[start:end])
+            safe_facts = api_errors.parse_json_lenient(text, "[", label=f"memory filter uid={user_id}") or []
         except Exception as e:
-            logger.error(f"Memory filter error: {e}")
+            logger.error(f"Memory filter error (uid={user_id}): {e}", exc_info=True)
 
     try:
         facts_hint = f"\nЧто ты знаешь об этом человеке (используй естественно, не перечисляй): {'; '.join(safe_facts)}" if safe_facts else ""
