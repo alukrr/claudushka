@@ -15,6 +15,7 @@
 import asyncio
 import json
 import logging
+import time
 
 import anthropic
 
@@ -22,6 +23,41 @@ logger = logging.getLogger(__name__)
 
 # Паузы между повторами транзиентной ошибки (сек). Длина кортежа = число ретраев.
 RETRY_DELAYS = (2, 6, 15)
+
+# Не чаще одного письма админу про пустой баланс в полчаса: 2026-08-03 таких ошибок
+# прилетело 41 штука за два часа — без кулдауна это 41 сообщение в личку подряд.
+BALANCE_ALERT_COOLDOWN = 1800
+_last_balance_alert = 0.0
+_admin_notifier = None
+
+
+def set_admin_notifier(fn) -> None:
+    """Зарегистрировать способ достучаться до админа: корутина одного аргумента (текст).
+
+    Хук, а не прямой вызов бота: api_errors общий для Telegram и WhatsApp и ничего
+    не знает ни про Application, ни про ADMIN_IDS. Не зарегистрирован — просто молчим.
+    """
+    global _admin_notifier
+    _admin_notifier = fn
+
+
+async def _alert_admin_balance(exc: BaseException) -> None:
+    """Сказать админу, что кончились деньги. Пользователь этого сам не починит."""
+    global _last_balance_alert
+    if _admin_notifier is None:
+        return
+    now = time.monotonic()
+    if now - _last_balance_alert < BALANCE_ALERT_COOLDOWN:
+        return
+    _last_balance_alert = now
+    try:
+        await _admin_notifier(
+            "💸 Кончились деньги на apitoken.sale — 402 insufficient balance.\n"
+            "Запросы не проходят, бот отвечает всем отказом. Пополни баланс.\n"
+            f"({str(exc)[:200]})"
+        )
+    except Exception as notify_exc:
+        logger.error(f"не смогла уведомить админа о балансе: {notify_exc}")
 
 PROMPT_TOO_LONG_MARKER = "prompt is too long"
 
@@ -95,7 +131,8 @@ def user_message(exc: BaseException, default: str | None = None, clear_hint: str
     if isinstance(exc, anthropic.APIConnectionError):
         return "Не достучалась до сервиса. Попробуй ещё раз."
     if is_insufficient_balance(exc):
-        return "У меня закончились деньги на счету. Алексей в курсе, ждём пополнения."
+        return ("Деньги на API кончились, я на мели. Алексею уже стукнула — "
+                "скиньтесь ему на токены, что ли, а то чо как эти.")
     if isinstance(exc, anthropic.APIStatusError):
         return "Сервис ответил ошибкой. Попробуй позже."
     return default or "Что-то сломалось на моей стороне. Попробуй ещё раз."
@@ -306,6 +343,8 @@ async def reply_api_error(
     (например «Не смогла прочитать файл»).
     """
     log_api_error(exc, context_label=context_label)
+    if is_insufficient_balance(exc):
+        await _alert_admin_balance(exc)
     try:
         await send(user_message(exc, default, clear_hint))
     except Exception as send_exc:

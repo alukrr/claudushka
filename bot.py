@@ -192,6 +192,7 @@ _halve_history = api_errors.halve_history
 # Bot info (set on startup)
 context_bot_id = None
 bot_username = None
+_admin_bot = None  # ставится в post_init, через него notify_admins шлёт сообщения
 
 
 # --- Role checks ---
@@ -1852,11 +1853,27 @@ async def cmd_reject_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Failed to leave chat: {e}")
 
 
+async def notify_admins(text: str) -> None:
+    """Разослать текст всем ADMIN_IDS. Молча переживает недоступность любого из них."""
+    if _admin_bot is None:
+        logger.warning(f"некому уведомить админа, бот ещё не поднят: {text[:80]}")
+        return
+    for admin_id in ADMIN_IDS:
+        try:
+            await _admin_bot.send_message(chat_id=admin_id, text=text)
+        except Exception as e:
+            logger.error(f"Failed to notify admin {admin_id}: {e}")
+
+
 async def post_init(application):
-    global context_bot_id, bot_username
+    global context_bot_id, bot_username, _admin_bot
     me = await application.bot.get_me()
     context_bot_id = me.id
     bot_username = me.username.lower()
+    # Через этот хук api_errors докричится до админа про пустой баланс (402):
+    # сам он про ADMIN_IDS и про Application ничего не знает.
+    _admin_bot = application.bot
+    api_errors.set_admin_notifier(notify_admins)
     logger.info(f"Bot: @{bot_username} (ID: {context_bot_id})")
 
 
