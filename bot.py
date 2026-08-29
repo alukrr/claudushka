@@ -1307,6 +1307,13 @@ async def cmd_ratelimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if reply_msg and reply_msg.from_user:
         target_id = reply_msg.from_user.id
         target_name = reply_msg.from_user.full_name or reply_msg.from_user.username or str(target_id)
+        if not args:
+            current = db.get_group_rate_limit(chat_id, target_id)
+            if current:
+                await update.effective_message.reply_text(f"{target_name}: не чаще раза в {current // 60} мин.")
+            else:
+                await update.effective_message.reply_text(f"{target_name}: лимитов нет.")
+            return
         value_tokens = args
     elif len(args) >= 2 and args[0].lstrip("-").isdigit():
         target_id = int(args[0])
@@ -1325,10 +1332,6 @@ async def cmd_ratelimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("Сняла лимиты со всех участников этого чата.")
         return
     else:
-        await update.effective_message.reply_text(RATELIMIT_USAGE)
-        return
-
-    if not value_tokens:
         await update.effective_message.reply_text(RATELIMIT_USAGE)
         return
 
@@ -1747,6 +1750,12 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_or_create_user(user_id, update.effective_user.username, update.effective_user.full_name)
     if user["role"] == "banned":
         return
+    is_group = update.effective_chat.type in ("group", "supergroup")
+    # /search и /imagine — отдельные CommandHandler'ы, а не текстовая ветка handle_message,
+    # поэтому /ratelimit туда не долетал бы без явной проверки здесь — а это самые дорогие
+    # команды, ограничивать имеет смысл в первую очередь их.
+    if is_group and not db.check_group_rate_limit(update.effective_chat.id, user_id):
+        return
     if not context.args:
         await update.message.reply_text("Использование: /imagine <описание картинки>")
         return
@@ -1783,6 +1792,9 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_or_create_user(user_id, update.effective_user.username, update.effective_user.full_name)
     if not can_search(user):
         await update.message.reply_text("Поиск доступен по приглашению. Попроси ссылку у друга!")
+        return
+    is_group = update.effective_chat.type in ("group", "supergroup")
+    if is_group and not db.check_group_rate_limit(update.effective_chat.id, user_id):
         return
     if not context.args:
         await update.message.reply_text("Использование: /search <запрос>")

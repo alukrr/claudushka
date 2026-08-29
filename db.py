@@ -598,6 +598,17 @@ def remove_group_rate_limit(chat_id: int, user_id: int = None):
     conn.close()
 
 
+def get_group_rate_limit(chat_id: int, user_id: int) -> int | None:
+    """Текущий лимит (в секундах) конкретного пользователя, без побочных эффектов."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT interval_seconds FROM chat_rate_limits WHERE chat_id = ? AND user_id = ?",
+        (chat_id, user_id)
+    ).fetchone()
+    conn.close()
+    return row["interval_seconds"] if row else None
+
+
 def get_group_rate_limits(chat_id: int) -> list[dict]:
     conn = get_conn()
     rows = conn.execute(
