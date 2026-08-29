@@ -201,6 +201,19 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+async def is_chat_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+    """Админ бота — всегда да. Иначе — реальный статус в этом Telegram-чате
+    (administrator/creator), чтобы /ratelimit могли выставлять и админы группы,
+    а не только глобальные админы бота."""
+    if is_admin(user_id):
+        return True
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
 def can_invite(user: dict) -> bool:
     return user["role"] in ("admin", "premium")
 
@@ -1262,6 +1275,81 @@ async def cmd_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+RATELIMIT_USAGE = (
+    "Использование:\n"
+    "/ratelimit — показать лимиты в этом чате\n"
+    "Ответом на сообщение участника:\n"
+    "  /ratelimit <N> — не чаще раза в N минут\n"
+    "  /ratelimit off — снять лимит с этого участника\n"
+    "Без ответа на сообщение:\n"
+    "  /ratelimit <user_id> <N|off> — то же самое по ID\n"
+    "  /ratelimit off — снять лимиты со всех в этом чате"
+)
+
+
+async def cmd_ratelimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ограничение частоты сообщений для отдельных участников группы.
+    Доступно чат-админам (не только глобальным админам бота) — см. is_chat_admin.
+    При превышении handle_message молча не отвечает, без явного сообщения об ошибке."""
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.effective_message.reply_text("/ratelimit работает только в групповых чатах.")
+        return
+
+    chat_id = chat.id
+    if not await is_chat_admin(context, chat_id, update.effective_user.id):
+        await update.effective_message.reply_text("Ограничивать частоту сообщений может только админ этого чата.")
+        return
+
+    args = context.args
+    reply_msg = update.message.reply_to_message if update.message else None
+
+    if reply_msg and reply_msg.from_user:
+        target_id = reply_msg.from_user.id
+        target_name = reply_msg.from_user.full_name or reply_msg.from_user.username or str(target_id)
+        value_tokens = args
+    elif len(args) >= 2 and args[0].lstrip("-").isdigit():
+        target_id = int(args[0])
+        target_name = str(target_id)
+        value_tokens = args[1:]
+    elif not args:
+        rows = db.get_group_rate_limits(chat_id)
+        if not rows:
+            await update.effective_message.reply_text("В этом чате лимитов нет — все пишут без ограничений.")
+        else:
+            lines = [f"  {r['user_id']}: раз в {r['interval_seconds'] // 60} мин." for r in rows]
+            await update.effective_message.reply_text("Лимиты в этом чате:\n" + "\n".join(lines))
+        return
+    elif len(args) == 1 and args[0].lower() == "off":
+        db.remove_group_rate_limit(chat_id)
+        await update.effective_message.reply_text("Сняла лимиты со всех участников этого чата.")
+        return
+    else:
+        await update.effective_message.reply_text(RATELIMIT_USAGE)
+        return
+
+    if not value_tokens:
+        await update.effective_message.reply_text(RATELIMIT_USAGE)
+        return
+
+    spec = value_tokens[0].lower()
+    if spec == "off":
+        db.remove_group_rate_limit(chat_id, target_id)
+        await update.effective_message.reply_text(f"Сняла лимит с {target_name}.")
+        return
+
+    try:
+        minutes = int(spec)
+        if minutes <= 0:
+            raise ValueError
+    except ValueError:
+        await update.effective_message.reply_text(RATELIMIT_USAGE)
+        return
+
+    db.set_group_rate_limit(chat_id, target_id, minutes * 60)
+    await update.effective_message.reply_text(f"{target_name}: не чаще раза в {minutes} мин. При превышении молчу.")
+
+
 async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -1440,7 +1528,8 @@ USER_HELP = """\
   /imagine <q>   — генерация изображения (referral+)
   /models        — какие модели доступны и что сейчас у чата
   /haiku         — переключить чат на Haiku 4.5 (дёшево и быстро)
-  /sonnet        — переключить чат на Sonnet 5 (умнее, дороже)\
+  /sonnet        — переключить чат на Sonnet 5 (умнее, дороже)
+  /ratelimit     — в группах: ограничить частоту сообщений участника (для админов группы)\
 """
 
 ADMIN_HELP = """\
@@ -1476,6 +1565,9 @@ ADMIN_HELP = """\
   /captcha_on/off          — включить/выключить капчу
   /captcha_unban <id>      — разбанить после капчи
   /activity [0-100]        — вероятность авто-реплаев в группе (%)
+  /ratelimit               — лимит частоты сообщений участника в группе (доступно и админам группы,
+                              не только боту-админу); ответом на сообщение: <N мин.>|off,
+                              без ответа: <user_id> <N|off>, без аргументов — список, "off" — сброс всем
   /cost                    — расход токенов по моделям
   /review                  — AI-обзор чата прямо сейчас
   /migrate                 — миграция JSON → SQLite
@@ -1912,6 +2004,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Никакой персональной капчи/допуска/дневного лимита. Бан остаётся (проверен в начале хендлера).
         if WHITELIST_ENABLED and not db.is_chat_allowed(chat_id):
             return
+        # Лимит частоты запросов per-user, выставляется чат-админами через /ratelimit.
+        # Превышение — молчим, без сообщения об ошибке (см. cmd_ratelimit).
+        if not db.check_group_rate_limit(chat_id, user_id):
+            return
     else:
         # Личка — персональный гейтинг.
         if needs_captcha(user):
@@ -2342,6 +2438,7 @@ def main():
     app.add_handler(CommandHandler("premium", cmd_premium))
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("activity", cmd_activity))
+    app.add_handler(CommandHandler("ratelimit", cmd_ratelimit))
     app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler("haiku", cmd_haiku))
     app.add_handler(CommandHandler("sonnet", cmd_sonnet))

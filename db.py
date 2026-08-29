@@ -98,6 +98,14 @@ def init_db():
             last_extract_id INTEGER NOT NULL DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS chat_rate_limits (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            interval_seconds INTEGER NOT NULL,
+            last_ts INTEGER,
+            PRIMARY KEY (chat_id, user_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_conv_user ON conversations(user_id);
         CREATE INDEX IF NOT EXISTS idx_conv_ts ON conversations(user_id, timestamp);
         CREATE INDEX IF NOT EXISTS idx_memory_user ON memory(user_id);
@@ -564,6 +572,63 @@ def set_chat_model_db(chat_id: int, model: str):
     )
     conn.commit()
     conn.close()
+
+
+# --- Group rate limits (per chat_id + user_id, set by chat admins) ---
+# Отсутствие строки = без ограничений. Строка есть = не чаще раза в interval_seconds.
+
+def set_group_rate_limit(chat_id: int, user_id: int, interval_seconds: int):
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO chat_rate_limits (chat_id, user_id, interval_seconds, last_ts) VALUES (?, ?, ?, NULL)",
+        (chat_id, user_id, interval_seconds)
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_group_rate_limit(chat_id: int, user_id: int = None):
+    """user_id=None — снять лимиты со всех пользователей чата."""
+    conn = get_conn()
+    if user_id is None:
+        conn.execute("DELETE FROM chat_rate_limits WHERE chat_id = ?", (chat_id,))
+    else:
+        conn.execute("DELETE FROM chat_rate_limits WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+    conn.commit()
+    conn.close()
+
+
+def get_group_rate_limits(chat_id: int) -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT user_id, interval_seconds FROM chat_rate_limits WHERE chat_id = ? ORDER BY user_id",
+        (chat_id,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def check_group_rate_limit(chat_id: int, user_id: int) -> bool:
+    """True — можно отвечать. False — лимит ещё не истёк, надо молча промолчать."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT interval_seconds, last_ts FROM chat_rate_limits WHERE chat_id = ? AND user_id = ?",
+        (chat_id, user_id)
+    ).fetchone()
+    if row is None:
+        conn.close()
+        return True
+    now = int(time.time())
+    if row["last_ts"] is not None and now - row["last_ts"] < row["interval_seconds"]:
+        conn.close()
+        return False
+    conn.execute(
+        "UPDATE chat_rate_limits SET last_ts = ? WHERE chat_id = ? AND user_id = ?",
+        (now, chat_id, user_id)
+    )
+    conn.commit()
+    conn.close()
+    return True
 
 
 def get_all_chats_for_status() -> list[dict]:
