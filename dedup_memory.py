@@ -72,6 +72,10 @@ PRICING = {
     "claude-opus-5": (5.0, 25.0),
     "claude-fable-5": (10.0, 50.0),
 }
+# Стандартные множители Anthropic для prompt caching (5-минутный ephemeral, тот тип,
+# что реально приходит с этого ключа/пула — см. usage.cache_creation).
+CACHE_WRITE_MULTIPLIER = 1.25
+CACHE_READ_MULTIPLIER = 0.1
 
 
 def get_conn(writable: bool) -> tuple[sqlite3.Connection, str | None]:
@@ -185,7 +189,7 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
         print(f"[llm] ограничено --limit-groups до {len(candidates)} групп")
 
     total_before = total_after = 0
-    total_in_tok = total_out_tok = 0
+    total_in_tok = total_cache_write_tok = total_cache_read_tok = total_out_tok = 0
     started = time.monotonic()
     for (uid, ctx, cid, grp_tier), rows in candidates.items():
         facts = [r["fact"] for r in rows]
@@ -218,13 +222,27 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
             text = api_errors.response_text(resp)
             data = api_errors.parse_json_lenient(text, "{", label=f"dedup user={uid} chat={cid}")
             merged = [f.strip() for f in (data or {}).get("facts", []) if isinstance(f, str) and f.strip()]
+            # Этот ключ/пул автоматически кеширует большие входы (prompt caching) —
+            # для уникального, ни разу не повторяющегося входа (каждая группа фактов
+            # своя) это ВСЕГДА запись в кэш, никогда чтение: input_tokens сам по себе
+            # почти пустой (несколько токенов), а реальный вес — в
+            # cache_creation_input_tokens. Проверено живьём 2026-08-31: на 400 фактах
+            # (40690 симв.) input_tokens=2, cache_creation_input_tokens=16186 — без
+            # этой строки оценка стоимости занижалась в ~100 раз. Цена записи в кэш —
+            # премия ~1.25x к обычному input (5-минутный ephemeral, как здесь), чтение
+            # из кэша было бы ~0.1x, но тут читать нечего — каждый вход уникален.
             usage = getattr(resp, "usage", None)
             in_tok = getattr(usage, "input_tokens", 0) or 0
+            cache_write_tok = getattr(usage, "cache_creation_input_tokens", 0) or 0
+            cache_read_tok = getattr(usage, "cache_read_input_tokens", 0) or 0
             out_tok = getattr(usage, "output_tokens", 0) or 0
             total_in_tok += in_tok
+            total_cache_write_tok += cache_write_tok
+            total_cache_read_tok += cache_read_tok
             total_out_tok += out_tok
             if verbose:
-                print(f"[llm][токены] user={uid} chat={cid} tier={grp_tier}: in={in_tok} out={out_tok}")
+                print(f"[llm][токены] user={uid} chat={cid} tier={grp_tier}: "
+                      f"in={in_tok} cache_write={cache_write_tok} cache_read={cache_read_tok} out={out_tok}")
         except Exception as e:
             print(f"[llm] user={uid} chat={cid} tier={grp_tier}: ошибка ({e}), пропуск")
             total_after += len(facts)
@@ -257,15 +275,24 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
     price_in, price_out = PRICING.get(model, (None, None))
     cost = None
     if price_in is not None:
-        cost = total_in_tok / 1_000_000 * price_in + total_out_tok / 1_000_000 * price_out
+        # cache_creation ~1.25x обычного input (5-минутный ephemeral, см. CACHE_WRITE_MULTIPLIER),
+        # cache_read ~0.1x — но для дедупа он почти всегда 0: каждый вход уникален,
+        # читать из кэша нечего, это ВСЕГДА запись, никогда чтение.
+        cost = (
+            total_in_tok / 1_000_000 * price_in
+            + total_cache_write_tok / 1_000_000 * price_in * CACHE_WRITE_MULTIPLIER
+            + total_cache_read_tok / 1_000_000 * price_in * CACHE_READ_MULTIPLIER
+            + total_out_tok / 1_000_000 * price_out
+        )
     cost_str = f"${cost:.4f}" if cost is not None else "? (модель не в PRICING — сверься с /cost в боте)"
     n_groups = len(candidates)
     per_group = elapsed / n_groups if n_groups else 0
 
     suffix = "" if apply else " (dry-run — ничего не записано, добавь --apply)"
     print(f"[llm] итого по обработанным группам: {total_before} -> {total_after}{suffix}")
-    print(f"[llm] время: {elapsed:.1f}с на {n_groups} групп (~{per_group:.1f}с/группу), "
-          f"токены: in={total_in_tok} out={total_out_tok}, оценка стоимости: {cost_str}")
+    print(f"[llm] время: {elapsed:.1f}с на {n_groups} групп (~{per_group:.1f}с/группу)")
+    print(f"[llm] токены: in={total_in_tok} cache_write={total_cache_write_tok} "
+          f"cache_read={total_cache_read_tok} out={total_out_tok}, оценка стоимости: {cost_str}")
 
     # Экстраполяция на ВЕСЬ фильтр (полезно после пробного --limit-groups N, прежде чем
     # снимать лимит и гонять все группы разом): грубая, по СРЕДНЕМУ на группу — реальные
