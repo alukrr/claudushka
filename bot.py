@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import html
 import logging
 import time
 import asyncio
@@ -132,6 +133,28 @@ async def _keep_chat_action(bot, chat_id: int, action: str, stop_event: asyncio.
                 pass
     except asyncio.CancelledError:
         pass
+
+
+async def reply_expandable(reply_fn, body: str, header: str = "") -> None:
+    """Отправляет длинную «простыню» свёрнутым Telegram-блоком <blockquote expandable> —
+    в чате видна одна строка со стрелочкой «развернуть», а не вся простыня сразу
+    (найдено 2026-08-31: /memory одним махом печатала весь список в чат). `header` —
+    обычная строка перед блоком (не сворачивается). Лимит Telegram на сообщение (4096
+    символов) никуда не делся — если body не влезает даже под тегом, режем на несколько
+    сообщений, каждое в своём collapsible-блоке.
+    """
+    header_line = html.escape(header) + "\n" if header else ""
+    prefix, suffix = "<blockquote expandable>", "</blockquote>"
+    budget = 4096 - len(header_line) - len(prefix) - len(suffix)
+    escaped = html.escape(body)
+    chunks = [escaped[i:i + budget] for i in range(0, len(escaped), budget)] or [""]
+    for i, chunk in enumerate(chunks):
+        text = (header_line if i == 0 else "") + prefix + chunk + suffix
+        try:
+            await reply_fn(text, parse_mode="HTML")
+        except Exception:
+            plain = (header + "\n" if header and i == 0 else "") + html.unescape(chunk)
+            await reply_fn(plain)
 
 
 async def call_claude(context, chat_id: int | None, *, label: str, **kwargs):
@@ -2011,17 +2034,11 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             facts = db.get_memory_for_private(update.effective_user.id)
         if facts:
-            # Копится без потолка (особенно в личке — see db.get_memory_for_private,
-            # там течёт память из ВСЕХ групп) — у активных пользователей легко перевалит
-            # за лимит Telegram в 4096 символов одним сообщением и падало BadRequest
-            # "Text is too long" (обнаружено 2026-08-31). Та же разбивка на части, что
-            # уже используется для длинных ответов по фото/документам.
-            text = "Я помню о тебе:\n\n" + "\n".join(f"• {f}" for f in facts)
-            if len(text) <= 4096:
-                await update.effective_message.reply_text(text)
-            else:
-                for i in range(0, len(text), 4096):
-                    await update.effective_message.reply_text(text[i:i + 4096])
+            # Даже с потолком (см. db.get_memory_for_private) список фактов — простыня,
+            # которая раньше валилась в чат целиком; теперь сворачиваем её тегом
+            # <blockquote expandable> (найдено 2026-08-31, "потестировал на себе, засрал чат").
+            body = "\n".join(f"• {f}" for f in facts)
+            await reply_expandable(update.effective_message.reply_text, body, header="Я помню о тебе:")
         else:
             await update.effective_message.reply_text("Пока ничего не помню. Поговорим — запомню!")
     except Exception as e:
