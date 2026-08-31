@@ -142,12 +142,36 @@ async def reply_expandable(reply_fn, body: str, header: str = "") -> None:
     обычная строка перед блоком (не сворачивается). Лимит Telegram на сообщение (4096
     символов) никуда не делся — если body не влезает даже под тегом, режем на несколько
     сообщений, каждое в своём collapsible-блоке.
+
+    Режем по ГРАНИЦАМ СТРОК, а не по количеству символов подряд: сырая нарезка
+    "escaped[i:i+budget]" рвала текст посреди слова между соседними сообщениями
+    (найдено 2026-08-31: "техно" в одном сообщении, "ческой историей" в следующем).
+    Отдельная строка длиннее budget — редкий случай, режется по символам только она.
     """
     header_line = html.escape(header) + "\n" if header else ""
     prefix, suffix = "<blockquote expandable>", "</blockquote>"
     budget = 4096 - len(header_line) - len(prefix) - len(suffix)
-    escaped = html.escape(body)
-    chunks = [escaped[i:i + budget] for i in range(0, len(escaped), budget)] or [""]
+
+    chunks: list[str] = []
+    current = ""
+    for line in body.split("\n"):
+        esc_line = html.escape(line)
+        candidate = f"{current}\n{esc_line}" if current else esc_line
+        if len(candidate) <= budget:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        if len(esc_line) <= budget:
+            current = esc_line
+        else:
+            for i in range(0, len(esc_line), budget):
+                chunks.append(esc_line[i:i + budget])
+            current = ""
+    if current:
+        chunks.append(current)
+    chunks = chunks or [""]
+
     for i, chunk in enumerate(chunks):
         text = (header_line if i == 0 else "") + prefix + chunk + suffix
         try:

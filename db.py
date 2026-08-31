@@ -272,20 +272,37 @@ def clear_conversation(user_id: int):
 # --- Memory ---
 
 def get_memory(user_id: int, context: str = "private", chat_id: int = None) -> list[str]:
+    """Факты одного человека в одном контексте (личка, либо конкретный чат группы).
+
+    Потолок MEMORY_LONG_PER_USER/MEMORY_MEDIUM_PER_USER (те же, что у get_all_chat_memory
+    и get_memory_for_private) — без него /memory в группе для давнего активного участника
+    рассыпалась на несколько сообщений вперемешку с обрывками слов посреди строки (найдено
+    2026-08-31: 740 фактов на одного человека в одном чате, 34k символов — извлечение
+    памяти плодит почти дубли типа "Поделился фото"/"Поделился фото в чате"/"Отправил фото
+    в чат" вместо дедупа; сама гигиена дублей — отдельная открытая задача, см. CLAUDE.md).
+    """
     conn = get_conn()
     now = int(time.time())
-    if context == "group" and chat_id:
-        rows = conn.execute(
-            "SELECT fact FROM memory WHERE user_id = ? AND context = ? AND chat_id = ? "
-            "AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at",
-            (user_id, context, chat_id, now)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT fact FROM memory WHERE user_id = ? AND context = ? AND chat_id IS NULL "
-            "AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at",
-            (user_id, context, now)
-        ).fetchall()
+    chat_filter = "AND chat_id = ?" if (context == "group" and chat_id) else "AND chat_id IS NULL"
+    params = (user_id, context) + ((chat_id,) if (context == "group" and chat_id) else ()) + (now,)
+    rows = conn.execute(
+        f"""
+        WITH ranked AS (
+            SELECT fact, created_at, COALESCE(tier, 'long') AS tier,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY COALESCE(tier, 'long')
+                       ORDER BY created_at DESC
+                   ) AS rn
+            FROM memory
+            WHERE user_id = ? AND context = ? {chat_filter}
+              AND (expires_at IS NULL OR expires_at > ?)
+        )
+        SELECT fact FROM ranked
+        WHERE (tier = 'medium' AND rn <= ?) OR (tier != 'medium' AND rn <= ?)
+        ORDER BY created_at
+        """,
+        params + (MEMORY_MEDIUM_PER_USER, MEMORY_LONG_PER_USER)
+    ).fetchall()
     conn.close()
     return [r["fact"] for r in rows]
 
