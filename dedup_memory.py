@@ -1,30 +1,40 @@
 #!/usr/bin/env python3
-"""Ручная дедупликация фактов в таблице memory. НЕ часть бота, не импортируется bot.py —
-запускать вручную с сервера, когда накопился дублирующий мусор (см. CLAUDE.md,
-"Гигиена памяти"). Дефолт — dry-run, ничего не пишет в БД, пока не передан --apply.
+"""Ручная дедупликация и точечная правка фактов в таблице memory. НЕ часть бота, не
+импортируется bot.py — запускать вручную с сервера (см. CLAUDE.md, "Гигиена памяти").
+Дефолт — dry-run, ничего не пишет в БД, пока не передан --apply.
 
-Два режима:
-  --mode exact  Убирает строго идентичные (user_id, context, chat_id, fact) — дёшево,
-                без обращения к API, безопасно. Оставляет самую РАННЮЮ запись из дублей.
-                Ловит только буквальные повторы, не варианты формулировок.
+Три режима:
+  --mode exact   Убирает строго идентичные (user_id, context, chat_id, fact) — дёшево,
+                 без обращения к API, безопасно. Оставляет самую РАННЮЮ запись из дублей.
+                 Ловит только буквальные повторы, не варианты формулировок.
 
-  --mode llm    Просит модель объединить факты, похожие по смыслу, но разные по
-                формулировке (например "Поделился фото" / "Поделился фото в чате" /
-                "Отправил фото в чат" -> один факт). Один вызов модели на группу
-                (user_id, context, chat_id, tier) — СТОИТ ДЕНЕГ, задаётся --model
-                (короткое имя haiku/sonnet/opus/fable, как в bot.py, дефолт haiku,
-                либо полная API-строка). Старые записи группы удаляются, вместо
-                них вставляется объединённый список с tier и (для medium)
-                максимальным expires_at среди объединяемых записей. Нужен пакет
-                anthropic и ANTHROPIC_API_KEY — на голом хосте их обычно нет
-                (см. ниже про docker exec).
+  --mode llm     Просит модель объединить факты, похожие по смыслу, но разные по
+                 формулировке (например "Поделился фото" / "Поделился фото в чате" /
+                 "Отправил фото в чат" -> один факт). Один вызов модели на группу
+                 (user_id, context, chat_id, tier) — СТОИТ ДЕНЕГ, задаётся --model
+                 (короткое имя haiku/sonnet/opus/fable, как в bot.py, дефолт haiku,
+                 либо полная API-строка). Старые записи группы удаляются, вместо
+                 них вставляется объединённый список с tier и (для medium)
+                 максимальным expires_at среди объединяемых записей. Нужен пакет
+                 anthropic и ANTHROPIC_API_KEY — на голом хосте их обычно нет
+                 (см. ниже про docker exec).
+
+  --mode delete  Точечно удаляет конкретный факт — --fact "точный текст" (--like — как
+                 подстрока, LIKE %...%), ОБЯЗАТЕЛЕН --user-id (иначе слишком легко
+                 задеть чужие факты, если формулировка не уникальна). Для случаев,
+                 когда извлечение памяти намусорило что-то откровенно НЕВЕРНОЕ — не
+                 дубль, а галлюцинация — dedup сам такое не ловит, он про повторы, не
+                 про достоверность. /forget в самом боте чистит ВСЮ память юзера
+                 разом, точечного удаления там нет.
 
 Фильтры (по умолчанию — вся таблица, сузьте перед первым запуском):
-  --user-id ID        только этот пользователь
+  --user-id ID        только этот пользователь (обязателен для --mode delete)
   --chat-id ID        только этот чат (для context=group)
   --tier long|medium  только этот tier
   --limit-groups N    (только --mode llm) не более N групп за один запуск —
                        подстраховка от случайного дорогого прогона на всей таблице
+  --fact "текст"       (только --mode delete) что искать
+  --like               (только --mode delete) --fact как подстрока, не точное совпадение
 
 Примеры (без --apply — всегда dry-run, только печатает что было бы сделано):
   ./dedup_memory.py --mode exact
@@ -39,6 +49,10 @@
   # (процесс внутри контейнера и так root), /repo — это ~/claudushka, смонтирован туда
   docker exec claudushka python3 /repo/dedup_memory.py --mode llm --model sonnet --user-id 592441
   docker exec claudushka python3 /repo/dedup_memory.py --mode llm --model sonnet --user-id 592441 --apply
+
+  # --mode delete — убрать конкретный неверный факт (dry-run покажет совпадения и id)
+  ./dedup_memory.py --mode delete --user-id 592441 --fact "Учит сербский язык"
+  sudo ./dedup_memory.py --mode delete --user-id 592441 --fact "Учит сербский язык" --apply
 
 Для --apply на ГОЛОМ ХОСТЕ нужен sudo — каталог data/ обычно root:root (самообновление
 бота пишет в БД изнутри контейнера от root); для --mode llm --apply на хосте — sudo -E,
@@ -144,6 +158,39 @@ def dedup_exact(conn, user_id=None, chat_id=None, tier=None, apply=False, verbos
         conn.executemany("DELETE FROM memory WHERE id = ?", [(i,) for i in to_delete])
         conn.commit()
     print(f"[exact] удалено {len(to_delete)} строк")
+
+
+def dedup_delete(conn, user_id=None, chat_id=None, tier=None, fact=None, like=False, apply=False):
+    """Точечное удаление конкретного факта — то, чего не делает /forget (она чистит
+
+    ВСЮ память юзера). Нужно, когда извлечение памяти намусорило что-то откровенно
+    неверное (не дубль, просто неправда/галлюцинация) — dedup сам такое не ловит,
+    он про повторы, не про достоверность.
+    """
+    if user_id is None:
+        sys.exit("--mode delete требует --user-id — без него слишком легко случайно "
+                 "задеть факты не того человека, если формулировка не уникальна")
+    if not fact:
+        sys.exit("--mode delete требует --fact \"точный текст факта\" (--like — как подстрока)")
+    where, params = _filters(user_id, chat_id, tier)
+    where.append("fact LIKE ?" if like else "fact = ?")
+    params.append(f"%{fact}%" if like else fact)
+    where_sql = "WHERE " + " AND ".join(where)
+    rows = conn.execute(
+        f"SELECT id, user_id, chat_id, COALESCE(tier, 'long') AS tier, fact FROM memory {where_sql}",
+        params,
+    ).fetchall()
+
+    print(f"[delete] совпадений: {len(rows)}")
+    for r in rows:
+        print(f"  id={r['id']} chat={r['chat_id']} tier={r['tier']}: {r['fact']!r}")
+    if not apply:
+        print("[delete] dry-run — ничего не удалено, добавь --apply")
+        return
+    if rows:
+        conn.executemany("DELETE FROM memory WHERE id = ?", [(r["id"],) for r in rows])
+        conn.commit()
+    print(f"[delete] удалено {len(rows)} строк")
 
 
 def _groups_for_llm(conn, user_id, chat_id, tier):
@@ -306,7 +353,7 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mode", choices=["exact", "llm"], required=True)
+    p.add_argument("--mode", choices=["exact", "llm", "delete"], required=True)
     p.add_argument("--user-id", type=int, default=None)
     p.add_argument("--chat-id", type=int, default=None)
     p.add_argument("--tier", choices=["long", "medium"], default=None)
@@ -314,6 +361,12 @@ def main():
     p.add_argument("--model", default="haiku",
                     help="только для --mode llm — короткое имя (haiku/sonnet/opus/fable, "
                          "как в bot.py) или полная API-строка")
+    p.add_argument("--fact", default=None,
+                    help="только для --mode delete — текст факта на удаление (точное "
+                         "совпадение, если не передан --like)")
+    p.add_argument("--like", action="store_true",
+                    help="только для --mode delete — --fact ищется как подстрока (LIKE %%...%%), "
+                         "не точным совпадением")
     p.add_argument("--apply", action="store_true", help="реально писать в БД (иначе dry-run)")
     p.add_argument("-v", "--verbose", action="store_true",
                     help="показать сами факты (exact: какой дубль какому id соответствует; "
@@ -330,6 +383,8 @@ def main():
     try:
         if args.mode == "exact":
             dedup_exact(conn, args.user_id, args.chat_id, args.tier, args.apply, args.verbose)
+        elif args.mode == "delete":
+            dedup_delete(conn, args.user_id, args.chat_id, args.tier, args.fact, args.like, args.apply)
         else:
             dedup_llm(conn, args.user_id, args.chat_id, args.tier, args.apply,
                       args.model, args.limit_groups, args.verbose)
