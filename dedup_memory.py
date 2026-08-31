@@ -176,12 +176,15 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
         facts = [r["fact"] for r in rows]
         total_before += len(facts)
         try:
-            # max_tokens=4096, не 1024: на группах в сотни фактов (см. живой случай — 740
-            # в одном чате) 1024 не хватает и ответ обрывается — тот же класс проблемы,
-            # что инцидент 2026-08-03 в extract_all_participants_memory (см. CLAUDE.md).
+            # max_tokens=8192: на группах в сотни-тысячи фактов (живой случай — 1441
+            # medium-фактов в одном чате) даже 4096 не хватило и ответ обрывался — тот же
+            # класс проблемы, что инцидент 2026-08-03 в extract_all_participants_memory
+            # (см. CLAUDE.md). parse_json_lenient ниже переживёт обрыв и на этом лимите —
+            # это подстраховка, а не гарантия, что 8192 хватит на ЛЮБую группу; если
+            # снова обрежет — сузьте --user-id/--chat-id/--tier и прогоните по частям.
             resp = client.messages.create(
                 model=model,
-                max_tokens=4096,
+                max_tokens=8192,
                 system=(
                     "Тебе дан список фактов об одном человеке — часть из них дубли или "
                     "перефразировки одного и того же. Объедини по смыслу, убери повторы, "
