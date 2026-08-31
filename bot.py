@@ -2173,20 +2173,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # одно и то же аудио/видео дважды — один раз для лога, один раз для ответа адресату.
     voice_transcript_cache: str | None = None
     video_note_description_cache: str | None = None
+    video_description_cache: str | None = None
 
     if is_group and update.message:
         sender = update.effective_user.first_name or "Unknown"
-        # Бот и так ответит на это сообщение своей веткой ниже (has_photo и т.п.) —
-        # повторное фоновое распознавание было бы задвоенным API-вызовом.
-        bot_will_handle = is_bot_mentioned(update)
         # Пассивное распознавание (стоит денег на каждое медиа) — только в approved-чатах,
         # см. CLAUDE.md. Дефолт WHITELIST_ENABLED=False — гейт большую часть времени неактивен.
         media_gated = WHITELIST_ENABLED and not db.is_chat_allowed(chat_id)
         if update.message.text:
             db.save_group_message(chat_id, user_id, sender, update.message.text)
         elif update.message.photo:
+            # ВСЕГДА распознаём, даже если бот и так ответит своей веткой ниже (has_photo):
+            # раньше при адресованном фото пассивная запись оставалась голым "[Фото]", и в
+            # СЛЕДУЮЩЕЙ реплике модель, глядя на свой же прошлый ответ рядом с пустым тегом,
+            # решала что сама всё выдумала — хотя реально видела фото (инцидент 2026-08-31,
+            # "до меня прилетело просто «Фото»"). Двойной Haiku-вызов на адресованное фото —
+            # приемлемая цена за то, что тег в транскрипте всегда содержит правду.
             caption = update.message.caption or ""
-            if bot_will_handle or media_gated:
+            if media_gated:
                 db.save_group_message(chat_id, user_id, sender, f"[Фото] {caption}".strip())
             else:
                 description = await _recognize_photo_for_context(context, update.message.photo[-1])
@@ -2199,24 +2203,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # содержимого (баг v0.11.1: "до меня доезжает только имя файла").
             # Тот же Animation.file_id/.duration, что у Video, поэтому подходит тот же
             # _recognize_video без изменений (кадры через ffmpeg, Haiku-описание).
+            # ВСЕГДА распознаём (см. комментарий у photo) — результат кэшируется в
+            # video_description_cache и переиспользуется ниже, если бот адресован, чтобы
+            # не платить за Haiku-вызов дважды (в отличие от фото, у GIF/video нет отдельной
+            # более богатой Q&A-ветки, которую жалко было бы не использовать).
             cap = update.message.caption or ""
-            if bot_will_handle or media_gated:
+            if media_gated:
                 db.save_group_message(chat_id, user_id, sender, f"[GIF] {cap}".strip())
             else:
-                description = await _recognize_video(context, update.message.animation)
-                text = f"[GIF: {description}]" if description else "[GIF]"
+                video_description_cache = await _recognize_video(context, update.message.animation)
+                text = f"[GIF: {video_description_cache}]" if video_description_cache else "[GIF]"
                 db.save_group_message(chat_id, user_id, sender, f"{text} {cap}".strip())
         elif update.message.document:
             fn = update.message.document.file_name or "файл"
             cap = update.message.caption or ""
             db.save_group_message(chat_id, user_id, sender, f"[Файл: {fn}] {cap}".strip())
         elif update.message.video:
+            # ВСЕГДА распознаём + кэшируем — см. комментарий у animation.
             cap = update.message.caption or ""
-            if bot_will_handle or media_gated:
+            if media_gated:
                 db.save_group_message(chat_id, user_id, sender, f"[Видео] {cap}".strip())
             else:
-                description = await _recognize_video(context, update.message.video)
-                text = f"[Видео: {description}]" if description else "[Видео]"
+                video_description_cache = await _recognize_video(context, update.message.video)
+                text = f"[Видео: {video_description_cache}]" if video_description_cache else "[Видео]"
                 db.save_group_message(chat_id, user_id, sender, f"{text} {cap}".strip())
         elif update.message.voice:
             if media_gated:
@@ -2310,13 +2319,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             user_text = "Кружочек. " + ". ".join(parts)
         elif update.message.video:
-            description = await _recognize_video(context, update.message.video)
+            # В группе уже посчитано в пассивном блоке (video_description_cache) — не дублируем вызов.
+            description = video_description_cache if is_group else await _recognize_video(context, update.message.video)
             if not description:
                 await update.message.reply_text("Не смогла разобрать видео.")
                 return
             user_text = f"[Видео: {description}]"
         elif update.message.animation:
-            description = await _recognize_video(context, update.message.animation)
+            description = video_description_cache if is_group else await _recognize_video(context, update.message.animation)
             if not description:
                 await update.message.reply_text("Не смогла разобрать гифку.")
                 return
