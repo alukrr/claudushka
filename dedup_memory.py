@@ -12,9 +12,12 @@
                 формулировке (например "Поделился фото" / "Поделился фото в чате" /
                 "Отправил фото в чат" -> один факт). Один вызов модели на группу
                 (user_id, context, chat_id, tier) — СТОИТ ДЕНЕГ, задаётся --model
-                (дефолт Haiku). Старые записи группы удаляются, вместо них
-                вставляется объединённый список с tier и (для medium) максимальным
-                expires_at среди объединяемых записей.
+                (короткое имя haiku/sonnet/opus/fable, как в bot.py, дефолт haiku,
+                либо полная API-строка). Старые записи группы удаляются, вместо
+                них вставляется объединённый список с tier и (для medium)
+                максимальным expires_at среди объединяемых записей. Нужен пакет
+                anthropic и ANTHROPIC_API_KEY — на голом хосте их обычно нет
+                (см. ниже про docker exec).
 
 Фильтры (по умолчанию — вся таблица, сузьте перед первым запуском):
   --user-id ID        только этот пользователь
@@ -24,15 +27,22 @@
                        подстраховка от случайного дорогого прогона на всей таблице
 
 Примеры (без --apply — всегда dry-run, только печатает что было бы сделано):
-  python3 dedup_memory.py --mode exact
-  sudo python3 dedup_memory.py --mode exact --apply
-  set -a; source .env; set +a
-  python3 dedup_memory.py --mode llm --user-id 592441
-  sudo -E python3 dedup_memory.py --mode llm --user-id 592441 --chat-id -1001032770549 --apply
+  ./dedup_memory.py --mode exact
+  sudo ./dedup_memory.py --mode exact --apply
 
-Для --apply нужен sudo — каталог data/ обычно root:root (самообновление бота пишет
-в БД изнутри контейнера от root); для --mode llm --apply — sudo -E, чтобы прокинуть
-ANTHROPIC_API_KEY из окружения. Обычный dry-run (без --apply) sudo НЕ требует —
+  # --mode llm на голом хосте: нужны `pip install anthropic==0.43.0` и ключ в окружении
+  set -a; source .env; set +a
+  ./dedup_memory.py --mode llm --model sonnet --user-id 592441
+  sudo -E ./dedup_memory.py --mode llm --model sonnet --user-id 592441 --apply
+
+  # --mode llm через контейнер — ПРОЩЕ: anthropic и ключ там уже есть, sudo не нужен
+  # (процесс внутри контейнера и так root), /repo — это ~/claudushka, смонтирован туда
+  docker exec claudushka python3 /repo/dedup_memory.py --mode llm --model sonnet --user-id 592441
+  docker exec claudushka python3 /repo/dedup_memory.py --mode llm --model sonnet --user-id 592441 --apply
+
+Для --apply на ГОЛОМ ХОСТЕ нужен sudo — каталог data/ обычно root:root (самообновление
+бота пишет в БД изнутри контейнера от root); для --mode llm --apply на хосте — sudo -E,
+чтобы прокинуть ANTHROPIC_API_KEY. Обычный dry-run (без --apply) sudo НЕ требует —
 читает со снимка во временном файле, см. get_conn().
 """
 import argparse
@@ -46,6 +56,14 @@ import time
 from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "claudushka.db"
+
+# Короткие имена — как в реестре MODELS в bot.py, чтобы не помнить точные API-строки.
+MODEL_ALIASES = {
+    "haiku": "claude-haiku-4-5-20251001",
+    "sonnet": "claude-sonnet-5",
+    "opus": "claude-opus-5",
+    "fable": "claude-fable-5",
+}
 
 
 def get_conn(writable: bool) -> tuple[sqlite3.Connection, str | None]:
@@ -131,8 +149,18 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
               model="claude-haiku-4-5-20251001", limit_groups=None):
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        sys.exit("ANTHROPIC_API_KEY не задан в окружении — source .env (и sudo -E, если apply)")
-    import anthropic
+        sys.exit("ANTHROPIC_API_KEY не задан в окружении — source .env (и sudo -E, если apply), "
+                 "либо запусти через docker exec claudushka — там ключ уже есть, см. --help")
+    try:
+        import anthropic
+    except ModuleNotFoundError:
+        sys.exit(
+            "Модуль anthropic не установлен на хосте (он есть только внутри контейнера).\n"
+            "Либо: pip install anthropic==0.43.0\n"
+            "Либо (проще, не нужен ни pip, ни sudo — контейнер уже root и с ключом в окружении):\n"
+            "  docker exec claudushka python3 /repo/dedup_memory.py --mode llm ...\n"
+            "  docker exec claudushka python3 /repo/dedup_memory.py --mode llm ... --apply"
+        )
     client = anthropic.Anthropic(api_key=api_key)
 
     groups = _groups_for_llm(conn, user_id, chat_id, tier)
@@ -194,9 +222,12 @@ def main():
     p.add_argument("--chat-id", type=int, default=None)
     p.add_argument("--tier", choices=["long", "medium"], default=None)
     p.add_argument("--limit-groups", type=int, default=None, help="только для --mode llm")
-    p.add_argument("--model", default="claude-haiku-4-5-20251001", help="только для --mode llm")
+    p.add_argument("--model", default="haiku",
+                    help="только для --mode llm — короткое имя (haiku/sonnet/opus/fable, "
+                         "как в bot.py) или полная API-строка")
     p.add_argument("--apply", action="store_true", help="реально писать в БД (иначе dry-run)")
     args = p.parse_args()
+    args.model = MODEL_ALIASES.get(args.model, args.model)
 
     if not DB_PATH.exists():
         sys.exit(f"Не нашла БД: {DB_PATH}")
