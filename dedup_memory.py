@@ -49,7 +49,9 @@ DB_PATH = Path(__file__).resolve().parent / "data" / "claudushka.db"
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    # НЕ трогаем journal_mode: БД уже в WAL (выставлен ботом), а сама попытка
+    # ЗАДАТЬ этот PRAGMA — даже тем же значением — требует прав на запись в каталог
+    # data/, который обычно root:root. Из-за этого дефолтный dry-run падал без sudo.
     conn.execute("PRAGMA busy_timeout=5000")  # бот может писать параллельно
     return conn
 
