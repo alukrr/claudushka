@@ -304,6 +304,18 @@ GEMINI_MAX_RETRIES = 1
 GEMINI_RETRY_DELAY = 2
 GEMINI_MODEL_NAME = "Nano Banana 2"
 
+# --- Голос/видео: расшифровка и фоновое распознавание (v0.11.0) ---
+# Модель для аудио-транскрипции через тот же Gemini REST API/ключ, что и рисование.
+# Не проверялась живым запросом на этом ключе (WSL без доступа к серверу) — если Google
+# вернёт 404/400, заменить строку здесь, остальная логика не меняется.
+GEMINI_AUDIO_MODEL_NAME = "gemini-2.5-flash"
+GEMINI_AUDIO_TRANSCRIPT_MAX_CHARS = 1500  # уходит в group_messages/историю — не раздувать контекст
+MAX_VOICE_SECONDS = 300       # длиннее — не транскрибируем, только плейсхолдер
+MAX_VIDEO_NOTE_SECONDS = 60   # кружочки и так капаются клиентом Telegram на 60с
+MAX_VIDEO_SECONDS = 120       # длиннее — кадры не тянем
+VIDEO_FRAME_COUNT = 3
+MEDIA_DESCRIPTION_MAX_TOKENS = 250  # короткое описание — тоже копируется в каждый промпт чата
+
 
 async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str | None]:
     import base64
@@ -383,6 +395,57 @@ async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str 
         return None, f"Gemini ответил: {error_msg}", None
 
     return None, last_error_msg, None
+
+
+async def _transcribe_audio_gemini(audio_bytes: bytes, mime_type: str) -> str | None:
+    """Расшифровывает речь из голосового/видео через Gemini (тот же REST-паттерн, что и
+    рисование, тот же GEMINI_API_KEY). None — при любой ошибке или отсутствии речи.
+
+    В отличие от _try_gemini_image, запрос идёт через asyncio.to_thread — не блокирует
+    event loop; текст исключения requests содержит URL с ключом, наружу не отдаём
+    (см. известный баг v0.8.1 про Gemini-ключ в логе).
+    """
+    import base64
+    if not GEMINI_API_KEY:
+        return None
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_AUDIO_MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": "Расшифруй речь из этого файла дословно, без комментариев и пояснений. Если речи нет — верни пустую строку."},
+                {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(audio_bytes).decode()}},
+            ]
+        }],
+    }
+
+    for attempt in range(1, GEMINI_MAX_RETRIES + 1):
+        try:
+            resp = await asyncio.to_thread(http_requests.post, url, json=payload, timeout=GEMINI_TIMEOUT)
+        except Exception as e:
+            logger.warning(f"Gemini audio request failed (attempt {attempt}/{GEMINI_MAX_RETRIES}): {e}")
+            if attempt < GEMINI_MAX_RETRIES:
+                await asyncio.sleep(GEMINI_RETRY_DELAY)
+            continue
+
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                text = "".join(p.get("text", "") for p in parts).strip()
+            except Exception as e:
+                logger.warning(f"Gemini audio: unparseable response: {e}")
+                return None
+            return text[:GEMINI_AUDIO_TRANSCRIPT_MAX_CHARS] if text else None
+
+        if resp.status_code in (429, 500, 502, 503, 504) and attempt < GEMINI_MAX_RETRIES:
+            await asyncio.sleep(GEMINI_RETRY_DELAY)
+            continue
+
+        logger.warning(f"Gemini audio non-retryable error: HTTP {resp.status_code}")
+        return None
+
+    return None
 
 
 async def _rewrite_prompt(prompt: str) -> str | None:
@@ -480,6 +543,110 @@ async def _draw_and_send(update, context, chat_id: int, is_group: bool,
         return False
 
 
+def _extract_video_frames(video_bytes: bytes, count: int = VIDEO_FRAME_COUNT, duration: float | None = None) -> list[bytes]:
+    """Синхронная — звать ТОЛЬКО через asyncio.to_thread (ffmpeg-subprocess блокирует).
+
+    Захватывает `count` кадров равномерно по длительности (не через fps-фильтр — при
+    непостоянном FPS он даёт неровный разброс). Возвращает JPEG-байты, пустой список —
+    если ffmpeg недоступен/упал (нет ffmpeg в образе — см. docker-compose.yml).
+    """
+    import subprocess
+    import tempfile
+    frames: list[bytes] = []
+    with tempfile.TemporaryDirectory() as td:
+        in_path = os.path.join(td, "in.mp4")
+        with open(in_path, "wb") as f:
+            f.write(video_bytes)
+
+        dur = duration or 3.0  # длительность неизвестна — берём кадр около начала
+        fractions = [(i + 1) / (count + 1) for i in range(count)]
+        for i, frac in enumerate(fractions):
+            ts = max(0.0, dur * frac)
+            out_path = os.path.join(td, f"frame_{i}.jpg")
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-y", "-ss", str(ts), "-i", in_path, "-frames:v", "1", "-q:v", "3", out_path],
+                    capture_output=True, timeout=20,
+                )
+            except Exception as e:
+                logger.warning(f"ffmpeg frame extraction failed at {ts}s: {e}")
+                continue
+            if os.path.exists(out_path):
+                with open(out_path, "rb") as f:
+                    frames.append(f.read())
+    return frames
+
+
+async def _describe_media_haiku(images_b64: list[str], hint: str) -> str | None:
+    """Короткое описание фото/кадров видео — ВСЕГДА Haiku, не модель чата (фоновое
+    распознавание не должно платить по цене Opus/Fable). Не реплаит пользователю —
+    поэтому aux_create без keep-alive индикатора."""
+    if not images_b64:
+        return None
+    content = [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}}
+        for b64 in images_b64
+    ]
+    content.append({"type": "text", "text": hint})
+    try:
+        response = await aux_create(
+            model=DEFAULT_MODEL_ID,
+            max_tokens=MEDIA_DESCRIPTION_MAX_TOKENS,
+            system=(
+                "Опиши коротко, 1-2 предложения, только суть — это уйдёт в контекст "
+                "группового чата и будет копироваться в каждый следующий промпт, не пользователю напрямую."
+            ),
+            messages=[{"role": "user", "content": content}],
+        )
+        text = response_text(response).strip()
+        return text or None
+    except Exception as e:
+        logger.warning(f"Haiku media description failed: {e}")
+        return None
+
+
+async def _download_telegram_file(context, file_id: str) -> bytes:
+    tg_file = await context.bot.get_file(file_id)
+    return bytes(await tg_file.download_as_bytearray())
+
+
+async def _recognize_voice(context, voice) -> str | None:
+    """Транскрипт голосового или None (слишком длинное / ошибка). duration в секундах."""
+    if voice.duration and voice.duration > MAX_VOICE_SECONDS:
+        return None
+    audio_bytes = await _download_telegram_file(context, voice.file_id)
+    return await _transcribe_audio_gemini(audio_bytes, voice.mime_type or "audio/ogg")
+
+
+async def _recognize_video_note(context, video_note) -> tuple[str | None, str | None]:
+    """(транскрипт речи, описание кадров) для кружочка — любое из двух может быть None."""
+    if video_note.duration and video_note.duration > MAX_VIDEO_NOTE_SECONDS:
+        return None, None
+    video_bytes = await _download_telegram_file(context, video_note.file_id)
+    transcript = await _transcribe_audio_gemini(video_bytes, "video/mp4")
+    frames = await asyncio.to_thread(_extract_video_frames, video_bytes, VIDEO_FRAME_COUNT, video_note.duration)
+    frames_b64 = [__import__('base64').b64encode(f).decode() for f in frames]
+    description = await _describe_media_haiku(frames_b64, "Опиши коротко что происходит на видео.")
+    return transcript, description
+
+
+async def _recognize_video(context, video) -> str | None:
+    """Короткое Haiku-описание обычного видео (не кружочка) по кадрам, или None."""
+    if video.duration and video.duration > MAX_VIDEO_SECONDS:
+        return None
+    video_bytes = await _download_telegram_file(context, video.file_id)
+    frames = await asyncio.to_thread(_extract_video_frames, video_bytes, VIDEO_FRAME_COUNT, video.duration)
+    frames_b64 = [__import__('base64').b64encode(f).decode() for f in frames]
+    return await _describe_media_haiku(frames_b64, "Опиши коротко что происходит на видео.")
+
+
+async def _recognize_photo_for_context(context, photo) -> str | None:
+    """Короткое Haiku-описание фото для пассивного группового контекста (не Q&A-ветка)."""
+    photo_bytes = await _download_telegram_file(context, photo.file_id)
+    image_b64 = __import__('base64').b64encode(photo_bytes).decode()
+    return await _describe_media_haiku([image_b64], "Опиши коротко что на этом фото.")
+
+
 # --- Captcha ---
 
 def generate_captcha_question(user_text: str) -> str:
@@ -575,7 +742,11 @@ def get_system_prompt(user_id: int, is_group: bool = False, chat_id: int = None,
             "В истории несколько разных людей — каждая их реплика подписана «Имя: текст». "
             "Не путай собеседников и не сливай их в одного, обращайся к тому, кто пишет сейчас. "
             "Твои собственные прошлые реплики идут как assistant-сообщения — это то, что ты УЖЕ сказала, "
-            "не повторяйся и не приписывай свои слова другим."
+            "не повторяйся и не приписывай свои слова другим. "
+            "Сообщения вида «[Фото: описание]», «[Видео: описание]», «[Кружок] Сказано: ...Видно: ...», "
+            "«[Голосовое] текст» — это то, что ты сама увидела или услышала в медиа-сообщении участника "
+            "(картинку/видео распознала ты же, голос расшифрован), а не то, что участник написал текстом. "
+            "Отвечай на содержание так же естественно, как на обычный текст, не упоминай что это «тег»."
         )
     if not include_memory:
         return base
@@ -898,7 +1069,10 @@ BOT_TRIGGERS = {"клод", "клодушка", "claude"}
 DRAW_TRIGGERS = {"нарисуй", "нарисуй-ка", "draw", "zeichne", "рисуй", "изобрази", "покажи"}
 
 # Маркер, которым Клодушка сама инициирует генерацию картинки внутри текстового ответа.
-DRAW_MARKER_RE = re.compile(r"\[\[DRAW:\s*(.+?)\]\]", re.IGNORECASE | re.DOTALL)
+# Ловит и правильный [[DRAW: ...]], и то, как модель иногда сбивается на одинарную
+# скобку и/или забывает закрыть маркер ("[DRAW: ..." до конца строки) — без этого
+# сбойный маркер вываливался в чат текстом вместо того, чтобы вырезаться (см. CLAUDE.md).
+DRAW_MARKER_RE = re.compile(r"\[{1,2}DRAW:\s*(.+?)(?:\]{1,2}|$)", re.IGNORECASE | re.DOTALL)
 
 
 def is_bot_mentioned(update: Update) -> bool:
@@ -1991,17 +2165,61 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user["role"] == "banned":
         return
 
+    # Заполняются в пассивном блоке ниже (группа), чтобы не транскрибировать/распознавать
+    # одно и то же аудио/видео дважды — один раз для лога, один раз для ответа адресату.
+    voice_transcript_cache: str | None = None
+    video_note_description_cache: str | None = None
+
     if is_group and update.message:
         sender = update.effective_user.first_name or "Unknown"
+        # Бот и так ответит на это сообщение своей веткой ниже (has_photo и т.п.) —
+        # повторное фоновое распознавание было бы задвоенным API-вызовом.
+        bot_will_handle = is_bot_mentioned(update)
+        # Пассивное распознавание (стоит денег на каждое медиа) — только в approved-чатах,
+        # см. CLAUDE.md. Дефолт WHITELIST_ENABLED=False — гейт большую часть времени неактивен.
+        media_gated = WHITELIST_ENABLED and not db.is_chat_allowed(chat_id)
         if update.message.text:
             db.save_group_message(chat_id, user_id, sender, update.message.text)
         elif update.message.photo:
             caption = update.message.caption or ""
-            db.save_group_message(chat_id, user_id, sender, f"[Фото] {caption}".strip())
+            if bot_will_handle or media_gated:
+                db.save_group_message(chat_id, user_id, sender, f"[Фото] {caption}".strip())
+            else:
+                description = await _recognize_photo_for_context(context, update.message.photo[-1])
+                text = f"[Фото: {description}]" if description else "[Фото]"
+                db.save_group_message(chat_id, user_id, sender, f"{text} {caption}".strip())
         elif update.message.document:
             fn = update.message.document.file_name or "файл"
             cap = update.message.caption or ""
             db.save_group_message(chat_id, user_id, sender, f"[Файл: {fn}] {cap}".strip())
+        elif update.message.video:
+            cap = update.message.caption or ""
+            if bot_will_handle or media_gated:
+                db.save_group_message(chat_id, user_id, sender, f"[Видео] {cap}".strip())
+            else:
+                description = await _recognize_video(context, update.message.video)
+                text = f"[Видео: {description}]" if description else "[Видео]"
+                db.save_group_message(chat_id, user_id, sender, f"{text} {cap}".strip())
+        elif update.message.voice:
+            if media_gated:
+                db.save_group_message(chat_id, user_id, sender, "[Голосовое]")
+            else:
+                voice_transcript_cache = await _recognize_voice(context, update.message.voice)
+                text = f"[Голосовое] {voice_transcript_cache}" if voice_transcript_cache else "[Голосовое]"
+                db.save_group_message(chat_id, user_id, sender, text)
+        elif update.message.video_note:
+            if media_gated:
+                db.save_group_message(chat_id, user_id, sender, "[Кружок]")
+            else:
+                voice_transcript_cache, video_note_description_cache = await _recognize_video_note(
+                    context, update.message.video_note
+                )
+                parts = []
+                if voice_transcript_cache:
+                    parts.append(f"Сказано: {voice_transcript_cache}")
+                if video_note_description_cache:
+                    parts.append(f"Видно: {video_note_description_cache}")
+                db.save_group_message(chat_id, user_id, sender, "[Кружок] " + ". ".join(parts) if parts else "[Кружок]")
         # Извлечение памяти для всех участников — каждые MEMORY_EXTRACT_EVERY_CHAT сообщений,
         # независимо от того, упомянут бот или нет. Каденс считается по дельте
         # group_messages.id, а не по COUNT(*) — см. db.should_extract_chat_memory.
@@ -2049,6 +2267,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_text = update.message.text or update.message.caption or ""
     has_photo = bool(update.message.photo)
+
+    # --- Голос/кружочек/видео → user_text, дальше идут по ОБЫЧНОМУ диалоговому пайплайну
+    # (не отдельная Q&A-ветка, как фото) — "как будто написал текстом", была идея Алексея.
+    if not user_text:
+        if update.message.voice:
+            transcript = voice_transcript_cache if is_group else await _recognize_voice(context, update.message.voice)
+            if not transcript:
+                await update.message.reply_text("Не смогла разобрать голосовое — плохое качество или слишком длинное.")
+                return
+            user_text = transcript
+        elif update.message.video_note:
+            if is_group:
+                transcript, description = voice_transcript_cache, video_note_description_cache
+            else:
+                transcript, description = await _recognize_video_note(context, update.message.video_note)
+            parts = []
+            if transcript:
+                parts.append(f"Сказано: {transcript}")
+            if description:
+                parts.append(f"Видно: {description}")
+            if not parts:
+                await update.message.reply_text("Не смогла разобрать кружочек.")
+                return
+            user_text = "Кружочек. " + ". ".join(parts)
+        elif update.message.video:
+            description = await _recognize_video(context, update.message.video)
+            if not description:
+                await update.message.reply_text("Не смогла разобрать видео.")
+                return
+            user_text = f"[Видео: {description}]"
 
     # --- Подхватываем контекст реплая ---
     reply_context = ""
@@ -2466,6 +2714,9 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_message))
+    app.add_handler(MessageHandler(filters.VOICE, handle_message))
+    app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_message))
+    app.add_handler(MessageHandler(filters.VIDEO, handle_message))
 
     berlin_tz = timezone(timedelta(hours=2))
     app.job_queue.run_daily(
