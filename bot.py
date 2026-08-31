@@ -746,8 +746,9 @@ def get_system_prompt(user_id: int, is_group: bool = False, chat_id: int = None,
             "Не путай собеседников и не сливай их в одного, обращайся к тому, кто пишет сейчас. "
             "Твои собственные прошлые реплики идут как assistant-сообщения — это то, что ты УЖЕ сказала, "
             "не повторяйся и не приписывай свои слова другим. "
-            "Сообщения вида «[Фото: описание]», «[Видео: описание]», «[Кружок] Сказано: ...Видно: ...», "
-            "«[Голосовое] текст» — это то, что ты сама увидела или услышала в медиа-сообщении участника "
+            "Сообщения вида «[Фото: описание]», «[Видео: описание]», «[GIF: описание]», "
+            "«[Кружок] Сказано: ...Видно: ...», «[Голосовое] текст» — это то, что ты сама увидела "
+            "или услышала в медиа-сообщении участника "
             "(картинку/видео распознала ты же, голос расшифрован), а не то, что участник написал текстом. "
             "Отвечай на содержание так же естественно, как на обычный текст, не упоминай что это «тег»."
         )
@@ -2203,6 +2204,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 description = await _recognize_video(context, update.message.video)
                 text = f"[Видео: {description}]" if description else "[Видео]"
                 db.save_group_message(chat_id, user_id, sender, f"{text} {cap}".strip())
+        elif update.message.animation:
+            # GIF — тот же Animation.file_id/.duration, что у Video, поэтому подходит
+            # тот же _recognize_video без изменений (кадры через ffmpeg, Haiku-описание).
+            cap = update.message.caption or ""
+            if bot_will_handle or media_gated:
+                db.save_group_message(chat_id, user_id, sender, f"[GIF] {cap}".strip())
+            else:
+                description = await _recognize_video(context, update.message.animation)
+                text = f"[GIF: {description}]" if description else "[GIF]"
+                db.save_group_message(chat_id, user_id, sender, f"{text} {cap}".strip())
         elif update.message.voice:
             if media_gated:
                 db.save_group_message(chat_id, user_id, sender, "[Голосовое]")
@@ -2300,6 +2311,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Не смогла разобрать видео.")
                 return
             user_text = f"[Видео: {description}]"
+        elif update.message.animation:
+            description = await _recognize_video(context, update.message.animation)
+            if not description:
+                await update.message.reply_text("Не смогла разобрать гифку.")
+                return
+            user_text = f"[GIF: {description}]"
 
     # --- Подхватываем контекст реплая ---
     reply_context = ""
@@ -2720,6 +2737,7 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, handle_message))
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_message))
     app.add_handler(MessageHandler(filters.VIDEO, handle_message))
+    app.add_handler(MessageHandler(filters.ANIMATION, handle_message))
 
     berlin_tz = timezone(timedelta(hours=2))
     app.job_queue.run_daily(
