@@ -65,6 +65,14 @@ MODEL_ALIASES = {
     "fable": "claude-fable-5",
 }
 
+# $/MTok in,out — продублировано из реестра MODELS в bot.py (сверять при изменении цен там).
+PRICING = {
+    "claude-haiku-4-5-20251001": (1.0, 5.0),
+    "claude-sonnet-5": (3.0, 15.0),
+    "claude-opus-5": (5.0, 25.0),
+    "claude-fable-5": (10.0, 50.0),
+}
+
 
 def get_conn(writable: bool) -> tuple[sqlite3.Connection, str | None]:
     """(connection, temp_path). temp_path не None — вызывающий обязан его удалить.
@@ -170,12 +178,15 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
 
     groups = _groups_for_llm(conn, user_id, chat_id, tier)
     candidates = {k: v for k, v in groups.items() if len(v) >= 2}
-    print(f"[llm] групп (user,context,chat,tier) в фильтре: {len(groups)}, с 2+ фактами: {len(candidates)}")
+    total_candidate_groups = len(candidates)  # до обрезки --limit-groups — нужно для экстраполяции ниже
+    print(f"[llm] групп (user,context,chat,tier) в фильтре: {len(groups)}, с 2+ фактами: {total_candidate_groups}")
     if limit_groups:
         candidates = dict(list(candidates.items())[:limit_groups])
         print(f"[llm] ограничено --limit-groups до {len(candidates)} групп")
 
     total_before = total_after = 0
+    total_in_tok = total_out_tok = 0
+    started = time.monotonic()
     for (uid, ctx, cid, grp_tier), rows in candidates.items():
         facts = [r["fact"] for r in rows]
         total_before += len(facts)
@@ -207,6 +218,13 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
             text = api_errors.response_text(resp)
             data = api_errors.parse_json_lenient(text, "{", label=f"dedup user={uid} chat={cid}")
             merged = [f.strip() for f in (data or {}).get("facts", []) if isinstance(f, str) and f.strip()]
+            usage = getattr(resp, "usage", None)
+            in_tok = getattr(usage, "input_tokens", 0) or 0
+            out_tok = getattr(usage, "output_tokens", 0) or 0
+            total_in_tok += in_tok
+            total_out_tok += out_tok
+            if verbose:
+                print(f"[llm][токены] user={uid} chat={cid} tier={grp_tier}: in={in_tok} out={out_tok}")
         except Exception as e:
             print(f"[llm] user={uid} chat={cid} tier={grp_tier}: ошибка ({e}), пропуск")
             total_after += len(facts)
@@ -235,8 +253,28 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
             )
             conn.commit()
 
+    elapsed = time.monotonic() - started
+    price_in, price_out = PRICING.get(model, (None, None))
+    cost = None
+    if price_in is not None:
+        cost = total_in_tok / 1_000_000 * price_in + total_out_tok / 1_000_000 * price_out
+    cost_str = f"${cost:.4f}" if cost is not None else "? (модель не в PRICING — сверься с /cost в боте)"
+    n_groups = len(candidates)
+    per_group = elapsed / n_groups if n_groups else 0
+
     suffix = "" if apply else " (dry-run — ничего не записано, добавь --apply)"
     print(f"[llm] итого по обработанным группам: {total_before} -> {total_after}{suffix}")
+    print(f"[llm] время: {elapsed:.1f}с на {n_groups} групп (~{per_group:.1f}с/группу), "
+          f"токены: in={total_in_tok} out={total_out_tok}, оценка стоимости: {cost_str}")
+
+    # Экстраполяция на ВЕСЬ фильтр (полезно после пробного --limit-groups N, прежде чем
+    # снимать лимит и гонять все группы разом): грубая, по СРЕДНЕМУ на группу — реальные
+    # группы сильно различаются по размеру (от 2 фактов до 1441), не точная оценка.
+    if limit_groups and n_groups < total_candidate_groups and cost is not None:
+        factor = total_candidate_groups / n_groups
+        print(f"[llm] грубая экстраполяция на все {total_candidate_groups} групп в фильтре "
+              f"(± сильно, группы разного размера): ~{elapsed * factor / 60:.1f} мин, "
+              f"~${cost * factor:.2f}")
 
 
 def main():
