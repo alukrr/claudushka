@@ -2011,8 +2011,17 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             facts = db.get_memory_for_private(update.effective_user.id)
         if facts:
-            text = "\n".join(f"• {f}" for f in facts)
-            await update.effective_message.reply_text(f"Я помню о тебе:\n\n{text}")
+            # Копится без потолка (особенно в личке — see db.get_memory_for_private,
+            # там течёт память из ВСЕХ групп) — у активных пользователей легко перевалит
+            # за лимит Telegram в 4096 символов одним сообщением и падало BadRequest
+            # "Text is too long" (обнаружено 2026-08-31). Та же разбивка на части, что
+            # уже используется для длинных ответов по фото/документам.
+            text = "Я помню о тебе:\n\n" + "\n".join(f"• {f}" for f in facts)
+            if len(text) <= 4096:
+                await update.effective_message.reply_text(text)
+            else:
+                for i in range(0, len(text), 4096):
+                    await update.effective_message.reply_text(text[i:i + 4096])
         else:
             await update.effective_message.reply_text("Пока ничего не помню. Поговорим — запомню!")
     except Exception as e:

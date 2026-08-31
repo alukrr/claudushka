@@ -324,13 +324,33 @@ def get_memory_for_private(user_id: int) -> list[str]:
     чтение (get_memory(context='group', chat_id)) личку не видит.
     Дедуп с сохранением порядка — один и тот же факт мог осесть и в личке, и в группе.
     Просроченные среднесрочные факты не включаются.
+
+    Потолок MEMORY_LONG_PER_USER/MEMORY_MEDIUM_PER_USER (те же, что у get_all_chat_memory)
+    обязателен: без него активный участник многих групп копит факты без ограничения —
+    найдено 2026-08-31 у одного пользователя 1860 фактов, ~80k символов. Это и роняло
+    /memory (BadRequest: Text is too long, лимит Telegram 4096), и молча раздувало
+    system-prompt личных диалогов на КАЖДОЕ сообщение — тот же класс проблемы, что
+    инцидент 2026-07-26, только на масштабе одного пользователя, а не всего чата.
     """
     conn = get_conn()
     now = int(time.time())
     rows = conn.execute(
-        "SELECT fact FROM memory WHERE user_id = ? AND context IN ('private','group') "
-        "AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at",
-        (user_id, now)
+        """
+        WITH ranked AS (
+            SELECT fact, created_at, COALESCE(tier, 'long') AS tier,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY COALESCE(tier, 'long')
+                       ORDER BY created_at DESC
+                   ) AS rn
+            FROM memory
+            WHERE user_id = ? AND context IN ('private', 'group')
+              AND (expires_at IS NULL OR expires_at > ?)
+        )
+        SELECT fact FROM ranked
+        WHERE (tier = 'medium' AND rn <= ?) OR (tier != 'medium' AND rn <= ?)
+        ORDER BY created_at
+        """,
+        (user_id, now, MEMORY_MEDIUM_PER_USER, MEMORY_LONG_PER_USER)
     ).fetchall()
     conn.close()
     seen, out = set(), []
