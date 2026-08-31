@@ -153,10 +153,11 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
                  "либо запусти через docker exec claudushka — там ключ уже есть, см. --help")
     try:
         import anthropic
-    except ModuleNotFoundError:
+        import api_errors  # тот же общий модуль, что у bot.py/whatsapp.py — не изобретаем заново
+    except ModuleNotFoundError as e:
         sys.exit(
-            "Модуль anthropic не установлен на хосте (он есть только внутри контейнера).\n"
-            "Либо: pip install anthropic==0.43.0\n"
+            f"Не хватает модуля ({e}) — он есть только внутри контейнера.\n"
+            "Либо: pip install anthropic==0.43.0 (api_errors.py — свой файл рядом, копировать не надо)\n"
             "Либо (проще, не нужен ни pip, ни sudo — контейнер уже root и с ключом в окружении):\n"
             "  docker exec claudushka python3 /repo/dedup_memory.py --mode llm ...\n"
             "  docker exec claudushka python3 /repo/dedup_memory.py --mode llm ... --apply"
@@ -175,9 +176,12 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
         facts = [r["fact"] for r in rows]
         total_before += len(facts)
         try:
+            # max_tokens=4096, не 1024: на группах в сотни фактов (см. живой случай — 740
+            # в одном чате) 1024 не хватает и ответ обрывается — тот же класс проблемы,
+            # что инцидент 2026-08-03 в extract_all_participants_memory (см. CLAUDE.md).
             resp = client.messages.create(
                 model=model,
-                max_tokens=1024,
+                max_tokens=4096,
                 system=(
                     "Тебе дан список фактов об одном человеке — часть из них дубли или "
                     "перефразировки одного и того же. Объедини по смыслу, убери повторы, "
@@ -187,9 +191,15 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
                 ),
                 messages=[{"role": "user", "content": json.dumps(facts, ensure_ascii=False)}],
             )
-            text = "".join(b.text for b in resp.content if hasattr(b, "text"))
-            data = json.loads(text[text.find("{"):text.rfind("}") + 1])
-            merged = [f.strip() for f in data.get("facts", []) if isinstance(f, str) and f.strip()]
+            # response_text/parse_json_lenient — те же хелперы, что у bot.py/whatsapp.py,
+            # не голый content[0].text/find+rfind: у пятого поколения content[0] может
+            # быть thinking-блоком без текста, а обрезанный по max_tokens JSON рвёт
+            # наивный find/rfind (оба класса багов задокументированы в CLAUDE.md).
+            if api_errors.was_truncated(resp):
+                print(f"[llm] user={uid} chat={cid} tier={grp_tier}: ответ обрезан по max_tokens")
+            text = api_errors.response_text(resp)
+            data = api_errors.parse_json_lenient(text, "{", label=f"dedup user={uid} chat={cid}")
+            merged = [f.strip() for f in (data or {}).get("facts", []) if isinstance(f, str) and f.strip()]
         except Exception as e:
             print(f"[llm] user={uid} chat={cid} tier={grp_tier}: ошибка ({e}), пропуск")
             total_after += len(facts)
