@@ -271,16 +271,24 @@ def clear_conversation(user_id: int):
 
 # --- Memory ---
 
-def get_memory(user_id: int, context: str = "private", chat_id: int = None) -> list[str]:
+def get_memory(user_id: int, context: str = "private", chat_id: int = None,
+               long_limit: int = None, medium_limit: int = None) -> list[str]:
     """Факты одного человека в одном контексте (личка, либо конкретный чат группы).
 
-    Потолок MEMORY_LONG_PER_USER/MEMORY_MEDIUM_PER_USER (те же, что у get_all_chat_memory
-    и get_memory_for_private) — без него /memory в группе для давнего активного участника
+    long_limit/medium_limit — потолок на tier для ЭТОГО конкретного чтения; по умолчанию
+    (None) — MEMORY_LONG_PER_USER/MEMORY_MEDIUM_PER_USER, те же, что кормят system-prompt
+    (см. get_all_chat_memory). `/memory` передаёт побольше — MEMORY_LONG_DISPLAY/
+    MEMORY_MEDIUM_DISPLAY (30/10), `/memory_full` — заведомо огромные числа (без потолка
+    вообще). Без потолка по умолчанию /memory в группе для давнего активного участника
     рассыпалась на несколько сообщений вперемешку с обрывками слов посреди строки (найдено
     2026-08-31: 740 фактов на одного человека в одном чате, 34k символов — извлечение
     памяти плодит почти дубли типа "Поделился фото"/"Поделился фото в чате"/"Отправил фото
     в чат" вместо дедупа; сама гигиена дублей — отдельная открытая задача, см. CLAUDE.md).
     """
+    if long_limit is None:
+        long_limit = MEMORY_LONG_PER_USER
+    if medium_limit is None:
+        medium_limit = MEMORY_MEDIUM_PER_USER
     conn = get_conn()
     now = int(time.time())
     chat_filter = "AND chat_id = ?" if (context == "group" and chat_id) else "AND chat_id IS NULL"
@@ -301,7 +309,7 @@ def get_memory(user_id: int, context: str = "private", chat_id: int = None) -> l
         WHERE (tier = 'medium' AND rn <= ?) OR (tier != 'medium' AND rn <= ?)
         ORDER BY created_at
         """,
-        params + (MEMORY_MEDIUM_PER_USER, MEMORY_LONG_PER_USER)
+        params + (medium_limit, long_limit)
     ).fetchall()
     conn.close()
     return [r["fact"] for r in rows]
@@ -333,7 +341,7 @@ def clear_memory(user_id: int, context: str = None):
     conn.close()
 
 
-def get_memory_for_private(user_id: int) -> list[str]:
+def get_memory_for_private(user_id: int, long_limit: int = None, medium_limit: int = None) -> list[str]:
     """Чтение памяти для ЛИЧКИ (асимметрия секретности).
 
     Возвращает личные факты про человека ПЛЮС все групповые факты про него
@@ -342,13 +350,19 @@ def get_memory_for_private(user_id: int) -> list[str]:
     Дедуп с сохранением порядка — один и тот же факт мог осесть и в личке, и в группе.
     Просроченные среднесрочные факты не включаются.
 
-    Потолок MEMORY_LONG_PER_USER/MEMORY_MEDIUM_PER_USER (те же, что у get_all_chat_memory)
-    обязателен: без него активный участник многих групп копит факты без ограничения —
-    найдено 2026-08-31 у одного пользователя 1860 фактов, ~80k символов. Это и роняло
-    /memory (BadRequest: Text is too long, лимит Telegram 4096), и молча раздувало
-    system-prompt личных диалогов на КАЖДОЕ сообщение — тот же класс проблемы, что
-    инцидент 2026-07-26, только на масштабе одного пользователя, а не всего чата.
+    long_limit/medium_limit — см. get_memory: по умолчанию (None) MEMORY_LONG_PER_USER/
+    MEMORY_MEDIUM_PER_USER (то, что кормит system-prompt), `/memory` передаёт побольше,
+    `/memory_full` — без потолка. Потолок по умолчанию обязателен: без него активный
+    участник многих групп копит факты без ограничения — найдено 2026-08-31 у одного
+    пользователя 1860 фактов, ~80k символов. Это и роняло /memory (BadRequest: Text is
+    too long, лимит Telegram 4096), и молча раздувало system-prompt личных диалогов на
+    КАЖДОЕ сообщение — тот же класс проблемы, что инцидент 2026-07-26, только на
+    масштабе одного пользователя, а не всего чата.
     """
+    if long_limit is None:
+        long_limit = MEMORY_LONG_PER_USER
+    if medium_limit is None:
+        medium_limit = MEMORY_MEDIUM_PER_USER
     conn = get_conn()
     now = int(time.time())
     rows = conn.execute(
@@ -367,7 +381,7 @@ def get_memory_for_private(user_id: int) -> list[str]:
         WHERE (tier = 'medium' AND rn <= ?) OR (tier != 'medium' AND rn <= ?)
         ORDER BY created_at
         """,
-        (user_id, now, MEMORY_MEDIUM_PER_USER, MEMORY_LONG_PER_USER)
+        (user_id, now, medium_limit, long_limit)
     ).fetchall()
     conn.close()
     seen, out = set(), []
@@ -494,6 +508,11 @@ def get_user_id_by_name_in_chat(chat_id: int, sender_name: str) -> int | None:
 
 MEMORY_LONG_PER_USER = 12
 MEMORY_MEDIUM_PER_USER = 8
+
+# Отдельный, более щедрый потолок для команды /memory (человек читает сам, не модель
+# на каждый промпт) — 30 долгосрочных + 10 недельных, против 12+8 для system-prompt.
+MEMORY_LONG_DISPLAY = 30
+MEMORY_MEDIUM_DISPLAY = 10
 
 
 def get_all_chat_memory(chat_id: int) -> list[dict]:

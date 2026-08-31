@@ -2050,25 +2050,41 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _send_memory(update: Update, long_limit: int, medium_limit: int, header: str, label: str) -> None:
     try:
         is_group = update.effective_chat.type in ("group", "supergroup")
         if is_group:
-            facts = db.get_memory(update.effective_user.id, "group", update.effective_chat.id)
+            facts = db.get_memory(update.effective_user.id, "group", update.effective_chat.id,
+                                   long_limit=long_limit, medium_limit=medium_limit)
         else:
-            facts = db.get_memory_for_private(update.effective_user.id)
+            facts = db.get_memory_for_private(update.effective_user.id,
+                                               long_limit=long_limit, medium_limit=medium_limit)
         if facts:
-            # Даже с потолком (см. db.get_memory_for_private) список фактов — простыня,
-            # которая раньше валилась в чат целиком; теперь сворачиваем её тегом
-            # <blockquote expandable> (найдено 2026-08-31, "потестировал на себе, засрал чат").
+            # Даже с потолком список фактов — простыня, которая раньше валилась в чат
+            # целиком; сворачиваем тегом <blockquote expandable> (найдено 2026-08-31,
+            # "потестировал на себе, засрал чат").
             body = "\n".join(f"• {f}" for f in facts)
-            await reply_expandable(update.effective_message.reply_text, body, header="Я помню о тебе:")
+            await reply_expandable(update.effective_message.reply_text, body, header=header)
         else:
             await update.effective_message.reply_text("Пока ничего не помню. Поговорим — запомню!")
     except Exception as e:
         await api_errors.reply_api_error(
-            update.effective_message.reply_text, e, context_label="/memory",
+            update.effective_message.reply_text, e, context_label=label,
         )
+
+
+async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _send_memory(update, db.MEMORY_LONG_DISPLAY, db.MEMORY_MEDIUM_DISPLAY,
+                        "Я помню о тебе:", "/memory")
+
+
+async def cmd_memory_full(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Намеренно НЕ в USER_HELP/ADMIN_HELP — не документируем открыто, чтобы не звали
+    почём зря (может уйти десятками сообщений на давнего активного участника, см.
+    CLAUDE.md). Без потолка вообще — вся история, что накопилась."""
+    UNBOUNDED = 10 ** 9
+    await _send_memory(update, UNBOUNDED, UNBOUNDED,
+                        "Я помню о тебе (полный список):", "/memory_full")
 
 
 async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2762,6 +2778,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("memory", cmd_memory))
+    app.add_handler(CommandHandler("memory_full", cmd_memory_full))  # намеренно не в USER_HELP/ADMIN_HELP
     app.add_handler(CommandHandler("forget", cmd_forget))
     app.add_handler(CommandHandler("imagine", cmd_imagine))
     app.add_handler(CommandHandler("search", cmd_search))
