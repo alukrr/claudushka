@@ -30,30 +30,45 @@
   python3 dedup_memory.py --mode llm --user-id 592441
   sudo -E python3 dedup_memory.py --mode llm --user-id 592441 --chat-id -1001032770549 --apply
 
-Требует прав на запись в data/claudushka.db — каталог data/ обычно root:root
-(самообновление бота пишет в БД изнутри контейнера от root), поэтому для --apply
-скорее всего нужен sudo (для --mode llm — sudo -E, чтобы прокинуть ANTHROPIC_API_KEY
-из окружения, или экспортировать переменную уже под sudo).
+Для --apply нужен sudo — каталог data/ обычно root:root (самообновление бота пишет
+в БД изнутри контейнера от root); для --mode llm --apply — sudo -E, чтобы прокинуть
+ANTHROPIC_API_KEY из окружения. Обычный dry-run (без --apply) sudo НЕ требует —
+читает со снимка во временном файле, см. get_conn().
 """
 import argparse
 import json
 import os
+import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "claudushka.db"
 
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
+def get_conn(writable: bool) -> tuple[sqlite3.Connection, str | None]:
+    """(connection, temp_path). temp_path не None — вызывающий обязан его удалить.
+
+    WAL-режим требует прав на запись в -wal/-shm файлы ДАЖЕ ДЛЯ ЧТЕНИЯ (ограничение
+    самого SQLite, не наше) — на сервере они root:root. Поэтому dry-run читает со
+    снимка во временном файле (та же схема, что использовалась вручную весь этот
+    день — cp data/claudushka.db /tmp/... && sqlite3 /tmp/...), а не с боевого файла:
+    так --apply=False не требует sudo вообще. --apply=True подключается к настоящему
+    файлу напрямую и пишет туда — для этого нужны реальные права (sudo).
+    """
+    if writable:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute("PRAGMA busy_timeout=5000")  # бот может писать параллельно
+        conn.row_factory = sqlite3.Row
+        return conn, None
+    fd, tmp_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    shutil.copyfile(str(DB_PATH), tmp_path)
+    conn = sqlite3.connect(tmp_path)
     conn.row_factory = sqlite3.Row
-    # НЕ трогаем journal_mode: БД уже в WAL (выставлен ботом), а сама попытка
-    # ЗАДАТЬ этот PRAGMA — даже тем же значением — требует прав на запись в каталог
-    # data/, который обычно root:root. Из-за этого дефолтный dry-run падал без sudo.
-    conn.execute("PRAGMA busy_timeout=5000")  # бот может писать параллельно
-    return conn
+    return conn, tmp_path
 
 
 def _filters(user_id, chat_id, tier):
@@ -186,7 +201,9 @@ def main():
     if not DB_PATH.exists():
         sys.exit(f"Не нашла БД: {DB_PATH}")
 
-    conn = get_conn()
+    conn, tmp_path = get_conn(writable=args.apply)
+    if tmp_path:
+        print(f"[dry-run] читаю снимок {tmp_path} (боевой файл не трогаю, sudo не нужен)")
     try:
         if args.mode == "exact":
             dedup_exact(conn, args.user_id, args.chat_id, args.tier, args.apply)
@@ -195,6 +212,8 @@ def main():
                       args.model, args.limit_groups)
     finally:
         conn.close()
+        if tmp_path:
+            os.remove(tmp_path)
 
 
 if __name__ == "__main__":
