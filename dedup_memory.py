@@ -103,7 +103,7 @@ def _filters(user_id, chat_id, tier):
     return where, params
 
 
-def dedup_exact(conn, user_id=None, chat_id=None, tier=None, apply=False):
+def dedup_exact(conn, user_id=None, chat_id=None, tier=None, apply=False, verbose=False):
     where, params = _filters(user_id, chat_id, tier)
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     rows = conn.execute(
@@ -112,13 +112,17 @@ def dedup_exact(conn, user_id=None, chat_id=None, tier=None, apply=False):
         params,
     ).fetchall()
 
-    seen, to_delete = set(), []
+    seen, kept_id, to_delete = set(), {}, []
     for r in rows:
         key = (r["user_id"], r["context"], r["chat_id"], r["fact"])
         if key in seen:
             to_delete.append(r["id"])
+            if verbose:
+                print(f"[exact][dup] user={r['user_id']} chat={r['chat_id']}: "
+                      f"{r['fact']!r} (id={r['id']}, оставляем id={kept_id[key]})")
         else:
             seen.add(key)
+            kept_id[key] = r["id"]
 
     print(f"[exact] строк в области фильтра: {len(rows)}, точных дублей: {len(to_delete)}")
     if not apply:
@@ -146,7 +150,7 @@ def _groups_for_llm(conn, user_id, chat_id, tier):
 
 
 def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
-              model="claude-haiku-4-5-20251001", limit_groups=None):
+              model="claude-haiku-4-5-20251001", limit_groups=None, verbose=False):
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         sys.exit("ANTHROPIC_API_KEY не задан в окружении — source .env (и sudo -E, если apply), "
@@ -209,6 +213,13 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
             continue
 
         print(f"[llm] user={uid} chat={cid} tier={grp_tier}: {len(facts)} -> {len(merged)}")
+        if verbose:
+            print(f"[llm][было] user={uid} chat={cid} tier={grp_tier}:")
+            for f in facts:
+                print(f"    - {f}")
+            print(f"[llm][стало] user={uid} chat={cid} tier={grp_tier}:")
+            for f in merged:
+                print(f"    + {f}")
         total_after += len(merged) or len(facts)
         if not merged:
             continue
@@ -239,6 +250,9 @@ def main():
                     help="только для --mode llm — короткое имя (haiku/sonnet/opus/fable, "
                          "как в bot.py) или полная API-строка")
     p.add_argument("--apply", action="store_true", help="реально писать в БД (иначе dry-run)")
+    p.add_argument("-v", "--verbose", action="store_true",
+                    help="показать сами факты (exact: какой дубль какому id соответствует; "
+                         "llm: полный список 'было'/'стало' по каждой группе), не только счётчики")
     args = p.parse_args()
     args.model = MODEL_ALIASES.get(args.model, args.model)
 
@@ -250,10 +264,10 @@ def main():
         print(f"[dry-run] читаю снимок {tmp_path} (боевой файл не трогаю, sudo не нужен)")
     try:
         if args.mode == "exact":
-            dedup_exact(conn, args.user_id, args.chat_id, args.tier, args.apply)
+            dedup_exact(conn, args.user_id, args.chat_id, args.tier, args.apply, args.verbose)
         else:
             dedup_llm(conn, args.user_id, args.chat_id, args.tier, args.apply,
-                      args.model, args.limit_groups)
+                      args.model, args.limit_groups, args.verbose)
     finally:
         conn.close()
         if tmp_path:
