@@ -130,12 +130,17 @@
 `_transcribe_audio_gemini(audio_bytes, mime_type)` — POST на
 `generativelanguage.googleapis.com/.../{GEMINI_AUDIO_MODEL_NAME}:generateContent` с
 `inline_data`, в отличие от `_try_gemini_image` вызывается через `asyncio.to_thread` (не
-блокирует event loop). `GEMINI_AUDIO_MODEL_NAME = "gemini-2.5-flash"` — **не проверена
-живым запросом** (WSL без доступа к серверу/ключам, см. `_try_gemini_image`-прецедент с
-живой проверкой реестра `MODELS`); если Google ответит 404/400 — заменить константу,
-логика не меняется. Транскрипт режется до `GEMINI_AUDIO_TRANSCRIPT_MAX_CHARS` (1500) —
-уходит в `group_messages`, которая копируется в каждый следующий промпт чата (см. общий
-инвариант про лимит по размеру в разделе памяти).
+блокирует event loop). `GEMINI_AUDIO_MODEL_NAME = "gemini-3.6-flash"` — **проверено живым
+запросом 31.08.2026** (curl с сервера, тот же `GEMINI_API_KEY`): `gemini-2.5-flash` отдаёт
+404 «no longer available to new users», Google сам предлагает `gemini-3.6-flash`; и текст,
+и `audio/wav` inline_data вернули 200. **Модель галлюцинирует на чистой тишине** —
+вместо пустой строки выдаёт правдоподобный, но полностью выдуманный текст (проверено:
+1 секунда цифровой тишины → связная фраза на английском). Транскрипту доверять нельзя
+на 100%, особенно для коротких/тихих войсов — это поведение самой модели Google, не баг
+парсинга на нашей стороне, чинить нечем. Транскрипт режется до
+`GEMINI_AUDIO_TRANSCRIPT_MAX_CHARS` (1500) — уходит в `group_messages`, которая
+копируется в каждый следующий промпт чата (см. общий инвариант про лимит по размеру в
+разделе памяти).
 
 ### Кадры из видео (video_note, video) — ffmpeg + Haiku
 `_extract_video_frames(video_bytes, count, duration)` — синхронная, звать только через
