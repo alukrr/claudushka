@@ -2192,6 +2192,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 description = await _recognize_photo_for_context(context, update.message.photo[-1])
                 text = f"[Фото: {description}]" if description else "[Фото]"
                 db.save_group_message(chat_id, user_id, sender, f"{text} {caption}".strip())
+        elif update.message.animation:
+            # ПЕРЕД document: Telegram зеркалит GIF ещё и в message.document (легаси-совместимость
+            # с ботами, не знающими про animation) — если проверить document раньше, вся ветка
+            # ниже никогда не сработает, и GIF молча ляжет как голый "[Файл: name.mp4]" без
+            # содержимого (баг v0.11.1: "до меня доезжает только имя файла").
+            # Тот же Animation.file_id/.duration, что у Video, поэтому подходит тот же
+            # _recognize_video без изменений (кадры через ffmpeg, Haiku-описание).
+            cap = update.message.caption or ""
+            if bot_will_handle or media_gated:
+                db.save_group_message(chat_id, user_id, sender, f"[GIF] {cap}".strip())
+            else:
+                description = await _recognize_video(context, update.message.animation)
+                text = f"[GIF: {description}]" if description else "[GIF]"
+                db.save_group_message(chat_id, user_id, sender, f"{text} {cap}".strip())
         elif update.message.document:
             fn = update.message.document.file_name or "файл"
             cap = update.message.caption or ""
@@ -2203,16 +2217,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 description = await _recognize_video(context, update.message.video)
                 text = f"[Видео: {description}]" if description else "[Видео]"
-                db.save_group_message(chat_id, user_id, sender, f"{text} {cap}".strip())
-        elif update.message.animation:
-            # GIF — тот же Animation.file_id/.duration, что у Video, поэтому подходит
-            # тот же _recognize_video без изменений (кадры через ffmpeg, Haiku-описание).
-            cap = update.message.caption or ""
-            if bot_will_handle or media_gated:
-                db.save_group_message(chat_id, user_id, sender, f"[GIF] {cap}".strip())
-            else:
-                description = await _recognize_video(context, update.message.animation)
-                text = f"[GIF: {description}]" if description else "[GIF]"
                 db.save_group_message(chat_id, user_id, sender, f"{text} {cap}".strip())
         elif update.message.voice:
             if media_gated:
@@ -2336,7 +2340,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # --- Handle document/file ---
-    has_document = bool(update.message.document)
+    # Исключаем animation: Telegram зеркалит GIF в message.document для легаси-совместимости,
+    # без этой проверки GIF, адресованный боту напрямую, попадал бы сюда вместо ветки
+    # animation чуть выше и падал бы в "файл бинарный или неизвестного типа" (баг v0.11.1).
+    has_document = bool(update.message.document) and not update.message.animation
     if has_document:
         doc = update.message.document
         mime = doc.mime_type or ""
