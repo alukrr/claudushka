@@ -94,12 +94,24 @@ def model_meta(model_id: str) -> dict:
 # Per-model token tracking
 token_usage: dict[str, dict[str, int]] = {}
 
+# Стандартные множители Anthropic для prompt caching (5-минутный ephemeral). Найдено
+# 2026-08-31 при разборе dedup_memory.py: пул этого ключа кеширует любой достаточно
+# большой вход, не только системные промпты — а у больших групповых system-prompt'ов
+# (20-30k+ символов, см. PROMPT в логах) это ровно наш случай. При этом usage.input_tokens
+# сам по себе почти пустой, реальный вес — в cache_creation_input_tokens/cache_read_input_tokens,
+# которые /cost раньше вообще не видел — расход занижался (порядок величины подтверждён
+# в dedup_memory.py: 40690 символов -> input_tokens=2, cache_creation_input_tokens=16186).
+CACHE_WRITE_MULTIPLIER = 1.25
+CACHE_READ_MULTIPLIER = 0.1
 
-def _track_tokens(model: str, inp: int, out: int):
+
+def _track_tokens(model: str, inp: int, out: int, cache_write: int = 0, cache_read: int = 0):
     if model not in token_usage:
-        token_usage[model] = {"input": 0, "output": 0}
+        token_usage[model] = {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}
     token_usage[model]["input"] += inp
     token_usage[model]["output"] += out
+    token_usage[model]["cache_write"] += cache_write
+    token_usage[model]["cache_read"] += cache_read
 
 
 def _track_response(model: str, response) -> None:
@@ -108,10 +120,17 @@ def _track_response(model: str, response) -> None:
     Зовётся из обёрток (sync_create / call_claude), а НЕ по месту: раньше половина
     путей — should_search, перевод, капча, extract_*, /search — не считалась вовсе,
     и /cost занижал расход. Новый вызов API автоматически попадает в учёт.
+
+    cache_creation_input_tokens/cache_read_input_tokens — см. CACHE_WRITE_MULTIPLIER
+    выше: без них /cost занижал расход на большом system-prompt'е на порядки, не проценты.
     """
     usage = getattr(response, "usage", None)
     if usage is not None:
-        _track_tokens(model, usage.input_tokens, usage.output_tokens)
+        _track_tokens(
+            model, usage.input_tokens, usage.output_tokens,
+            getattr(usage, "cache_creation_input_tokens", 0) or 0,
+            getattr(usage, "cache_read_input_tokens", 0) or 0,
+        )
 
 
 # --- Вызов Anthropic API из async-хендлеров ---
@@ -1590,14 +1609,24 @@ async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for model, usage in sorted(token_usage.items()):
             inp = usage["input"]
             out = usage["output"]
+            cache_write = usage.get("cache_write", 0)
+            cache_read = usage.get("cache_read", 0)
             meta = model_meta(model)
             price_in, price_out = meta["in"], meta["out"]
-            cost = (inp / 1_000_000 * price_in) + (out / 1_000_000 * price_out)
+            # cache_write/cache_read — см. CACHE_WRITE_MULTIPLIER: без них цифра занижена
+            # на порядки на большом system-prompt'е, не на проценты (найдено 2026-08-31).
+            cost = (
+                (inp / 1_000_000 * price_in)
+                + (cache_write / 1_000_000 * price_in * CACHE_WRITE_MULTIPLIER)
+                + (cache_read / 1_000_000 * price_in * CACHE_READ_MULTIPLIER)
+                + (out / 1_000_000 * price_out)
+            )
             grand_total += cost
             # Модель вне реестра считается по дефолтным ценам — говорим об этом прямо,
             # иначе цифра выглядит точной, не будучи ею.
             name = meta["label"] if model in _MODELS_BY_ID else f"{model} (нет в реестре, цена по {meta['label']})"
-            lines.append(f"  {name}: вх {inp:,} / вых {out:,} — ~${cost:.4f}")
+            cache_part = f", кэш зап {cache_write:,} / чтен {cache_read:,}" if (cache_write or cache_read) else ""
+            lines.append(f"  {name}: вх {inp:,} / вых {out:,}{cache_part} — ~${cost:.4f}")
         lines.append(f"Итого: ~${grand_total:.4f}")
         await update.effective_message.reply_text("\n".join(lines))
     except Exception as e:
