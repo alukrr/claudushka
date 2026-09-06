@@ -1061,21 +1061,15 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
             _model = get_chat_model(chat_id)
             response = await aux_create(
                 model=_model,
-                max_tokens=1024,
+                max_tokens=500,
                 system=(
                     "Ты Клодушка — AI с характером, которая считает себя умнее всех в чате (и не без оснований). "
-                    "Напиши ироничный, саркастичный обзор дня в чате. "
-                    "Анализируй социальную динамику: "
-                    "- Кто с кем дружит, кто кого троллит, кто кого игнорирует "
-                    "- Как люди друг к другу обращаются (ники, прозвища, клички) "
-                    "- Кто лидер мнений, кто тихоня, кто провокатор "
-                    "- Какие темы обсуждались, кто что умного (или тупого) сказал "
-                    "- Кто больше всех писал, а кто отмалчивался "
-                    "В конце — поставь себя выше всех, мягко но уверенно напомни что ты AI "
-                    "и видишь картину целиком, а они — нет. Подведи итог с лёгким превосходством. "
+                    "Напиши КОРОТКИЙ ироничный, саркастичный обзор дня в чате — 2-3 абзаца, не больше 600 знаков суммарно. "
+                    "Не старайся упомянуть всех и каждую тему — выбери 2-3 самых сочных момента: "
+                    "кто с кем дружит/троллит/игнорирует, как обращаются друг к другу, кто лидер мнений. "
+                    "В конце — коротко, мягко но уверенно напомни что ты AI и видишь картину целиком, а они — нет. "
                     "Будь остроумной, дерзкой, но не жестокой — ты ведь их любишь, просто они смешные. "
-                    "Формат: живой текст, 4-6 абзацев. "
-                    "Пиши на языке чата."
+                    "Пиши на языке чата. Уложись в объём — оборванный на середине текст хуже короткого."
                 ),
                 messages=[{"role": "user", "content": f"Вот сообщения за день:\n{chat_log}"}],
             )
@@ -1083,7 +1077,11 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
             if not review:
                 logger.warning(f"Дневной обзор пуст: {api_errors.response_debug(response)}")
                 continue
+            if api_errors.was_truncated(response):
+                logger.warning(f"Дневной обзор обрезан по max_tokens, chat={chat_id}: {api_errors.response_debug(response)}")
+                review = api_errors.trim_to_last_sentence(review)
             await context.bot.send_message(chat_id=chat_id, text=review)
+            db.save_group_message(chat_id, context_bot_id, "Клодушка", review, is_bot=True)
             logger.info(f"Daily review sent to {chat_id}")
         except Exception as e:
             logger.error(f"Daily review error for {chat_id}: {e}")
@@ -1413,13 +1411,13 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await call_claude(
             context, chat_id, label=f"/review chat={chat_id}",
             model=_model,
-            max_tokens=1024,
+            max_tokens=500,
             system=(
                 "Ты Клодушка — AI с характером, которая считает себя умнее всех в чате (и не без оснований). "
-                "Напиши ироничный, саркастичный обзор дня в чате. "
-                "Анализируй социальную динамику, темы, активность участников. "
-                "В конце напомни что ты AI и видишь картину целиком. "
-                "Формат: живой текст, 4-6 абзацев. Пиши на языке чата."
+                "Напиши КОРОТКИЙ ироничный, саркастичный обзор дня в чате — 2-3 абзаца, не больше 600 знаков суммарно. "
+                "Анализируй социальную динамику, темы, активность участников — но выбери только 2-3 самых сочных момента. "
+                "В конце коротко напомни что ты AI и видишь картину целиком. "
+                "Пиши на языке чата. Уложись в объём — оборванный на середине текст хуже короткого."
             ),
             messages=[{"role": "user", "content": f"Вот сообщения за день:\n{chat_log}"}],
         )
@@ -1427,7 +1425,11 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not review:
             logger.warning(f"/review пуст: {api_errors.response_debug(response)}")
             review = "Модель вернула пустой ответ. Попробуй ещё раз или смени модель через /models."
+        elif api_errors.was_truncated(response):
+            logger.warning(f"/review обрезан по max_tokens, chat={chat_id}: {api_errors.response_debug(response)}")
+            review = api_errors.trim_to_last_sentence(review)
         await update.message.reply_text(review)
+        db.save_group_message(chat_id, context_bot_id, "Клодушка", review, is_bot=True)
     except Exception as e:
         await api_errors.reply_api_error(
             update.message.reply_text, e, context_label=f"/review chat={chat_id}",

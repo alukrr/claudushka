@@ -177,6 +177,21 @@ def was_truncated(response) -> bool:
     return getattr(response, "stop_reason", None) == "max_tokens"
 
 
+def trim_to_last_sentence(text: str) -> str:
+    """Обрезает висящее недописанное предложение в конце свободного текста.
+
+    Для JSON-ответов обрыв дошивает `_repair_truncated_json`, но для живого текста
+    (обзоры чата, приветствия) это не JSON — обрыв на середине слова просто режем
+    до последнего целого предложения. Если целого предложения нет вообще (обрыв
+    случился в первом же), возвращает исходный текст как есть — лучше урезанный
+    ответ, чем пустой.
+    """
+    last = max(text.rfind("."), text.rfind("!"), text.rfind("?"), text.rfind("…"))
+    if last == -1:
+        return text
+    return text[:last + 1].strip()
+
+
 def _repair_truncated_json(text: str, start: int) -> str | None:
     """Дописать закрывающие скобки, отбросив последний недописанный элемент.
 
