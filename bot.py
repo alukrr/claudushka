@@ -371,13 +371,23 @@ GEMINI_RETRY_DELAY = 2
 GEMINI_MODEL_NAME = "Nano Banana 2"
 
 # --- Голос/видео: расшифровка и фоновое распознавание (v0.11.0) ---
-# Модель для аудио-транскрипции через тот же Gemini REST API/ключ, что и рисование.
-# Проверено живым запросом 31.08.2026: gemini-2.5-flash отдаёт 404 ("no longer available
-# to new users"), Google сам предлагает gemini-3.6-flash — им и пользуемся, текст и
-# audio/wav inline_data оба вернули 200. ВАЖНО: на чистой тишине модель ГАЛЛЮЦИНИРУЕТ
-# правдоподобный текст вместо пустой строки — это не баг парсинга, так себя ведёт сама
-# модель. Не полагаться на транскрипт как на 100% достоверный, особенно короткие/тихие войсы.
+# Модель для аудио-транскрипции. Проверено живым запросом 31.08.2026: gemini-2.5-flash
+# отдаёт 404 ("no longer available to new users"), Google сам предлагает gemini-3.6-flash
+# — им и пользуемся, текст и audio/wav inline_data оба вернули 200. ВАЖНО: на чистой
+# тишине модель ГАЛЛЮЦИНИРУЕТ правдоподобный текст вместо пустой строки — это не баг
+# парсинга, так себя ведёт сама модель. Не полагаться на транскрипт как на 100%
+# достоверный, особенно короткие/тихие войсы.
+#
+# С v0.11.9 транскрипция идёт через пул api.apitoken.sale (`router.apitoken.sale`,
+# заголовок x-goog-api-key: ANTHROPIC_API_KEY — тот же ключ, что и Claude), а НЕ через
+# прямой Google API с отдельным GEMINI_API_KEY. Проверено живым запросом 06.09.2026 с
+# сервера: audio/wav inline_data на gemini-3.6-flash вернул 200 через пул (даже несмотря
+# на то, что доки пула заявляют «Modalities: text and image input» — на практике
+# audio проходит). Рисование (_try_gemini_image) осталось на прямом Google API: у пула
+# нет модели генерации изображений вообще — gemini-3.1-flash-image-preview там отдаёт
+# 404 «not found», проверено тем же запросом.
 GEMINI_AUDIO_MODEL_NAME = "gemini-3.6-flash"
+GEMINI_POOL_BASE_URL = "https://router.apitoken.sale"
 GEMINI_AUDIO_TRANSCRIPT_MAX_CHARS = 1500  # уходит в group_messages/историю — не раздувать контекст
 MAX_VOICE_SECONDS = 300       # длиннее — не транскрибируем, только плейсхолдер
 MAX_VIDEO_NOTE_SECONDS = 60   # кружочки и так капаются клиентом Telegram на 60с
@@ -467,18 +477,17 @@ async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str 
 
 
 async def _transcribe_audio_gemini(audio_bytes: bytes, mime_type: str) -> str | None:
-    """Расшифровывает речь из голосового/видео через Gemini (тот же REST-паттерн, что и
-    рисование, тот же GEMINI_API_KEY). None — при любой ошибке или отсутствии речи.
+    """Расшифровывает речь из голосового/видео через Gemini на пуле api.apitoken.sale
+    (тот же ANTHROPIC_API_KEY, что и Claude — не GEMINI_API_KEY). None — при любой
+    ошибке или отсутствии речи.
 
     В отличие от _try_gemini_image, запрос идёт через asyncio.to_thread — не блокирует
-    event loop; текст исключения requests содержит URL с ключом, наружу не отдаём
-    (см. известный баг v0.8.1 про Gemini-ключ в логе).
+    event loop. Ключ передаётся заголовком x-goog-api-key, а не query-параметром — в
+    URL секрета нет, поэтому (в отличие от рисования, см. известный баг v0.8.1) текст
+    сетевого исключения requests безопасно попадает в лог как есть.
     """
     import base64
-    if not GEMINI_API_KEY:
-        return None
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_AUDIO_MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
+    url = f"{GEMINI_POOL_BASE_URL}/v1beta/models/{GEMINI_AUDIO_MODEL_NAME}:generateContent"
     payload = {
         "contents": [{
             "parts": [
@@ -487,10 +496,11 @@ async def _transcribe_audio_gemini(audio_bytes: bytes, mime_type: str) -> str | 
             ]
         }],
     }
+    headers = {"x-goog-api-key": ANTHROPIC_API_KEY}
 
     for attempt in range(1, GEMINI_MAX_RETRIES + 1):
         try:
-            resp = await asyncio.to_thread(http_requests.post, url, json=payload, timeout=GEMINI_TIMEOUT)
+            resp = await asyncio.to_thread(http_requests.post, url, json=payload, headers=headers, timeout=GEMINI_TIMEOUT)
         except Exception as e:
             logger.warning(f"Gemini audio request failed (attempt {attempt}/{GEMINI_MAX_RETRIES}): {e}")
             if attempt < GEMINI_MAX_RETRIES:

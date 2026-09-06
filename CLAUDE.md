@@ -124,24 +124,43 @@
 
 Три новых типа Telegram-сообщений: `voice` (голосовое), `video_note` (кружочек, mp4 со
 звуком), `video` (обычное видео). Ноль новых pip-зависимостей: расшифровка речи идёт через
-уже подключённый Gemini (`GEMINI_API_KEY`, тот же REST-паттерн, что и рисование), кадры из
-видео — через системный `ffmpeg` (добавлен в `docker-compose.yml`, не Python-пакет).
+Gemini, кадры из видео — через системный `ffmpeg` (добавлен в `docker-compose.yml`, не
+Python-пакет).
 
-### Расшифровка речи (voice, video_note) — Gemini
+### Расшифровка речи (voice, video_note) — Gemini через пул api.apitoken.sale
 `_transcribe_audio_gemini(audio_bytes, mime_type)` — POST на
-`generativelanguage.googleapis.com/.../{GEMINI_AUDIO_MODEL_NAME}:generateContent` с
+`{GEMINI_POOL_BASE_URL}/v1beta/models/{GEMINI_AUDIO_MODEL_NAME}:generateContent` с
 `inline_data`, в отличие от `_try_gemini_image` вызывается через `asyncio.to_thread` (не
-блокирует event loop). `GEMINI_AUDIO_MODEL_NAME = "gemini-3.6-flash"` — **проверено живым
-запросом 31.08.2026** (curl с сервера, тот же `GEMINI_API_KEY`): `gemini-2.5-flash` отдаёт
-404 «no longer available to new users», Google сам предлагает `gemini-3.6-flash`; и текст,
-и `audio/wav` inline_data вернули 200. **Модель галлюцинирует на чистой тишине** —
-вместо пустой строки выдаёт правдоподобный, но полностью выдуманный текст (проверено:
-1 секунда цифровой тишины → связная фраза на английском). Транскрипту доверять нельзя
-на 100%, особенно для коротких/тихих войсов — это поведение самой модели Google, не баг
-парсинга на нашей стороне, чинить нечем. Транскрипт режется до
-`GEMINI_AUDIO_TRANSCRIPT_MAX_CHARS` (1500) — уходит в `group_messages`, которая
-копируется в каждый следующий промпт чата (см. общий инвариант про лимит по размеру в
-разделе памяти).
+блокирует event loop). **С v0.11.9 идёт через пул `api.apitoken.sale`
+(`GEMINI_POOL_BASE_URL = "https://router.apitoken.sale"`, заголовок `x-goog-api-key:
+ANTHROPIC_API_KEY`), а НЕ напрямую в Google с отдельным `GEMINI_API_KEY`** — один ключ,
+общий баланс с Claude-вызовами, честная скидка пула. Проверено живым запросом 06.09.2026
+с сервера (curl с реальным `ANTHROPIC_API_KEY` из `.env`): `audio/wav` inline_data на
+`gemini-3.6-flash` вернул 200 через пул — несмотря на то, что раздел API reference доков
+пула прямым текстом заявляет «Modalities: text and image input, text output» (без audio),
+на практике audio на вход пул пропускает и распознаёт нормально. Из-за заголовочной
+авторизации (вместо `?key=` в URL) для этой функции больше не актуален общий класс бага
+«ключ в тексте сетевого исключения requests» — секрета в URL просто нет.
+
+`GEMINI_AUDIO_MODEL_NAME = "gemini-3.6-flash"` — **проверено живым запросом 31.08.2026**:
+`gemini-2.5-flash` отдаёт 404 «no longer available to new users», Google сам предлагает
+`gemini-3.6-flash`; и текст, и `audio/wav` inline_data вернули 200 (тогда ещё через прямой
+Google API — сама модель не менялась при переезде на пул). **Модель галлюцинирует на
+чистой тишине** — вместо пустой строки выдаёт правдоподобный, но полностью выдуманный
+текст (проверено: 1 секунда цифровой тишины → связная фраза на английском, воспроизведено
+и через пул). Транскрипту доверять нельзя на 100%, особенно для коротких/тихих войсов —
+это поведение самой модели Google, не баг парсинга на нашей стороне, чинить нечем.
+Транскрипт режется до `GEMINI_AUDIO_TRANSCRIPT_MAX_CHARS` (1500) — уходит в
+`group_messages`, которая копируется в каждый следующий промпт чата (см. общий инвариант
+про лимит по размеру в разделе памяти).
+
+**Рисование (`_try_gemini_image`) НА ПУЛ НЕ ПЕРЕЕХАЛО и остаётся на прямом Google API со
+своим `GEMINI_API_KEY`** — у пула нет модели генерации изображений вообще: запрос на
+`gemini-3.1-flash-image-preview:generateContent` через `router.apitoken.sale` вернул
+404 «is not found for API version v1beta, or is not supported for generateContent»
+(проверено тем же запросом 06.09.2026). Каталог моделей пула (`/md/models`) содержит
+только текстовые Gemini-модели (flash/pro-preview) — если Google/пул когда-нибудь добавят
+image-preview туда, переезд рисования стоит переоценить, но пока это тупик.
 
 ### Кадры из видео (video_note, video) — ffmpeg + Haiku
 `_extract_video_frames(video_bytes, count, duration)` — синхронная, звать только через
@@ -466,7 +485,9 @@ Remote на сервере переключён на HTTPS (`https://github.com/
 
 Отдельно (v0.8.1): текст сетевого исключения `requests` при обращении к Gemini содержит
 URL, а в URL — `GEMINI_API_KEY`. Наружу отдаётся общая фраза, ключ остаётся в логе.
-Не возвращать `f"Сетевая ошибка: {e}"` в `_try_gemini_image`.
+Не возвращать `f"Сетевая ошибка: {e}"` в `_try_gemini_image`. **Актуально только для
+`_try_gemini_image`** — `_transcribe_audio_gemini` с v0.11.9 шлёт ключ заголовком
+(`x-goog-api-key`), в URL секрета нет, класс бага для неё закрыт архитектурно.
 
 ## Трёхуровневая память (секретность личка/группа)
 
