@@ -370,6 +370,32 @@ GEMINI_MAX_RETRIES = 1
 GEMINI_RETRY_DELAY = 2
 GEMINI_MODEL_NAME = "Nano Banana 2"
 
+# GPT Image 2, добавлен 2026-09: идёт через пул api.apitoken.sale (POOL_BASE_URL,
+# заголовок Authorization: Bearer ANTHROPIC_API_KEY — тот же ключ, что и Claude/аудио),
+# а НЕ напрямую в OpenAI. Проверено живым запросом с сервера 07.09.2026: POST
+# {POOL_BASE_URL}/v1/images/generations с {"model": "gpt-image-2", "prompt": ..., "n": 1,
+# "size": "1024x1024"} вернул 200, тело — {"data": [{"b64_json": "..."}]} (b64_json, не url
+# — как у настоящего gpt-image-1 в OpenAI). Ключ передаётся заголовком, не query-параметром
+# — как и у аудио-транскрипции, в URL секрета нет, текст сетевого исключения requests
+# безопасно попадает в лог как есть (в отличие от banana ниже, см. известный баг v0.8.1).
+GPT_IMAGE_TIMEOUT = 60
+GPT_IMAGE_MAX_RETRIES = 1
+GPT_IMAGE_RETRY_DELAY = 2
+GPT_IMAGE_MODEL_ID = "gpt-image-2"
+GPT_IMAGE_MODEL_NAME = "GPT Image 2"
+
+# Реестр провайдеров генерации картинок, по аналогии с MODELS — но переключение per-chat
+# хранится в отдельной таблице chat_image_provider (db.py), не в chat_models, и без
+# admin_only: обоими может пользоваться любой, кому вообще доступно рисование (referral+,
+# см. /imagine). banana остаётся дефолтом (обратная совместимость). Ключевое отличие —
+# КТО платит: banana идёт напрямую в Google по отдельному GEMINI_API_KEY и общий баланс
+# пула не трогает, gpt идёт через пул и тратит тот же баланс, что и все вызовы Claude.
+IMAGE_PROVIDERS = {
+    "banana": {"label": "Nano Banana 2"},
+    "gpt":    {"label": "GPT Image 2"},
+}
+DEFAULT_IMAGE_PROVIDER = "banana"
+
 # --- Голос/видео: расшифровка и фоновое распознавание (v0.11.0) ---
 # Модель для аудио-транскрипции. Проверено живым запросом 31.08.2026: gemini-2.5-flash
 # отдаёт 404 ("no longer available to new users"), Google сам предлагает gemini-3.6-flash
@@ -383,11 +409,15 @@ GEMINI_MODEL_NAME = "Nano Banana 2"
 # прямой Google API с отдельным GEMINI_API_KEY. Проверено живым запросом 06.09.2026 с
 # сервера: audio/wav inline_data на gemini-3.6-flash вернул 200 через пул (даже несмотря
 # на то, что доки пула заявляют «Modalities: text and image input» — на практике
-# audio проходит). Рисование (_try_gemini_image) осталось на прямом Google API: у пула
-# нет модели генерации изображений вообще — gemini-3.1-flash-image-preview там отдаёт
-# 404 «not found», проверено тем же запросом.
+# audio проходит). Banana (_try_gemini_image) осталась на прямом Google API: у пула нет
+# модели ГЕНЕРАЦИИ ЧЕРЕЗ GEMINI — gemini-3.1-flash-image-preview там отдаёт 404 «not
+# found», проверено тем же запросом. У пула ЕСТЬ своя модель для картинок под другим
+# именем — GPT Image 2 (см. IMAGE_PROVIDERS ниже), это не то же самое, что «банан через
+# пул», а второй независимый провайдер.
 GEMINI_AUDIO_MODEL_NAME = "gemini-3.6-flash"
-GEMINI_POOL_BASE_URL = "https://router.apitoken.sale"
+# POOL_BASE_URL — общий пул api.apitoken.sale, не только для Gemini: с добавлением
+# GPT Image 2 через него же идёт и OpenAI-совместимый /v1/images/generations.
+POOL_BASE_URL = "https://router.apitoken.sale"
 GEMINI_AUDIO_TRANSCRIPT_MAX_CHARS = 1500  # уходит в group_messages/историю — не раздувать контекст
 MAX_VOICE_SECONDS = 300       # длиннее — не транскрибируем, только плейсхолдер
 MAX_VIDEO_NOTE_SECONDS = 60   # кружочки и так капаются клиентом Telegram на 60с
@@ -487,7 +517,7 @@ async def _transcribe_audio_gemini(audio_bytes: bytes, mime_type: str) -> str | 
     сетевого исключения requests безопасно попадает в лог как есть.
     """
     import base64
-    url = f"{GEMINI_POOL_BASE_URL}/v1beta/models/{GEMINI_AUDIO_MODEL_NAME}:generateContent"
+    url = f"{POOL_BASE_URL}/v1beta/models/{GEMINI_AUDIO_MODEL_NAME}:generateContent"
     payload = {
         "contents": [{
             "parts": [
@@ -527,6 +557,72 @@ async def _transcribe_audio_gemini(audio_bytes: bytes, mime_type: str) -> str | 
     return None
 
 
+async def _try_gpt_image(prompt: str) -> tuple[bytes | None, str | None, str | None]:
+    """GPT Image 2 через пул api.apitoken.sale. Сигнатура и семантика возврата — как у
+    _try_gemini_image (image, error, provider_label), чтобы generate_image_with_error мог
+    звать оба провайдера единообразно.
+
+    В отличие от _try_gemini_image (блокирующий http_requests.post прямо в event loop —
+    исторически так, не трогать по месту), здесь запрос идёт через asyncio.to_thread, как
+    и _transcribe_audio_gemini — благо это НОВЫЙ код, повода мириться со старым блокирующим
+    паттерном нет.
+    """
+    import base64
+    url = f"{POOL_BASE_URL}/v1/images/generations"
+    payload = {"model": GPT_IMAGE_MODEL_ID, "prompt": prompt, "n": 1, "size": "1024x1024"}
+    headers = {"Authorization": f"Bearer {ANTHROPIC_API_KEY}"}
+
+    last_error_msg: str | None = None
+    for attempt in range(1, GPT_IMAGE_MAX_RETRIES + 1):
+        try:
+            resp = await asyncio.to_thread(http_requests.post, url, json=payload, headers=headers, timeout=GPT_IMAGE_TIMEOUT)
+        except Exception as e:
+            # Ключ в заголовке, не в URL — в отличие от _try_gemini_image текст исключения
+            # requests безопасно логировать как есть (см. комментарий у POOL_BASE_URL).
+            logger.warning(f"GPT Image request failed (attempt {attempt}/{GPT_IMAGE_MAX_RETRIES}): {e}")
+            last_error_msg = "Сетевая ошибка при обращении к генератору картинок"
+            if attempt < GPT_IMAGE_MAX_RETRIES:
+                await asyncio.sleep(GPT_IMAGE_RETRY_DELAY)
+            continue
+
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                b64 = data["data"][0]["b64_json"]
+            except Exception as e:
+                logger.warning(f"GPT Image returned 200 with unparseable JSON: {e}")
+                last_error_msg = "GPT Image вернул некорректный ответ"
+                break
+            logger.info(f"Image generated via {GPT_IMAGE_MODEL_NAME} (attempt {attempt})")
+            return base64.b64decode(b64), None, GPT_IMAGE_MODEL_NAME
+
+        try:
+            error_data = resp.json()
+            error_msg = error_data.get("error", {}).get("message", f"HTTP {resp.status_code}")
+        except Exception:
+            error_msg = f"HTTP {resp.status_code}"
+
+        if resp.status_code in (429, 500, 502, 503, 504):
+            logger.warning(f"GPT Image transient error (attempt {attempt}/{GPT_IMAGE_MAX_RETRIES}): {error_msg}")
+            last_error_msg = f"GPT Image ответил: {error_msg}"
+            if attempt < GPT_IMAGE_MAX_RETRIES:
+                await asyncio.sleep(GPT_IMAGE_RETRY_DELAY)
+            continue
+
+        # Модерация OpenAI-совместимых image-эндпоинтов обычно приходит как 400 с упоминанием
+        # safety/moderation/policy в тексте ошибки — не проверено живым отказом (не нашли
+        # промпт, чтобы модель отказалась), но тот же паттерн, что у настоящего OpenAI API.
+        # Ловим сюда же логику переформулировки, что и у banana.
+        if resp.status_code == 400 and any(w in error_msg.lower() for w in ("safety", "moderation", "policy")):
+            logger.warning(f"GPT Image refused: {error_msg[:200]}")
+            return None, "__REFUSAL__", None
+
+        logger.warning(f"GPT Image non-retryable error: {error_msg}")
+        return None, f"GPT Image ответил: {error_msg}", None
+
+    return None, last_error_msg, None
+
+
 async def _rewrite_prompt(prompt: str) -> str | None:
     try:
         resp = await aux_create(
@@ -548,25 +644,38 @@ async def _rewrite_prompt(prompt: str) -> str | None:
         return None
 
 
-async def generate_image_with_error(prompt: str) -> tuple[bytes | None, str | None, str | None]:
-    image, error, provider = await _try_gemini_image(prompt)
+def get_chat_image_provider(chat_id: int) -> str:
+    return db.get_chat_image_provider_db(chat_id)
+
+
+async def generate_image_with_error(prompt: str, chat_id: int) -> tuple[bytes | None, str | None, str | None]:
+    """Провайдер выбирается per-chat (IMAGE_PROVIDERS/chat_image_provider) — banana или
+    gpt. Между собой НЕ фоллбечат: разный провайдер — разный счёт (banana не трогает
+    баланс пула, gpt тратит его), молча подменять один другим при отказе значило бы
+    незаметно для чата начать тратить деньги. Retry-с-переформулировкой при отказе — свой
+    для каждого провайдера, второй не пробуем.
+    """
+    provider_key = get_chat_image_provider(chat_id)
+    try_fn = _try_gpt_image if provider_key == "gpt" else _try_gemini_image
+    provider_label = IMAGE_PROVIDERS[provider_key]["label"]
+
+    image, error, provider = await try_fn(prompt)
     if image:
         return image, None, provider
 
     if error == "__REFUSAL__":
-        logger.info("Gemini refused, rewriting prompt...")
+        logger.info(f"{provider_label} refused, rewriting prompt...")
         rewritten = await _rewrite_prompt(prompt)
         if rewritten:
-            image, error, provider = await _try_gemini_image(rewritten)
+            image, error, provider = await try_fn(rewritten)
             if image:
                 return image, None, provider
 
-    # Фоллбека нет — банан единственный провайдер (FLUX выпилен: качество и gated-лицензия).
     if error == "__REFUSAL__":
-        final_error = "Банан отказался это рисовать, даже после переформулировки."
+        final_error = f"{provider_label} отказался это рисовать, даже после переформулировки."
     else:
         final_error = error or "Генератор картинок сейчас недоступен. Попробуй позже."
-    logger.error(f"Image generation failed (Gemini only): {error}")
+    logger.error(f"Image generation failed ({provider_label}): {error}")
     return None, final_error, None
 
 
@@ -597,7 +706,7 @@ async def _draw_and_send(update, context, chat_id: int, is_group: bool,
     stop_event = asyncio.Event()
     keepalive_task = asyncio.create_task(_keep_chat_action(context.bot, chat_id, "upload_photo", stop_event))
     try:
-        image_data, error_msg, provider = await generate_image_with_error(en_prompt)
+        image_data, error_msg, provider = await generate_image_with_error(en_prompt, chat_id)
     finally:
         stop_event.set()
         try:
@@ -1784,6 +1893,78 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("\n".join(lines))
 
 
+async def _set_image_provider(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str):
+    """Переключение провайдера картинок чата. key — ключ реестра IMAGE_PROVIDERS.
+
+    В отличие от _set_chat_model, пробного запроса перед записью нет: пробная генерация
+    картинки стоит реальных денег и десятки секунд (а не max_tokens=1 на "hi"). Ошибка
+    провайдера всплывёт при первой настоящей генерации — оба пути (/imagine, «нарисуй»)
+    уже умеют честно сообщать о недоступности.
+    """
+    meta = IMAGE_PROVIDERS[key]
+    admin = is_admin(update.effective_user.id)
+
+    if context.args:
+        if not admin:
+            await update.effective_message.reply_text(
+                "Менять провайдера картинок в другом чате может только админ. "
+                "Без аргумента команда переключит текущий чат."
+            )
+            return
+        try:
+            chat_id = int(context.args[0])
+        except ValueError:
+            await update.effective_message.reply_text(
+                f"ID чата — это число (обычно с минусом). Формат: /{key} -1001234567890"
+            )
+            return
+    else:
+        chat_id = update.effective_chat.id
+
+    known, label = _chat_display(update, chat_id)
+    warn = "" if known or not context.args else \
+        "\n⚠️ Такого чата нет среди разрешённых — записала, но проверь ID."
+
+    db.set_chat_image_provider_db(chat_id, key)
+    await update.effective_message.reply_text(f"{label}: рисуем через {meta['label']}.{warn}")
+
+
+async def cmd_banana(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _set_image_provider(update, context, "banana")
+
+
+async def cmd_gptimage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _set_image_provider(update, context, "gpt")
+
+
+async def cmd_imagemodels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список провайдеров картинок с пометкой текущего — аналог /models для рисования."""
+    admin = is_admin(update.effective_user.id)
+    chat_id = update.effective_chat.id
+    if context.args:
+        if not admin:
+            await update.effective_message.reply_text("Смотреть чужие чаты может только админ.")
+            return
+        try:
+            chat_id = int(context.args[0])
+        except ValueError:
+            await update.effective_message.reply_text("ID чата — это число. Формат: /imagemodels -1001234567890")
+            return
+
+    current = get_chat_image_provider(chat_id)
+    _, label = _chat_display(update, chat_id)
+    lines = [f"Провайдер картинок для {label}: {IMAGE_PROVIDERS[current]['label']}", "", "Доступно:"]
+    for key, meta in IMAGE_PROVIDERS.items():
+        mark = "▸" if key == current else " "
+        lines.append(f"{mark} /{key:8} {meta['label']}")
+    lines.append("")
+    lines.append("banana — напрямую в Google, общий баланс пула не трогает.")
+    lines.append("gpt — через пул api.apitoken.sale, тратит общий баланс (тот же, что и Claude).")
+    if admin:
+        lines.append("Переключить чужой чат: /gptimage <chat_id>")
+    await update.effective_message.reply_text("\n".join(lines))
+
+
 # --- User commands ---
 
 USER_HELP = """\
@@ -1800,6 +1981,9 @@ USER_HELP = """\
   /models        — какие модели доступны и что сейчас у чата
   /haiku         — переключить чат на Haiku 4.5 (дёшево и быстро)
   /sonnet        — переключить чат на Sonnet 5 (умнее, дороже)
+  /imagemodels   — какой провайдер картинок сейчас у чата
+  /banana        — рисовать через Nano Banana 2 (дефолт)
+  /gptimage      — рисовать через GPT Image 2
   /ratelimit     — в группах: ограничить частоту сообщений участника (для админов группы)\
 """
 
@@ -1829,6 +2013,14 @@ ADMIN_HELP = """\
   chat_id — число с минусом, например: /opus -1001109809707
   Выбор постоянный: пишется в chat_models и переживает рестарт.
   Перед записью бот делает пробный запрос — нерабочая модель не сохранится.
+
+Провайдер картинок (без аргумента — текущий чат; с chat_id — любой, только админу):
+  /imagemodels [chat_id]   — текущий провайдер картинок чата
+  /banana [chat_id]        — Nano Banana 2 — прямой Google API, баланс пула не трогает (дефолт)
+  /gptimage [chat_id]      — GPT Image 2 — через пул api.apitoken.sale, тратит общий баланс
+  Доступно всем, кому доступно рисование (referral+), без гейтинга по цене.
+  В отличие от /haiku и т.п. — без пробного запроса перед записью (генерация картинки
+  стоит реальных денег и десятки секунд): ошибка провайдера всплывёт при первом рисовании.
 
 Прочее:
   /whitelist               — показать белые списки
@@ -2034,7 +2226,7 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stop_event = asyncio.Event()
     keepalive_task = asyncio.create_task(_keep_chat_action(context.bot, chat_id, "upload_photo", stop_event))
     try:
-        image_data, error_msg, provider = await generate_image_with_error(prompt)
+        image_data, error_msg, provider = await generate_image_with_error(prompt, chat_id)
     finally:
         stop_event.set()
         try:
@@ -2852,6 +3044,9 @@ def main():
     app.add_handler(CommandHandler("opus", cmd_opus))
     app.add_handler(CommandHandler("fable", cmd_fable))
     app.add_handler(CommandHandler("models", cmd_models))
+    app.add_handler(CommandHandler("banana", cmd_banana))
+    app.add_handler(CommandHandler("gptimage", cmd_gptimage))
+    app.add_handler(CommandHandler("imagemodels", cmd_imagemodels))
     app.add_handler(CommandHandler("approve_chat", cmd_approve_chat))
     app.add_handler(CommandHandler("reject_chat", cmd_reject_chat))
     app.add_handler(ChatMemberHandler(handle_new_chat, ChatMemberHandler.MY_CHAT_MEMBER))

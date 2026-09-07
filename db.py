@@ -93,6 +93,11 @@ def init_db():
             model TEXT NOT NULL DEFAULT 'claude-haiku-4-5-20251001'
         );
 
+        CREATE TABLE IF NOT EXISTS chat_image_provider (
+            chat_id INTEGER PRIMARY KEY,
+            provider TEXT NOT NULL DEFAULT 'banana'
+        );
+
         CREATE TABLE IF NOT EXISTS chat_extract_state (
             chat_id INTEGER PRIMARY KEY,
             last_extract_id INTEGER NOT NULL DEFAULT 0
@@ -625,6 +630,25 @@ def set_chat_model_db(chat_id: int, model: str):
     conn.execute(
         "INSERT OR REPLACE INTO chat_models (chat_id, model) VALUES (?, ?)",
         (chat_id, model)
+    )
+    conn.commit()
+    conn.close()
+
+
+# --- Chat image provider settings (banana / gpt, см. IMAGE_PROVIDERS в bot.py) ---
+
+def get_chat_image_provider_db(chat_id: int) -> str:
+    conn = get_conn()
+    row = conn.execute("SELECT provider FROM chat_image_provider WHERE chat_id = ?", (chat_id,)).fetchone()
+    conn.close()
+    return row["provider"] if row else "banana"
+
+
+def set_chat_image_provider_db(chat_id: int, provider: str):
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO chat_image_provider (chat_id, provider) VALUES (?, ?)",
+        (chat_id, provider)
     )
     conn.commit()
     conn.close()
