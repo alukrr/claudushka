@@ -1187,6 +1187,8 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
     chats = db.get_allowed_chats()
     for chat in chats:
         chat_id = chat["chat_id"]
+        if not chat["daily_review_enabled"]:
+            continue
         messages = db.get_group_history(chat_id, 100)
         if len(messages) < 5:
             continue
@@ -1580,6 +1582,35 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await api_errors.reply_api_error(
             update.message.reply_text, e, context_label=f"/review chat={chat_id}",
         )
+
+
+async def _set_chat_review_enabled(update: Update, context: ContextTypes.DEFAULT_TYPE, enabled: bool):
+    """Включает/выключает ежедневный авто-обзор этого чата (daily_chat_review).
+    Доступно чат-админам (не только глобальным админам бота) — см. is_chat_admin,
+    тот же паттерн, что у /ratelimit. Не путать с /review — тот шлёт обзор прямо сейчас
+    и остаётся admin-only, здесь речь только про ежедневную рассылку по расписанию."""
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.effective_message.reply_text("Ежедневный обзор — только для групповых чатов.")
+        return
+    chat_id = chat.id
+    if not await is_chat_admin(context, chat_id, update.effective_user.id):
+        await update.effective_message.reply_text("Включать/выключать ежедневный обзор может только админ этого чата.")
+        return
+    updated = db.set_chat_review_enabled(chat_id, enabled)
+    if not updated:
+        await update.effective_message.reply_text("Этот чат ещё не известен боту (не одобрен) — попробуй позже.")
+        return
+    state = "ВКЛЮЧЁН" if enabled else "ВЫКЛЮЧЕН"
+    await update.effective_message.reply_text(f"Ежедневный обзор чата {state}.")
+
+
+async def cmd_review_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _set_chat_review_enabled(update, context, True)
+
+
+async def cmd_review_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _set_chat_review_enabled(update, context, False)
 
 
 async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2009,7 +2040,9 @@ USER_HELP = """\
   /imagemodels   — какой провайдер картинок сейчас у чата
   /banana        — рисовать через Nano Banana 2 (дефолт)
   /gptimage      — рисовать через GPT Image 2
-  /ratelimit     — в группах: ограничить частоту сообщений участника (для админов группы)\
+  /ratelimit     — в группах: ограничить частоту сообщений участника (для админов группы)
+  /review_on     — в группах: включить ежедневный авто-обзор чата (для админов группы)
+  /review_off    — в группах: выключить ежедневный авто-обзор чата (для админов группы)\
 """
 
 ADMIN_HELP = """\
@@ -2058,6 +2091,8 @@ ADMIN_HELP = """\
                               без ответа: <user_id> <N|off>, без аргументов — список, "off" — сброс всем
   /cost                    — расход токенов по моделям
   /review                  — AI-обзор чата прямо сейчас
+  /review_on / /review_off — вкл/выкл ЕЖЕДНЕВНЫЙ авто-обзор этого чата (доступно и админам
+                              группы, не только боту-админу; /review — разовый, admin-only)
   /migrate                 — миграция JSON → SQLite
   /update                  — git pull + рестарт контейнера\
 """
@@ -3083,6 +3118,8 @@ def main():
     app.add_handler(CommandHandler("chats", cmd_chats))
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("review", cmd_review))
+    app.add_handler(CommandHandler("review_on", cmd_review_on))
+    app.add_handler(CommandHandler("review_off", cmd_review_off))
     app.add_handler(CommandHandler("approve", cmd_approve))
     app.add_handler(CommandHandler("promote", cmd_promote))
     app.add_handler(CommandHandler("premium", cmd_premium))

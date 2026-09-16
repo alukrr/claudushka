@@ -70,7 +70,8 @@ def init_db():
             requested_by INTEGER,
             approved_by INTEGER,
             created_at INTEGER,
-            approved_at INTEGER
+            approved_at INTEGER,
+            daily_review_enabled INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS wa_conversations (
@@ -132,6 +133,7 @@ def init_db():
         # Haiku не трогаем — claude-haiku-4-5-20251001 остаётся дефолтом.
         "UPDATE chat_models SET model='claude-sonnet-5' WHERE model LIKE 'claude-sonnet-4-%'",
         "UPDATE chat_models SET model='claude-opus-5'   WHERE model LIKE 'claude-opus-4-%'",
+        "ALTER TABLE allowed_chats ADD COLUMN daily_review_enabled INTEGER NOT NULL DEFAULT 1",
     ]:
         try:
             conn.execute(migration)
@@ -614,6 +616,19 @@ def is_chat_allowed(chat_id: int) -> bool:
     row = conn.execute("SELECT 1 FROM allowed_chats WHERE chat_id = ? AND status = 'approved'", (chat_id,)).fetchone()
     conn.close()
     return row is not None
+
+
+def set_chat_review_enabled(chat_id: int, enabled: bool) -> bool:
+    """Возвращает True, если строка чата найдена и обновлена (чат уже известен боту)."""
+    conn = get_conn()
+    cur = conn.execute(
+        "UPDATE allowed_chats SET daily_review_enabled = ? WHERE chat_id = ?",
+        (1 if enabled else 0, chat_id)
+    )
+    conn.commit()
+    updated = cur.rowcount > 0
+    conn.close()
+    return updated
 
 
 # --- Chat model settings ---
