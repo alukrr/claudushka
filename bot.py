@@ -2470,7 +2470,12 @@ async def cmd_approve_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Использование: /approve_chat <chat_id>")
         return
     chat_id = int(context.args[0])
-    db.set_chat_status(chat_id, "approved", update.effective_user.id)
+    if not db.set_chat_status(chat_id, "approved", update.effective_user.id):
+        await update.message.reply_text(
+            f"Чата {chat_id} нет в базе — /approve_chat одобряет ТОЛЬКО уже известный "
+            f"боту чат (из /pending). Чтобы добавить новый чат с нуля — используй /allow_chat {chat_id} [имя]."
+        )
+        return
     chats = db.get_allowed_chats()
     chat_name = next((c["name"] for c in chats if c["chat_id"] == chat_id), f"chat_{chat_id}")
     await update.message.reply_text(f"✅ Чат {chat_name} ({chat_id}) одобрен.")
@@ -2487,7 +2492,9 @@ async def cmd_reject_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Использование: /reject_chat <chat_id>")
         return
     chat_id = int(context.args[0])
-    db.set_chat_status(chat_id, "rejected")
+    if not db.set_chat_status(chat_id, "rejected"):
+        await update.message.reply_text(f"Чата {chat_id} нет в базе — нечего отклонять (если бот там всё же есть, выйти можно вручную).")
+        return
     await update.message.reply_text(f"❌ Чат {chat_id} отклонён. Выхожу.")
     try:
         await context.bot.send_message(chat_id=chat_id, text="Извините, мой админ не одобрил этот чат. Пока! 👋")

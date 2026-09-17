@@ -580,14 +580,21 @@ def add_allowed_chat(chat_id: int, name: str = None, added_by: int = None, statu
     conn.close()
 
 
-def set_chat_status(chat_id: int, status: str, approved_by: int = None):
+def set_chat_status(chat_id: int, status: str, approved_by: int = None) -> bool:
+    """Возвращает True, если строка чата найдена и обновлена. Если chat_id не встречался
+    в allowed_chats (чат подключён до появления трекинга через handle_new_chat, либо
+    строку почему-то удалили) — UPDATE молча ничего не меняет, rowcount=0. Вызывающий
+    обязан это проверять и не докладывать об успехе, которого не было — см. инцидент
+    2026-09-16/17 в CLAUDE.md."""
     conn = get_conn()
-    conn.execute(
+    cur = conn.execute(
         "UPDATE allowed_chats SET status = ?, approved_by = ?, approved_at = ? WHERE chat_id = ?",
         (status, approved_by, int(time.time()) if status == "approved" else None, chat_id)
     )
     conn.commit()
+    updated = cur.rowcount > 0
     conn.close()
+    return updated
 
 
 def get_pending_chats() -> list[dict]:
