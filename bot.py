@@ -2272,11 +2272,63 @@ async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
  
  
+def _chown_repo_paths(paths: list[str], uid: int, gid: int) -> list[str]:
+    """Синхронная — звать только через asyncio.to_thread. В .git могут быть тысячи
+    loose-объектов, блокирующий os.walk+os.chown в цикле не должен вешать event loop.
+    Возвращает список путей, где chown не удался (не бросает исключение)."""
+    failed = []
+    for rel in paths:
+        full = os.path.join("/repo", rel)
+        targets = [full]
+        if os.path.isdir(full):
+            for root, dirs, files in os.walk(full):
+                targets.extend(os.path.join(root, n) for n in dirs + files)
+        for p in targets:
+            try:
+                os.chown(p, uid, gid)
+            except OSError:
+                failed.append(p)
+    return failed
+
+
+async def _fix_repo_ownership() -> str | None:
+    """После self-update git pull работает от root внутри контейнера (у claudushka нет
+    user: в docker-compose.yml, а /repo — bind-mount .:/repo с хоста) — новые файлы и
+    git-объекты становятся root:root НА ХОСТЕ, и следующий git pull/status от обычного
+    пользователя падает с permission denied. Живой случай 2026-09-19: Алексей упёрся в
+    это при деплое ТЗ-5 — chown вручную одного `.git` не хватило, часть файлов
+    (`docs/claude/*.md`) осталась root-owned и блокировала pull ещё раз.
+
+    Владелец берётся из самого `/repo` (`os.stat` — тот же bind-mount, значит то же
+    UID/GID, что и на хосте), НЕ хардкодится. Трогает ТОЛЬКО `.git` и файлы,
+    отслеживаемые git (`git ls-files`) — не `data/` (бот и так пишет туда от root
+    изнутри контейнера, это штатно и не тот конфликт) и не что-то непредвиденное в
+    `/repo` (`.env`, `data-test/` и т.п. — не отслеживаются git, не трогаем).
+
+    `None` при успехе, иначе — текст ошибки. Не бросает исключение и не блокирует
+    рестарт — вызывающая сторона обязана сообщить об этом админу и перезапуститься
+    всё равно (лучше рассказать, что chown не удался, чем не обновиться вовсе)."""
+    try:
+        st = os.stat("/repo")
+    except OSError as e:
+        return f"не смогла прочитать владельца /repo: {e}"
+
+    rc, out = await _git("ls-files")
+    if rc != 0:
+        return f"git ls-files упал: {out}"
+    tracked = [ln for ln in out.splitlines() if ln.strip()]
+
+    failed = await asyncio.to_thread(_chown_repo_paths, [".git"] + tracked, st.st_uid, st.st_gid)
+    if failed:
+        return f"не удалось сменить владельца у {len(failed)} путей, например: {failed[0]}"
+    return None
+
+
 async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Pull latest code and restart container. Admin only."""
     if not is_admin(update.effective_user.id):
         return
- 
+
     old_version = await _get_version()
     rc, old_head = await _git("rev-parse", "HEAD")
     if rc != 0:
@@ -2306,13 +2358,26 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_version = await _get_version()
     rc, log_out = await _git("log", f"{old_head}..{new_head}", "--oneline")
     changes = log_out if rc == 0 and log_out else "(список изменений недоступен)"
- 
+
+    # Возвращаем владельца .git и отслеживаемых файлов тому, кто владеет самим /repo
+    # на хосте — иначе следующий git pull/git status ОТ АЛЕКСЕЯ на сервере упадёт с
+    # permission denied (живой случай 2026-09-19). Не блокирует рестарт при ошибке —
+    # только предупреждает.
+    ownership_error = await _fix_repo_ownership()
+    ownership_note = (
+        f"\n\n⚠️ Не смогла поправить владельца файлов в /repo: {ownership_error}"
+        if ownership_error else ""
+    )
+
     await update.message.reply_text(
         f"Обновление: {old_version} → {new_version}\n\n"
         f"Изменения:\n{changes}\n\n"
-        f"Перезапускаюсь..."
+        f"Перезапускаю claudushka (claudushka-wa этой командой не трогается — "
+        f"перезапускай отдельно, если менялся и он). Если менялся .env — restart "
+        f"его не подхватит, нужен вручную docker compose up -d --force-recreate."
+        f"{ownership_note}"
     )
- 
+
     restart = await asyncio.create_subprocess_exec(
         "docker", "restart", "claudushka",
         stdout=asyncio.subprocess.PIPE,

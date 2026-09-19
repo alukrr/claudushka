@@ -11,7 +11,12 @@ paths: ["docker-compose.yml"]
 - `environment: GIT_CONFIG_COUNT=1` + `safe.directory=/repo` — без этого git внутри
   контейнера не работает.
 - Монтирование `.:/repo` и `/var/run/docker.sock` — нужно для self-update (`/update`
-  в Telegram запускает `git pull` и рестарт контейнера изнутри).
+  в Telegram запускает `git pull` и рестарт контейнера изнутри). У `claudushka` нет
+  `user:` в compose — процесс в контейнере root, значит `git pull` изнутри пишет новые
+  файлы и git-объекты на bind-mount root-owned'ыми — `cmd_update` (bot.py) после
+  успешного pull сама возвращает владельца (`_fix_repo_ownership`, только `.git` и
+  файлы из `git ls-files`, `data/` не трогает) — не убирать этот шаг, живой инцидент
+  2026-09-19 в `docs/claude/incidents.md`.
 - Установка `git` и `docker.io` в `command:` — нужна там же, для self-update.
 - Установка `ffmpeg` в той же строке (с v0.11.0) — нужна для извлечения кадров из
   видео/кружочков, см. `docs/claude/media.md`.
