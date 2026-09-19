@@ -55,15 +55,15 @@ clear_hint=...)`: полный traceback (`exc_info=True`) в `logger.error`, п
 в документации asyncio). `_spawn_background_task` (bot.py и, отдельной копией, whatsapp.py
 — модули друг друга не импортируют, см. `.claude/rules/whatsapp.md`) держит ссылку в
 модульном `_background_tasks: set` и снимает её через `add_done_callback` по завершении.
-Введено в ТЗ-1 (задача A, живой баг найден при ревью `handle_wa_message` в whatsapp.py,
-тот же паттерн нашёлся и в bot.py в трёх местах — все три починены заодно).
+Введено 2026-09-19 (`d71d7c9`, живой баг найден при ревью `handle_wa_message` в
+whatsapp.py, тот же паттерн нашёлся и в bot.py в трёх местах — все три починены заодно).
 Прямой `client.messages.create(` остался ровно в одном месте — внутри `sync_create`.
 Добавляешь новый вызов — выбери строку из таблицы, не пиши напрямую.
 
 **Отдельная категория — блокирующий `requests.post` к сторонним HTTP API (Gemini,
 GPT Image), не к Anthropic SDK.** Тот же принцип, тот же симптом (весь бот стоит на всё
 время запроса), другой источник. `_try_gemini_image` был последним таким исключением
-(блокировал по месту, комментарий «исторически так, не трогать») — с ТЗ-1 (задача B)
+(блокировал по месту, комментарий «исторически так, не трогать») — 2026-09-19 (`a9912bc`)
 переведён на `await asyncio.to_thread(http_requests.post, ...)`, как `_try_gpt_image` и
 `_transcribe_audio_gemini`. Все три HTTP-вызова к Gemini/GPT-image теперь однотипны —
 подробности в `docs/claude/images.md` и `docs/claude/media.md`.

@@ -12,8 +12,8 @@ Python-пакет — см. `.claude/rules/docker-compose.md`).
 `_transcribe_audio_gemini(audio_bytes, mime_type)` — POST на
 `{GEMINI_POOL_BASE_URL}/v1beta/models/{GEMINI_AUDIO_MODEL_NAME}:generateContent` с
 `inline_data`, вызывается через `asyncio.to_thread` (не блокирует event loop) — тем же
-паттерном вызывается и `_try_gemini_image` (`docs/claude/images.md`), с ТЗ-1 задача B
-блокирующих исключений из этого правила не осталось. **С v0.11.9 идёт через пул
+паттерном вызывается и `_try_gemini_image` (`docs/claude/images.md`), с фикса 2026-09-19
+(`a9912bc`) блокирующих исключений из этого правила не осталось. **С v0.11.9 идёт через пул
 `api.apitoken.sale`
 (`GEMINI_POOL_BASE_URL = "https://router.apitoken.sale"`, заголовок `x-goog-api-key:
 ANTHROPIC_API_KEY`), а НЕ напрямую в Google с отдельным `GEMINI_API_KEY`** — один ключ,

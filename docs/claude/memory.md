@@ -3,7 +3,8 @@
 Перед правкой `memory`-таблицы, `extract_memory`, `extract_all_participants_memory`,
 `get_memory`/`get_memory_for_private`/`get_all_chat_memory`, `/memory`, `/memory_full`,
 `/forget` — читай этот файл. **Этот раздел раньше жил без собственного заголовка внутри
-«Известные баги» — заголовок `## Память` восстановлен при переносе (ТЗ-2).**
+«Известные баги» — заголовок `## Память` восстановлен при переносе (2026-09-19,
+разбивка CLAUDE.md, `855bcfe`).**
 
 ## Схема
 Факты хранятся в таблице `memory` (`context` + `chat_id` + `tier` + `expires_at`):
