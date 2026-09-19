@@ -1010,7 +1010,12 @@ def extract_memory(user_id: int, messages: list, is_group: bool = False, chat_id
     try:
         recent = messages[-6:]
         response = sync_create(
-            model=MODELS["sonnet"]["id"],
+            # Служебный вызов — только DEFAULT_MODEL_ID, без исключений (правило
+            # Алексея, 2026-09-19). Раньше здесь был MODELS["sonnet"]["id"] "осознанно,
+            # аналитическая задача" — решение отменено, срабатывает каждые 10
+            # сообщений в личке и не должно платить по цене Sonnet. См.
+            # docs/claude/models-and-costs.md.
+            model=DEFAULT_MODEL_ID,
             max_tokens=512,
             system=(
                 "Извлеки важные факты о пользователе из диалога. "
@@ -2360,9 +2365,12 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ничего не нашёл.")
         return
     try:
+        # Ответ пользователю (уходит в чат), не служебный вызов — модель чата, не
+        # хардкод. Дефолт Haiku, если чат переключён на Sonnet/Opus/Fable — та модель
+        # (2026-09-19, раньше было захардкожено MODELS["sonnet"]["id"]).
         response = await call_claude(
             context, update.effective_chat.id, label=f"/search uid={user_id}",
-            model=MODELS["sonnet"]["id"],
+            model=get_chat_model(update.effective_chat.id),
             max_tokens=2048,
             system="Ты Клодушка. Дай краткий ответ на основе результатов поиска. Отвечай на языке пользователя.",
             messages=[{"role": "user", "content": f"Вопрос: {query}\n\nРезультаты:\n{results}"}],
