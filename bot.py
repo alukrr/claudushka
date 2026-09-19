@@ -461,19 +461,21 @@ async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str 
     if not any(lower.startswith(s) for s in action_starters):
         normalized = f"A picture of {normalized}"
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent?key={GEMINI_API_KEY}"
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent"
     payload = {
         "contents": [{"parts": [{"text": normalized}]}],
         "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
     }
+    headers = {"x-goog-api-key": GEMINI_API_KEY}
 
     last_error_msg: str | None = None
     for attempt in range(1, GEMINI_MAX_RETRIES + 1):
         try:
-            resp = http_requests.post(url, json=payload, timeout=GEMINI_TIMEOUT)
+            resp = await asyncio.to_thread(http_requests.post, url, json=payload, headers=headers, timeout=GEMINI_TIMEOUT)
         except Exception as e:
+            # Ключ теперь в заголовке, не в URL (ТЗ-1, задача B) — текст исключения requests
+            # безопасно логировать как есть, тот же класс, что у _try_gpt_image.
             logger.warning(f"Gemini image request failed (attempt {attempt}/{GEMINI_MAX_RETRIES}): {e}")
-            # Текст исключения requests содержит URL, а в URL — ключ Gemini. Наружу не отдаём.
             last_error_msg = "Сетевая ошибка при обращении к генератору картинок"
             if attempt < GEMINI_MAX_RETRIES:
                 await asyncio.sleep(GEMINI_RETRY_DELAY)
@@ -531,10 +533,10 @@ async def _transcribe_audio_gemini(audio_bytes: bytes, mime_type: str) -> str | 
     (тот же ANTHROPIC_API_KEY, что и Claude — не GEMINI_API_KEY). None — при любой
     ошибке или отсутствии речи.
 
-    В отличие от _try_gemini_image, запрос идёт через asyncio.to_thread — не блокирует
-    event loop. Ключ передаётся заголовком x-goog-api-key, а не query-параметром — в
-    URL секрета нет, поэтому (в отличие от рисования, см. известный баг v0.8.1) текст
-    сетевого исключения requests безопасно попадает в лог как есть.
+    Запрос идёт через asyncio.to_thread — не блокирует event loop, как и _try_gemini_image
+    (переведена на тот же паттерн, ТЗ-1). Ключ передаётся заголовком x-goog-api-key, а не
+    query-параметром — в URL секрета нет, текст сетевого исключения requests безопасно
+    попадает в лог как есть.
     """
     import base64
     url = f"{POOL_BASE_URL}/v1beta/models/{GEMINI_AUDIO_MODEL_NAME}:generateContent"
@@ -580,12 +582,8 @@ async def _transcribe_audio_gemini(audio_bytes: bytes, mime_type: str) -> str | 
 async def _try_gpt_image(prompt: str) -> tuple[bytes | None, str | None, str | None]:
     """GPT Image 2 через пул api.apitoken.sale. Сигнатура и семантика возврата — как у
     _try_gemini_image (image, error, provider_label), чтобы generate_image_with_error мог
-    звать оба провайдера единообразно.
-
-    В отличие от _try_gemini_image (блокирующий http_requests.post прямо в event loop —
-    исторически так, не трогать по месту), здесь запрос идёт через asyncio.to_thread, как
-    и _transcribe_audio_gemini — благо это НОВЫЙ код, повода мириться со старым блокирующим
-    паттерном нет.
+    звать оба провайдера единообразно. Запрос идёт через asyncio.to_thread, как и
+    _try_gemini_image и _transcribe_audio_gemini — единый паттерн для всех трёх.
     """
     import base64
     url = f"{POOL_BASE_URL}/v1/images/generations"

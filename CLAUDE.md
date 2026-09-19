@@ -132,11 +132,10 @@ diary page...» (весь английский промпт) — БЕЗ марк
   тот же ключ, что и Claude/аудио, НЕ отдельный OpenAI-ключ). Проверено живым запросом
   с сервера 07.09.2026: 200, тело `{"data": [{"b64_json": "..."}]}` (только `b64_json`,
   без `url` — как у настоящего `gpt-image-1` в OpenAI). Ключ в заголовке, не в URL —
-  как у `_transcribe_audio_gemini`, текст сетевого исключения `requests` безопасно
-  логировать как есть (в отличие от banana, см. известный баг v0.8.1).
-  Идёт через `asyncio.to_thread` (не блокирует event loop) — в отличие от
-  `_try_gemini_image`, который блокирует по месту исторически; это НОВЫЙ код, повода
-  мириться со старым блокирующим паттерном не было.
+  как у `_transcribe_audio_gemini`. Идёт через `asyncio.to_thread` (не блокирует event
+  loop) — тот же паттерн, что и у `_try_gemini_image`/`_transcribe_audio_gemini` (см.
+  «ТЗ-1 задача B» в разделе про блокирующие вызовы ниже — раньше `_try_gemini_image` был
+  исключением, теперь все три однотипны).
   **Не проверено живым отказом** (не нашли промпт, чтобы GPT Image отказался рисовать):
   модерация распознаётся эвристикой — 400 с "safety"/"moderation"/"policy" в тексте
   ошибки трактуется как отказ и уходит на переформулировку через Haiku, как у banana.
@@ -294,8 +293,9 @@ Python-пакет).
 ### Расшифровка речи (voice, video_note) — Gemini через пул api.apitoken.sale
 `_transcribe_audio_gemini(audio_bytes, mime_type)` — POST на
 `{GEMINI_POOL_BASE_URL}/v1beta/models/{GEMINI_AUDIO_MODEL_NAME}:generateContent` с
-`inline_data`, в отличие от `_try_gemini_image` вызывается через `asyncio.to_thread` (не
-блокирует event loop). **С v0.11.9 идёт через пул `api.apitoken.sale`
+`inline_data`, вызывается через `asyncio.to_thread` (не блокирует event loop) — с ТЗ-1
+(задача B) тем же паттерном вызывается и `_try_gemini_image` (было исключением, блокировало
+по месту исторически, теперь нет). **С v0.11.9 идёт через пул `api.apitoken.sale`
 (`GEMINI_POOL_BASE_URL = "https://router.apitoken.sale"`, заголовок `x-goog-api-key:
 ANTHROPIC_API_KEY`), а НЕ напрямую в Google с отдельным `GEMINI_API_KEY`** — один ключ,
 общий баланс с Claude-вызовами, честная скидка пула. Проверено живым запросом 06.09.2026
@@ -325,6 +325,8 @@ Google API — сама модель не менялась при переезд
 (проверено тем же запросом 06.09.2026). Каталог моделей пула (`/md/models`) содержит
 только текстовые Gemini-модели (flash/pro-preview) — если Google/пул когда-нибудь добавят
 image-preview туда, переезд рисования стоит переоценить, но пока это тупик.
+С ТЗ-1 (задача B) `GEMINI_API_KEY` уходит заголовком `x-goog-api-key`, не query-параметром
+`?key=` — как и у `_transcribe_audio_gemini`/`_try_gpt_image`, единый паттерн для всех трёх.
 
 ### Кадры из видео (video_note, video) — ffmpeg + Haiku
 `_extract_video_frames(video_bytes, count, duration)` — синхронная, звать только через
@@ -574,6 +576,13 @@ clear_hint=...)`: полный traceback (`exc_info=True`) в `logger.error`, п
 Прямой `client.messages.create(` остался ровно в одном месте — внутри `sync_create`.
 Добавляешь новый вызов — выбери строку из таблицы, не пиши напрямую.
 
+**Отдельная категория — блокирующий `requests.post` к сторонним HTTP API (Gemini,
+GPT Image), не к Anthropic SDK.** Тот же принцип, тот же симптом (весь бот стоит на всё
+время запроса), другой источник. `_try_gemini_image` был последним таким исключением
+(блокировал по месту, комментарий «исторически так, не трогать») — с ТЗ-1 (задача B)
+переведён на `await asyncio.to_thread(http_requests.post, ...)`, как `_try_gpt_image` и
+`_transcribe_audio_gemini`. Все три HTTP-вызова к Gemini/GPT-image теперь однотипны.
+
 ### Ретраи: два уровня, не путать
 1. **SDK-ретраи** (`ANTHROPIC_SDK_RETRIES = 3` в конструкторе `anthropic.Anthropic`) —
    для служебных вызовов. SDK ретраит 408/409/429/5xx, бэкофф 0.5→8с, блокирующий —
@@ -687,11 +696,12 @@ Remote на сервере переключён на HTTPS (`https://github.com/
 ## Известные баги
 Все ранее перечисленные баги устранены: дубль `daily_chat_review`, дубль `run_daily` в `main()`, инвертированные `cmd_whitelist_on` / `cmd_captcha_on` (теперь ставят `True`). Открытых известных багов нет — не «чини» эти места повторно.
 
-Отдельно (v0.8.1): текст сетевого исключения `requests` при обращении к Gemini содержит
-URL, а в URL — `GEMINI_API_KEY`. Наружу отдаётся общая фраза, ключ остаётся в логе.
-Не возвращать `f"Сетевая ошибка: {e}"` в `_try_gemini_image`. **Актуально только для
-`_try_gemini_image`** — `_transcribe_audio_gemini` с v0.11.9 шлёт ключ заголовком
-(`x-goog-api-key`), в URL секрета нет, класс бага для неё закрыт архитектурно.
+Отдельно (v0.8.1, закрыт архитектурно в ТЗ-1/задача B): текст сетевого исключения
+`requests` при обращении к Gemini мог содержать URL, а в URL — `GEMINI_API_KEY`. Наружу
+по-прежнему отдаётся только общая фраза (инвариант не менялся), но теперь `GEMINI_API_KEY`
+у `_try_gemini_image` тоже передаётся заголовком `x-goog-api-key`, а не query-параметром
+`?key=` — как и у `_transcribe_audio_gemini`/`_try_gpt_image`. Секрета в URL нет ни у
+одной из трёх функций, весь класс бага закрыт для всех, не только для аудио.
 
 ### Инцидент 2026-09-16/17: `/approve_chat` врал об успехе на чате, которого нет в БД
 `db.set_chat_status()` делала голый `UPDATE allowed_chats SET status=... WHERE chat_id=?`
