@@ -49,6 +49,24 @@ chat_id=?` без проверки `rowcount` — вызывающий код (`
 Пиши новые `UPDATE`-функции по этому же контракту, если вызывающий код должен знать,
 сработало ли обновление, — не полагайся на «ноль строк = ошибка будет видна и так».
 
+## `allowed_chats.chat_id > 0` — личные чаты, ошибочно попавшие в таблицу
+Telegram ID групп/супергрупп/каналов отрицательные, личных чатов — положительные (это
+сам `telegram_id` пользователя). `allowed_chats` по смыслу — только группы; до фикса
+2026-09-19 `handle_new_chat` не проверял `chat.type` и писал туда личку тоже (см.
+инцидент 2026-09-19 в `docs/claude/incidents.md`) — `my_chat_member` Telegram шлёт и на
+`/start`/разблокировку бота в личке, не только на добавление в группу. Функционального
+влияния такие строки не оказывают, пока остаются `status='pending'` (`is_chat_allowed`/
+`get_allowed_chats` читают только `status='approved'`, личный гейтинг `allowed_chats`
+вообще не трогает) — но если такую строку по ошибке одобрить (`/approve_chat`), в неё
+начнёт слать `daily_chat_review`. Посмотреть, сколько таких строк накопилось (read-only):
+```sql
+SELECT chat_id, name, status, created_at FROM allowed_chats WHERE chat_id > 0;
+```
+Удалять или нет — решает Алексей, автоматической чистки/миграции нет и не планируется:
+```sql
+DELETE FROM allowed_chats WHERE chat_id > 0;
+```
+
 ## Паттерн потолка на чтение: `ROW_NUMBER() OVER (PARTITION BY ...)`
 `get_memory`, `get_memory_for_private`, `get_all_chat_memory` (`docs/claude/memory.md`)
 все используют один и тот же паттерн для потолка «N самых свежих строк на группу»:

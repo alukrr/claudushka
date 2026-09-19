@@ -2473,8 +2473,16 @@ async def cmd_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.my_chat_member:
-        new_status = update.my_chat_member.new_chat_member.status
         chat = update.my_chat_member.chat
+        # Telegram шлёт my_chat_member и в личке — когда пользователь запускает или
+        # разблокирует бота, это моделируется тем же переходом статуса, что добавление
+        # в группу. Без этой проверки /start в личке уходил на одобрение как новый
+        # групповой чат (найдено на стенде 2026-09-19: "🆕 Меня добавили в чат! Чат:
+        # Без названия, ID: <user_id>"). "Меня удалили" для личных чатов тоже не нужно
+        # — там это означает, что пользователь заблокировал бота, чистый шум админу.
+        if chat.type not in ("group", "supergroup"):
+            return
+        new_status = update.my_chat_member.new_chat_member.status
         added_by = update.my_chat_member.from_user
 
         if new_status in ("member", "administrator"):
