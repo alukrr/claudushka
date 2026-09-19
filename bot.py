@@ -2778,9 +2778,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_context = ""
     if update.message.reply_to_message:
         src = update.message.reply_to_message
-        reply_text = src.text or src.caption or ""
-        if reply_text and src.from_user and src.from_user.id != context_bot_id:
-            reply_context = reply_text
+        if src.from_user and src.from_user.id == context_bot_id and src.photo and src.caption:
+            # Реплай на КАРТИНКУ, которую прислал сам бот — обычные сообщения бота и так
+            # есть в истории/транскрипте, но фото туда попадает отдельным reply_photo с
+            # промптом только в caption, не в тексте. Без этого реплай "а приделай ему
+            # крылья" на нарисованного кота терял контекст полностью — модель не знала,
+            # о какой картинке речь (найдено на стенде 2026-09-19). Круглые скобки, без
+            # слова "нарисовала" — тот же принцип, что инцидент 2026-09-08 в
+            # docs/claude/incidents.md, хоть это и system-prompt, а не сохранённая история.
+            reply_context = f"(в чат была отправлена картинка; подпись: {src.caption})"
+        else:
+            reply_text = src.text or src.caption or ""
+            if reply_text and src.from_user and src.from_user.id != context_bot_id:
+                reply_context = reply_text
 
     if not user_text and not has_photo and not has_document:
         return
@@ -2951,7 +2961,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         author = update.effective_user.first_name or update.effective_user.username or "Unknown"
-        await _draw_and_send(update, context, chat_id, is_group, draw_prompt, author=author)
+        success = await _draw_and_send(update, context, chat_id, is_group, draw_prompt, author=author)
+        if not is_group:
+            # Группа: юзер-текст уже сохранён пассивным блоком в начале handle_message,
+            # факт рисования — самой _draw_and_send (см. её код). Личке эквивалента
+            # пассивного блока нет — без этого явный путь "нарисуй …" не оставлял в
+            # истории НИ реплики пользователя, НИ факта рисования вообще (найдено на
+            # стенде 2026-09-19: реплай на нарисованную картинку "приделай ему крылья"
+            # получал "Какому ему?"). Сохраняем оба сообщения ВСЕГДА парой, даже при
+            # неудаче — иначе одинокий "user" без ответного "assistant" в БД столкнётся
+            # со следующим user-сообщением и нарушит чередование ролей, которое ждёт API.
+            db.save_message(user_id, "user", user_text)
+            if success:
+                db.save_message(user_id, "assistant", f"(в чат отправлена картинка по промпту: {draw_prompt})")
+            else:
+                db.save_message(user_id, "assistant", "(попытка нарисовать картинку не удалась)")
         return
 
     # Main conversation
@@ -3102,9 +3126,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     draw_en_prompt = candidate
                     assistant_text = assistant_text[:leak_match.start()].rstrip()
 
-        # В историю кладём текст без маркера. Если весь ответ был маркером — про картинку
-        # запишет _draw_and_send (группа); для лички оставим короткую пометку.
-        saved_text = assistant_text or ("(картинка отправлена)" if draw_en_prompt else assistant_text)
+        # В историю кладём текст без маркера. Если весь ответ был маркером — для группы
+        # факт рисования допишет _draw_and_send в транскрипт отдельной записью; для лички
+        # эквивалента нет (conversations — плоский список, второй "assistant" подряд без
+        # "user" между ними сломал бы чередование ролей), поэтому placeholder уже должен
+        # нести сам промпт, а не быть пустой меткой "(картинка отправлена)" — та раньше
+        # НЕ содержала prompt вообще, и реплай на такую картинку терял контекст (найдено
+        # на стенде 2026-09-19, см. docs/claude/incidents.md).
+        saved_text = assistant_text or (
+            f"(в чат отправлена картинка по промпту: {draw_en_prompt})" if draw_en_prompt else assistant_text
+        )
         if is_group:
             # Ответ Клодушки — в групповой транскрипт, чтобы видела свои реплики.
             # При пустом тексте + рисовании запись сделает _draw_and_send, чтобы не дублировать.
