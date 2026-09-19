@@ -44,7 +44,16 @@ tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 # с бэкоффом 0.5→8с. Пользовательские вызовы идут через call_claude() на client_noretry —
 # там ретраи наши, с «печатает…» между попытками (см. api_errors.call_with_retry).
 ANTHROPIC_SDK_RETRIES = 3
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, max_retries=ANTHROPIC_SDK_RETRIES)
+# base_url явно, не полагаемся на неявное чтение ANTHROPIC_BASE_URL внутри SDK — весь
+# трафик молча уйдёт мимо пула api.apitoken.sale, если это поведение когда-нибудь
+# поменяется между мажорными версиями SDK (anthropic 1.7.0 проверено: `base_url=None`
+# внутри `__init__` эквивалентно `os.environ.get("ANTHROPIC_BASE_URL")` с фолбэком на
+# api.anthropic.com — то есть текущий вызов ничего не меняет по факту, но перестаёт
+# зависеть от того, что это поведение SDK не изменится молча в будущем).
+client = anthropic.Anthropic(
+    api_key=ANTHROPIC_API_KEY, max_retries=ANTHROPIC_SDK_RETRIES,
+    base_url=os.environ.get("ANTHROPIC_BASE_URL") or None,
+)
 client_noretry = client.with_options(max_retries=0)  # переиспользует тот же httpx-пул
 
 MAX_HISTORY = 40

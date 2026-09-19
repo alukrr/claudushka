@@ -50,17 +50,24 @@
 - `whatsapp.py` — `.claude/rules/whatsapp.md` (грузится автоматически при чтении файла)
 - `db.py` — `.claude/rules/db.md` (автоматически)
 - `docker-compose.yml` — `.claude/rules/docker-compose.md` (автоматически)
+- Тестовый стенд (`docker-compose.test.yml`, обновление зависимостей, рискованные
+  правки перед продом) — `docs/claude/staging.md`
 
 ## Стек
 - Python 3.12 (python:3.12-slim Docker image)
-- python-telegram-bot 21.10
-- anthropic 0.43.0 — реестр моделей `MODELS` в bot.py, `/haiku /sonnet /opus /fable`.
-  Подробности — `docs/claude/models-and-costs.md`.
-- tavily-python 0.5.0 — веб-поиск (`/search`)
+- python-telegram-bot 22.8 (мажорное обновление с 21.10 — 2026-09-19, см.
+  `docs/claude/staging.md` про прогон на тестовом стенде перед продом)
+- anthropic 1.7.0 (мажорное обновление с 0.43.0 — та же правка; HTTP-слой SDK теперь на
+  `httpx2`, ОТДЕЛЬНОМ пакете от обычного `httpx`, конфликта версий нет, см.
+  `docs/claude/api-errors.md` про смену иерархии исключений 5xx) — реестр моделей
+  `MODELS` в bot.py, `/haiku /sonnet /opus /fable`. Подробности —
+  `docs/claude/models-and-costs.md`.
+- tavily-python 0.8.4 — веб-поиск (`/search`)
 - Генерация изображений — `/imagine`, DRAW-маркер, провайдеры banana/GPT Image 2.
   Подробности — `docs/claude/images.md`.
-- fastapi 0.115.0 + uvicorn 0.30.0 — WhatsApp webhook. Подробности — `.claude/rules/whatsapp.md`.
-- httpx 0.27.0
+- fastapi 0.141.1 + uvicorn 0.53.0 — WhatsApp webhook. Подробности — `.claude/rules/whatsapp.md`.
+- httpx 0.28.1 (для FastAPI/PTB/наших прямых вызовов — не путать с `httpx2`, отдельной
+  зависимостью только anthropic SDK)
 - tzdata — гарантирует `zoneinfo.ZoneInfo` независимо от системной базы поясов в
   образе. Единственный часовой пояс проекта — `BERLIN_TZ = ZoneInfo("Europe/Berlin")`
   (bot.py); новое место с датой/временем — брать его, не писать

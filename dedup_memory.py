@@ -41,7 +41,7 @@
   ./dedup_memory.py --mode exact
   sudo ./dedup_memory.py --mode exact --apply
 
-  # --mode llm на голом хосте: нужны `pip install anthropic==0.43.0` и ключ в окружении
+  # --mode llm на голом хосте: нужны `pip install anthropic==1.7.0` и ключ в окружении
   set -a; source .env; set +a
   ./dedup_memory.py --mode llm --model sonnet --user-id 592441
   sudo -E ./dedup_memory.py --mode llm --model sonnet --user-id 592441 --apply
@@ -223,12 +223,14 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
     except ModuleNotFoundError as e:
         sys.exit(
             f"Не хватает модуля ({e}) — он есть только внутри контейнера.\n"
-            "Либо: pip install anthropic==0.43.0 (api_errors.py — свой файл рядом, копировать не надо)\n"
+            "Либо: pip install anthropic==1.7.0 (api_errors.py — свой файл рядом, копировать не надо)\n"
             "Либо (проще, не нужен ни pip, ни sudo — контейнер уже root и с ключом в окружении):\n"
             "  docker exec claudushka python3 /repo/dedup_memory.py --mode llm ...\n"
             "  docker exec claudushka python3 /repo/dedup_memory.py --mode llm ... --apply"
         )
-    client = anthropic.Anthropic(api_key=api_key)
+    # base_url явно — та же причина, что в bot.py/whatsapp.py: не полагаемся на неявное
+    # чтение ANTHROPIC_BASE_URL внутри SDK.
+    client = anthropic.Anthropic(api_key=api_key, base_url=os.environ.get("ANTHROPIC_BASE_URL") or None)
 
     groups = _groups_for_llm(conn, user_id, chat_id, tier)
     candidates = {k: v for k, v in groups.items() if len(v) >= 2}

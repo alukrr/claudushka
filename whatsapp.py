@@ -48,7 +48,12 @@ WA_AUX_MODEL = "claude-haiku-4-5-20251001"
 # SDK-ретраи — для синхронных вспомогательных вызовов (should_search, extract_memory).
 # Основной диалог идёт через api_errors.call_with_retry на client_noretry.
 ANTHROPIC_SDK_RETRIES = 3
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, max_retries=ANTHROPIC_SDK_RETRIES)
+# base_url явно — та же причина, что в bot.py (см. комментарий там): не полагаемся на
+# неявное чтение ANTHROPIC_BASE_URL внутри SDK.
+client = anthropic.Anthropic(
+    api_key=ANTHROPIC_API_KEY, max_retries=ANTHROPIC_SDK_RETRIES,
+    base_url=os.environ.get("ANTHROPIC_BASE_URL") or None,
+)
 client_noretry = client.with_options(max_retries=0)
 tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 

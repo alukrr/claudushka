@@ -150,7 +150,7 @@
 ## Стек
 
 - Python 3.12
-- python-telegram-bot 21.10
+- python-telegram-bot 22.8
 - Anthropic Claude API — Haiku 4.5 по умолчанию; Sonnet 5 всем, Opus 5 и Fable 5.1 админам (`/models`)
 - Tavily API (веб-поиск)
 - Генерация изображений, переключаемый провайдер per-chat: Gemini «Nano Banana 2» (`gemini-3.1-flash-image-preview`, прямой Google API) или GPT Image 2 (`gpt-image-2`, через пул api.apitoken.sale)

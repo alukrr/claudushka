@@ -9,9 +9,19 @@
 clear_hint=...)`: полный traceback (`exc_info=True`) в `logger.error`, пользователю —
 короткая фраза в характере Клодушки.
 
-## Классы ошибок (проверено на anthropic 0.43.0)
-- **529 overloaded / любой 5xx → `anthropic.InternalServerError`.** Отдельного класса под
-  529 в SDK нет, ловится весь 5xx одним типом. Ретраебельно, тон «не наша вина».
+## Классы ошибок (проверено на anthropic 0.43.0, заново на 1.7.0 — 2026-09-19)
+- **529 overloaded / любой 5xx → ретраебельно, тон «не наша вина».** На 0.43.0 единственным
+  классом под весь 5xx был `anthropic.InternalServerError` — своего класса под 529 не было.
+  **С 1.x это изменилось**: у 529 теперь свой класс `anthropic.OverloadedError`, и это
+  СЕСТРА `InternalServerError` под `APIStatusError`, НЕ её подкласс (проверено по
+  исходнику `_client.py`: `if status_code == 529: return OverloadedError(...)`, и только
+  ниже `if status_code >= 500: return InternalServerError(...)` — отдельная ветка).
+  `isinstance(exc, anthropic.InternalServerError)` при обновлении на 1.x молча переставал
+  бы ловить именно 529 — самый частый транзиентный статус Anthropic. Найдено и починено
+  при обновлении зависимостей (2026-09-19): `is_retryable`/`user_message` в `api_errors.py`
+  теперь классифицируют по `isinstance(exc, anthropic.APIStatusError) and exc.status_code
+  >= 500`, а не по конкретному классу — переживает появление новых 5xx-подклассов в
+  будущих версиях SDK, не только этот один инцидент.
 - **429 → `RateLimitError`** — ретраебельно, «притормози».
 - **401/403 → `AuthenticationError` / `PermissionDeniedError`** — пользователю нейтрально,
   в лог явное «ПРОВЕРЬ ANTHROPIC_API_KEY».

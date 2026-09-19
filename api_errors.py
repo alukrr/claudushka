@@ -7,9 +7,17 @@
 (529 overloaded / 5xx, 429, обрыв связи) переживаем ретраями молча, окончательные —
 объясняем по-человечески. Полный traceback уходит в logger.error.
 
-Проверено на anthropic 0.43.0: SDK маппит HTTP 529 в anthropic.InternalServerError
-(подкласс APIStatusError, status_code >= 500). Свой класс под 529 в SDK не заведён,
-поэтому ловим весь 5xx одним типом.
+Проверено на anthropic 0.43.0 и заново на 1.7.0 (2026-09-19, обновление зависимостей).
+Поля Usage/Message (cache_creation_input_tokens, cache_read_input_tokens, stop_reason,
+content) и базовые классы исключений (RateLimitError/AuthenticationError/
+PermissionDeniedError/BadRequestError/NotFoundError/APIConnectionError/APITimeoutError)
+не изменились. НО: до 1.x единственным классом под весь 5xx (включая 529 overloaded)
+был anthropic.InternalServerError — с 1.x у 529/503/504 появились СВОИ классы
+(OverloadedError/ServiceUnavailableError/DeadlineExceededError), и это СЁСТРЫ
+InternalServerError под APIStatusError, а не её подклассы. isinstance-проверки по
+InternalServerError молча переставали ловить 529 — самый частый транзиентный статус
+Anthropic. Классификация 5xx теперь идёт по `exc.status_code >= 500`, не по имени
+класса — см. is_retryable/user_message ниже.
 """
 
 import asyncio
@@ -98,15 +106,18 @@ def is_insufficient_balance(exc: BaseException) -> bool:
 
 
 def is_retryable(exc: BaseException) -> bool:
-    """Переживаемые сами по себе: перегруз сервиса, рейт-лимит, сетевой обрыв/таймаут."""
-    return isinstance(
-        exc,
-        (
-            anthropic.InternalServerError,  # 5xx, включая 529 overloaded_error
-            anthropic.RateLimitError,       # 429
-            anthropic.APIConnectionError,   # сеть + APITimeoutError (наследник)
-        ),
-    )
+    """Переживаемые сами по себе: перегруз сервиса, рейт-лимит, сетевой обрыв/таймаут.
+
+    5xx проверяем по status_code, НЕ isinstance(exc, InternalServerError): с anthropic
+    1.x 529/503/504 получили свои классы (OverloadedError/ServiceUnavailableError/
+    DeadlineExceededError), и это СЁСТРЫ InternalServerError под APIStatusError, а не
+    её подклассы — до 1.x единственным классом под весь 5xx был InternalServerError,
+    и старая проверка молча переставала ретраить именно 529 (самый частый транзиентный
+    статус Anthropic). Найдено и починено при обновлении зависимостей (ТЗ-4, 2026-09-19).
+    """
+    if isinstance(exc, anthropic.APIStatusError) and (getattr(exc, "status_code", 0) or 0) >= 500:
+        return True
+    return isinstance(exc, (anthropic.RateLimitError, anthropic.APIConnectionError))
 
 
 def user_message(exc: BaseException, default: str | None = None, clear_hint: str = CLEAR_HINT_DEFAULT) -> str:
@@ -115,7 +126,7 @@ def user_message(exc: BaseException, default: str | None = None, clear_hint: str
     clear_hint — как пользователю сбросить историю. В Telegram это /clear,
     в WhatsApp команд нет, поэтому текст задаёт вызывающая сторона.
     """
-    if isinstance(exc, anthropic.InternalServerError):
+    if isinstance(exc, anthropic.APIStatusError) and (getattr(exc, "status_code", 0) or 0) >= 500:
         return "Сервис перегружен, я не виновата. Попробуй через минуту."
     if isinstance(exc, anthropic.RateLimitError):
         return "Слишком часто. Притормози на минутку — я не резиновая."
@@ -392,8 +403,9 @@ async def call_with_retry(fn, *, label: str, keepalive=None):
     """Выполнить синхронный вызов API в отдельном потоке, переживая транзиентные ошибки.
 
     fn — функция без аргументов (обычно functools.partial(client.messages.create, ...)).
-    Ретраи наши, а не SDK-шные: SDK умеет max_retries с бэкоффом (проверено в 0.43.0:
-    ретраит 408/409/429/5xx, задержка 0.5→8с), но это блокирующий sleep внутри потока,
+    Ретраи наши, а не SDK-шные: SDK умеет max_retries с бэкоффом (проверено в 0.43.0 и
+    заново в 1.7.0: ретраит 408/409/429/5xx, задержка 0.5→8с), но это блокирующий sleep
+    внутри потока,
     между попытками некому обновить «печатает…» и задержки перемножились бы с нашими.
     Поэтому здесь fn обязан быть построен на клиенте с max_retries=0.
 

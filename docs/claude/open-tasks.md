@@ -46,7 +46,7 @@
 
   **Проще всего гонять `--mode llm` через `docker exec claudushka python3 /repo/...`**
   (`/repo` — примонтированный туда же корень репо) — внутри контейнера уже есть пакет
-  `anthropic` (на голом хосте его нет, `pip install anthropic==0.43.0` либо так) и
+  `anthropic` (на голом хосте его нет, `pip install anthropic==1.7.0` либо так) и
   `ANTHROPIC_API_KEY` в окружении (не надо `source .env`), и процесс и так root
   (не надо `sudo`/`sudo -E`). `--help` в самом скрипте — там же все примеры.
 
