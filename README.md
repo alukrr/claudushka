@@ -110,7 +110,7 @@
 |---------|----------|
 | `/models [chat_id]` | Список моделей и текущая модель чата |
 | `/haiku [chat_id]` | Haiku 4.5 — $1/$5 за MTok, окно 200k (дефолт) |
-| `/sonnet [chat_id]` | Sonnet 5 — $3/$15, окно 1M |
+| `/sonnet [chat_id]` | Sonnet 5 — $2/$10, окно 1M |
 | `/opus [chat_id]` | Opus 5 — $5/$25, окно 1M (только админ) |
 | `/fable [chat_id]` | Fable 5 — $10/$50, окно 1M (только админ) |
 
