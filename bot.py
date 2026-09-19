@@ -66,20 +66,25 @@ captcha_state: dict[str, dict] = {}
 
 # Единственный источник правды по моделям: команды, цены, гейтинг, /models — отсюда.
 # Пул api.apitoken.sale принимает эти строки (проверено живым запросом 29.07.2026).
-# Цены — официальный прайс Anthropic в $/MTok (in/out), прокси даёт скидку сверху.
-# Sonnet 5: до 31.08.2026 действует вводная цена $2/$10 — ставим постоянные $3/$15,
-# после окончания акции значение станет верным само, до тех пор /cost слегка завышает.
+# Цены — официальный прайс Anthropic в $/MTok (in/out), сверено 2026-09-19 по
+# https://platform.claude.com/docs/en/about-claude/models/overview и .../pricing,
+# прокси даёт скидку сверху. Sonnet 5: вводная цена $2/$10 стала ПОСТОЯННОЙ — доки
+# Anthropic прямо говорят, что запланированное повышение до $3/$15 отменено (не
+# «станет верным само после 31.08», как считалось раньше — тот комментарий был ошибкой).
+# "cache_read_mult" — множитель цены input для чтения из prompt cache (см.
+# CACHE_READ_MULTIPLIER ниже): у всех текущих моделей 0.1x, КРОМЕ Fable 5.1/Mythos —
+# у них 0.025x, поэтому множитель — поле реестра, не глобальная константа.
 # Окна контекста: у Haiku 200k, у пятого поколения 1M. Лимиты памяти и истории
 # калиброваны под МИНИМАЛЬНОЕ (200k) — не поднимать их, ссылаясь на 1M у Opus.
 MODELS = {
     "haiku":  {"id": "claude-haiku-4-5-20251001", "label": "Haiku 4.5",
-               "in": 1.0,  "out": 5.0,  "context":   200_000, "admin_only": False},
+               "in": 1.0,  "out": 5.0,  "cache_read_mult": 0.1, "context":   200_000, "admin_only": False},
     "sonnet": {"id": "claude-sonnet-5",           "label": "Sonnet 5",
-               "in": 3.0,  "out": 15.0, "context": 1_000_000, "admin_only": False},
+               "in": 2.0,  "out": 10.0, "cache_read_mult": 0.1, "context": 1_000_000, "admin_only": False},
     "opus":   {"id": "claude-opus-5",             "label": "Opus 5",
-               "in": 5.0,  "out": 25.0, "context": 1_000_000, "admin_only": True},
+               "in": 5.0,  "out": 25.0, "cache_read_mult": 0.1, "context": 1_000_000, "admin_only": True},
     "fable":  {"id": "claude-fable-5",            "label": "Fable 5",
-               "in": 10.0, "out": 50.0, "context": 1_000_000, "admin_only": True},
+               "in": 10.0, "out": 50.0, "cache_read_mult": 0.1, "context": 1_000_000, "admin_only": True},
 }
 DEFAULT_MODEL_KEY = "haiku"
 DEFAULT_MODEL_ID = MODELS[DEFAULT_MODEL_KEY]["id"]
@@ -107,6 +112,9 @@ token_usage: dict[str, dict[str, int]] = {}
 # которые /cost раньше вообще не видел — расход занижался (порядок величины подтверждён
 # в dedup_memory.py: 40690 символов -> input_tokens=2, cache_creation_input_tokens=16186).
 CACHE_WRITE_MULTIPLIER = 1.25
+# Дефолт для моделей БЕЗ своего "cache_read_mult" в MODELS (например, легаси-строка в
+# chat_models, не найденная в реестре — см. model_meta). Для моделей из реестра
+# фактический множитель берётся из meta["cache_read_mult"], не отсюда напрямую.
 CACHE_READ_MULTIPLIER = 0.1
 
 
@@ -1811,10 +1819,13 @@ async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
             price_in, price_out = meta["in"], meta["out"]
             # cache_write/cache_read — см. CACHE_WRITE_MULTIPLIER: без них цифра занижена
             # на порядки на большом system-prompt'е, не на проценты (найдено 2026-08-31).
+            # cache_read_mult — из реестра, не общая константа: у Fable 5.1/Mythos 0.025x
+            # вместо стандартных 0.1x у всех остальных моделей.
+            cache_read_mult = meta.get("cache_read_mult", CACHE_READ_MULTIPLIER)
             cost = (
                 (inp / 1_000_000 * price_in)
                 + (cache_write / 1_000_000 * price_in * CACHE_WRITE_MULTIPLIER)
-                + (cache_read / 1_000_000 * price_in * CACHE_READ_MULTIPLIER)
+                + (cache_read / 1_000_000 * price_in * cache_read_mult)
                 + (out / 1_000_000 * price_out)
             )
             grand_total += cost

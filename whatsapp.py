@@ -25,9 +25,9 @@ WEBHOOK_VERIFY_TOKEN = os.environ["WEBHOOK_VERIFY_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 
-# ТЗ-1 задача A: подпись вебхука Meta. НЕ os.environ[...] (обязательный) — секрет может
-# отсутствовать на старте, и тогда сервис обязан fail-closed (стартовать и отклонять все
-# POST с 403), а не падать при импорте модуля.
+# Подпись вебхука Meta (2026-09-19, d71d7c9). НЕ os.environ[...] (обязательный) — секрет
+# может отсутствовать на старте, и тогда сервис обязан fail-closed (стартовать и отклонять
+# все POST с 403), а не падать при импорте модуля.
 WHATSAPP_APP_SECRET = os.environ.get("WHATSAPP_APP_SECRET", "")
 if not WHATSAPP_APP_SECRET:
     logger.critical(
@@ -37,6 +37,13 @@ if not WHATSAPP_APP_SECRET:
     )
 
 WHATSAPP_API_URL = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+
+# Модель для ответов пользователю (whatsapp.py вне реестра MODELS из bot.py — см.
+# docs/claude/models-and-costs.md). Было claude-sonnet-4-6, переведено на claude-sonnet-5
+# (ТЗ-3, Блок A) — тот же ID, которым bot.py уже пользуется для /sonnet в проде.
+WA_MODEL = "claude-sonnet-5"
+# Служебные вызовы (should_search, extract_memory) — только Haiku, никогда модель ответа.
+WA_AUX_MODEL = "claude-haiku-4-5-20251001"
 
 # SDK-ретраи — для синхронных вспомогательных вызовов (should_search, extract_memory).
 # Основной диалог идёт через api_errors.call_with_retry на client_noretry.
@@ -144,7 +151,7 @@ def web_search(query: str, max_results: int = 5) -> str:
 def should_search(text: str) -> str | None:
     try:
         response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=WA_AUX_MODEL,
             max_tokens=100,
             system=(
                 "Определи, нужен ли веб-поиск для ответа на вопрос пользователя. "
@@ -196,7 +203,7 @@ def extract_memory(phone: str, messages: list):
     try:
         recent = messages[-6:]
         response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=WA_AUX_MODEL,
             max_tokens=300,
             system=(
                 "Извлеки важные факты о пользователе из диалога. "
@@ -237,7 +244,7 @@ async def handle_wa_message(phone: str, text: str):
         if search_context:
             system += f"\n\nРезультаты поиска:\n{search_context}"
 
-        _model = "claude-sonnet-4-6"
+        _model = WA_MODEL
         hist_chars, hist_imgs = api_errors.history_stats(history)
         logger.info(
             f"PROMPT wa={phone} model={_model} "

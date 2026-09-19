@@ -79,17 +79,19 @@ MODEL_ALIASES = {
     "fable": "claude-fable-5",
 }
 
-# $/MTok in,out — продублировано из реестра MODELS в bot.py (сверять при изменении цен там).
+# $/MTok in,out,cache_read_mult — дубль MODELS из bot.py, менять синхронно (сверено
+# 2026-09-19 по https://platform.claude.com/docs/en/about-claude/pricing). cache_read_mult
+# — 0.1 у всех текущих моделей; Fable 5.1/Mythos — исключение с 0.025 (см. bot.py MODELS).
 PRICING = {
-    "claude-haiku-4-5-20251001": (1.0, 5.0),
-    "claude-sonnet-5": (3.0, 15.0),
-    "claude-opus-5": (5.0, 25.0),
-    "claude-fable-5": (10.0, 50.0),
+    "claude-haiku-4-5-20251001": (1.0, 5.0, 0.1),
+    "claude-sonnet-5": (2.0, 10.0, 0.1),
+    "claude-opus-5": (5.0, 25.0, 0.1),
+    "claude-fable-5": (10.0, 50.0, 0.1),
 }
-# Стандартные множители Anthropic для prompt caching (5-минутный ephemeral, тот тип,
-# что реально приходит с этого ключа/пула — см. usage.cache_creation).
+# Стандартный множитель Anthropic для записи в prompt cache (5-минутный ephemeral, тот
+# тип, что реально приходит с этого ключа/пула — см. usage.cache_creation). Одинаковый
+# для всех моделей, в отличие от чтения (см. PRICING) — глобальной константой оставлен.
 CACHE_WRITE_MULTIPLIER = 1.25
-CACHE_READ_MULTIPLIER = 0.1
 
 
 def get_conn(writable: bool) -> tuple[sqlite3.Connection, str | None]:
@@ -319,16 +321,16 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
             conn.commit()
 
     elapsed = time.monotonic() - started
-    price_in, price_out = PRICING.get(model, (None, None))
+    price_in, price_out, cache_read_mult = PRICING.get(model, (None, None, None))
     cost = None
     if price_in is not None:
         # cache_creation ~1.25x обычного input (5-минутный ephemeral, см. CACHE_WRITE_MULTIPLIER),
-        # cache_read ~0.1x — но для дедупа он почти всегда 0: каждый вход уникален,
-        # читать из кэша нечего, это ВСЕГДА запись, никогда чтение.
+        # cache_read — множитель модели из PRICING (0.1x у большинства, но для дедупа он
+        # почти всегда 0: каждый вход уникален, читать из кэша нечего, это ВСЕГДА запись).
         cost = (
             total_in_tok / 1_000_000 * price_in
             + total_cache_write_tok / 1_000_000 * price_in * CACHE_WRITE_MULTIPLIER
-            + total_cache_read_tok / 1_000_000 * price_in * CACHE_READ_MULTIPLIER
+            + total_cache_read_tok / 1_000_000 * price_in * cache_read_mult
             + total_out_tok / 1_000_000 * price_out
         )
     cost_str = f"${cost:.4f}" if cost is not None else "? (модель не в PRICING — сверься с /cost в боте)"

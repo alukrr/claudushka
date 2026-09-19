@@ -1,5 +1,44 @@
 # Открытые задачи (не «известные баги», а запланированное)
 
+- **Fable 5 → Fable 5.1 (`claude-fable-5-1`), ждём пробный запрос Алексея (ТЗ-3, Блок A,
+  2026-09-19).** Официальный прайс Anthropic уже перечисляет Fable 5.1 (та же цена
+  $10/$50, но `cache_read_mult` 0.025 вместо 0.1 — единственная модель с таким
+  множителем), Fable 5 помечена как legacy (retirement не раньше 1.09.2027 — доступна,
+  просто не рекомендуется для новых интеграций). Не проверено — принимает ли пул
+  `api.apitoken.sale` строку `claude-fable-5-1`. Пробная команда (ключ не попадает в
+  историю shell — используется переменная окружения, не литерал):
+  ```bash
+  cd ~/claudushka && set -a && source .env && set +a
+  for m in claude-fable-5-1 claude-sonnet-5; do
+    curl -s -o /tmp/probe_$m.json -w "$m: HTTP %{http_code}\n" \
+      "${ANTHROPIC_BASE_URL:-https://api.anthropic.com}/v1/messages" \
+      -H "x-api-key: $ANTHROPIC_API_KEY" \
+      -H "anthropic-version: 2023-06-01" \
+      -H "content-type: application/json" \
+      -d "{\"model\": \"$m\", \"max_tokens\": 1, \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}]}"
+  done
+  cat /tmp/probe_claude-*.json; rm /tmp/probe_claude-*.json
+  ```
+  `claude-sonnet-5` в этой же команде — сверка для `WA_MODEL` в whatsapp.py (ТЗ-3, Блок A
+  п.4): bot.py им уже пользуется в проде для `/sonnet`, ожидаемо 200, код уже переведён
+  на него не дожидаясь (риск минимальный) — но если пул вдруг вернёт не 200, дай знать,
+  откатим `WA_MODEL` обратно на `claude-sonnet-4-6`.
+
+  `fable-5-1: 200` → пул принял. Дальше (не сделано, ждёт этого ответа):
+  1. `bot.py` `MODELS["fable"]`: `"id": "claude-fable-5-1"`, `"label": "Fable 5.1"`,
+     `"cache_read_mult": 0.025`.
+  2. `db.py`, список идемпотентных миграций (рядом с `UPDATE chat_models SET
+     model='claude-sonnet-5' WHERE model LIKE 'claude-sonnet-4-%'`, см.
+     `.claude/rules/db.md`): добавить `UPDATE chat_models SET model='claude-fable-5-1'
+     WHERE model='claude-fable-5'`. Без миграции чаты на `claude-fable-5` попадут в
+     `model_meta()` фолбэк на дефолт (Haiku) — `/cost` посчитает их по ценам Haiku, а
+     не Fable, занижая расход в разы.
+  3. `dedup_memory.py`: `MODEL_ALIASES["fable"]` и `PRICING["claude-fable-5-1"]`
+     синхронно с `MODELS` (см. комментарий «дубль MODELS из bot.py»).
+
+  Если пул НЕ принял (не 200) — ничего не менять, эта запись остаётся как есть до
+  следующей проверки.
+
 - **Гигиена памяти**: дедуп фактов (`UNIQUE(user_id, context, chat_id, fact)` +
   `INSERT OR IGNORE`; индекс не создастся, пока в таблице есть дубликаты) и разовая
   чистка просроченных (`DELETE FROM memory WHERE expires_at IS NOT NULL AND expires_at <= now`,
