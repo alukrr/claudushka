@@ -43,8 +43,10 @@ paths: ["whatsapp.py"]
 
 **Деплой.** `WHATSAPP_APP_SECRET` должен появиться в `.env` на сервере ДО деплоя этого
 кода — иначе fail-closed сразу отключит WhatsApp. Порядок: добавить секрет в `.env` →
-`git pull` → `docker compose up -d --force-recreate` (нужен `--force-recreate`, не
-просто `restart`, если менялся `requirements.txt`).
+`git pull` → `docker compose up -d --force-recreate` (нужен именно `--force-recreate`,
+а не `restart`, — поменялась переменная окружения `.env`, а не только `requirements.txt`;
+`.env` контейнер читает один раз при создании, `restart` его не перечитывает — см.
+`.claude/rules/docker-compose.md`).
 
 **Не проверено живым Meta-вебхуком** (проверено только локально `TestClient`'ом с
 фиктивными env, 2026-09-19): реальная доставка от Meta, формат её ретраев при таймауте.

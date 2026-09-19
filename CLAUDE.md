@@ -147,7 +147,16 @@ SemVer:
 1. Правки в WSL (`~/projects/claudushka`)
 2. Проверить синтаксис: `python3 -c "import ast; ast.parse(open('bot.py').read())"`
 3. Коммит → push в ветку → мерж в main
-4. Деплой: `/update` в Telegram (пишет Алексей) или `git pull && docker restart claudushka` на сервере
+4. Деплой: `/update` в Telegram (пишет Алексей) или `git pull && docker restart claudushka`
+   на сервере — **но это перезапускает только Telegram-сервис (`claudushka`)**.
+   - Менялись `whatsapp.py`, `db.py`, `api_errors.py` или `requirements.txt` —
+     перезапускать ОБА сервиса (`docker restart claudushka claudushka-wa`): `db.py`/
+     `api_errors.py` общие для обоих, а `restart` достаточно и для подхвата нового
+     `requirements.txt` — `command:` каждого сервиса перевыполняет `pip install` при
+     каждом старте процесса.
+   - Менялся `.env` — `restart` его НЕ подхватит (переменные окружения читаются один
+     раз при создании контейнера), нужен `docker compose up -d --force-recreate`.
+     Подробности — `.claude/rules/docker-compose.md`.
 
 Стиль коммитов: `feat:`, `fix:`, `docs:`, `chore:`. Коротко и осмысленно — сообщения видны пользователям в `/update`.
 
