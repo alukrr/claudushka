@@ -21,6 +21,12 @@ services:
   claudushka-wa-test:
     image: python:3.12-slim
     container_name: claudushka-wa-test
+    # WA на паузе и на проде (2026-09-19, токен Meta протух) — тот же profiles:, что в
+    # docker-compose.yml, для симметрии: обычный `docker compose -f docker-compose.test.yml
+    # up -d` больше не поднимает и тестовый WA-сервис. Явный запуск, если понадобится
+    # тестировать именно WhatsApp: `docker compose -f docker-compose.test.yml --profile
+    # whatsapp up -d`. См. docs/claude/incidents.md.
+    profiles: ["whatsapp"]
     working_dir: /app
     volumes:
       - ./whatsapp.py:/app/whatsapp.py

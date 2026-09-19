@@ -80,9 +80,11 @@
 - db.py — слой данных SQLite (пользователи, история, память, чаты) — `.claude/rules/db.md`
 - api_errors.py — классификация ошибок Anthropic API, ретраи, сообщения пользователю
   (общий для bot.py и whatsapp.py) — `docs/claude/api-errors.md`
-- whatsapp.py — WhatsApp-бот (FastAPI webhook, отдельный сервис) — `.claude/rules/whatsapp.md`
+- whatsapp.py — WhatsApp-бот (FastAPI webhook, отдельный сервис; **сервис на паузе с
+  2026-09-19**, код и правила не трогали) — `.claude/rules/whatsapp.md`
 - allowed.json — белые списки пользователей и чатов (legacy, основной источник — SQLite)
-- docker-compose.yml — два сервиса: claudushka + claudushka-wa (WhatsApp) — `.claude/rules/docker-compose.md`
+- docker-compose.yml — два сервиса: claudushka + claudushka-wa (WhatsApp, `profiles:`,
+  на паузе) — `.claude/rules/docker-compose.md`
 - .env — секреты (не в git)
 - requirements.txt — все зависимости
 - dedup_memory.py — ручная дедупликация фактов памяти, см. `docs/claude/open-tasks.md`
@@ -158,11 +160,15 @@ SemVer:
 3. Коммит → push в ветку → мерж в main
 4. Деплой: `/update` в Telegram (пишет Алексей) или `git pull && docker restart claudushka`
    на сервере — **но это перезапускает только Telegram-сервис (`claudushka`)**.
-   - Менялись `whatsapp.py`, `db.py`, `api_errors.py` или `requirements.txt` —
-     перезапускать ОБА сервиса (`docker restart claudushka claudushka-wa`): `db.py`/
-     `api_errors.py` общие для обоих, а `restart` достаточно и для подхвата нового
-     `requirements.txt` — `command:` каждого сервиса перевыполняет `pip install` при
-     каждом старте процесса.
+   `claudushka-wa` (WhatsApp) **на паузе с 2026-09-19** (`profiles: ["whatsapp"]` в
+   `docker-compose.yml`, токен Meta протух, каналом никто не пользуется) — обычный
+   `docker compose up -d` его больше не поднимает и не перезапускает. Правки в
+   `whatsapp.py` сейчас никуда не выкатываются, пока сервис не поднят явно
+   (`docker compose --profile whatsapp up -d`) — см. `.claude/rules/whatsapp.md`.
+   - Менялись `db.py` или `api_errors.py` (общие для обоих сервисов) или
+     `requirements.txt` — `docker restart claudushka` достаточно: `command:`
+     перевыполняет `pip install` при каждом старте процесса, пересоздавать
+     контейнер не нужно.
    - Менялся `.env` — `restart` его НЕ подхватит (переменные окружения читаются один
      раз при создании контейнера), нужен `docker compose up -d --force-recreate`.
      Подробности — `.claude/rules/docker-compose.md`.

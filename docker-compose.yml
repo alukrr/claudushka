@@ -24,6 +24,12 @@ services:
   claudushka-wa:
     image: python:3.12-slim
     container_name: claudushka-wa
+    # На паузе с 2026-09-19 (решение Алексея): токен Meta протух, каналом никто не
+    # пользуется, держать открытым порт 8080 ради мёртвого сервиса незачем. Обычный
+    # `docker compose up -d` этот сервис больше не поднимает — явный запуск:
+    # `docker compose --profile whatsapp up -d`. Код и .claude/rules/whatsapp.md не
+    # трогали, см. docs/claude/incidents.md.
+    profiles: ["whatsapp"]
     working_dir: /app
     volumes:
       - ./whatsapp.py:/app/whatsapp.py
