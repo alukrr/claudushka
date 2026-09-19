@@ -1,8 +1,7 @@
 .env
+.env.test
 __pycache__/
 *.pyc
 data/
-.claude/settings.local.json
-.claude/settings.local.json
-.claude/settings.local.json
+data-test/
 .claude/settings.local.json

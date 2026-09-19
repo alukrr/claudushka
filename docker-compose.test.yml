@@ -1,0 +1,37 @@
+services:
+  claudushka-test:
+    image: python:3.12-slim
+    container_name: claudushka-test
+    working_dir: /app
+    volumes:
+      - ./bot.py:/app/bot.py
+      - ./api_errors.py:/app/api_errors.py
+      - ./db.py:/app/db.py
+      - ./requirements.txt:/app/requirements.txt
+      - ./allowed.json:/app/allowed.json
+      - ./data-test:/app/data
+    env_file:
+      - .env.test
+    # НЕТ /var/run/docker.sock и НЕТ .:/repo — /update на стенде не нужен и опасен
+    # (self-update стенда не предусмотрен, обновление — только git pull + пересборка).
+    # Поэтому НЕТ и git/docker.io в command: они там были только ради /update.
+    command: /bin/sh -c "pip install --no-cache-dir -r requirements.txt && apt-get update -qq && apt-get install -y -qq ffmpeg && python bot.py"
+    restart: unless-stopped
+
+  claudushka-wa-test:
+    image: python:3.12-slim
+    container_name: claudushka-wa-test
+    working_dir: /app
+    volumes:
+      - ./whatsapp.py:/app/whatsapp.py
+      - ./api_errors.py:/app/api_errors.py
+      - ./db.py:/app/db.py
+      - ./requirements.txt:/app/requirements.txt
+      - ./data-test:/app/data
+    env_file:
+      - .env.test
+    ports:
+      # Только localhost — не светить наружу. curl с самого сервера, не из интернета.
+      - "127.0.0.1:8081:8080"
+    command: /bin/sh -c "pip install --no-cache-dir -r requirements.txt && uvicorn whatsapp:app --host 0.0.0.0 --port 8080"
+    restart: unless-stopped
