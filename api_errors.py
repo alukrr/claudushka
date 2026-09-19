@@ -286,6 +286,44 @@ def parse_json_lenient(text: str, opener: str = "{", *, label: str = "json"):
     return data
 
 
+SEARCH_DECISION_MAX_LINE_CHARS = 80
+SEARCH_DECISION_SENTENCE_MIN_WORDS = 6
+
+
+def parse_search_decision(raw: str, *, label: str = "should_search") -> str | None:
+    """Строгий разбор ответа should_search на 'NO' или поисковый запрос.
+
+    Модель, классифицирующая нужен ли веб-поиск, иногда вместо NO/запроса отвечает
+    болтовнёй вместо классификации (живые случаи со стенда 2026-09-19: "Я понимаю,
+    что вы делитесь своим опытом…" или "NO\n\nЯ не могу рисовать…") — раньше код
+    сравнивал только `result.upper() == "NO"`, и любой такой текст целиком уходил в
+    Tavily как поисковый запрос, а затем в ответ пользователю как "результаты поиска".
+
+    Берём ПЕРВУЮ непустую строку, срезаем кавычки/пробелы. Если она начинается с NO
+    (без учёта регистра) — поиска нет, готово (даже если после NO модель дописала
+    ещё что-то — вроде "NO\n\nЯ не могу..." — решение уже принято верно, варнинг тут
+    не нужен). Иначе строка обязана быть ПОХОЖА на поисковый запрос: не длиннее
+    SEARCH_DECISION_MAX_LINE_CHARS, единственная непустая строка в ответе, не похожа
+    на законченное предложение (не длиннее SEARCH_DECISION_SENTENCE_MIN_WORDS слов,
+    если заканчивается на . ! ? …). Не прошло — невалидный ответ, поиска нет,
+    warning в лог с первыми 100 символами сырого ответа (иначе непонятно, что
+    отфильтровалось и почему).
+    """
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    first = lines[0].strip(" \t'\"«»")
+    if first.upper().startswith("NO"):
+        return None
+    looks_like_sentence = (
+        bool(first) and first[-1] in ".!?…" and len(first.split()) > SEARCH_DECISION_SENTENCE_MIN_WORDS
+    )
+    if len(first) > SEARCH_DECISION_MAX_LINE_CHARS or len(lines) > 1 or looks_like_sentence:
+        logger.warning(f"[{label}] невалидный ответ модели, поиск отменён: {raw[:100]!r}")
+        return None
+    return first
+
+
 def history_stats(messages: list) -> tuple[int, int]:
     """(символы ТЕКСТА, число картинок).
 
