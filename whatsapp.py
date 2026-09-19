@@ -68,7 +68,41 @@ _seen_message_ids: "collections.OrderedDict[str, float]" = collections.OrderedDi
 # asyncio.create_task). Тот же паттерн, что и в bot.py._spawn_background_task.
 _background_tasks: set[asyncio.Task] = set()
 
+# Каждое входящее сообщение обрабатывается в фоне (_spawn_background_task) — если один
+# номер присылает два сообщения подряд, обе обработки читают историю
+# (db.get_conversation_by_key) раньше, чем любая из них её сохранит: второй ответ не
+# видит первого вопроса, ответы могут прийти в обратном порядке. Лок на номер сериализует
+# обработку ОДНОГО номера, разные номера по-прежнему идут параллельно (ТЗ-3, Блок B).
+# Рефкаунт рядом с каждым Lock — чтобы удалять лок из словаря, когда его больше никто не
+# держит и не ждёт, и словарь не рос бесконечно на каждый новый номер, который когда-либо
+# писал боту. Приватные атрибуты asyncio.Lock (`_waiters` и т.п.) для этого не трогаем —
+# не публичный API, менять паттерн от версии к версии Python не хочется.
+_phone_locks: dict[str, asyncio.Lock] = {}
+_phone_lock_refcount: dict[str, int] = {}
+
 app = FastAPI()
+
+
+def _acquire_phone_lock(phone: str) -> asyncio.Lock:
+    """Лок для номера + учёт «сколько задач сейчас держат или ждут этот лок». Парная
+    функция — _release_phone_lock, звать в finally после выхода из `async with`.
+
+    Синхронная, без await внутри — весь блок atomarен относительно других корутин
+    (event loop однопоточный), гонки между двумя одновременными вызовами быть не может.
+    """
+    lock = _phone_locks.setdefault(phone, asyncio.Lock())
+    _phone_lock_refcount[phone] = _phone_lock_refcount.get(phone, 0) + 1
+    return lock
+
+
+def _release_phone_lock(phone: str) -> None:
+    """Уменьшает счётчик держателей/ожидающих; на нуле — лок убирается из словаря."""
+    count = _phone_lock_refcount.get(phone, 1) - 1
+    if count <= 0:
+        _phone_lock_refcount.pop(phone, None)
+        _phone_locks.pop(phone, None)
+    else:
+        _phone_lock_refcount[phone] = count
 
 
 def _spawn_background_task(coro) -> asyncio.Task:
@@ -353,7 +387,15 @@ async def _process_wa_message(msg: dict):
 
         if msg_type == "text":
             text = msg["text"]["body"]
-            await handle_wa_message(phone, text)
+            # Лок берётся ЗДЕСЬ, внутри фоновой задачи — быстрый ответ 200 вебхуку это
+            # не трогает. Сериализует только обработку одного номера (история читается
+            # и пишется под локом), другие номера ждать не заставляет.
+            lock = _acquire_phone_lock(phone)
+            try:
+                async with lock:
+                    await handle_wa_message(phone, text)
+            finally:
+                _release_phone_lock(phone)
         elif msg_type in ("image", "audio", "video", "document"):
             await send_whatsapp_message(
                 phone,
