@@ -8,6 +8,14 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = Path("/app/data/claudushka.db")
 
+# Дефолтный провайдер картинок для чатов, никогда не выставлявших /banana или /gpt.
+# Решение Алексея (2026-09-19): GPT Image 2 дешевле, banana дороже — по умолчанию и
+# для всех бесплатных чатов теперь GPT (медленнее, но это приемлемая цена). Строка в
+# chat_image_provider появляется только после явной команды — существующие явные
+# выборы (в любую сторону) эта константа не трогает и не мигрирует, см.
+# docs/claude/images.md.
+DEFAULT_IMAGE_PROVIDER = "gpt"
+
 
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH))
@@ -96,7 +104,7 @@ def init_db():
 
         CREATE TABLE IF NOT EXISTS chat_image_provider (
             chat_id INTEGER PRIMARY KEY,
-            provider TEXT NOT NULL DEFAULT 'banana'
+            provider TEXT NOT NULL DEFAULT 'gpt'
         );
 
         CREATE TABLE IF NOT EXISTS chat_extract_state (
@@ -657,7 +665,7 @@ def get_chat_image_provider_db(chat_id: int) -> str:
     conn = get_conn()
     row = conn.execute("SELECT provider FROM chat_image_provider WHERE chat_id = ?", (chat_id,)).fetchone()
     conn.close()
-    return row["provider"] if row else "banana"
+    return row["provider"] if row else DEFAULT_IMAGE_PROVIDER
 
 
 def set_chat_image_provider_db(chat_id: int, provider: str):
