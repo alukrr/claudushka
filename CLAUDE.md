@@ -78,7 +78,6 @@
 - docker-compose.yml — два сервиса: claudushka + claudushka-wa (WhatsApp) — `.claude/rules/docker-compose.md`
 - .env — секреты (не в git)
 - requirements.txt — все зависимости
-- fix_premium.py — одноразовый скрипт миграции ролей
 - dedup_memory.py — ручная дедупликация фактов памяти, см. `docs/claude/open-tasks.md`
 
 ## Инварианты (коротко — подробности в тематических файлах)

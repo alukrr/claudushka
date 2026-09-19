@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Ручная дедупликация и точечная правка фактов в таблице memory. НЕ часть бота, не
-импортируется bot.py — запускать вручную с сервера (см. CLAUDE.md, "Гигиена памяти").
+импортируется bot.py — запускать вручную с сервера (см. docs/claude/open-tasks.md,
+"Гигиена памяти").
 Дефолт — dry-run, ничего не пишет в БД, пока не передан --apply.
 
 Три режима:
@@ -247,7 +248,7 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
             # max_tokens=8192: на группах в сотни-тысячи фактов (живой случай — 1441
             # medium-фактов в одном чате) даже 4096 не хватило и ответ обрывался — тот же
             # класс проблемы, что инцидент 2026-08-03 в extract_all_participants_memory
-            # (см. CLAUDE.md). parse_json_lenient ниже переживёт обрыв и на этом лимите —
+            # (см. docs/claude/incidents.md). parse_json_lenient ниже переживёт обрыв на этом лимите —
             # это подстраховка, а не гарантия, что 8192 хватит на ЛЮБую группу; если
             # снова обрежет — сузьте --user-id/--chat-id/--tier и прогоните по частям.
             resp = client.messages.create(
@@ -265,7 +266,7 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
             # response_text/parse_json_lenient — те же хелперы, что у bot.py/whatsapp.py,
             # не голый content[0].text/find+rfind: у пятого поколения content[0] может
             # быть thinking-блоком без текста, а обрезанный по max_tokens JSON рвёт
-            # наивный find/rfind (оба класса багов задокументированы в CLAUDE.md).
+            # наивный find/rfind (оба класса багов задокументированы в docs/claude/api-errors.md).
             if api_errors.was_truncated(resp):
                 print(f"[llm] user={uid} chat={cid} tier={grp_tier}: ответ обрезан по max_tokens")
             text = api_errors.response_text(resp)

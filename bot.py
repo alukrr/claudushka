@@ -27,12 +27,11 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
-HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 ADMIN_IDS = {592441}
 
 # ZoneInfo вместо жёсткого timezone(timedelta(hours=N)) — тот держит фиксированное
-# смещение круглый год и врёт на час при переходе CET/CEST (see CLAUDE.md, ТЗ-1 задача C).
+# смещение круглый год и врёт на час при переходе CET/CEST (2026-09-19, b72e96e).
 BERLIN_TZ = ZoneInfo("Europe/Berlin")
 
 DATA_DIR = Path("/app/data")
@@ -56,7 +55,6 @@ MAX_CAPTCHA_ATTEMPTS = 3
 BAN_DURATION = 3600
 STREET_DAILY_LIMIT = 10
 CHAT_ACTIVITY_CHANCE = 0.03
-GEMINI_REFUSAL_MARKER = "__REFUSAL__"
 
 CAPTCHA_ENABLED = False
 WHITELIST_ENABLED = False
@@ -427,7 +425,13 @@ IMAGE_PROVIDERS = {
     "banana": {"label": "Nano Banana 2"},
     "gpt":    {"label": "GPT Image 2"},
 }
-DEFAULT_IMAGE_PROVIDER = "banana"
+# Дефолт "banana" не вынесен в константу здесь — фактический дефолт живёт в db.py
+# (схема chat_image_provider: provider DEFAULT 'banana', плюс Python-фолбэк в
+# get_chat_image_provider_db при отсутствии строки). bot.py его нигде не читает
+# напрямую — тот же паттерн, что у DEFAULT_MODEL_ID/chat_models: SQL-дефолт не связан
+# с константой в bot.py, потому что db.py ниже bot.py в зависимостях и не может его
+# импортировать. Раньше здесь была неиспользуемая DEFAULT_IMAGE_PROVIDER = "banana" —
+# удалена 2026-09-19: значение нигде не читалось, дублировало db.py вхолостую.
 
 # --- Голос/видео: расшифровка и фоновое распознавание (v0.11.0) ---
 # Модель для аудио-транскрипции. Проверено живым запросом 31.08.2026: gemini-2.5-flash
@@ -486,8 +490,8 @@ async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str 
         try:
             resp = await asyncio.to_thread(http_requests.post, url, json=payload, headers=headers, timeout=GEMINI_TIMEOUT)
         except Exception as e:
-            # Ключ теперь в заголовке, не в URL (ТЗ-1, задача B) — текст исключения requests
-            # безопасно логировать как есть, тот же класс, что у _try_gpt_image.
+            # Ключ теперь в заголовке, не в URL (2026-09-19, a9912bc) — текст исключения
+            # requests безопасно логировать как есть, тот же класс, что у _try_gpt_image.
             logger.warning(f"Gemini image request failed (attempt {attempt}/{GEMINI_MAX_RETRIES}): {e}")
             last_error_msg = "Сетевая ошибка при обращении к генератору картинок"
             if attempt < GEMINI_MAX_RETRIES:
@@ -547,7 +551,7 @@ async def _transcribe_audio_gemini(audio_bytes: bytes, mime_type: str) -> str | 
     ошибке или отсутствии речи.
 
     Запрос идёт через asyncio.to_thread — не блокирует event loop, как и _try_gemini_image
-    (переведена на тот же паттерн, ТЗ-1). Ключ передаётся заголовком x-goog-api-key, а не
+    (переведена на тот же паттерн 2026-09-19). Ключ передаётся заголовком x-goog-api-key, а не
     query-параметром — в URL секрета нет, текст сетевого исключения requests безопасно
     попадает в лог как есть.
     """
@@ -756,8 +760,9 @@ async def _draw_and_send(update, context, chat_id: int, is_group: bool,
         await update.message.reply_photo(photo=bio, caption=caption)
         if is_group:
             # НЕ использовать слово "нарисовала" и квадратные скобки — модель имитирует
-            # ЭТОТ формат в собственных живых ответах (см. LEAKED_DRAW_RE, CLAUDE.md,
-            # инцидент 2026-09-08), приняв его за правильный способ инициировать рисование.
+            # ЭТОТ формат в собственных живых ответах (см. LEAKED_DRAW_RE,
+            # docs/claude/incidents.md, инцидент 2026-09-08), приняв его за правильный
+            # способ инициировать рисование.
             db.save_group_message(chat_id, context_bot_id, "Клодушка", f"(в чат отправлена картинка по промпту: {draw_prompt})", is_bot=True)
         return True
     else:
@@ -1301,12 +1306,13 @@ DRAW_TRIGGERS = {"нарисуй", "нарисуй-ка", "draw", "zeichne", "р
 # Маркер, которым Клодушка сама инициирует генерацию картинки внутри текстового ответа.
 # Ловит и правильный [[DRAW: ...]], и то, как модель иногда сбивается на одинарную
 # скобку и/или забывает закрыть маркер ("[DRAW: ..." до конца строки) — без этого
-# сбойный маркер вываливался в чат текстом вместо того, чтобы вырезаться (см. CLAUDE.md).
+# сбойный маркер вываливался в чат текстом вместо того, чтобы вырезаться (см.
+# docs/claude/images.md).
 DRAW_MARKER_RE = re.compile(r"\[{1,2}DRAW:\s*(.+?)(?:\]{1,2}|$)", re.IGNORECASE | re.DOTALL)
 
 # Fallback-регекс на случай, если модель вообще не использовала маркер, а прямо
 # написала в видимый ответ «Нарисовала картинку: <промпт>» — увидено 2026-09-08 (см.
-# CLAUDE.md, инцидент): модель имитирует формат, которым МЫ САМИ подписываем её прошлые
+# docs/claude/incidents.md): модель имитирует формат, которым МЫ САМИ подписываем её прошлые
 # рисунки в истории (`[Нарисовала картинку: ...]` в group_messages), приняв его за
 # правильный способ сообщить о рисовании. Без этого промпт целиком (по-английски)
 # утекает в чат как обычный текст, а картинка вообще не генерируется. Требуем
@@ -1896,7 +1902,7 @@ async def _set_chat_model(update: Update, context: ContextTypes.DEFAULT_TYPE, ke
         if not admin:
             await update.effective_message.reply_text(
                 "Менять модель в другом чате может только админ. "
-                f"Без аргумента команда переключит текущий чат."
+                "Без аргумента команда переключит текущий чат."
             )
             return
         try:
@@ -2404,7 +2410,7 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_memory_full(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Намеренно НЕ в USER_HELP/ADMIN_HELP — не документируем открыто, чтобы не звали
     почём зря (может уйти десятками сообщений на давнего активного участника, см.
-    CLAUDE.md). Без потолка вообще — вся история, что накопилась."""
+    docs/claude/memory.md). Без потолка вообще — вся история, что накопилась."""
     UNBOUNDED = 10 ** 9
     await _send_memory(update, UNBOUNDED, UNBOUNDED,
                         "Я помню о тебе (полный список):", "/memory_full")
@@ -2574,7 +2580,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group and update.message:
         sender = update.effective_user.first_name or "Unknown"
         # Пассивное распознавание (стоит денег на каждое медиа) — только в approved-чатах,
-        # см. CLAUDE.md. Дефолт WHITELIST_ENABLED=False — гейт большую часть времени неактивен.
+        # см. docs/claude/media.md. Дефолт WHITELIST_ENABLED=False — гейт большую часть времени неактивен.
         media_gated = WHITELIST_ENABLED and not db.is_chat_allowed(chat_id)
         if update.message.text:
             db.save_group_message(chat_id, user_id, sender, update.message.text)
@@ -2777,9 +2783,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_bytes = await file.download_as_bytearray()
             file_text = file_bytes.decode("utf-8", errors="replace")
 
-            question = user_text if user_text else f"Проанализируй этот файл."
+            question = user_text if user_text else "Проанализируй этот файл."
             if is_group:
-                question = strip_trigger(question) or f"Проанализируй этот файл."
+                question = strip_trigger(question) or "Проанализируй этот файл."
 
             full_prompt = f"Пользователь прислал файл \u00ab{filename}\u00bb:\n\n```\n{file_text[:8000]}\n```\n\n{question}"
             if len(file_text) > 8000:
@@ -2830,7 +2836,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             photo = update.message.photo[-1]  # largest size
             photo_file = await context.bot.get_file(photo.file_id)
-            import io
             photo_bytes = await photo_file.download_as_bytearray()
             image_b64 = __import__('base64').b64encode(bytes(photo_bytes)).decode()
 
@@ -3044,7 +3049,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Модель иногда вообще не использует маркер, а прямо пишет в видимый ответ
         # «Нарисовала картинку: <промпт>» — имитирует формат, которым мы сами подписываем
-        # её прошлые рисунки в истории (см. LEAKED_DRAW_RE, инцидент 2026-09-08 в CLAUDE.md).
+        # её прошлые рисунки в истории (см. LEAKED_DRAW_RE, инцидент 2026-09-08 в
+        # docs/claude/incidents.md).
         # Без этой подстраховки промпт целиком (по-английски) утекает в чат как обычный
         # текст, а картинка вообще не рисуется. Восстанавливаем на лету, только если хвост
         # после "нарисовала картинку:" преимущественно латиница — иначе словим легитимные

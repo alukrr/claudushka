@@ -290,7 +290,8 @@ def get_memory(user_id: int, context: str = "private", chat_id: int = None,
     рассыпалась на несколько сообщений вперемешку с обрывками слов посреди строки (найдено
     2026-08-31: 740 фактов на одного человека в одном чате, 34k символов — извлечение
     памяти плодит почти дубли типа "Поделился фото"/"Поделился фото в чате"/"Отправил фото
-    в чат" вместо дедупа; сама гигиена дублей — отдельная открытая задача, см. CLAUDE.md).
+    в чат" вместо дедупа; сама гигиена дублей — отдельная открытая задача, см.
+    docs/claude/open-tasks.md).
     """
     if long_limit is None:
         long_limit = MEMORY_LONG_PER_USER
@@ -444,17 +445,6 @@ def get_group_transcript(chat_id: int, limit: int = 40) -> list[dict]:
     ]
 
 
-def count_user_messages_in_chat(chat_id: int, user_id: int) -> int:
-    """Сколько собственных (не-бот) сообщений написал юзер в чате — для каденса извлечения памяти."""
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT COUNT(*) AS c FROM group_messages WHERE chat_id = ? AND user_id = ? AND is_bot = 0",
-        (chat_id, user_id)
-    ).fetchone()
-    conn.close()
-    return row["c"] if row else 0
-
-
 def count_chat_messages(chat_id: int) -> int:
     """Сколько не-бот сообщений в чате — для чат-уровневого каденса извлечения памяти."""
     conn = get_conn()
@@ -585,7 +575,7 @@ def set_chat_status(chat_id: int, status: str, approved_by: int = None) -> bool:
     в allowed_chats (чат подключён до появления трекинга через handle_new_chat, либо
     строку почему-то удалили) — UPDATE молча ничего не меняет, rowcount=0. Вызывающий
     обязан это проверять и не докладывать об успехе, которого не было — см. инцидент
-    2026-09-16/17 в CLAUDE.md."""
+    2026-09-16/17 в docs/claude/incidents.md, контракт — .claude/rules/db.md."""
     conn = get_conn()
     cur = conn.execute(
         "UPDATE allowed_chats SET status = ?, approved_by = ?, approved_at = ? WHERE chat_id = ?",
@@ -780,13 +770,6 @@ def get_conversation_by_key(phone: str, limit: int = 40) -> list[dict]:
     return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
 
-def clear_conversation_by_key(phone: str):
-    conn = get_conn()
-    conn.execute("DELETE FROM wa_conversations WHERE phone = ?", (phone,))
-    conn.commit()
-    conn.close()
-
-
 # --- WhatsApp: memory ---
 
 def get_memory_by_key(phone: str, context: str = "whatsapp") -> list[str]:
@@ -809,13 +792,6 @@ def add_memory_facts_by_key(phone: str, facts: list[str], context: str = "whatsa
                 "INSERT INTO wa_memory (phone, fact, created_at) VALUES (?, ?, ?)",
                 (phone, fact, now)
             )
-    conn.commit()
-    conn.close()
-
-
-def clear_memory_by_key(phone: str):
-    conn = get_conn()
-    conn.execute("DELETE FROM wa_memory WHERE phone = ?", (phone,))
     conn.commit()
     conn.close()
 

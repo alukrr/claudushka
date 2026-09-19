@@ -17,7 +17,7 @@
 (плюс старые `claude-sonnet-4-6`, `claude-opus-4-8`, `claude-opus-4-7`). Цены — официальный
 прайс Anthropic, прокси даёт скидку сверху; **сверено 2026-09-19** по
 [models/overview](https://platform.claude.com/docs/en/about-claude/models/overview) и
-[pricing](https://platform.claude.com/docs/en/about-claude/pricing) (ТЗ-3, Блок A).
+[pricing](https://platform.claude.com/docs/en/about-claude/pricing).
 **Sonnet 5: цена $2/$10 постоянная** — доки Anthropic прямо говорят, что запланированное
 повышение до $3/$15 (1.09.2026) отменено. Старый комментарий в реестре («после 31.08
 станет верным само») был ошибкой — цена и так стоит правильно, `/cost` больше не завышает.
@@ -42,9 +42,9 @@ Fable 5 помечена как legacy, но ещё доступна), одна�
   поднять потолок значит вернуть июльский инцидент всем, кто сидит на `/haiku`.
   См. «Потолок на чтении» в `docs/claude/memory.md`.
 - **Служебные вызовы — ТОЛЬКО `DEFAULT_MODEL_ID` (Haiku), без исключений** (правило
-  Алексея, 2026-09-19, ТЗ-3 Блок D): капча, `should_search`, перевод промпта рисования,
+  Алексея, 2026-09-19): капча, `should_search`, перевод промпта рисования,
   `greet_new_member`, извлечение памяти (и `extract_memory` в личке, и
-  `extract_all_participants_memory` в группе — до ТЗ-3 `extract_memory` в личке шёл на
+  `extract_all_participants_memory` в группе — раньше `extract_memory` в личке шёл на
   Sonnet «осознанно, аналитическая задача»; это решение отменено, теперь единообразно
   Haiku, срабатывает каждые 10 сообщений и не должно платить по цене Sonnet/Opus).
   `daily_chat_review` и `cmd_review` — это ОТВЕТ пользователю (уходит в чат), не
@@ -55,7 +55,7 @@ Fable 5 помечена как legacy, но ещё доступна), одна�
   (`/haiku /sonnet /opus /fable`), это не подпадает под классификацию «служебный/ответ».
 - whatsapp.py собственного реестра `MODELS` не имеет, но своих моделей теперь две
   константы: `WA_MODEL = "claude-sonnet-5"` (ответы пользователю, было
-  `claude-sonnet-4-6` — переведено в ТЗ-3, тот же ID, что и `/sonnet` в bot.py) и
+  `claude-sonnet-4-6` — переведено 2026-09-19, тот же ID, что и `/sonnet` в bot.py) и
   `WA_AUX_MODEL = "claude-haiku-4-5-20251001"` (служебные `should_search`/
   `extract_memory`, тот же принцип «служебное — только Haiku»). Появится третья точка
   с похожей логикой — тогда осмысленно выносить `MODELS` в общий модуль.
@@ -95,7 +95,7 @@ Fable 5 помечена как legacy, но ещё доступна), одна�
 принимает `cache_write`/`cache_read` отдельными полями, `/cost` считает их с теми же
 множителями, что и `dedup_memory.py`: `CACHE_WRITE_MULTIPLIER`=1.25x — глобальная
 константа, одинаковая для всех моделей; чтение — `meta.get("cache_read_mult",
-CACHE_READ_MULTIPLIER)` из реестра `MODELS` (ТЗ-3, Блок A) — 0.1x у всех текущих
+CACHE_READ_MULTIPLIER)` из реестра `MODELS` (2026-09-19) — 0.1x у всех текущих
 моделей, `CACHE_READ_MULTIPLIER` (тоже 0.1) остаётся только дефолтом для строк ВНЕ
 реестра (легаси в `chat_models`). Если `fable` переедет на Fable 5.1 — её
 `cache_read_mult` 0.025, и `/cost` подхватит это автоматически, ничего в `/cost`
