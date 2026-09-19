@@ -1,8 +1,12 @@
 import os
 import json
+import time
+import hmac
+import hashlib
 import logging
 import asyncio
 import functools
+import collections
 import httpx
 import anthropic
 from fastapi import FastAPI, Request, Response
@@ -21,6 +25,17 @@ WEBHOOK_VERIFY_TOKEN = os.environ["WEBHOOK_VERIFY_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 
+# ТЗ-1 задача A: подпись вебхука Meta. НЕ os.environ[...] (обязательный) — секрет может
+# отсутствовать на старте, и тогда сервис обязан fail-closed (стартовать и отклонять все
+# POST с 403), а не падать при импорте модуля.
+WHATSAPP_APP_SECRET = os.environ.get("WHATSAPP_APP_SECRET", "")
+if not WHATSAPP_APP_SECRET:
+    logger.critical(
+        "WHATSAPP_APP_SECRET не задан — webhook в fail-closed режиме, ВСЕ входящие POST "
+        "будут отклонены с 403 до тех пор, пока секрет не появится в .env и сервис не "
+        "перезапустят."
+    )
+
 WHATSAPP_API_URL = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
 
 # SDK-ретраи — для синхронных вспомогательных вызовов (should_search, extract_memory).
@@ -33,7 +48,57 @@ tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 MAX_HISTORY = 40
 MEMORY_EXTRACT_EVERY = 5
 
+# Дедуп повторной доставки Meta по msg["id"] (ТЗ-1, задача A): in-memory, TTL и потолок
+# размера. OrderedDict — вставка идёт в хронологическом порядке, поэтому самый старый
+# элемент всегда в начале и TTL-чистка не требует полного скана словаря. Потеря словаря
+# при рестарте процесса — допустимо (Meta пришлёт дубль повторно, обработается как новый).
+WA_DEDUP_TTL_SECONDS = 600
+WA_DEDUP_MAX_SIZE = 10000
+_seen_message_ids: "collections.OrderedDict[str, float]" = collections.OrderedDict()
+
+# Фоновые fire-and-forget задачи обработки сообщений — без сохранённой ссылки asyncio
+# может собрать таску сборщиком мусора до завершения (прямое предупреждение в доках
+# asyncio.create_task). Тот же паттерн, что и в bot.py._spawn_background_task.
+_background_tasks: set[asyncio.Task] = set()
+
 app = FastAPI()
+
+
+def _spawn_background_task(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+def _verify_wa_signature(raw_body: bytes, signature_header: str | None) -> bool:
+    """HMAC-SHA256 подписи Meta (`X-Hub-Signature-256: sha256=<hex>`) над СЫРЫМ телом
+    запроса. Fail-closed: без WHATSAPP_APP_SECRET всегда False."""
+    if not WHATSAPP_APP_SECRET:
+        return False
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+    expected = hmac.new(WHATSAPP_APP_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
+    provided = signature_header[len("sha256="):]
+    return hmac.compare_digest(expected, provided)
+
+
+def _is_duplicate_wa_message(msg_id: str) -> bool:
+    """True — msg_id уже видели в последние WA_DEDUP_TTL_SECONDS (иначе запоминает его)."""
+    now = time.monotonic()
+    while _seen_message_ids:
+        oldest_id, oldest_ts = next(iter(_seen_message_ids.items()))
+        if now - oldest_ts <= WA_DEDUP_TTL_SECONDS:
+            break
+        del _seen_message_ids[oldest_id]
+
+    if msg_id in _seen_message_ids:
+        return True
+
+    if len(_seen_message_ids) >= WA_DEDUP_MAX_SIZE:
+        _seen_message_ids.popitem(last=False)
+    _seen_message_ids[msg_id] = now
+    return False
 
 
 # --- Send message ---
@@ -242,7 +307,7 @@ async def handle_wa_message(phone: str, text: str):
 
         msg_count = len(history)
         if msg_count > 0 and msg_count % (MEMORY_EXTRACT_EVERY * 2) == 0:
-            asyncio.create_task(asyncio.to_thread(
+            _spawn_background_task(asyncio.to_thread(
                 extract_memory, phone, history + [{"role": "assistant", "content": reply}]))
 
         await send_whatsapp_message(phone, reply)
@@ -273,36 +338,53 @@ async def verify_webhook(request: Request):
         return Response(status_code=403)
 
 
+async def _process_wa_message(msg: dict):
+    """Обработка одного входящего сообщения в фоне — вебхук уже ответил 200 раньше."""
+    try:
+        msg_type = msg.get("type")
+        phone = msg.get("from")
+
+        if msg_type == "text":
+            text = msg["text"]["body"]
+            await handle_wa_message(phone, text)
+        elif msg_type in ("image", "audio", "video", "document"):
+            await send_whatsapp_message(
+                phone,
+                "Пока работаю только с текстом. Напиши словами — отвечу!"
+            )
+    except Exception as e:
+        logger.error(f"Webhook message processing error: {e}", exc_info=True)
+
+
 @app.post("/webhook/whatsapp")
 async def receive_webhook(request: Request):
+    # Сначала сырые байты для HMAC, JSON парсим ТОЛЬКО после проверки подписи — если
+    # распарсить и сериализовать заново, подпись не сойдётся (тело не байт-в-байт то же).
+    raw_body = await request.body()
+    signature = request.headers.get("x-hub-signature-256")
+    if not _verify_wa_signature(raw_body, signature):
+        logger.warning("Webhook: подпись отсутствует или не совпала")
+        return Response(status_code=403)
+
     try:
-        body = await request.json()
+        body = json.loads(raw_body)
     except Exception:
         return Response(status_code=400)
 
     try:
-        entry = body.get("entry", [{}])[0]
-        changes = entry.get("changes", [{}])[0]
-        value = changes.get("value", {})
-        messages = value.get("messages", [])
-
-        for msg in messages:
-            msg_type = msg.get("type")
-            phone = msg.get("from")
-
-            if msg_type == "text":
-                text = msg["text"]["body"]
-                # await напрямую — ошибки будут пойманы и залогированы
-                await handle_wa_message(phone, text)
-
-            elif msg_type in ("image", "audio", "video", "document"):
-                await send_whatsapp_message(
-                    phone,
-                    "Пока работаю только с текстом. Напиши словами — отвечу!"
-                )
-
+        for entry in body.get("entry", []):
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+                for msg in value.get("messages", []):
+                    msg_id = msg.get("id")
+                    if msg_id and _is_duplicate_wa_message(msg_id):
+                        logger.debug(f"Webhook: повторная доставка msg_id={msg_id}, пропуск")
+                        continue
+                    # В фон — обработчик Claude может идти дольше таймаута ретраев Meta,
+                    # хендлер обязан ответить 200 сразу после проверки подписи и парсинга.
+                    _spawn_background_task(_process_wa_message(msg))
     except Exception as e:
-        logger.error(f"Webhook processing error: {e}")
+        logger.error(f"Webhook payload parsing error: {e}", exc_info=True)
 
     return Response(status_code=200)
 

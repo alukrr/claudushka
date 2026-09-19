@@ -133,6 +133,20 @@ def _track_response(model: str, response) -> None:
         )
 
 
+# --- Фоновые fire-and-forget задачи ---
+# asyncio.create_task(...) без сохранённой ссылки — задачу может собрать GC до завершения
+# (прямое предупреждение в документации asyncio). Все фоновые задачи, которым не нужен
+# результат (память, приветствие нового участника), идут через это, а не голый create_task.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background_task(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
 # --- Вызов Anthropic API из async-хендлеров ---
 
 async def _keep_chat_action(bot, chat_id: int, action: str, stop_event: asyncio.Event) -> None:
@@ -2460,7 +2474,7 @@ async def handle_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if user.is_bot:
             return
         user_name = user.first_name or user.username or str(user.id)
-        asyncio.create_task(greet_new_member(chat_id, user.id, user_name, context.bot))
+        _spawn_background_task(greet_new_member(chat_id, user.id, user_name, context.bot))
 
 
 async def cmd_approve_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2619,7 +2633,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # независимо от того, упомянут бот или нет. Каденс считается по дельте
         # group_messages.id, а не по COUNT(*) — см. db.should_extract_chat_memory.
         if db.should_extract_chat_memory(chat_id, MEMORY_EXTRACT_EVERY_CHAT):
-            asyncio.create_task(asyncio.to_thread(extract_all_participants_memory, chat_id))
+            _spawn_background_task(asyncio.to_thread(extract_all_participants_memory, chat_id))
 
     if is_group and not is_bot_mentioned(update):
         return
@@ -3067,7 +3081,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_group:
             msg_count = len(messages)
             if msg_count > 0 and msg_count % (MEMORY_EXTRACT_EVERY * 2) == 0:
-                asyncio.create_task(asyncio.to_thread(
+                _spawn_background_task(asyncio.to_thread(
                     extract_memory, user_id,
                     messages + [{"role": "assistant", "content": assistant_text}], False, None))
 
