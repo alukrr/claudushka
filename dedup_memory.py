@@ -77,7 +77,7 @@ MODEL_ALIASES = {
     "haiku": "claude-haiku-4-5-20251001",
     "sonnet": "claude-sonnet-5",
     "opus": "claude-opus-5",
-    "fable": "claude-fable-5",
+    "fable": "claude-fable-5-1",
 }
 
 # $/MTok in,out,cache_read_mult — дубль MODELS из bot.py, менять синхронно (сверено
@@ -87,7 +87,7 @@ PRICING = {
     "claude-haiku-4-5-20251001": (1.0, 5.0, 0.1),
     "claude-sonnet-5": (2.0, 10.0, 0.1),
     "claude-opus-5": (5.0, 25.0, 0.1),
-    "claude-fable-5": (10.0, 50.0, 0.1),
+    "claude-fable-5-1": (10.0, 50.0, 0.025),
 }
 # Стандартный множитель Anthropic для записи в prompt cache (5-минутный ephemeral, тот
 # тип, что реально приходит с этого ключа/пула — см. usage.cache_creation). Одинаковый

@@ -81,8 +81,8 @@ MODELS = {
                "in": 2.0,  "out": 10.0, "cache_read_mult": 0.1, "context": 1_000_000, "admin_only": False},
     "opus":   {"id": "claude-opus-5",             "label": "Opus 5",
                "in": 5.0,  "out": 25.0, "cache_read_mult": 0.1, "context": 1_000_000, "admin_only": True},
-    "fable":  {"id": "claude-fable-5",            "label": "Fable 5",
-               "in": 10.0, "out": 50.0, "cache_read_mult": 0.1, "context": 1_000_000, "admin_only": True},
+    "fable":  {"id": "claude-fable-5-1",           "label": "Fable 5.1",
+               "in": 10.0, "out": 50.0, "cache_read_mult": 0.025, "context": 1_000_000, "admin_only": True},
 }
 DEFAULT_MODEL_KEY = "haiku"
 DEFAULT_MODEL_ID = MODELS[DEFAULT_MODEL_KEY]["id"]
@@ -2104,9 +2104,9 @@ ADMIN_HELP = """\
 Модели (без аргумента — текущий чат; с chat_id — любой, только админу):
   /models [chat_id]        — список моделей, цены, окно; ▸ = текущая
   /haiku [chat_id]         — Haiku 4.5 — $1/$5, окно 200k (дефолт)
-  /sonnet [chat_id]        — Sonnet 5 — $3/$15, окно 1M
+  /sonnet [chat_id]        — Sonnet 5 — $2/$10, окно 1M
   /opus [chat_id]          — Opus 5 — $5/$25, окно 1M (только админ)
-  /fable [chat_id]         — Fable 5 — $10/$50, окно 1M (только админ)
+  /fable [chat_id]         — Fable 5.1 — $10/$50, окно 1M (только админ)
   chat_id — число с минусом, например: /opus -1001109809707
   Выбор постоянный: пишется в chat_models и переживает рестарт.
   Перед записью бот делает пробный запрос — нерабочая модель не сохранится.

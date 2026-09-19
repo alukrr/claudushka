@@ -112,7 +112,7 @@
 | `/haiku [chat_id]` | Haiku 4.5 — $1/$5 за MTok, окно 200k (дефолт) |
 | `/sonnet [chat_id]` | Sonnet 5 — $2/$10, окно 1M |
 | `/opus [chat_id]` | Opus 5 — $5/$25, окно 1M (только админ) |
-| `/fable [chat_id]` | Fable 5 — $10/$50, окно 1M (только админ) |
+| `/fable [chat_id]` | Fable 5.1 — $10/$50, окно 1M (только админ) |
 
 **Провайдер картинок per-chat:**
 
@@ -151,7 +151,7 @@
 
 - Python 3.12
 - python-telegram-bot 21.10
-- Anthropic Claude API — Haiku 4.5 по умолчанию; Sonnet 5 всем, Opus 5 и Fable 5 админам (`/models`)
+- Anthropic Claude API — Haiku 4.5 по умолчанию; Sonnet 5 всем, Opus 5 и Fable 5.1 админам (`/models`)
 - Tavily API (веб-поиск)
 - Генерация изображений, переключаемый провайдер per-chat: Gemini «Nano Banana 2» (`gemini-3.1-flash-image-preview`, прямой Google API) или GPT Image 2 (`gpt-image-2`, через пул api.apitoken.sale)
 - SQLite (пользователи, история, память, модели чатов, провайдер картинок) через `db.py`

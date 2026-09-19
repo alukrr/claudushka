@@ -134,6 +134,10 @@ def init_db():
         "UPDATE chat_models SET model='claude-sonnet-5' WHERE model LIKE 'claude-sonnet-4-%'",
         "UPDATE chat_models SET model='claude-opus-5'   WHERE model LIKE 'claude-opus-4-%'",
         "ALTER TABLE allowed_chats ADD COLUMN daily_review_enabled INTEGER NOT NULL DEFAULT 1",
+        # 2026-09-19: Fable 5 -> Fable 5.1 (пул подтверждён живым запросом). Без этой
+        # миграции чаты на старой строке попадут в model_meta() фолбэк на дефолт
+        # (Haiku) и /cost посчитает их по ценам Haiku, а не Fable.
+        "UPDATE chat_models SET model='claude-fable-5-1' WHERE model='claude-fable-5'",
     ]:
         try:
             conn.execute(migration)
