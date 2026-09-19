@@ -1341,18 +1341,23 @@ def is_bot_mentioned(update: Update) -> bool:
     message = update.message
     if not message:
         return False
-    # Photo without caption replying to bot — always process
-    if message.photo and not message.caption:
+    # Документ без caption — не GIF (тот зеркалится в message.document отдельно от
+    # animation, см. has_document в handle_message; не путать с реальным документом).
+    is_plain_document = bool(message.document) and not message.animation
+    # Медиа без подписи (фото, документ) replying to bot — always process. Без caption
+    # никакое @упоминание физически невозможно поймать (entities живут в тексте/подписи),
+    # поэтому единственный сигнал адресации — реплай на сообщение бота.
+    if (message.photo or is_plain_document) and not message.caption:
         if message.reply_to_message and message.reply_to_message.from_user:
             if message.reply_to_message.from_user.id == context_bot_id:
                 return True
-        # In private chat — always process photos
+        # In private chat — always process
         if update.effective_chat.type == "private":
             return True
         # In group — only if bot is mentioned or replied to
         return False
     text = message.text or message.caption or ""
-    if not text and not message.photo:
+    if not text and not message.photo and not is_plain_document:
         return False
     if message.reply_to_message and message.reply_to_message.from_user:
         if message.reply_to_message.from_user.id == context_bot_id:
@@ -2715,6 +2720,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_text = update.message.text or update.message.caption or ""
     has_photo = bool(update.message.photo)
+    # Исключаем animation: Telegram зеркалит GIF в message.document для легаси-совместимости
+    # — без этой проверки GIF, адресованный боту напрямую, попадал бы в ветку документа
+    # вместо animation чуть ниже и падал бы в "файл бинарный или неизвестного типа" (баг
+    # v0.11.1). Вычислено ЗДЕСЬ, а не только перед самой веткой документа ниже — иначе
+    # документ без подписи не проходил проверки "not user_text and not has_photo" и
+    # хендлер выходил ДО того, как эта переменная вообще появлялась (баг, найден на
+    # стенде 2026-09-19: .txt без подписи — тишина, ни строки в логе).
+    has_document = bool(update.message.document) and not update.message.animation
 
     # --- Голос/кружочек/видео → user_text, дальше идут по ОБЫЧНОМУ диалоговому пайплайну
     # (не отдельная Q&A-ветка, как фото) — "как будто написал текстом", была идея Алексея.
@@ -2761,20 +2774,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if reply_text and src.from_user and src.from_user.id != context_bot_id:
             reply_context = reply_text
 
-    if not user_text and not has_photo:
+    if not user_text and not has_photo and not has_document:
         return
 
     if is_group:
         user_text = strip_trigger(user_text)
-        if not user_text and not has_photo:
+        if not user_text and not has_photo and not has_document:
             await update.message.reply_text("Да? Чем помочь?")
             return
 
     # --- Handle document/file ---
-    # Исключаем animation: Telegram зеркалит GIF в message.document для легаси-совместимости,
-    # без этой проверки GIF, адресованный боту напрямую, попадал бы сюда вместо ветки
-    # animation чуть выше и падал бы в "файл бинарный или неизвестного типа" (баг v0.11.1).
-    has_document = bool(update.message.document) and not update.message.animation
     if has_document:
         doc = update.message.document
         mime = doc.mime_type or ""
