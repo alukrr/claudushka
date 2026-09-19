@@ -8,7 +8,8 @@ import asyncio
 import functools
 from pathlib import Path
 from telegram import Update
-from datetime import datetime, time as dt_time, timezone, timedelta
+from datetime import datetime, time as dt_time
+from zoneinfo import ZoneInfo
 from telegram.ext import Application, CommandHandler, MessageHandler, ChatMemberHandler, filters, ContextTypes
 import anthropic
 from tavily import TavilyClient
@@ -29,6 +30,10 @@ TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 ADMIN_IDS = {592441}
+
+# ZoneInfo вместо жёсткого timezone(timedelta(hours=N)) — тот держит фиксированное
+# смещение круглый год и врёт на час при переходе CET/CEST (see CLAUDE.md, ТЗ-1 задача C).
+BERLIN_TZ = ZoneInfo("Europe/Berlin")
 
 DATA_DIR = Path("/app/data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -902,7 +907,7 @@ def get_system_prompt(user_id: int, is_group: bool = False, chat_id: int = None,
     компонент system-prompt: в инциденте 2026-07-26 она весила 236k токенов против ~7k
     истории. Используется веткой восстановления при 400 prompt is too long.
     """
-    now = datetime.now(timezone(timedelta(hours=1)))  # CET/CEST approx Berlin
+    now = datetime.now(BERLIN_TZ)
     date_str = now.strftime("%d.%m.%Y %H:%M")
     base = (
         f"Сейчас: {date_str} (Берлин).\n"
@@ -3168,10 +3173,9 @@ def main():
     app.add_handler(MessageHandler(filters.VIDEO, handle_message))
     app.add_handler(MessageHandler(filters.ANIMATION, handle_message))
 
-    berlin_tz = timezone(timedelta(hours=2))
     app.job_queue.run_daily(
         daily_chat_review,
-        time=dt_time(hour=22, minute=0, tzinfo=berlin_tz),
+        time=dt_time(hour=22, minute=0, tzinfo=BERLIN_TZ),
         name="daily_review"
     )
     logger.info("Daily review scheduled at 22:00 Berlin time")

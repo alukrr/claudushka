@@ -163,6 +163,8 @@ diary page...» (весь английский промпт) — БЕЗ марк
   `/imagemodels [chat_id]` — список провайдеров с пометкой текущего, аналог `/models`.
 - fastapi 0.115.0 + uvicorn 0.30.0 — WhatsApp webhook
 - httpx 0.27.0
+- tzdata (гарантирует `zoneinfo.ZoneInfo` независимо от системной базы поясов в образе —
+  см. «Часовой пояс»)
 - SQLite (через stdlib sqlite3, обёртка в db.py)
 - Docker Compose (без Dockerfile)
 
@@ -441,6 +443,25 @@ Telegram-чата — переиспользован `is_chat_admin()` (см. «
 **Не путать `/review_on`/`/review_off` с `/review`**: `/review` — разовый обзор ПРЯМО
 СЕЙЧАС, остаётся admin-only (`is_admin`, глобальные админы бота), не трогали. Новые
 команды управляют только ЕЖЕДНЕВНОЙ фоновой рассылкой (`run_daily` в `main()`).
+
+## Часовой пояс (`BERLIN_TZ`, ТЗ-1 задача C)
+**Единственный источник правды — модульная константа `BERLIN_TZ = ZoneInfo("Europe/Berlin")`
+(bot.py).** До этой правки было два места с жёстким `timezone(timedelta(hours=N))` —
+фиксированное смещение не учитывает переход CET/CEST: `get_system_prompt` (время в
+system-prompt) врало на час всё летнее время, `main()` (`run_daily` дневного обзора,
+22:00 Берлин) съедет на час после перехода на зимнее время 25.10.2026. Оба переведены на
+`BERLIN_TZ`. `ZoneInfo` в `tzinfo` параметра `datetime.time` для `JobQueue.run_daily`
+(PTB 21.10) — штатный способ, PTB сам пересчитывает следующий запуск с учётом DST.
+Добавлять новое место с датой/временем — брать `BERLIN_TZ`, НЕ писать `timezone(timedelta(...))`
+по новой; `db.py` и `whatsapp.py` таких мест не содержат (проверено, `grep -n
+"timedelta(hours" *.py` перед правкой).
+
+Зависимость `tzdata` в `requirements.txt` — гарантия работы `ZoneInfo` независимо от
+того, есть ли системная база часовых поясов в образе `python:3.12-slim` (живая проверка
+07.09.2026 через `docker run --rm python:3.12-slim python3 -c "import zoneinfo;
+zoneinfo.ZoneInfo('Europe/Berlin')"` на сервере показала, что системная tzdata в образе
+УЖЕ есть — но пакет добавлен как защита от смены базового образа в будущем, а не потому,
+что без него сломано сейчас).
 
 ## Модели per-chat (реестр MODELS, v0.9.0)
 

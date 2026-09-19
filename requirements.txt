@@ -5,3 +5,4 @@ gradio_client==1.5.0
 fastapi==0.115.0
 uvicorn==0.30.0
 httpx==0.27.0
+tzdata==2025.2
