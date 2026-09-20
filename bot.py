@@ -3721,8 +3721,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     db.init_db()
-    db.get_or_create_user(592441, full_name="Aleksei")
-    db.set_role(592441, "admin")
+    # Строка и роль admin в БД — для ВСЕХ ADMIN_IDS (нужна /users и /chats; сами права даёт
+    # ADMIN_IDS, не БД). Без этого второй админ не появлялся в списке, пока не напишет боту.
+    for admin_id in ADMIN_IDS:
+        db.get_or_create_user(admin_id, full_name="Aleksei" if admin_id == 592441 else None)
+        db.set_role(admin_id, "admin")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
