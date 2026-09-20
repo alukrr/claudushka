@@ -54,7 +54,8 @@
 - `db.py` — `.claude/rules/db.md` (автоматически)
 - `docker-compose.yml` — `.claude/rules/docker-compose.md` (автоматически)
 - Тестовый стенд (`docker-compose.test.yml`, обновление зависимостей, рискованные
-  правки перед продом) — `docs/claude/staging.md`
+  правки перед продом) — `docs/claude/staging.md`; пошаговый чек-лист ТЗ v0.10 (с SELECT'ами) —
+  `docs/claude/staging-checklist-v0.10.md`
 
 ## Стек
 - Python 3.12 (python:3.12-slim Docker image)
