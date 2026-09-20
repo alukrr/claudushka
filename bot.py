@@ -32,7 +32,7 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-ADMIN_IDS = {592441}
+ADMIN_IDS = {592441, 63014107}
 
 # ZoneInfo вместо жёсткого timezone(timedelta(hours=N)) — тот держит фиксированное
 # смещение круглый год и врёт на час при переходе CET/CEST (2026-09-19, b72e96e).
