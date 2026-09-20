@@ -74,8 +74,8 @@ CAPTCHA_ENABLED = False
 # Все суммы в $. PRICE_MARKUP умножается на КАЖДУЮ запись usage_log при вставке (цена
 # заморожена в строке, пересчёта задним числом нет).
 PRICE_MARKUP = 1.0
-IMAGE_PRICES = {"gpt": 0.02, "banana": 0.05}
-SEARCH_PRICE = 0.01
+IMAGE_PRICES = {"gpt": 0.02, "banana": 0.067}
+SEARCH_PRICE = 0.008
 STARTER_BONUS_GROUP = 10.0
 STARTER_BONUS_PRIVATE = 5.0
 FREE_IMAGES_PRIVATE_PER_DAY = 10
@@ -2640,7 +2640,7 @@ ADMIN_HELP = """\
 
 Провайдер картинок (без аргумента — текущий чат; с chat_id — любой, только админу):
   /imagemodels [chat_id]   — текущий провайдер картинок чата
-  /banana [chat_id]        — Nano Banana 2 (~$0.05, дефолт платного режима)
+  /banana [chat_id]        — Nano Banana 2 (~$0.067, дефолт платного режима)
   /gptimage [chat_id]      — GPT Image 2 (~$0.02; в бесплатном режиме единственный)
   Без пробного запроса (генерация стоит денег): ошибка провайдера всплывёт при рисовании.
 

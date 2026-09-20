@@ -55,6 +55,7 @@
 Ошибка миграции → откат, маркер не ставится, повтор при следующем старте (лог `Migration FAILED`).
 
 ## Конфиг (bot.py, рядом с MODELS)
+Цены сверены 2026-09-20: banana $0.067 (прайс Google, 1K), gpt $0.02 (себестоимость пула $0.01, решение Алексея — ×2), поиск $0.008 (Tavily, 1 кредит pay-as-you-go).
 `PRICE_MARKUP`, `IMAGE_PRICES`, `SEARCH_PRICE`, `STARTER_BONUS_*`, `FREE_IMAGES_*`,
 `UNVERIFIED_*`, `VERIFY_MIN_TOPUP`, `ADMIN_CONTACT`, `FABLE_CONFIRM_WINDOW`. Сутки/неделя —
 `BERLIN_TZ`, неделя с понедельника (`_day_start`, `_week_start`).
