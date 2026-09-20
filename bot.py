@@ -1986,6 +1986,11 @@ async def cmd_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"Корректировка больше баланса — списано в ноль ещё {_money(written_off)} (writeoff).")
     await update.effective_message.reply_text("\n".join(lines))
     await _notice_tier_change(cid, before)
+    if kind == "topup" and chat_tier(cid) == before:
+        # Тариф не сменился — «Платный режим включён» не придёт, а чат должен узнать о пополнении.
+        await _send_chat_notice(
+            cid, f"Ура, баланс пополнен на ${amount:.2f}! Теперь на счету {_money(db.get_balance(cid))}."
+        )
 
 
 async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
