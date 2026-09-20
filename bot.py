@@ -198,12 +198,20 @@ def _record_usage(kind: str, model: str | None, label: str, base_cost: float,
             chat_id, chat_type, user_id, kind, model, label, base_cost * PRICE_MARKUP, billed,
             inp, out, cache_write, cache_read, settle=not is_admin(chat_id or 0),
         )
-        if label == "dialog" and chat_id is not None and user_id is not None:
-            db.daily_msgs_bump(_berlin_day(), chat_id, user_id)
         if went_free:
             _fire(_send_chat_notice(chat_id, TIER_FREE_MSG))
     except Exception:
         logger.exception(f"usage_log: не удалось записать {kind}/{label}")
+
+
+def _count_reply(user_id: int, chat_id: int) -> None:
+    """+1 к дневному счётчику ответов (лимит непроверенных). Зовётся ОДИН раз на реплику
+    пользователя в хендлере после успешного ответа модели — не из _record_usage: на одну
+    реплику может приходиться несколько LLM-вызовов (аварийная обрезка, повтор)."""
+    try:
+        db.daily_msgs_bump(_berlin_day(), chat_id, user_id)
+    except Exception:
+        logger.exception("daily_usage: не удалось увеличить счётчик")
 
 
 def _track_response(model: str, response, label: str = "aux") -> None:
@@ -1521,7 +1529,9 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
             chat_id = chat["chat_id"]
             if chat_tier(chat_id) != "paid":
                 continue
-            messages = db.get_group_history(chat_id, 100)
+            # Только сегодняшние сообщения (с полуночи по Берлину): «последние 100 вообще»
+            # пересказывали бы старое молчащего чата каждую ночь — теперь за деньги чата.
+            messages = db.get_group_history(chat_id, 100, since_ts=_day_start_ts())
             if len(messages) < 5:
                 continue
             usage_ctx.set((chat_id, "group", None))
@@ -1914,7 +1924,10 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _ban_unban(update, context, False)
 
 
-TOPUP_USAGE = "Использование: /topup <chat_id> <сумма> [комментарий]\nОтрицательная сумма — корректировка (adjust)."
+TOPUP_USAGE = (
+    "Использование: /topup <chat_id> <сумма> [комментарий] [force]\n"
+    "Отрицательная сумма — корректировка (adjust). Для ID, которого нет в базе, нужен последний аргумент force."
+)
 
 
 async def cmd_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1934,8 +1947,22 @@ async def cmd_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.effective_message.reply_text(TOPUP_USAGE)
         return
-    note = " ".join(context.args[2:]) or None
+    rest = context.args[2:]
+    force = bool(rest) and rest[-1].lower() == "force"
+    note = " ".join(rest[:-1] if force else rest) or None
     known = db.get_chat_row(cid) is not None if cid < 0 else db.get_user(cid) is not None
+    if not known and not force:
+        # Опечатка в ID иначе молча создала бы проверенный «фантом» с бонусом (авто-проверка от $5).
+        await update.effective_message.reply_text(
+            f"ID {cid} нет в базе — ничего не записала. Проверь ID; если так и надо: "
+            f"/topup {cid} {context.args[1]} force"
+        )
+        return
+    if not known:  # явный force: заводим непроверенную запись, чтобы следующие пополнения шли как обычные
+        if cid < 0:
+            db.ensure_group(cid, None, admin_id)
+        else:
+            db.get_or_create_user(cid)
 
     before = chat_tier(cid)
     kind = "topup" if amount > 0 else "adjust"
@@ -1948,8 +1975,8 @@ async def cmd_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         verified_now = True
 
     lines = [f"💰 {_chat_title(cid)} ({cid}): {amount:+.2f}$ ({kind})"]
-    if not known and not verified_now:
-        lines.append("⚠️ Такого чата/пользователя нет в базе — запись создана, проверь ID.")
+    if not known:
+        lines.append("⚠️ ID не было в базе — запись создана по force.")
     lines.append(f"Баланс: {_money(db.get_balance(cid))}")
     lines.append(f"Режим: {_tier_label(cid)} · {'проверен' if is_chat_verified(cid) else 'не проверен'}")
     if verified_now:
@@ -2588,7 +2615,7 @@ USER_HELP = """\
 
 ADMIN_HELP = """\
 Доступ и баланс:
-  /topup <id> <сумма> [коммент] — пополнить баланс чата ($); отрицательная = корректировка.
+  /topup <id> <сумма> [коммент] [force] — пополнить баланс ($); отрицательная = корректировка; ID вне базы — только с force.
                            От $5 суммарных пополнений чат проверяется автоматически
   /verify <id>             — проверить группу (id с минусом) или пользователя + стартовый бонус
   /unverify <id>           — снять проверку (баланс не трогается)
@@ -3329,6 +3356,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 model=_model, max_tokens=4096, system=system, messages=doc_history,
             )
             answer = response_text(response)
+            _count_reply(user_id, chat_id)
             if not answer:
                 logger.warning(f"Пустой ответ модели (файл): {api_errors.response_debug(response)}")
                 answer = "Модель вернула пустой ответ. Попробуй ещё раз или смени модель через /models."
@@ -3396,6 +3424,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 model=_model, max_tokens=2048, system=system, messages=vision_messages,
             )
             answer = response_text(response)
+            _count_reply(user_id, chat_id)
             if not answer:
                 logger.warning(f"Пустой ответ модели (фото): {api_errors.response_debug(response)}")
                 answer = "Модель вернула пустой ответ. Попробуй ещё раз или смени модель через /models."
@@ -3444,7 +3473,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if success:
             # Ответ картинкой — тоже «реальный ответ»: считаем в дневной лимит непроверенных
             # (обычные ответы считает _record_usage по метке dialog; здесь LLM-вызова нет).
-            db.daily_msgs_bump(_berlin_day(), chat_id, user_id)
+            _count_reply(user_id, chat_id)
         if not is_group:
             # Группа: юзер-текст уже сохранён пассивным блоком в начале handle_message,
             # факт рисования — самой _draw_and_send (см. её код). Личке эквивалента
@@ -3575,6 +3604,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "или сменить модель через /models."
                 )
             return
+
+        _count_reply(user_id, chat_id)
 
         # Клодушка могла сама инициировать рисование маркером [[DRAW: ...]] внутри ответа.
         draw_match = DRAW_MARKER_RE.search(assistant_text)

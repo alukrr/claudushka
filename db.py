@@ -230,6 +230,9 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_group_chat ON group_messages(chat_id, timestamp);
         CREATE INDEX IF NOT EXISTS idx_usage_chat_ts ON usage_log(chat_id, ts);
         CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_log(ts);
+        -- покрывающие для баланса (SUM по chat_id без чтения таблицы)
+        CREATE INDEX IF NOT EXISTS idx_usage_balance ON usage_log(chat_id, billed, cost_usd);
+        CREATE INDEX IF NOT EXISTS idx_credits_balance ON chat_credits(chat_id, amount);
         CREATE INDEX IF NOT EXISTS idx_credits_chat ON chat_credits(chat_id);
         CREATE INDEX IF NOT EXISTS idx_wa_conv_phone ON wa_conversations(phone, timestamp);
         CREATE INDEX IF NOT EXISTS idx_wa_memory_phone ON wa_memory(phone);
@@ -521,11 +524,13 @@ def save_group_message(chat_id: int, user_id: int, sender_name: str, content: st
     conn.close()
 
 
-def get_group_history(chat_id: int, limit: int = 30) -> list[str]:
+def get_group_history(chat_id: int, limit: int = 30, since_ts: int = 0) -> list[str]:
+    """since_ts — брать только сообщения не старше этой метки (ежедневный обзор: с полуночи)."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT sender_name, content FROM group_messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT ?",
-        (chat_id, limit)
+        "SELECT sender_name, content FROM group_messages WHERE chat_id = ? AND timestamp >= ? "
+        "ORDER BY timestamp DESC LIMIT ?",
+        (chat_id, since_ts, limit)
     ).fetchall()
     conn.close()
     return [f"{r['sender_name']}: {r['content']}" for r in reversed(rows)]
