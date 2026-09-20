@@ -8,7 +8,6 @@ services:
       - ./api_errors.py:/app/api_errors.py
       - ./db.py:/app/db.py
       - ./requirements.txt:/app/requirements.txt
-      - ./allowed.json:/app/allowed.json
       - ./data-test:/app/data
     env_file:
       - .env.test

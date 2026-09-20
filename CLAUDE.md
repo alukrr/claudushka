@@ -38,8 +38,11 @@
   `docs/claude/media.md`
 - Дневной обзор (`daily_chat_review`, `cmd_review`, `/review_on`, `/review_off`,
   `run_daily`, `BERLIN_TZ`) — `docs/claude/daily-review.md`
-- Модели и стоимость (`MODELS`, `/haiku /sonnet /opus /fable`, `/models`, `/cost`,
-  `_track_response`) — `docs/claude/models-and-costs.md`
+- Модели и цены (`MODELS`, `/haiku /sonnet /opus /fable`, `/models`, `calc_llm_cost`) —
+  `docs/claude/models-and-costs.md`
+- Деньги и доступ (`usage_log`, `chat_credits`, баланс, тарифы paid/free, `usage_ctx`,
+  `_record_usage`, `gate_update`, `/cost`, `/topup`, `/verify /unverify /ban /unban`,
+  лимиты непроверенных, стартовый бонус, `/fable`-подтверждение) — `docs/claude/billing.md`
 - Ошибки API, ретраи, блокирующие вызовы, `response_text`, `parse_json_lenient` —
   `docs/claude/api-errors.md`
 - Память (`memory`-таблица, `extract_memory`, `extract_all_participants_memory`,
@@ -51,7 +54,8 @@
 - `db.py` — `.claude/rules/db.md` (автоматически)
 - `docker-compose.yml` — `.claude/rules/docker-compose.md` (автоматически)
 - Тестовый стенд (`docker-compose.test.yml`, обновление зависимостей, рискованные
-  правки перед продом) — `docs/claude/staging.md`
+  правки перед продом) — `docs/claude/staging.md`; пошаговый чек-лист ТЗ v0.10 (с SELECT'ами) —
+  `docs/claude/staging-checklist-v0.10.md`
 
 ## Стек
 - Python 3.12 (python:3.12-slim Docker image)
@@ -76,13 +80,12 @@
 - Docker Compose (без Dockerfile). Подробности — `.claude/rules/docker-compose.md`.
 
 ## Структура
-- bot.py — основной код Telegram-бота (~3200 строк)
-- db.py — слой данных SQLite (пользователи, история, память, чаты) — `.claude/rules/db.md`
+- bot.py — основной код Telegram-бота (~3750 строк)
+- db.py — слой данных SQLite (пользователи, история, память, чаты, учёт расхода, балансы) — `.claude/rules/db.md`
 - api_errors.py — классификация ошибок Anthropic API, ретраи, сообщения пользователю
   (общий для bot.py и whatsapp.py) — `docs/claude/api-errors.md`
 - whatsapp.py — WhatsApp-бот (FastAPI webhook, отдельный сервис; **сервис на паузе с
   2026-09-19**, код и правила не трогали) — `.claude/rules/whatsapp.md`
-- allowed.json — белые списки пользователей и чатов (legacy, основной источник — SQLite)
 - docker-compose.yml — два сервиса: claudushka + claudushka-wa (WhatsApp, `profiles:`,
   на паузе) — `.claude/rules/docker-compose.md`
 - .env — секреты (не в git)
@@ -106,7 +109,15 @@
 - Пользователь никогда не видит сырой текст исключения — только `api_errors.reply_api_error`.
 - Служебные вызовы (капча, поиск, перевод промпта, извлечение памяти, описание медиа) —
   только `DEFAULT_MODEL_ID`; ответы пользователю — `get_chat_model(chat_id)`.
-  `MODELS["..."]["id"]` в новых вызовах не хардкодить. `docs/claude/models-and-costs.md`.
+  `MODELS["..."]["id"]` в новых вызовах не хардкодить (единственное сознательное исключение —
+  `daily_chat_review` на Opus, платная фича). `docs/claude/models-and-costs.md`.
+- Каждый вызов, стоящий денег (LLM/картинка/поиск), обязан попасть в `usage_log` через
+  `_record_usage` (LLM — автоматически внутри `call_claude`/`sync_create`/`aux_create`, но
+  ВСЕГДА с `label=`). Чат берётся из `usage_ctx` (contextvar, ставит `gate_update`; в джобах —
+  явно) — не передавать chat_id руками и не писать в `usage_log` в обход. `docs/claude/billing.md`.
+- Тариф чата — `chat_tier(chat_id)`; модель/провайдер — только через `get_chat_model` /
+  `get_chat_image_provider` (учитывают free), не читать `chat_models`/`chat_image_provider`
+  напрямую. В free записи этих таблиц не менять. `docs/claude/billing.md`.
 
 ## Команды (актуальный список)
 `/help` показывает всем пользователям базовые команды, adminам — полный список из двух блоков (`USER_HELP` + `ADMIN_HELP` в bot.py). При добавлении новой команды обновлять оба константы.
@@ -143,7 +154,7 @@ SemVer:
 - Отчёты и ответы Алексею — на русском.
 - Новые зависимости добавлять осознанно, минимизировать
 - Переменные окружения через .env и docker-compose env_file
-- Белые списки через allowed.json и БД, НЕ через .env
+- Проверка/бан/балансы — только в БД (`allowed_chats`, `users`, `chat_credits`), НЕ через .env; белых списков и allowed.json больше нет
 - Контейнер без Dockerfile, используем image + command
 - Данные (SQLite, data/) монтируются в /app/data, не в git
 - Не правь файлы напрямую на сервере — это ведёт к `-dirty` версии и расхождению с git

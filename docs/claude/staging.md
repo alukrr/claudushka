@@ -154,9 +154,13 @@ docker compose -f docker-compose.test.yml up -d --force-recreate
 
 ```bash
 cd ~/claudushka-test
-git pull                                                    # текущая ветка worktree'а
+git fetch origin
+git checkout origin/<ветка>          # worktree создан от origin/<ветка> — это detached HEAD,
+                                     # поэтому `git pull` даст «You are not currently on a branch»
 docker compose -f docker-compose.test.yml up -d --force-recreate
 ```
+(`git pull` заработает, только если worktree привязан к локальной ветке:
+`git checkout -B <ветка> origin/<ветка>`.)
 
 `--force-recreate` тут оправдан всегда (не только при смене `.env.test`) — стенд
 предназначен для быстрой итерации, пересоздание контейнера дешевле, чем гадать,

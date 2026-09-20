@@ -6,11 +6,15 @@ import logging
 import time
 import asyncio
 import functools
+import contextvars
 from pathlib import Path
 from telegram import Update
-from datetime import datetime, time as dt_time
+from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
-from telegram.ext import Application, CommandHandler, MessageHandler, ChatMemberHandler, filters, ContextTypes
+from telegram.ext import (
+    Application, ApplicationHandlerStop, CommandHandler, MessageHandler, ChatMemberHandler,
+    TypeHandler, filters, ContextTypes,
+)
 import anthropic
 from tavily import TavilyClient
 import requests as http_requests
@@ -28,7 +32,7 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-ADMIN_IDS = {592441}
+ADMIN_IDS = {592441, 63014107}
 
 # ZoneInfo вместо жёсткого timezone(timedelta(hours=N)) — тот держит фиксированное
 # смещение круглый год и врёт на час при переходе CET/CEST (2026-09-19, b72e96e).
@@ -61,12 +65,27 @@ GROUP_TRANSCRIPT_LIMIT = 50   # сколько реплик группового
 MEMORY_EXTRACT_EVERY = 5
 MEMORY_EXTRACT_EVERY_CHAT = 15  # чат-уровневый каденс извлечения памяти; считает и реплики бота
 MAX_CAPTCHA_ATTEMPTS = 3
-BAN_DURATION = 3600
-STREET_DAILY_LIMIT = 10
+BAN_DURATION = 3600  # бан после провала капчи (не путать с /ban: banned-колонки в БД)
 CHAT_ACTIVITY_CHANCE = 0.03
 
 CAPTCHA_ENABLED = False
-WHITELIST_ENABLED = False
+
+# --- Стоимость, тарифы, лимиты (ТЗ v0.10, docs/claude/billing.md) ---
+# Все суммы в $. PRICE_MARKUP умножается на КАЖДУЮ запись usage_log при вставке (цена
+# заморожена в строке, пересчёта задним числом нет).
+PRICE_MARKUP = 1.0
+IMAGE_PRICES = {"gpt": 0.02, "banana": 0.067}
+SEARCH_PRICE = 0.008
+STARTER_BONUS_GROUP = 10.0
+STARTER_BONUS_PRIVATE = 5.0
+FREE_IMAGES_PRIVATE_PER_DAY = 10
+FREE_IMAGES_GROUP_PER_USER_PER_DAY = 5
+UNVERIFIED_MSG_PRIVATE_PER_DAY = 50
+UNVERIFIED_MSG_GROUP_PER_USER_PER_DAY = 20
+UNVERIFIED_SEARCH_PER_DAY = 20
+VERIFY_MIN_TOPUP = 5.0
+ADMIN_CONTACT = "@alukr"
+FABLE_CONFIRM_WINDOW = 120  # секунд на повтор /fable
 
 # Captcha state (in-memory, resets on restart)
 captcha_state: dict[str, dict] = {}
@@ -85,13 +104,13 @@ captcha_state: dict[str, dict] = {}
 # калиброваны под МИНИМАЛЬНОЕ (200k) — не поднимать их, ссылаясь на 1M у Opus.
 MODELS = {
     "haiku":  {"id": "claude-haiku-4-5-20251001", "label": "Haiku 4.5",
-               "in": 1.0,  "out": 5.0,  "cache_read_mult": 0.1, "context":   200_000, "admin_only": False},
+               "in": 1.0,  "out": 5.0,  "cache_read_mult": 0.1, "context":   200_000},
     "sonnet": {"id": "claude-sonnet-5",           "label": "Sonnet 5",
-               "in": 2.0,  "out": 10.0, "cache_read_mult": 0.1, "context": 1_000_000, "admin_only": False},
+               "in": 2.0,  "out": 10.0, "cache_read_mult": 0.1, "context": 1_000_000},
     "opus":   {"id": "claude-opus-5",             "label": "Opus 5",
-               "in": 5.0,  "out": 25.0, "cache_read_mult": 0.1, "context": 1_000_000, "admin_only": True},
+               "in": 5.0,  "out": 25.0, "cache_read_mult": 0.1, "context": 1_000_000},
     "fable":  {"id": "claude-fable-5-1",           "label": "Fable 5.1",
-               "in": 10.0, "out": 50.0, "cache_read_mult": 0.025, "context": 1_000_000, "admin_only": True},
+               "in": 10.0, "out": 50.0, "cache_read_mult": 0.025, "context": 1_000_000},
 }
 DEFAULT_MODEL_KEY = "haiku"
 DEFAULT_MODEL_ID = MODELS[DEFAULT_MODEL_KEY]["id"]
@@ -108,9 +127,6 @@ def model_meta(model_id: str) -> dict:
     return _MODELS_BY_ID.get(model_id, MODELS[DEFAULT_MODEL_KEY])
 
 
-# Per-model token tracking
-token_usage: dict[str, dict[str, int]] = {}
-
 # Стандартные множители Anthropic для prompt caching (5-минутный ephemeral). Найдено
 # 2026-08-31 при разборе dedup_memory.py: пул этого ключа кеширует любой достаточно
 # большой вход, не только системные промпты — а у больших групповых system-prompt'ов
@@ -125,32 +141,93 @@ CACHE_WRITE_MULTIPLIER = 1.25
 CACHE_READ_MULTIPLIER = 0.1
 
 
-def _track_tokens(model: str, inp: int, out: int, cache_write: int = 0, cache_read: int = 0):
-    if model not in token_usage:
-        token_usage[model] = {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}
-    token_usage[model]["input"] += inp
-    token_usage[model]["output"] += out
-    token_usage[model]["cache_write"] += cache_write
-    token_usage[model]["cache_read"] += cache_read
+def calc_llm_cost(model: str, inp: int, out: int, cache_write: int = 0, cache_read: int = 0) -> float:
+    """Стоимость одного LLM-вызова в $ БЕЗ наценки (наценку добавляет _record_usage).
+
+    cache_write/cache_read — см. CACHE_WRITE_MULTIPLIER выше: без них цифра занижена на
+    порядки на большом system-prompt'е, не на проценты (найдено 2026-08-31).
+    cache_read_mult — из реестра, не общая константа: у Fable 5.1/Mythos 0.025x вместо 0.1x.
+    """
+    meta = model_meta(model)
+    price_in, price_out = meta["in"], meta["out"]
+    cache_read_mult = meta.get("cache_read_mult", CACHE_READ_MULTIPLIER)
+    return (
+        (inp / 1_000_000 * price_in)
+        + (cache_write / 1_000_000 * price_in * CACHE_WRITE_MULTIPLIER)
+        + (cache_read / 1_000_000 * price_in * cache_read_mult)
+        + (out / 1_000_000 * price_out)
+    )
 
 
-def _track_response(model: str, response) -> None:
-    """Учёт токенов по ответу API.
+# --- Привязка вызова к чату (usage_ctx) ---
+# (chat_id, chat_type, user_id) текущего апдейта. Выставляется в gate_update (group=-1),
+# в daily_chat_review — явно на каждый чат цикла. asyncio.to_thread и create_task
+# копируют контекст, поэтому sync_create/extract_*/фоновые задачи наследуют чат сами.
+# None = служебный вызов вне чата (chat_id NULL в usage_log, billed=0).
+usage_ctx: contextvars.ContextVar = contextvars.ContextVar("usage_ctx", default=None)
+
+
+def _fire(coro) -> None:
+    """Запустить корутину из любого контекста: из event loop (spawn) или из потока
+    to_thread (run_coroutine_threadsafe на основной цикл). Ошибки только в лог."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        if _main_loop is None or _main_loop.is_closed():
+            coro.close()
+            logger.warning("некуда отправить уведомление: основной цикл не готов")
+            return
+        asyncio.run_coroutine_threadsafe(coro, _main_loop)
+    else:
+        _spawn_background_task(coro)
+
+
+def _record_usage(kind: str, model: str | None, label: str, base_cost: float,
+                  inp: int = 0, out: int = 0, cache_write: int = 0, cache_read: int = 0) -> None:
+    """Единственная точка записи usage_log. Не роняет ответ: любая ошибка — в лог.
+
+    billed=1 только если чат в платном тарифе на момент вызова (chat_id NULL → 0).
+    Админский личный чат всегда paid и учитывается (billed=1), но без writeoff — баланс
+    админа может уходить в минус, это чисто учёт (docs/claude/billing.md).
+    """
+    try:
+        ctx = usage_ctx.get()
+        chat_id, chat_type, user_id = ctx if ctx else (None, None, None)
+        billed = chat_id is not None and chat_tier(chat_id) == "paid"
+        went_free = db.record_usage(
+            chat_id, chat_type, user_id, kind, model, label, base_cost * PRICE_MARKUP, billed,
+            inp, out, cache_write, cache_read, settle=not is_admin(chat_id or 0),
+        )
+        if went_free:
+            _fire(_send_chat_notice(chat_id, TIER_FREE_MSG))
+    except Exception:
+        logger.exception(f"usage_log: не удалось записать {kind}/{label}")
+
+
+def _count_reply(user_id: int, chat_id: int) -> None:
+    """+1 к дневному счётчику ответов (лимит непроверенных). Зовётся ОДИН раз на реплику
+    пользователя в хендлере после успешного ответа модели — не из _record_usage: на одну
+    реплику может приходиться несколько LLM-вызовов (аварийная обрезка, повтор)."""
+    try:
+        db.daily_msgs_bump(_berlin_day(), chat_id, user_id)
+    except Exception:
+        logger.exception("daily_usage: не удалось увеличить счётчик")
+
+
+def _track_response(model: str, response, label: str = "aux") -> None:
+    """Учёт токенов по ответу API (пишет в usage_log).
 
     Зовётся из обёрток (sync_create / call_claude), а НЕ по месту: раньше половина
     путей — should_search, перевод, капча, extract_*, /search — не считалась вовсе,
     и /cost занижал расход. Новый вызов API автоматически попадает в учёт.
-
-    cache_creation_input_tokens/cache_read_input_tokens — см. CACHE_WRITE_MULTIPLIER
-    выше: без них /cost занижал расход на большом system-prompt'е на порядки, не проценты.
     """
     usage = getattr(response, "usage", None)
-    if usage is not None:
-        _track_tokens(
-            model, usage.input_tokens, usage.output_tokens,
-            getattr(usage, "cache_creation_input_tokens", 0) or 0,
-            getattr(usage, "cache_read_input_tokens", 0) or 0,
-        )
+    if usage is None:
+        return
+    inp, out = usage.input_tokens or 0, usage.output_tokens or 0
+    cw = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    cr = getattr(usage, "cache_read_input_tokens", 0) or 0
+    _record_usage("llm", model, label, calc_llm_cost(model, inp, out, cw, cr), inp, out, cw, cr)
 
 
 # --- Фоновые fire-and-forget задачи ---
@@ -234,8 +311,12 @@ async def reply_expandable(reply_fn, body: str, header: str = "") -> None:
             await reply_fn(plain)
 
 
-async def call_claude(context, chat_id: int | None, *, label: str, **kwargs):
+async def call_claude(context, chat_id: int | None, *, label: str, usage_label: str | None = None, **kwargs):
     """messages.create из хендлера: не блокирует event loop, переживает 529/429/сеть.
+
+    label — для логов ретраев; usage_label — метка в usage_log (по умолчанию первое слово
+    label). Ответы на реплики пользователя (диалог/фото/файл) пишутся с usage_label="dialog":
+    по нему считается дневной лимит сообщений непроверенных.
 
     Всю паузу между попытками держит «печатает…», чтобы ожидание (до 15с) не выглядело
     зависанием. Исключение после всех попыток пробрасывается наверх — его ловит
@@ -250,7 +331,7 @@ async def call_claude(context, chat_id: int | None, *, label: str, **kwargs):
         label=label,
         keepalive=keepalive,
     )
-    _track_response(kwargs.get("model", ""), response)
+    _track_response(kwargs.get("model", ""), response, usage_label or label.split()[0])
     return response
 
 
@@ -269,9 +350,11 @@ def sync_create(**kwargs):
 
     Единственная точка входа для служебных вызовов внутри sync-функций
     (should_search, капча, extract_*): считает токены и берёт SDK-ретраи.
+    `label=` (не уходит в API) — метка строки usage_log; чат берётся из usage_ctx.
     """
+    label = kwargs.pop("label", "aux")
     response = client.messages.create(**kwargs)
-    _track_response(kwargs.get("model", ""), response)
+    _track_response(kwargs.get("model", ""), response, label)
     return response
 
 
@@ -293,9 +376,44 @@ _halve_history = api_errors.halve_history
 context_bot_id = None
 bot_username = None
 _admin_bot = None  # ставится в post_init, через него notify_admins шлёт сообщения
+_main_loop = None  # основной event loop, ставится в post_init (для _fire из потоков)
 
 
-# --- Role checks ---
+# --- Время: сутки и неделя по BERLIN_TZ ---
+
+def _berlin_now() -> datetime:
+    return datetime.now(BERLIN_TZ)
+
+
+def _berlin_day() -> str:
+    return _berlin_now().strftime("%Y-%m-%d")
+
+
+def _day_start(now: datetime | None = None) -> datetime:
+    now = now or _berlin_now()
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _day_start_ts() -> int:
+    return int(_day_start().timestamp())
+
+
+def _week_start(now: datetime | None = None) -> datetime:
+    """Понедельник 00:00 по Берлину (через дату, не вычитанием timedelta из aware-времени —
+    так полночь остаётся полуночью и на переходе CET/CEST)."""
+    d = _day_start(now).date()
+    return datetime.combine(d - timedelta(days=d.weekday()), dt_time(0, 0), tzinfo=BERLIN_TZ)
+
+
+def _reset_in_text() -> str:
+    nxt = datetime.combine(_berlin_now().date() + timedelta(days=1), dt_time(0, 0), tzinfo=BERLIN_TZ)
+    mins = max(1, int((nxt - _berlin_now()).total_seconds() // 60))
+    return f"{mins // 60} ч {mins % 60} мин"
+
+
+# --- Роли, проверка, тариф (ТЗ v0.10, docs/claude/billing.md) ---
+# Два независимых измерения: доверие (banned | непроверенный | проверенный → лимиты) и
+# тариф по балансу (paid | free → модели, картинки, обзоры). Бот отвечает всем, кроме banned.
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -314,38 +432,178 @@ async def is_chat_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_i
         return False
 
 
-def can_invite(user: dict) -> bool:
-    return user["role"] in ("admin", "premium")
+def is_user_verified(user_id: int, user: dict | None = None) -> bool:
+    """Проверенный пользователь = админ бота или users.role admin/premium.
+    users.verified — это КАПЧА и к проверке отношения не имеет."""
+    if is_admin(user_id):
+        return True
+    user = user or db.get_user(user_id)
+    return bool(user and user["role"] in ("admin", "premium"))
 
 
-def can_search(user: dict) -> bool:
-    return user["role"] in ("admin", "premium", "referral")
+def is_chat_verified(chat_id: int) -> bool:
+    """Группа: allowed_chats.status='approved'. Личный чат (chat_id > 0) — пользователь."""
+    return db.is_group_verified(chat_id) if chat_id < 0 else is_user_verified(chat_id)
 
 
 def needs_captcha(user: dict) -> bool:
-    if user["role"] in ("admin", "premium", "banned"):
+    if is_admin(user["telegram_id"]) or user["role"] in ("admin", "premium") or user.get("banned"):
         return False
     return not user["verified"]
 
 
-def is_allowed_in_chat(user: dict, chat_id: int) -> bool:
-    if not WHITELIST_ENABLED:
+def chat_tier(chat_id: int) -> str:
+    """'paid' | 'free' по балансу. Личный чат админа бота — всегда paid."""
+    if is_admin(chat_id):
+        return "paid"
+    return "paid" if db.get_balance(chat_id) > db.PAID_MIN_BALANCE else "free"
+
+
+PAID_DEFAULT_MODEL_KEY = "sonnet"   # модель платного чата, который ничего не выбирал
+FREE_IMAGE_PROVIDER = "gpt"         # единственный провайдер картинок в free
+
+
+def get_chat_model(chat_id: int) -> str:
+    """Эффективная модель чата: free → всегда Haiku (запись chat_models НЕ трогаем — при
+    возврате в paid прошлый выбор восстанавливается), paid → выбор чата, иначе Sonnet."""
+    if chat_tier(chat_id) == "free":
+        return DEFAULT_MODEL_ID
+    return db.get_chat_model_db(chat_id, MODELS[PAID_DEFAULT_MODEL_KEY]["id"])
+
+
+def get_chat_image_provider(chat_id: int) -> str:
+    if chat_tier(chat_id) == "free":
+        return FREE_IMAGE_PROVIDER
+    return db.get_chat_image_provider_db(chat_id)
+
+
+TIER_FREE_MSG = (
+    "Баланс закончился, я перешла в бесплатный режим: Haiku, картинки через GPT "
+    "(лимит в сутки). Баланс — /cost"
+)
+
+
+def _tier_paid_msg(chat_id: int) -> str:
+    model = model_meta(get_chat_model(chat_id))["label"]
+    provider = IMAGE_PROVIDERS[get_chat_image_provider(chat_id)]["label"]
+    return f"Платный режим включён: {model}, картинки — {provider}. Выбор модели — /models"
+
+
+async def _send_chat_notice(chat_id: int, text: str) -> None:
+    if _admin_bot is None:
+        return
+    try:
+        await _admin_bot.send_message(chat_id=chat_id, text=text)
+    except Exception as e:
+        logger.warning(f"не смогла отправить уведомление в {chat_id}: {e}")
+
+
+async def _notice_tier_change(chat_id: int, before: str) -> None:
+    """Сообщение о смене тарифа — ровно на переход (before → нынешний), не на каждое событие."""
+    after = chat_tier(chat_id)
+    if before == "free" and after == "paid":
+        await _send_chat_notice(chat_id, _tier_paid_msg(chat_id))
+    elif before == "paid" and after == "free":
+        await _send_chat_notice(chat_id, TIER_FREE_MSG)
+
+
+# Чаты, у которых стартовый бонус уже проверен в этом процессе — чтобы не ходить в БД на
+# каждое сообщение. Пополняется только после успешной проверки (ошибка БД → повтор).
+_bonus_checked: set[int] = set()
+
+
+def _starter_bonus_amount(chat_id: int) -> float:
+    return STARTER_BONUS_GROUP if chat_id < 0 else STARTER_BONUS_PRIVATE
+
+
+async def _ensure_starter_bonus(chat_id: int) -> None:
+    """Стартовый бонус — ТОЛЬКО проверенным (при первом новом сообщении, если миграция или
+    /verify его не выдали). Идемпотентно на уровне БД."""
+    if chat_id in _bonus_checked or not is_chat_verified(chat_id):
+        return
+    try:
+        before = chat_tier(chat_id)
+        if db.grant_starter_bonus(chat_id, _starter_bonus_amount(chat_id)):
+            logger.info(f"Стартовый бонус выдан: chat={chat_id}")
+            await _notice_tier_change(chat_id, before)
+        _bonus_checked.add(chat_id)
+    except Exception:
+        logger.exception(f"стартовый бонус chat={chat_id}")
+
+
+def verify_target(target_id: int, by_user: int | None) -> bool:
+    """Проверить группу (id < 0 → approved) или пользователя (→ premium) + стартовый бонус,
+    если не выдавался. Возвращает True, если бонус выдан прямо сейчас."""
+    if target_id < 0:
+        db.ensure_group(target_id, None, by_user)
+        db.set_chat_status(target_id, "approved", by_user)
+    else:
+        user = db.get_or_create_user(target_id)
+        if user["role"] not in ("admin", "premium"):
+            db.set_role(target_id, "premium")
+    granted = db.grant_starter_bonus(target_id, _starter_bonus_amount(target_id))
+    _bonus_checked.add(target_id)
+    return granted
+
+
+def unverify_target(target_id: int) -> bool:
+    """Снять проверку. Админов бота не трогаем (False). Баланс и бонус остаются."""
+    if is_admin(target_id):
+        return False
+    if target_id < 0:
+        return db.set_chat_status(target_id, "pending", None)
+    user = db.get_user(target_id)
+    if user and user["role"] == "premium":
+        db.set_role(target_id, "street")
+    return user is not None
+
+
+def _limits_apply(user_id: int, chat_id: int, is_group: bool) -> bool:
+    """Лимиты непроверенных действуют: личка — если пользователь не проверен; группа —
+    только если НЕ проверены ни чат, ни автор."""
+    if is_user_verified(user_id):
+        return False
+    return not (is_group and is_chat_verified(chat_id))
+
+
+def _msg_limit(is_group: bool) -> int:
+    return UNVERIFIED_MSG_GROUP_PER_USER_PER_DAY if is_group else UNVERIFIED_MSG_PRIVATE_PER_DAY
+
+
+async def _check_message_limit(update: Update, user_id: int, chat_id: int, is_group: bool) -> bool:
+    """True — можно отвечать. Сверх лимита непроверенных: один ответ в сутки, дальше тишина."""
+    if not _limits_apply(user_id, chat_id, is_group):
         return True
-    if user["role"] in ("admin", "premium", "referral"):
+    day = _berlin_day()
+    if db.daily_msgs_get(day, chat_id, user_id) < _msg_limit(is_group):
         return True
-    if user["verified"]:
-        return True
-    if db.is_chat_allowed(chat_id):
-        return True
+    if db.daily_limit_notice_claim(day, chat_id, user_id):
+        await update.effective_message.reply_text(
+            "Дневной лимит для непроверенных исчерпан, сброс в 00:00. "
+            f"Снять лимиты навсегда: пополнить баланс от ${VERIFY_MIN_TOPUP:g} или написать {ADMIN_CONTACT}."
+        )
     return False
 
 
-def check_daily_limit(user: dict) -> bool:
-    """Returns True if user can send a message."""
-    if user["role"] in ("admin", "premium", "referral"):
+def _search_allowed(user_id: int, chat_id: int, is_group: bool) -> bool:
+    """Поиск непроверенных — UNVERIFIED_SEARCH_PER_DAY в сутки (группа: на чат, личка: на
+    пользователя = на личный чат). Сверх лимита ответ идёт без поиска, молча."""
+    if not _limits_apply(user_id, chat_id, is_group):
         return True
-    count = db.increment_daily_messages(user["telegram_id"])
-    return count <= STREET_DAILY_LIMIT
+    return db.usage_count("search", _day_start_ts(), chat_id) < UNVERIFIED_SEARCH_PER_DAY
+
+
+def image_quota(chat_id: int, is_group: bool, user_id: int) -> tuple[int, int] | None:
+    """(использовано, лимит) дневного лимита картинок free-режима; None — лимита нет (paid).
+    Лимит действует на ВСЕХ, включая проверенных. Считаем billed=0 с полуночи по Берлину:
+    личка — на чат, группа — на пользователя."""
+    if chat_tier(chat_id) == "paid":
+        return None
+    since = _day_start_ts()
+    if is_group:
+        return (db.usage_count("image", since, chat_id, user_id=user_id, billed=False),
+                FREE_IMAGES_GROUP_PER_USER_PER_DAY)
+    return db.usage_count("image", since, chat_id, billed=False), FREE_IMAGES_PRIVATE_PER_DAY
 
 
 # --- Web search ---
@@ -355,6 +613,9 @@ def web_search(query: str, max_results: int = 5) -> str:
         return ""
     try:
         results = tavily.search(query=query, max_results=max_results)
+        # Учёт — по факту успешного вызова API (Tavily берёт деньги и за пустую выдачу).
+        # Звать из потока безопасно: usage_ctx копируется в to_thread.
+        _record_usage("search", "tavily", "search", SEARCH_PRICE)
         if not results.get("results"):
             return "Поиск не дал результатов."
         output = []
@@ -369,6 +630,7 @@ def web_search(query: str, max_results: int = 5) -> str:
 def should_search(text: str) -> str | None:
     try:
         response = sync_create(
+            label="should_search",
             model=DEFAULT_MODEL_ID,
             max_tokens=30,
             system=(
@@ -427,11 +689,11 @@ GPT_IMAGE_MODEL_ID = "gpt-image-2"
 GPT_IMAGE_MODEL_NAME = "GPT Image 2"
 
 # Реестр провайдеров генерации картинок, по аналогии с MODELS — но переключение per-chat
-# хранится в отдельной таблице chat_image_provider (db.py), не в chat_models, и без
-# admin_only: обоими может пользоваться любой, кому вообще доступно рисование (referral+,
-# см. /imagine). Ключевое отличие — КТО платит: banana идёт напрямую в Google по
-# отдельному GEMINI_API_KEY и общий баланс пула не трогает, gpt идёт через пул и тратит
-# тот же баланс, что и все вызовы Claude.
+# хранится в отдельной таблице chat_image_provider (db.py), не в chat_models. Доступность
+# по тарифу (ТЗ v0.10): banana — платный режим, gpt — везде (в free единственный, с дневным
+# лимитом), см. docs/claude/billing.md. Ключевое отличие для КОНТРАГЕНТА: banana идёт
+# напрямую в Google по отдельному GEMINI_API_KEY, gpt — через пул, как и вызовы Claude;
+# для КЛИЕНТА (баланс чата) обе картинки стоят IMAGE_PRICES.
 IMAGE_PROVIDERS = {
     "banana": {"label": "Nano Banana 2"},
     "gpt":    {"label": "GPT Image 2"},
@@ -673,6 +935,7 @@ async def _try_gpt_image(prompt: str) -> tuple[bytes | None, str | None, str | N
 async def _rewrite_prompt(prompt: str) -> str | None:
     try:
         resp = await aux_create(
+            label="image_prompt_rewrite",
             model=DEFAULT_MODEL_ID,
             max_tokens=150,
             system=(
@@ -691,10 +954,6 @@ async def _rewrite_prompt(prompt: str) -> str | None:
         return None
 
 
-def get_chat_image_provider(chat_id: int) -> str:
-    return db.get_chat_image_provider_db(chat_id)
-
-
 async def generate_image_with_error(prompt: str, chat_id: int) -> tuple[bytes | None, str | None, str | None]:
     """Провайдер выбирается per-chat (IMAGE_PROVIDERS/chat_image_provider) — banana или
     gpt. Между собой НЕ фоллбечат: разный провайдер — разный счёт (banana не трогает
@@ -708,6 +967,7 @@ async def generate_image_with_error(prompt: str, chat_id: int) -> tuple[bytes | 
 
     image, error, provider = await try_fn(prompt)
     if image:
+        _record_usage("image", provider_key, "image", IMAGE_PRICES[provider_key])
         return image, None, provider
 
     if error == "__REFUSAL__":
@@ -716,6 +976,7 @@ async def generate_image_with_error(prompt: str, chat_id: int) -> tuple[bytes | 
         if rewritten:
             image, error, provider = await try_fn(rewritten)
             if image:
+                _record_usage("image", provider_key, "image", IMAGE_PRICES[provider_key])
                 return image, None, provider
 
     if error == "__REFUSAL__":
@@ -726,17 +987,41 @@ async def generate_image_with_error(prompt: str, chat_id: int) -> tuple[bytes | 
     return None, final_error, None
 
 
+async def _image_limit_blocked(update, chat_id: int, is_group: bool, user_id: int,
+                               silent: bool = False) -> bool:
+    """True — дневной лимит картинок free-режима исчерпан, рисовать нельзя. Явный запрос
+    получает короткий ответ с лимитом и временем сброса; спонтанное рисование (silent) —
+    молча, маркер [[DRAW]] к этому моменту уже вырезан из ответа."""
+    quota = image_quota(chat_id, is_group, user_id)
+    if quota is None or quota[0] < quota[1]:
+        return False
+    if not silent:
+        await update.effective_message.reply_text(
+            f"Лимит картинок на сегодня исчерпан ({quota[0]}/{quota[1]}). Сброс в 00:00 по Берлину, "
+            f"через {_reset_in_text()}. Платный режим снимает лимит — баланс: /cost"
+        )
+    return True
+
+
 async def _draw_and_send(update, context, chat_id: int, is_group: bool,
-                         draw_prompt: str, en_prompt: str = None, author: str = None) -> bool:
+                         draw_prompt: str, en_prompt: str = None, author: str = None,
+                         silent_limit: bool = False) -> bool:
     """Генерирует картинку и отправляет в чат. Возвращает True при успехе.
+
+    Первым делом — дневной лимит free-режима (до дорогого перевода промпта и генерации);
+    silent_limit=True для спонтанного [[DRAW]]: при исчерпании не рисуем без единого слова.
 
     draw_prompt — человекочитаемое описание (для caption). en_prompt — готовый английский
     промпт для генератора; если None, draw_prompt переводится через Haiku. Используется и в
     ветке команды «нарисуй», и когда Клодушка сама решает нарисовать (маркер [[DRAW: ...]]).
     """
+    if await _image_limit_blocked(update, chat_id, is_group, update.effective_user.id, silent_limit):
+        return False
+
     if en_prompt is None:
         try:
             translate_resp = await aux_create(
+                label="draw_translate",
                 model=DEFAULT_MODEL_ID,
                 max_tokens=200,
                 system=(
@@ -829,6 +1114,7 @@ async def _describe_media_haiku(images_b64: list[str], hint: str) -> str | None:
     content.append({"type": "text", "text": hint})
     try:
         response = await aux_create(
+            label="media_describe",
             model=DEFAULT_MODEL_ID,
             max_tokens=MEDIA_DESCRIPTION_MAX_TOKENS,
             system=(
@@ -890,6 +1176,7 @@ async def _recognize_photo_for_context(context, photo) -> str | None:
 
 def generate_captcha_question(user_text: str) -> str:
     response = sync_create(
+        label="captcha_gen",
         model=DEFAULT_MODEL_ID,
         max_tokens=200,
         system=(
@@ -909,6 +1196,7 @@ def generate_captcha_question(user_text: str) -> str:
 
 def check_captcha_answer(question: str, answer: str) -> bool:
     response = sync_create(
+        label="captcha_check",
         model=DEFAULT_MODEL_ID,
         max_tokens=50,
         system=(
@@ -1022,6 +1310,7 @@ def extract_memory(user_id: int, messages: list, is_group: bool = False, chat_id
     try:
         recent = messages[-6:]
         response = sync_create(
+            label="extract_memory",
             # Служебный вызов — только DEFAULT_MODEL_ID, без исключений (правило
             # Алексея, 2026-09-19). Раньше здесь был MODELS["sonnet"]["id"] "осознанно,
             # аналитическая задача" — решение отменено, срабатывает каждые 10
@@ -1068,6 +1357,7 @@ def extract_all_participants_memory(chat_id: int):
         lines = [("Клодушка" if e["is_bot"] else e["sender"]) + f": {e['text']}" for e in transcript]
         dialog = "\n".join(lines)
         response = sync_create(
+            label="extract_chat_memory",
             model=DEFAULT_MODEL_ID,
             # 4096, а не 1024: на 12 участников с двумя массивами фактов на каждого
             # 1024 не хватало, ответ обрывался на полуслове и разбор терял ВСЁ окно
@@ -1171,10 +1461,6 @@ def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GRO
     return messages
 
 
-def get_chat_model(chat_id: int) -> str:
-    return db.get_chat_model_db(chat_id)
-
-
 # --- Captcha handler ---
 
 async def handle_captcha(update: Update, user: dict) -> bool:
@@ -1229,46 +1515,63 @@ async def handle_captcha(update: Update, user: dict) -> bool:
 
 # --- Daily review ---
 
+DAILY_REVIEW_MODEL_ID = MODELS["opus"]["id"]  # осознанное исключение из «служебное — Haiku»: платная фича
+DAILY_REVIEW_FOOTER = "Отключить ежедневный обзор: /review_off (админ чата)"
+
+
 async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
-    """Generate ironic daily review for each active chat."""
-    chats = db.get_allowed_chats()
-    for chat in chats:
-        chat_id = chat["chat_id"]
-        if not chat["daily_review_enabled"]:
-            continue
-        messages = db.get_group_history(chat_id, 100)
-        if len(messages) < 5:
-            continue
-        try:
-            chat_log = "\n".join(messages)
-            _model = get_chat_model(chat_id)
-            response = await aux_create(
-                model=_model,
-                max_tokens=500,
-                system=(
-                    "Ты Клодушка — AI с характером, которая считает себя умнее всех в чате (и не без оснований). "
-                    "Напиши КОРОТКИЙ ироничный, саркастичный обзор дня в чате — 2-3 абзаца, не больше 600 знаков суммарно. "
-                    "Не старайся упомянуть всех и каждую тему — выбери 2-3 самых сочных момента: "
-                    "кто с кем дружит/троллит/игнорирует, как обращаются друг к другу, кто лидер мнений. "
-                    "В конце — одна короткая фраза-афоризм или шутка, которая подводит итог именно ЭТОМУ дню "
-                    "(придумай новую под конкретные события, не используй заготовленную фразу про то, что ты AI). "
-                    "Будь остроумной, дерзкой, но не жестокой — ты ведь их любишь, просто они смешные. "
-                    "Пиши на языке чата. Уложись в объём — оборванный на середине текст хуже короткого."
-                ),
-                messages=[{"role": "user", "content": f"Вот сообщения за день:\n{chat_log}"}],
-            )
-            review = response_text(response)
-            if not review:
-                logger.warning(f"Дневной обзор пуст: {api_errors.response_debug(response)}")
+    """Ежедневный обзор — только paid-группы, не забаненные, с включённым флагом.
+    Модель — Opus независимо от модели чата; стоимость идёт в usage_log с billed=1
+    (chat_id выставляется явно на каждый чат цикла: у джоба нет апдейта → нет gate_update).
+    Free-чатам обзор не шлём, флаг daily_review_enabled при этом не трогаем."""
+    try:
+        for chat in db.get_review_chats():
+            chat_id = chat["chat_id"]
+            if chat_tier(chat_id) != "paid":
                 continue
-            if api_errors.was_truncated(response):
-                logger.warning(f"Дневной обзор обрезан по max_tokens, chat={chat_id}: {api_errors.response_debug(response)}")
-                review = api_errors.trim_to_last_sentence(review)
-            await context.bot.send_message(chat_id=chat_id, text=review)
-            db.save_group_message(chat_id, context_bot_id, "Клодушка", review, is_bot=True)
-            logger.info(f"Daily review sent to {chat_id}")
-        except Exception as e:
-            logger.error(f"Daily review error for {chat_id}: {e}")
+            # Только сегодняшние сообщения (с полуночи по Берлину): «последние 100 вообще»
+            # пересказывали бы старое молчащего чата каждую ночь — теперь за деньги чата.
+            messages = db.get_group_history(chat_id, 100, since_ts=_day_start_ts())
+            if len(messages) < 5:
+                continue
+            usage_ctx.set((chat_id, "group", None))
+            try:
+                chat_log = "\n".join(messages)
+                response = await aux_create(
+                    label="daily_review",
+                    model=DAILY_REVIEW_MODEL_ID,
+                    max_tokens=1000,
+                    system=(
+                        "Ты Клодушка — AI с характером, которая считает себя умнее всех в чате (и не без оснований). "
+                        "Напиши ироничный, остроумный обзор дня в чате — 3-4 абзаца, ОКОЛО 1000-1200 знаков суммарно. "
+                        "Это не сухой пересказ, а маленький фельетон: найди сюжет дня и расскажи его живо. "
+                        "Выбери 3-4 самых сочных момента: кто с кем дружит/троллит/игнорирует, как обращаются друг к другу, "
+                        "кто лидер мнений, какие темы повторялись, у кого был звёздный час, а у кого — провал. "
+                        "Не старайся упомянуть всех и каждую тему. Можно сравнения, метафоры, лёгкое преувеличение. "
+                        "В конце — одна короткая фраза-афоризм или шутка, которая подводит итог именно ЭТОМУ дню "
+                        "(придумай новую под конкретные события, не используй заготовленную фразу про то, что ты AI). "
+                        "Будь остроумной, дерзкой, но не жестокой — ты ведь их любишь, просто они смешные. "
+                        "Пиши на языке чата, без markdown-разметки. "
+                        "Уложись в объём — оборванный на середине текст хуже короткого."
+                    ),
+                    messages=[{"role": "user", "content": f"Вот сообщения за день:\n{chat_log}"}],
+                )
+                review = response_text(response)
+                if not review:
+                    logger.warning(f"Дневной обзор пуст: {api_errors.response_debug(response)}")
+                    continue
+                if api_errors.was_truncated(response):
+                    logger.warning(f"Дневной обзор обрезан по max_tokens, chat={chat_id}: {api_errors.response_debug(response)}")
+                    review = api_errors.trim_to_last_sentence(review)
+                # Подсказку про отключение добавляет КОД, не модель. В транскрипт кладём обзор
+                # без неё — иначе модель начнёт копировать хвост в живые ответы.
+                await context.bot.send_message(chat_id=chat_id, text=f"{review}\n\n{DAILY_REVIEW_FOOTER}")
+                db.save_group_message(chat_id, context_bot_id, "Клодушка", review, is_bot=True)
+                logger.info(f"Daily review sent to {chat_id}")
+            except Exception as e:
+                logger.error(f"Daily review error for {chat_id}: {e}")
+    finally:
+        usage_ctx.set(None)
 
 
 # --- New member greeting ---
@@ -1279,6 +1582,7 @@ async def greet_new_member(chat_id: int, user_id: int, user_name: str, bot):
     if facts:
         try:
             filter_resp = await aux_create(
+                label="greet_filter",
                 model=DEFAULT_MODEL_ID,
                 max_tokens=300,
                 system=(
@@ -1298,6 +1602,7 @@ async def greet_new_member(chat_id: int, user_id: int, user_name: str, bot):
     try:
         facts_hint = f"\nЧто ты знаешь об этом человеке (используй естественно, не перечисляй): {'; '.join(safe_facts)}" if safe_facts else ""
         response = await aux_create(
+            label="greet",
             model=DEFAULT_MODEL_ID,
             max_tokens=150,
             system=(
@@ -1411,22 +1716,43 @@ def strip_trigger(text: str) -> str:
 
 # --- Admin commands ---
 
-async def cmd_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+def _chat_title(chat_id: int) -> str:
+    """Человекочитаемое имя чата: группа — название, личка — имя пользователя."""
+    if chat_id < 0:
+        row = db.get_chat_row(chat_id)
+        return (row and row["name"]) or str(chat_id)
+    user = db.get_user(chat_id)
+    return (user and (user["full_name"] or user["username"])) or str(chat_id)
+
+
+def _tier_label(chat_id: int) -> str:
+    return "платный" if chat_tier(chat_id) == "paid" else "бесплатный"
+
+
+def _money(x: float) -> str:
+    return f"${x:.2f}" if x == 0 or abs(x) >= 0.005 else f"${x:.4f}"
+
+
+async def _reply_private(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Длинные админские списки (/users, /chats) — только в личку: в группе они светили бы
+    список пользователей и балансов всем участникам. Если бот не может написать админу в личку
+    (тот ни разу не открывал диалог — Telegram запрещает начинать первым), в группу список НЕ
+    выводим, а объясняем, что сделать."""
+    chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]
+    if update.effective_chat.type == "private":
+        for chunk in chunks:
+            await update.effective_message.reply_text(chunk)
         return
-    if len(context.args) < 2:
-        await update.message.reply_text("Использование: /role <user_id> <admin|premium|referral|street|banned>")
+    try:
+        for chunk in chunks:
+            await context.bot.send_message(chat_id=update.effective_user.id, text=chunk)
+    except Exception as e:
+        logger.info(f"личка админа недоступна ({update.effective_user.id}): {e}")
+        await update.effective_message.reply_text(
+            "Не могу написать тебе в личку — открой диалог со мной, нажми /start и повтори команду."
+        )
         return
-    uid = int(context.args[0])
-    role = context.args[1].lower()
-    if role not in ("admin", "premium", "referral", "street", "banned"):
-        await update.message.reply_text("Роли: admin, premium, referral, street, banned")
-        return
-    db.get_or_create_user(uid)
-    db.set_role(uid, role)
-    if role == "admin":
-        ADMIN_IDS.add(uid)
-    await update.message.reply_text(f"Пользователь {uid} → {role}")
+    await update.effective_message.reply_text("Отправила в личку.")
 
 
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1437,102 +1763,19 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not users:
             await update.effective_message.reply_text("Пользователей нет.")
             return
-        role_emoji = {"admin": "👑", "premium": "⭐", "referral": "🔗", "street": "🚶", "banned": "🚫"}
         lines = []
         for u in users:
-            emoji = role_emoji.get(u["role"], "?")
-            name = u["full_name"] or u["username"] or str(u["telegram_id"])
-            verified = "✓" if u["verified"] else "✗"
-            lines.append(f"{emoji} {name} ({u['telegram_id']}) [{verified}]")
-        text = "Пользователи:\n\n" + "\n".join(lines)
-        for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
-            await update.effective_message.reply_text(chunk)
+            uid = u["telegram_id"]
+            emoji = "👑" if is_admin(uid) or u["role"] == "admin" else ("⭐" if u["role"] == "premium" else "🚶")
+            name = u["full_name"] or u["username"] or str(uid)
+            flags = " 🚫" if u.get("banned") else ""
+            lines.append(f"{emoji} {name} ({uid}){flags}")
+        text = "Пользователи (👑 админ, ⭐ проверенный, 🚶 непроверенный, 🚫 бан):\n\n" + "\n".join(lines)
+        await _reply_private(update, context, text)
     except Exception as e:
         await api_errors.reply_api_error(
             update.effective_message.reply_text, e, context_label="/users",
         )
-
-
-async def cmd_allow_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /allow_chat <id> [имя]")
-        return
-    cid = int(context.args[0])
-    name = " ".join(context.args[1:]) if len(context.args) > 1 else f"chat_{cid}"
-    db.add_allowed_chat(cid, name, update.effective_user.id, status="approved")
-    await update.message.reply_text(f"Чат {name} ({cid}) добавлен.")
-
-
-async def cmd_deny_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /deny_chat <id>")
-        return
-    cid = int(context.args[0])
-    db.remove_allowed_chat(cid)
-    await update.message.reply_text(f"Чат {cid} удалён.")
-
-
-async def cmd_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    try:
-        admins = db.list_users_by_role("admin")
-        premiums = db.list_users_by_role("premium")
-        referrals = db.list_users_by_role("referral")
-        streets = db.list_users_by_role("street")
-        banned = db.list_users_by_role("banned")
-        chats = db.get_allowed_chats()
-
-        def fmt(users):
-            if not users:
-                return "  пусто"
-            return "\n".join(f"  • {u['full_name'] or u['telegram_id']} ({u['telegram_id']})" for u in users)
-
-        text = (
-            f"Whitelist: {'ВКЛ' if WHITELIST_ENABLED else 'ВЫКЛ'}\n"
-            f"Капча: {'ВКЛ' if CAPTCHA_ENABLED else 'ВЫКЛ'}\n\n"
-            f"👑 Админы:\n{fmt(admins)}\n\n"
-            f"⭐ Премиум:\n{fmt(premiums)}\n\n"
-            f"🔗 По приглашению:\n{fmt(referrals)}\n\n"
-            f"🚶 С улицы:\n{fmt(streets)}\n\n"
-            f"🚫 Забанены:\n{fmt(banned)}\n\n"
-            f"Чаты: {len(chats)}"
-        )
-        sent_pm = False
-        if update.effective_user:
-            try:
-                await context.bot.send_message(chat_id=update.effective_user.id, text=text)
-                sent_pm = True
-            except Exception:
-                pass
-        if not sent_pm or update.effective_chat.id == update.effective_user.id:
-            await update.effective_message.reply_text(text)
-        elif update.effective_chat.id != update.effective_user.id:
-            await update.effective_message.reply_text("Отправила в личку.")
-    except Exception as e:
-        await api_errors.reply_api_error(
-            update.effective_message.reply_text, e, context_label="/whitelist",
-        )
-
-
-async def cmd_whitelist_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global WHITELIST_ENABLED
-    if not is_admin(update.effective_user.id):
-        return
-    WHITELIST_ENABLED = True
-    await update.message.reply_text("Белый список ВКЛЮЧЕН.")
-
-
-async def cmd_whitelist_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global WHITELIST_ENABLED
-    if not is_admin(update.effective_user.id):
-        return
-    WHITELIST_ENABLED = False
-    await update.message.reply_text("Белый список ВЫКЛЮЧЕН.")
 
 
 async def cmd_captcha_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1569,53 +1812,194 @@ async def cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chats = db.get_all_chats_for_status()
         users = db.list_all_users()
 
-        STATUS_ICON = {"approved": "✅", "pending": "⏳", "rejected": "❌"}
-        lines = ["Группы:"]
+        def eff_model(chat_id: int, saved: str | None, balance: float) -> str:
+            paid = is_admin(chat_id) or balance > db.PAID_MIN_BALANCE
+            model_id = (saved or MODELS[PAID_DEFAULT_MODEL_KEY]["id"]) if paid else DEFAULT_MODEL_ID
+            return model_meta(model_id)["label"]
+
+        lines = ["Группы (✅ проверена, ⏳ нет, 🚫 бан):"]
         for c in chats:
-            icon = STATUS_ICON.get(c["status"], "?")
+            icon = "✅" if c["status"] == "approved" else "⏳"
+            ban = "🚫" if c["banned"] else ""
             name = c["name"] or str(c["chat_id"])
-            model = model_meta(c["model"])["label"]
-            lines.append(f"  {icon} {name} ({c['chat_id']}) — {model}")
+            paid = c["balance"] > db.PAID_MIN_BALANCE
+            lines.append(
+                f"  {icon}{ban} {name} ({c['chat_id']}) — {eff_model(c['chat_id'], c['model'], c['balance'])}"
+                f" · {'paid' if paid else 'free'} {_money(max(c['balance'], 0))}"
+            )
         if not chats:
             lines.append("  нет чатов")
 
         lines.append("")
         lines.append("Пользователи:")
         for u in users:
-            name = u["full_name"] or u["username"] or str(u["telegram_id"])
-            model = model_meta(db.get_chat_model_db(u["telegram_id"]))["label"]
-            lines.append(f"  {u['role']:8} {name} ({u['telegram_id']}) — {model}")
+            uid = u["telegram_id"]
+            name = u["full_name"] or u["username"] or str(uid)
+            bal = db.get_balance(uid)
+            mark = "✅" if is_user_verified(uid, u) else "⏳"
+            ban = "🚫" if u.get("banned") else ""
+            model = eff_model(uid, db.get_chat_model_db(uid), bal)
+            lines.append(f"  {mark}{ban} {name} ({uid}) — {model} · {_money(bal)}")
 
-        text = "\n".join(lines)
-        sent_pm = False
-        if update.effective_user:
-            try:
-                await context.bot.send_message(chat_id=update.effective_user.id, text=text)
-                sent_pm = True
-            except Exception:
-                pass
-        if not sent_pm or update.effective_chat.id == update.effective_user.id:
-            for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
-                await update.effective_message.reply_text(chunk)
-        elif update.effective_chat.id != update.effective_user.id:
-            await update.effective_message.reply_text("Отправила в личку.")
+        await _reply_private(update, context, "\n".join(lines))
     except Exception as e:
         await api_errors.reply_api_error(
             update.effective_message.reply_text, e, context_label="/chats",
         )
 
 
-async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _parse_chat_arg(args: list[str]) -> int | None:
+    try:
+        return int(args[0])
+    except (IndexError, ValueError):
+        return None
+
+
+async def cmd_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/verify <id> — проверить группу (id < 0) или пользователя. Выдаёт стартовый бонус,
+    если его ещё не было. Только админ бота."""
     if not is_admin(update.effective_user.id):
         return
-    pending = db.get_pending_chats()
-    if not pending:
-        await update.message.reply_text("Нет чатов на одобрение.")
+    target = _parse_chat_arg(context.args)
+    if target is None:
+        await update.effective_message.reply_text("Использование: /verify <id> (группа — id с минусом)")
         return
-    lines = []
-    for c in pending:
-        lines.append(f"  {c['name'] or 'без имени'} ({c['chat_id']})\n  /approve_chat {c['chat_id']}  |  /reject_chat {c['chat_id']}")
-    await update.message.reply_text("Чаты на одобрение:\n\n" + "\n\n".join(lines))
+    before = chat_tier(target)
+    granted = verify_target(target, update.effective_user.id)
+    text = f"✅ {_chat_title(target)} ({target}) проверен(а)."
+    if granted:
+        text += f" Стартовый бонус ${_starter_bonus_amount(target):g} выдан."
+    text += f"\nБаланс: {_money(db.get_balance(target))}, режим: {_tier_label(target)}."
+    await update.effective_message.reply_text(text)
+    await _notice_tier_change(target, before)
+
+
+async def cmd_unverify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    target = _parse_chat_arg(context.args)
+    if target is None:
+        await update.effective_message.reply_text("Использование: /unverify <id> (группа — id с минусом)")
+        return
+    if not unverify_target(target):
+        await update.effective_message.reply_text(
+            "Админов бота не трогаю." if is_admin(target) else f"{target}: такого пользователя/группы нет в базе."
+        )
+        return
+    await update.effective_message.reply_text(
+        f"⏳ {_chat_title(target)} ({target}) больше не проверен(а). Баланс не тронут."
+    )
+
+
+async def _ban_unban(update: Update, context: ContextTypes.DEFAULT_TYPE, banned: bool):
+    if not is_admin(update.effective_user.id):
+        return
+    cmd = "ban" if banned else "unban"
+    reply = update.effective_message.reply_to_message
+    if context.args:
+        target = _parse_chat_arg(context.args)
+    elif reply and reply.from_user and not reply.from_user.is_bot:
+        target = reply.from_user.id
+    else:
+        target = None
+    if target is None:
+        await update.effective_message.reply_text(
+            f"Использование: /{cmd} <id> (группа — id с минусом) или ответом на сообщение участника"
+        )
+        return
+    if banned and is_admin(target):
+        await update.effective_message.reply_text("Админов бота банить нельзя.")
+        return
+    if target < 0:
+        db.ensure_group(target, None, update.effective_user.id)
+        ok = db.set_chat_banned(target, banned)
+    else:
+        db.get_or_create_user(target)
+        ok = db.set_user_banned(target, banned)
+    if not ok:
+        await update.effective_message.reply_text(f"Не нашла {target} в базе.")
+        return
+    what = "забанен(а): бот молчит" if banned else "разбанен(а)"
+    await update.effective_message.reply_text(
+        f"{'🚫' if banned else '🔓'} {_chat_title(target)} ({target}) {what}. Баланс и проверка не тронуты."
+    )
+
+
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _ban_unban(update, context, True)
+
+
+async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _ban_unban(update, context, False)
+
+
+TOPUP_USAGE = (
+    "Использование: /topup <chat_id> <сумма> [комментарий] [force]\n"
+    "Отрицательная сумма — корректировка (adjust). Для ID, которого нет в базе, нужен последний аргумент force."
+)
+
+
+async def cmd_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пополнение (или корректировка) баланса чата. Только админ бота. Пополнения от
+    VERIFY_MIN_TOPUP суммарно автоматически проверяют чат и выдают стартовый бонус."""
+    admin_id = update.effective_user.id
+    if not is_admin(admin_id):
+        return
+    if len(context.args) < 2:
+        await update.effective_message.reply_text(TOPUP_USAGE)
+        return
+    try:
+        cid = int(context.args[0])
+        amount = float(context.args[1].replace(",", "."))
+        if amount != amount or abs(amount) in (float("inf"), 0.0):
+            raise ValueError
+    except ValueError:
+        await update.effective_message.reply_text(TOPUP_USAGE)
+        return
+    rest = context.args[2:]
+    force = bool(rest) and rest[-1].lower() == "force"
+    note = " ".join(rest[:-1] if force else rest) or None
+    known = db.get_chat_row(cid) is not None if cid < 0 else db.get_user(cid) is not None
+    if not known and not force:
+        # Опечатка в ID иначе молча создала бы проверенный «фантом» с бонусом (авто-проверка от $5).
+        await update.effective_message.reply_text(
+            f"ID {cid} нет в базе — ничего не записала. Проверь ID; если так и надо: "
+            f"/topup {cid} {context.args[1]} force"
+        )
+        return
+    if not known:  # явный force: заводим непроверенную запись, чтобы следующие пополнения шли как обычные
+        if cid < 0:
+            db.ensure_group(cid, None, admin_id)
+        else:
+            db.get_or_create_user(cid)
+
+    before = chat_tier(cid)
+    kind = "topup" if amount > 0 else "adjust"
+    db.add_credit(cid, amount, kind, note, admin_id)
+    written_off = db.settle_negative_balance(cid) if amount < 0 else 0.0
+    bonus = False
+    verified_now = False
+    if amount > 0 and not is_chat_verified(cid) and db.topup_total(cid) >= VERIFY_MIN_TOPUP:
+        bonus = verify_target(cid, admin_id)
+        verified_now = True
+
+    lines = [f"💰 {_chat_title(cid)} ({cid}): {amount:+.2f}$ ({kind})"]
+    if not known:
+        lines.append("⚠️ ID не было в базе — запись создана по force.")
+    lines.append(f"Баланс: {_money(db.get_balance(cid))}")
+    lines.append(f"Режим: {_tier_label(cid)} · {'проверен' if is_chat_verified(cid) else 'не проверен'}")
+    if verified_now:
+        lines.append(f"Авто-проверка (пополнения ≥ ${VERIFY_MIN_TOPUP:g})"
+                     + (f", стартовый бонус ${_starter_bonus_amount(cid):g}." if bonus else "."))
+    if written_off:
+        lines.append(f"Корректировка больше баланса — списано в ноль ещё {_money(written_off)} (writeoff).")
+    await update.effective_message.reply_text("\n".join(lines))
+    await _notice_tier_change(cid, before)
+    if kind == "topup" and chat_tier(cid) == before:
+        # Тариф не сменился — «Платный режим включён» не придёт, а чат должен узнать о пополнении.
+        await _send_chat_notice(
+            cid, f"Ура, баланс пополнен на ${amount:.2f}! Теперь на счету {_money(db.get_balance(cid))}."
+        )
 
 
 async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1674,7 +2058,7 @@ async def _set_chat_review_enabled(update: Update, context: ContextTypes.DEFAULT
         return
     updated = db.set_chat_review_enabled(chat_id, enabled)
     if not updated:
-        await update.effective_message.reply_text("Этот чат ещё не известен боту (не одобрен) — попробуй позже.")
+        await update.effective_message.reply_text("Этот чат ещё не известен боту — напиши что-нибудь в чат и повтори.")
         return
     state = "ВКЛЮЧЁН" if enabled else "ВЫКЛЮЧЕН"
     await update.effective_message.reply_text(f"Ежедневный обзор чата {state}.")
@@ -1686,68 +2070,6 @@ async def cmd_review_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_review_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _set_chat_review_enabled(update, context, False)
-
-
-async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /approve <user_id>")
-        return
-    uid = int(context.args[0])
-    db.set_verified(uid, True)
-    user = db.get_user(uid)
-    name = user["full_name"] if user else str(uid)
-    await update.message.reply_text(f"✅ {name} ({uid}) допущен.")
-    try:
-        await context.bot.send_message(chat_id=uid, text="Админ одобрил тебя! Можешь общаться свободно.")
-    except Exception:
-        pass
-
-
-async def cmd_promote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /promote <user_id>")
-        return
-    uid = int(context.args[0])
-    user = db.get_or_create_user(uid)
-    db.set_role(uid, "referral")
-    name = user["full_name"] or user["username"] or str(uid)
-    await update.message.reply_text(f"🔗 {name} ({uid}) → referral")
-    try:
-        await context.bot.send_message(chat_id=uid, text="Хорошие новости! Админ открыл тебе доступ к поиску и другим функциям.")
-    except Exception:
-        pass
-
-
-async def cmd_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /premium <user_id>")
-        return
-    uid = int(context.args[0])
-    user = db.get_or_create_user(uid)
-    db.set_role(uid, "premium")
-    name = user["full_name"] or user["username"] or str(uid)
-    await update.message.reply_text(f"⭐ {name} ({uid}) → premium")
-    try:
-        await context.bot.send_message(chat_id=uid, text="Поздравляю! Тебе открыт полный доступ — поиск, картинки, без лимитов.")
-    except Exception:
-        pass
-
-
-async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /ban <user_id>")
-        return
-    uid = int(context.args[0])
-    db.set_role(uid, "banned")
-    await update.message.reply_text(f"🚫 {uid} забанен.")
 
 
 async def cmd_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1851,41 +2173,168 @@ async def cmd_ratelimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(f"{target_name}: не чаще раза в {minutes} мин. При превышении молчу.")
 
 
+def _usage_model_label(kind: str, model: str | None) -> str:
+    """Подпись «модели» строки usage_log: LLM — из реестра; картинки хранят ключ провайдера,
+    поиск — 'tavily'. Модель вне реестра показываем как есть (цена по дефолту, см. model_meta)."""
+    if kind == "llm":
+        return model_meta(model or "")["label"] if model in _MODELS_BY_ID else f"{model} (нет в реестре)"
+    if kind == "image":
+        return IMAGE_PROVIDERS.get(model, {}).get("label", model or "?")
+    return "Tavily" if model == "tavily" else (model or "?")
+
+
+def _sum_cost(rows: list[dict]) -> float:
+    return sum(r["cost"] for r in rows)
+
+
+def _cost_report(scope: int | None, viewer_id: int) -> str:
+    """Отчёт /cost. scope=None — все чаты (только админ бота), иначе один чат.
+    Основные суммы — только платное (billed=1), то, что списывалось с баланса."""
+    now = _berlin_now()
+    end = int(now.timestamp()) + 1
+    day0, wk0 = _day_start(now), _week_start(now)
+    prev0 = datetime.combine(wk0.date() - timedelta(days=7), dt_time(0, 0), tzinfo=BERLIN_TZ)
+    prev2 = datetime.combine(wk0.date() - timedelta(days=14), dt_time(0, 0), tzinfo=BERLIN_TZ)
+    ts = lambda d: int(d.timestamp())
+    kw = dict(chat_id=scope, billed=True)
+
+    today = db.usage_grouped(ts(day0), end, ("chat_type",), **kw)
+    week = db.usage_grouped(ts(wk0), end, ("kind", "chat_type"), **kw)
+    last_week = _sum_cost(db.usage_grouped(ts(prev0), ts(wk0), (), **kw))
+    prev_week = _sum_cost(db.usage_grouped(ts(prev2), ts(prev0), (), **kw))
+    rate = _sum_cost(db.usage_grouped(end - 7 * 86400, end, (), **kw)) / 7
+
+    balance = db.get_total_balance() if scope is None else db.get_balance(scope)
+    lines = []
+    bal_line = f"Баланс{' (сумма по чатам)' if scope is None else ''}: {_money(balance)}"
+    if balance > 0 and rate > 0:
+        bal_line += f" (≈ на {int(balance / rate)} дн. при темпе последних 7 дней)"
+    lines.append(bal_line)
+
+    if scope is not None:
+        is_group = scope < 0
+        lines.append(f"Режим: {_tier_label(scope)} · {'проверен' if is_chat_verified(scope) else 'не проверен'}")
+        quota = image_quota(scope, is_group, viewer_id)
+        if quota:
+            who = " (у тебя)" if is_group else ""
+            lines.append(f"картинок сегодня{who}: {quota[0]}/{quota[1]}")
+        if _limits_apply(viewer_id, scope, is_group):
+            msgs = db.daily_msgs_get(_berlin_day(), scope, viewer_id)
+            searches = db.usage_count("search", _day_start_ts(), scope)
+            who = " (у тебя)" if is_group else ""
+            lines.append(f"сообщений сегодня{who}: {msgs}/{_msg_limit(is_group)}, "
+                         f"поисков: {searches}/{UNVERIFIED_SEARCH_PER_DAY}")
+
+    today_total = _sum_cost(today)
+    if scope is None:
+        by_type = {r["chat_type"]: r["cost"] for r in today}
+        lines.append(f"Сегодня:        {_money(today_total)} "
+                     f"(группы {_money(by_type.get('group', 0))} / лички {_money(by_type.get('private', 0))})")
+    else:
+        lines.append(f"Сегодня:        {_money(today_total)}")
+    week_total = _sum_cost(week)
+    lines.append(f"Эта неделя:     {_money(week_total)}")
+    change = f" ({(last_week - prev_week) / prev_week * 100:+.0f}%)".replace("-", "−") if prev_week > 0 else ""
+    lines.append(f"Прошлая неделя: {_money(last_week)}{change}")
+
+    if scope is None:
+        by_chat: dict[int, dict] = {}
+        for r in db.usage_grouped(ts(wk0), end, ("chat_id", "kind", "model"), billed=True, chat_null=False):
+            c = by_chat.setdefault(r["chat_id"], {"total": 0.0, "models": {}})
+            c["total"] += r["cost"]
+            label = _usage_model_label(r["kind"], r["model"])
+            c["models"][label] = c["models"].get(label, 0.0) + r["cost"]
+        if by_chat:
+            lines.append("Топ чатов за неделю:")
+            for cid, c in sorted(by_chat.items(), key=lambda kv: -kv[1]["total"])[:5]:
+                shares = ", ".join(
+                    f"{name} {v / c['total'] * 100:.0f}%"
+                    for name, v in sorted(c["models"].items(), key=lambda kv: -kv[1])[:3] if v / c["total"] >= 0.005
+                )
+                lines.append(f"  {_chat_title(cid)} {_money(c['total'])} — {shares}")
+
+    by_kind: dict[str, float] = {}
+    for r in week:
+        by_kind[r["kind"]] = by_kind.get(r["kind"], 0.0) + r["cost"]
+    lines.append(
+        f"По видам за неделю: LLM {_money(by_kind.get('llm', 0))} · "
+        f"картинки {_money(by_kind.get('image', 0))} · поиск {_money(by_kind.get('search', 0))}"
+    )
+
+    if scope is None:  # только админ бота
+        free_cost = _sum_cost(db.usage_grouped(ts(wk0), end, (), billed=False, chat_null=False))
+        service = _sum_cost(db.usage_grouped(ts(wk0), end, (), chat_null=True))
+        writeoff = db.credits_sum("writeoff", ts(wk0), end)
+        lines.append("")
+        lines.append(f"Бесплатный режим (неделя): {_money(free_cost)}")
+        lines.append(f"Служебное, без чата (неделя): {_money(service)}")
+        lines.append(f"Списано writeoff (неделя): {_money(writeoff)}")
+    return "\n".join(lines)
+
+
+def _cost_detail(target: int) -> str:
+    """/cost <chat_id> (только админ): модели, метки и дни за последние 7 дней."""
+    now = _berlin_now()
+    end = int(now.timestamp()) + 1
+    start = datetime.combine(now.date() - timedelta(days=6), dt_time(0, 0), tzinfo=BERLIN_TZ)
+    ts = lambda d: int(d.timestamp())
+    lines = [
+        f"{_chat_title(target)} ({target}) — детализация за 7 дней",
+        f"Баланс: {_money(db.get_balance(target))} · {_tier_label(target)} · "
+        f"{'проверен' if is_chat_verified(target) else 'не проверен'}",
+    ]
+    for billed, title in ((True, "Платное (billed=1)"), (False, "Бесплатное (billed=0)")):
+        rows = db.usage_grouped(ts(start), end, ("kind", "model"), chat_id=target, billed=billed)
+        if not rows:
+            continue
+        lines.append("")
+        lines.append(f"{title}: {_money(_sum_cost(rows))}")
+        for r in sorted(rows, key=lambda r: -r["cost"]):
+            tokens = ""
+            if r["kind"] == "llm":
+                tokens = f", вх {r['input'] or 0:,} / вых {r['output'] or 0:,}"
+                if r["cache_write"] or r["cache_read"]:
+                    tokens += f", кэш зап {r['cache_write']:,} / чтен {r['cache_read']:,}"
+            lines.append(f"  {_usage_model_label(r['kind'], r['model'])}: {r['calls']} выз.{tokens} — {_money(r['cost'])}")
+        labels = db.usage_grouped(ts(start), end, ("label",), chat_id=target, billed=billed)
+        lines.append("  по меткам: " + " · ".join(
+            f"{r['label']} {_money(r['cost'])}" for r in sorted(labels, key=lambda r: -r["cost"])[:8]))
+    lines.append("")
+    lines.append("По дням (платное / бесплатное):")
+    for i in range(7):
+        d0 = datetime.combine(start.date() + timedelta(days=i), dt_time(0, 0), tzinfo=BERLIN_TZ)
+        d1 = datetime.combine(start.date() + timedelta(days=i + 1), dt_time(0, 0), tzinfo=BERLIN_TZ)
+        paid = _sum_cost(db.usage_grouped(ts(d0), ts(d1), (), chat_id=target, billed=True))
+        free = _sum_cost(db.usage_grouped(ts(d0), ts(d1), (), chat_id=target, billed=False))
+        lines.append(f"  {d0.strftime('%d.%m')}: {_money(paid)} / {_money(free)}")
+    return "\n".join(lines)
+
+
 async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
+    """Права: админ бота в личке — все чаты; чат-админ в группе — только этот чат; обычный
+    пользователь в личке — только его личка; всем остальным — молчание. Работает в любом тарифе."""
+    user_id = update.effective_user.id
+    chat = update.effective_chat
+    admin = is_admin(user_id)
+    is_group = chat.type in ("group", "supergroup")
     try:
-        if not token_usage:
-            await update.effective_message.reply_text("Токенов пока нет (счётчик сбрасывается при рестарте).")
-            return
-        lines = ["Токены по моделям:"]
-        grand_total = 0.0
-        for model, usage in sorted(token_usage.items()):
-            inp = usage["input"]
-            out = usage["output"]
-            cache_write = usage.get("cache_write", 0)
-            cache_read = usage.get("cache_read", 0)
-            meta = model_meta(model)
-            price_in, price_out = meta["in"], meta["out"]
-            # cache_write/cache_read — см. CACHE_WRITE_MULTIPLIER: без них цифра занижена
-            # на порядки на большом system-prompt'е, не на проценты (найдено 2026-08-31).
-            # cache_read_mult — из реестра, не общая константа: у Fable 5.1/Mythos 0.025x
-            # вместо стандартных 0.1x у всех остальных моделей.
-            cache_read_mult = meta.get("cache_read_mult", CACHE_READ_MULTIPLIER)
-            cost = (
-                (inp / 1_000_000 * price_in)
-                + (cache_write / 1_000_000 * price_in * CACHE_WRITE_MULTIPLIER)
-                + (cache_read / 1_000_000 * price_in * cache_read_mult)
-                + (out / 1_000_000 * price_out)
-            )
-            grand_total += cost
-            # Модель вне реестра считается по дефолтным ценам — говорим об этом прямо,
-            # иначе цифра выглядит точной, не будучи ею.
-            name = meta["label"] if model in _MODELS_BY_ID else f"{model} (нет в реестре, цена по {meta['label']})"
-            cache_part = f", кэш зап {cache_write:,} / чтен {cache_read:,}" if (cache_write or cache_read) else ""
-            lines.append(f"  {name}: вх {inp:,} / вых {out:,}{cache_part} — ~${cost:.4f}")
-        lines.append(f"Итого: ~${grand_total:.4f}")
-        await update.effective_message.reply_text("\n".join(lines))
+        if context.args:
+            if not admin:
+                return
+            target = _parse_chat_arg(context.args)
+            if target is None:
+                await update.effective_message.reply_text("Использование: /cost [chat_id]")
+                return
+            text = await asyncio.to_thread(_cost_detail, target)
+        else:
+            if is_group:
+                if not await is_chat_admin(context, chat.id, user_id):
+                    return
+                scope = chat.id
+            else:
+                scope = None if admin else user_id
+            text = await asyncio.to_thread(_cost_report, scope, user_id)
+        await update.effective_message.reply_text(text)
     except Exception as e:
         await api_errors.reply_api_error(
             update.effective_message.reply_text, e, context_label="/cost",
@@ -1925,44 +2374,81 @@ async def _probe_model(context, chat_id: int, model_id: str) -> None:
     )
 
 
+# Ожидание подтверждения /fable: chat_id → время первой команды (в памяти, сбрасывается
+# рестартом — цена ошибки нулевая, просто надо повторить).
+_fable_pending: dict[int, float] = {}
+
+
+def _parse_target_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str) -> tuple[int | None, str | None]:
+    """(chat_id, ошибка). Без аргумента — текущий чат, с аргументом — чужой, ТОЛЬКО админу:
+    иначе любой участник менял бы настройки чужого чата, зная только его ID."""
+    if not context.args:
+        return update.effective_chat.id, None
+    if not is_admin(update.effective_user.id):
+        return None, ("Менять настройки другого чата может только админ. "
+                      "Без аргумента команда переключит текущий чат.")
+    try:
+        return int(context.args[0]), None
+    except ValueError:
+        return None, f"ID чата — это число (обычно с минусом). Формат: /{cmd} -1001234567890"
+
+
 async def _set_chat_model(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str):
-    """Переключение модели чата. key — ключ реестра MODELS, не API-строка."""
+    """Переключение модели чата. key — ключ реестра MODELS, не API-строка.
+
+    Гейтинг: не-Haiku модели — «админ ИЛИ платный режим». В free запись chat_models не
+    меняем вовсе (get_chat_model и так отдаёт Haiku) — прошлый платный выбор дождётся
+    возвращения в paid."""
     meta = MODELS[key]
-    user_id = update.effective_user.id
-    admin = is_admin(user_id)
-
-    # Гейтинг по роли: дорогие модели — только админам, и с объяснением, а не молчанием.
-    if meta["admin_only"] and not admin:
-        await update.effective_message.reply_text(
-            f"{meta['label']} — только для админов, она дорогая "
-            f"(${meta['in']:.0f}/${meta['out']:.0f} за миллион токенов). "
-            f"Доступны /haiku и /sonnet, список — /models."
-        )
+    admin = is_admin(update.effective_user.id)
+    chat_id, err = _parse_target_chat(update, context, key)
+    if err:
+        await update.effective_message.reply_text(err)
         return
+    tier = chat_tier(chat_id)
 
-    # Аргумент = чужой чат. Без этой проверки любой участник переключал бы модель
-    # в чужом чате, зная только его ID.
-    if context.args:
-        if not admin:
+    if tier == "free" and not admin:
+        if key == DEFAULT_MODEL_KEY:
             await update.effective_message.reply_text(
-                "Менять модель в другом чате может только админ. "
-                "Без аргумента команда переключит текущий чат."
-            )
-            return
-        try:
-            chat_id = int(context.args[0])
-        except ValueError:
+                f"Сейчас бесплатный режим — {meta['label']} и так включён. Баланс — /cost")
+        else:
             await update.effective_message.reply_text(
-                f"ID чата — это число (обычно с минусом). Формат: /{key} -1001234567890"
+                f"{meta['label']} — доступно в платном режиме "
+                f"(${meta['in']:g}/${meta['out']:g} за миллион токенов). "
+                f"Баланс — /cost, пополнить — {ADMIN_CONTACT}."
             )
-            return
-    else:
-        chat_id = update.effective_chat.id
+        return
 
     known, label = _chat_display(update, chat_id)
     # Чат мог ещё не попасть в allowed_chats — предупреждаем, но запись разрешаем.
     warn = "" if known or not context.args else \
         "\n⚠️ Такого чата нет среди разрешённых — записала, но проверь ID."
+    if tier == "free":  # сюда попадает только админ
+        warn += "\nℹ️ Чат в бесплатном режиме: выбор сохранён, включится после пополнения."
+
+    if key == "fable" and tier == "paid":
+        current = get_chat_model(chat_id)
+        if current == meta["id"]:
+            await update.effective_message.reply_text(f"{label}: уже на {meta['label']}.")
+            return
+        started = _fable_pending.get(chat_id)
+        if started is None or time.time() - started > FABLE_CONFIRM_WINDOW:
+            _fable_pending[chat_id] = time.time()
+            ratio = meta["out"] / model_meta(current)["out"]
+            again = f"/fable {chat_id}" if context.args else "/fable"
+            await update.effective_message.reply_text(
+                f"<b>Внимание: {meta['label']} примерно в {ratio:g} раз дороже текущей модели. "
+                f"Баланс будет расходоваться в {ratio:g} раз быстрее. Точно переключить?</b>\n"
+                f"Повтори {again} в течение {FABLE_CONFIRM_WINDOW // 60} минут для подтверждения.",
+                parse_mode="HTML",
+            )
+            return
+
+    if tier == "free":
+        # Админ пишет выбор в чужой free-чат без пробы: get_chat_model в free всё равно Haiku.
+        db.set_chat_model_db(chat_id, meta["id"])
+        await update.effective_message.reply_text(f"{label} → {meta['label']}.{warn}")
+        return
 
     try:
         await _probe_model(context, update.effective_chat.id, meta["id"])
@@ -1974,6 +2460,7 @@ async def _set_chat_model(update: Update, context: ContextTypes.DEFAULT_TYPE, ke
         return
 
     db.set_chat_model_db(chat_id, meta["id"])
+    _fable_pending.pop(chat_id, None)
     await update.effective_message.reply_text(f"{label} → {meta['label']}.{warn}")
 
 
@@ -2008,20 +2495,26 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text("ID чата — это число. Формат: /models -1001234567890")
             return
 
-    current = db.get_chat_model_db(chat_id)
+    current = get_chat_model(chat_id)
+    tier = chat_tier(chat_id)
     _, label = _chat_display(update, chat_id)
-    lines = [f"Модель для {label}: {model_meta(current)['label']}", "", "Доступно:"]
+    lines = [f"Модель для {label}: {model_meta(current)['label']}",
+             f"Режим: {_tier_label(chat_id)}", "", "Модели:"]
     for key, meta in MODELS.items():
-        if meta["admin_only"] and not admin:
-            continue
         mark = "▸" if meta["id"] == current else " "
         window = f"{meta['context'] // 1000}k" if meta["context"] < 1_000_000 else "1M"
-        tail = "  (только админ)" if meta["admin_only"] else ""
+        tail = "  (платный режим)" if key != DEFAULT_MODEL_KEY and tier == "free" else ""
         lines.append(
             f"{mark} /{key:6} {meta['label']:10} ${meta['in']:g}/${meta['out']:g} за MTok, окно {window}{tail}"
         )
     lines.append("")
-    lines.append("Цены — прайс Anthropic за миллион токенов (вход/выход), у прокси дешевле.")
+    lines.append("Цены — прайс Anthropic за миллион токенов (вход/выход).")
+    if tier == "free":
+        lines.append("В бесплатном режиме работает только Haiku; остальные — после пополнения баланса (/cost).")
+        saved = db.get_chat_model_db(chat_id)
+        if saved and saved != DEFAULT_MODEL_ID:
+            lines.append(f"Прошлый выбор ({model_meta(saved)['label']}) вернётся в платном режиме.")
+    lines.append("/fable просит подтверждения: она в разы дороже остальных.")
     if admin:
         lines.append("Переключить чужой чат: /sonnet <chat_id>")
     await update.effective_message.reply_text("\n".join(lines))
@@ -2034,30 +2527,32 @@ async def _set_image_provider(update: Update, context: ContextTypes.DEFAULT_TYPE
     картинки стоит реальных денег и десятки секунд (а не max_tokens=1 на "hi"). Ошибка
     провайдера всплывёт при первой настоящей генерации — оба пути (/imagine, «нарисуй»)
     уже умеют честно сообщать о недоступности.
+
+    В free (кроме админа) переключать нечего: рисуем только через GPT, запись
+    chat_image_provider не меняем — прошлый платный выбор восстановится в paid.
     """
     meta = IMAGE_PROVIDERS[key]
     admin = is_admin(update.effective_user.id)
+    chat_id, err = _parse_target_chat(update, context, key)
+    if err:
+        await update.effective_message.reply_text(err)
+        return
+    tier = chat_tier(chat_id)
 
-    if context.args:
-        if not admin:
+    if tier == "free" and not admin:
+        if key == FREE_IMAGE_PROVIDER:
             await update.effective_message.reply_text(
-                "Менять провайдера картинок в другом чате может только админ. "
-                "Без аргумента команда переключит текущий чат."
-            )
-            return
-        try:
-            chat_id = int(context.args[0])
-        except ValueError:
+                f"Сейчас бесплатный режим — рисую через {meta['label']} (лимит картинок в сутки). Баланс — /cost")
+        else:
             await update.effective_message.reply_text(
-                f"ID чата — это число (обычно с минусом). Формат: /{key} -1001234567890"
-            )
-            return
-    else:
-        chat_id = update.effective_chat.id
+                f"{meta['label']} — доступно в платном режиме. Баланс — /cost, пополнить — {ADMIN_CONTACT}.")
+        return
 
     known, label = _chat_display(update, chat_id)
     warn = "" if known or not context.args else \
         "\n⚠️ Такого чата нет среди разрешённых — записала, но проверь ID."
+    if tier == "free":  # только админ
+        warn += "\nℹ️ Чат в бесплатном режиме: выбор сохранён, но пока рисуем через GPT."
 
     db.set_chat_image_provider_db(chat_id, key)
     await update.effective_message.reply_text(f"{label}: рисуем через {meta['label']}.{warn}")
@@ -2086,14 +2581,20 @@ async def cmd_imagemodels(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     current = get_chat_image_provider(chat_id)
+    tier = chat_tier(chat_id)
     _, label = _chat_display(update, chat_id)
-    lines = [f"Провайдер картинок для {label}: {IMAGE_PROVIDERS[current]['label']}", "", "Доступно:"]
+    lines = [f"Провайдер картинок для {label}: {IMAGE_PROVIDERS[current]['label']}",
+             f"Режим: {_tier_label(chat_id)}", "", "Доступно:"]
     for key, meta in IMAGE_PROVIDERS.items():
         mark = "▸" if key == current else " "
-        lines.append(f"{mark} /{key:8} {meta['label']}")
+        tail = "  (платный режим)" if key != FREE_IMAGE_PROVIDER and tier == "free" else ""
+        lines.append(f"{mark} /{key:8} {meta['label']} — ~${IMAGE_PRICES[key] * PRICE_MARKUP:g} за картинку{tail}")
     lines.append("")
-    lines.append("banana — напрямую в Google, общий баланс пула не трогает.")
-    lines.append("gpt — через пул api.apitoken.sale, тратит общий баланс (тот же, что и Claude).")
+    if tier == "free":
+        lines.append("В бесплатном режиме — только GPT Image 2 и лимит картинок в сутки "
+                     f"(личка {FREE_IMAGES_PRIVATE_PER_DAY}, группа {FREE_IMAGES_GROUP_PER_USER_PER_DAY} на участника).")
+    else:
+        lines.append("Платный режим: без дневного лимита картинок; стоимость списывается с баланса (/cost).")
     if admin:
         lines.append("Переключить чужой чат: /gptimage <chat_id>")
     await update.effective_message.reply_text("\n".join(lines))
@@ -2103,75 +2604,70 @@ async def cmd_imagemodels(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 USER_HELP = """\
 Команды:
-  /start         — начало работы, реферальная ссылка
+  /start         — начало работы
   /help          — этот список
   /clear         — очистить историю диалога
   /memory        — что бот помнит о тебе
   /forget        — забыть всё о тебе
-  /id            — показать Telegram ID и роль
+  /id            — показать Telegram ID и статус
   /version       — версия бота
-  /search <q>    — веб-поиск (referral+)
-  /imagine <q>   — генерация изображения (referral+)
-  /models        — какие модели доступны и что сейчас у чата
-  /haiku         — переключить чат на Haiku 4.5 (дёшево и быстро)
-  /sonnet        — переключить чат на Sonnet 5 (умнее, дороже)
+  /cost          — баланс, режим и расход (в группе — для админов группы)
+  /search <q>    — веб-поиск
+  /imagine <q>   — генерация изображения
+  /models        — модели, режим (платный/бесплатный) и что сейчас у чата
+  /haiku         — Haiku 4.5 (дёшево и быстро; единственная в бесплатном режиме)
+  /sonnet        — Sonnet 5 (платный режим)
+  /opus          — Opus 5 (платный режим)
+  /fable         — Fable 5.1 (платный режим, просит подтверждения — очень дорогая)
   /imagemodels   — какой провайдер картинок сейчас у чата
-  /banana        — рисовать через Nano Banana 2
-  /gptimage      — рисовать через GPT Image 2 (дефолт)
+  /banana        — рисовать через Nano Banana 2 (платный режим)
+  /gptimage      — рисовать через GPT Image 2 (единственный в бесплатном режиме)
   /ratelimit     — в группах: ограничить частоту сообщений участника (для админов группы)
-  /review_on     — в группах: включить ежедневный авто-обзор чата (для админов группы)
+  /review_on     — в группах: включить ежедневный авто-обзор чата (платный режим, для админов группы)
   /review_off    — в группах: выключить ежедневный авто-обзор чата (для админов группы)\
 """
 
 ADMIN_HELP = """\
-Пользователи:
-  /users                   — все пользователи
-  /role <id> <роль>        — изменить роль (admin/premium/referral/street/banned)
-  /promote <id>            — → referral
-  /premium <id>            — → premium
-  /ban <id>                — забанить
-  /approve <id>            — вручную допустить (set verified)
+Доступ и баланс:
+  /topup <id> <сумма> [коммент] [force] — пополнить баланс ($); отрицательная = корректировка; ID вне базы — только с force.
+                           От $5 суммарных пополнений чат проверяется автоматически
+  /verify <id>             — проверить группу (id с минусом) или пользователя + стартовый бонус
+  /unverify <id>           — снять проверку (баланс не трогается)
+  /ban <id>                — бан (id < 0 — группа; в группе можно ответом на сообщение)
+  /unban <id>              — разбан. Бан не трогает баланс и проверку
+  /cost                    — в личке: расход по ВСЕМ чатам (+ бесплатный режим, служебное, writeoff)
+  /cost <chat_id>          — детализация чата за 7 дней: модели, метки, дни
 
-Чаты:
-  /chats                   — группы (статус+модель) + пользователи
-  /pending                 — чаты на одобрение
-  /approve_chat <id>       — одобрить чат
-  /reject_chat <id>        — отклонить и выйти
-  /allow_chat <id> [имя]   — добавить чат вручную
-  /deny_chat <id>          — удалить чат
+Пользователи и чаты:
+  /users                   — все пользователи
+  /chats                   — группы и пользователи: проверка, бан, модель, баланс
 
 Модели (без аргумента — текущий чат; с chat_id — любой, только админу):
   /models [chat_id]        — список моделей, цены, окно; ▸ = текущая
-  /haiku [chat_id]         — Haiku 4.5 — $1/$5, окно 200k (дефолт)
-  /sonnet [chat_id]        — Sonnet 5 — $2/$10, окно 1M
-  /opus [chat_id]          — Opus 5 — $5/$25, окно 1M (только админ)
-  /fable [chat_id]         — Fable 5.1 — $10/$50, окно 1M (только админ)
+  /haiku [chat_id]         — Haiku 4.5 — $1/$5, окно 200k (бесплатный режим)
+  /sonnet [chat_id]        — Sonnet 5 — $2/$10, окно 1M (дефолт платного режима)
+  /opus [chat_id]          — Opus 5 — $5/$25, окно 1M
+  /fable [chat_id]         — Fable 5.1 — $10/$50, окно 1M (повтор в течение 2 минут = подтверждение)
   chat_id — число с минусом, например: /opus -1001109809707
-  Выбор постоянный: пишется в chat_models и переживает рестарт.
-  Перед записью бот делает пробный запрос — нерабочая модель не сохранится.
+  Не-Haiku модели — админу или чату в платном режиме. Выбор постоянный (chat_models),
+  в бесплатном режиме не применяется, но и не стирается. Перед записью — пробный запрос.
 
 Провайдер картинок (без аргумента — текущий чат; с chat_id — любой, только админу):
   /imagemodels [chat_id]   — текущий провайдер картинок чата
-  /banana [chat_id]        — Nano Banana 2 — прямой Google API, баланс пула не трогает
-  /gptimage [chat_id]      — GPT Image 2 — через пул api.apitoken.sale, тратит общий баланс (дефолт)
-  Доступно всем, кому доступно рисование (referral+), без гейтинга по цене.
-  В отличие от /haiku и т.п. — без пробного запроса перед записью (генерация картинки
-  стоит реальных денег и десятки секунд): ошибка провайдера всплывёт при первом рисовании.
+  /banana [chat_id]        — Nano Banana 2 (~$0.067, дефолт платного режима)
+  /gptimage [chat_id]      — GPT Image 2 (~$0.02; в бесплатном режиме единственный)
+  Без пробного запроса (генерация стоит денег): ошибка провайдера всплывёт при рисовании.
 
 Прочее:
-  /whitelist               — показать белые списки
-  /whitelist_on/off        — включить/выключить белый список
   /captcha_on/off          — включить/выключить капчу
   /captcha_unban <id>      — разбанить после капчи
   /activity [0-100]        — вероятность авто-реплаев в группе (%)
   /ratelimit               — лимит частоты сообщений участника в группе (доступно и админам группы,
                               не только боту-админу); ответом на сообщение: <N мин.>|off,
                               без ответа: <user_id> <N|off>, без аргументов — список, "off" — сброс всем
-  /cost                    — расход токенов по моделям
   /review                  — AI-обзор чата прямо сейчас
   /review_on / /review_off — вкл/выкл ЕЖЕДНЕВНЫЙ авто-обзор этого чата (доступно и админам
-                              группы, не только боту-админу; /review — разовый, admin-only)
-  /migrate                 — миграция JSON → SQLite
+                              группы; /review — разовый, admin-only)
   /update                  — git pull + рестарт контейнера\
 """
 
@@ -2189,37 +2685,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.effective_user.username
     full_name = update.effective_user.full_name
 
-    referral_role = None
-    if context.args and context.args[0].startswith("ref_"):
-        ref_code = context.args[0][4:]
-        referrer = db.get_user_by_referral(ref_code)
-        if referrer and can_invite(referrer):
-            referral_role = "referral"
-            user = db.get_or_create_user(user_id, username, full_name)
-            if user["role"] == "street":
-                db.set_role(user_id, "referral")
-                conn = db.get_conn()
-                conn.execute("UPDATE users SET referred_by = ? WHERE telegram_id = ?", (referrer["telegram_id"], user_id))
-                conn.commit()
-                conn.close()
-
     user = db.get_or_create_user(user_id, username, full_name)
 
-    if user["role"] == "banned":
+    if user.get("banned"):
         return
 
-    if needs_captcha(user):
-        if CAPTCHA_ENABLED:
-            try:
-                question = await call_claude_aux(generate_captcha_question, "hello", label="captcha_gen")
-                captcha_state[str(user_id)] = {"question": question, "attempts": 0}
-                await update.message.reply_text(f"Привет! Для начала ответь на вопрос:\n\n{question}")
-            except Exception as e:
-                logger.error(f"Captcha error: {e}")
+    # Капча (если включена) — единственное, что может задержать ответ; иначе бот отвечает
+    # всем, кроме забаненных (ТЗ v0.10).
+    if CAPTCHA_ENABLED and needs_captcha(user):
+        try:
+            question = await call_claude_aux(generate_captcha_question, "hello", label="captcha_gen")
+            captcha_state[str(user_id)] = {"question": question, "attempts": 0}
+            await update.message.reply_text(f"Привет! Для начала ответь на вопрос:\n\n{question}")
+        except Exception as e:
+            logger.error(f"Captcha error: {e}")
         return
-
-    ref_code = db.get_referral_code(user_id)
-    ref_link = f"https://t.me/{bot_username}?start=ref_{ref_code}" if ref_code else ""
 
     text = (
         "Привет! Я Клодушка — Claude через Telegram.\n\n"
@@ -2227,31 +2707,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/memory — что я о тебе помню\n"
         "/forget — забыть всё о тебе\n"
         "/search — поиск в интернете\n"
+        "/cost — баланс и расход\n"
         "/id — показать Telegram ID\n"
+        "/help — все команды\n"
     )
-
-    if can_invite(user):
-        text += f"\n📨 Твоя реферальная ссылка:\n{ref_link}\n"
 
     if is_admin(user_id):
         text += (
-            "\nАдмин-команды:\n"
-            "/users — список пользователей\n"
-            "/role <id> <role> — изменить роль\n"
-            "/whitelist — показать списки\n"
-            "/whitelist_on /whitelist_off\n"
-            "/captcha_on /captcha_off\n"
-            "/captcha_unban <id>\n"
-            "/allow_chat <id> [имя]\n"
-            "/deny_chat <id>\n"
-            "/cost — расход токенов\n"
-            "/promote <id> — дать referral\n"
-            "/premium <id> — дать premium\n"
-            "/migrate — миграция из JSON\n"
+            "\nАдмин-команды — в /help (/topup, /verify, /ban, /chats, /cost)\n"
         )
-
-    if referral_role:
-        text = "Ты пришёл по приглашению! Добро пожаловать.\n\n" + text
 
     await update.message.reply_text(text)
 
@@ -2282,7 +2746,7 @@ async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_or_create_user(
         user_id, update.effective_user.username, update.effective_user.full_name
     )
-    if user["role"] == "banned":
+    if user.get("banned"):
         return
  
     version = await _get_version()
@@ -2410,9 +2874,7 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user = db.get_or_create_user(user_id, update.effective_user.username, update.effective_user.full_name)
-    if user["role"] == "banned":
-        return
+    db.get_or_create_user(user_id, update.effective_user.username, update.effective_user.full_name)
     is_group = update.effective_chat.type in ("group", "supergroup")
     # /search и /imagine — отдельные CommandHandler'ы, а не текстовая ветка handle_message,
     # поэтому /ratelimit туда не долетал бы без явной проверки здесь — а это самые дорогие
@@ -2424,6 +2886,8 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     prompt = " ".join(context.args)
     chat_id = update.effective_chat.id
+    if await _image_limit_blocked(update, chat_id, is_group, user_id):
+        return
     msg = await update.message.reply_text("Рисую... это может занять пару минут.")
 
     stop_event = asyncio.Event()
@@ -2452,19 +2916,23 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user = db.get_or_create_user(user_id, update.effective_user.username, update.effective_user.full_name)
-    if not can_search(user):
-        await update.message.reply_text("Поиск доступен по приглашению. Попроси ссылку у друга!")
-        return
+    db.get_or_create_user(user_id, update.effective_user.username, update.effective_user.full_name)
     is_group = update.effective_chat.type in ("group", "supergroup")
     if is_group and not db.check_group_rate_limit(update.effective_chat.id, user_id):
         return
     if not context.args:
         await update.message.reply_text("Использование: /search <запрос>")
         return
+    if not _search_allowed(user_id, update.effective_chat.id, is_group):
+        # Явная команда — не «молча», как автопоиск: иначе она выглядит сломанной.
+        await update.message.reply_text(
+            f"Дневной лимит поиска для непроверенных исчерпан ({UNVERIFIED_SEARCH_PER_DAY}), сброс в 00:00. "
+            f"Снять лимиты навсегда: пополнить баланс от ${VERIFY_MIN_TOPUP:g} или написать {ADMIN_CONTACT}."
+        )
+        return
     query = " ".join(context.args)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    results = web_search(query)
+    results = await call_claude_aux(web_search, query, label="web_search")
     if not results:
         await update.message.reply_text("Ничего не нашёл.")
         return
@@ -2543,30 +3011,34 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     cid = update.effective_chat.id
-    user = db.get_user(uid)
-    role = user["role"] if user else "unknown"
-    await update.message.reply_text(f"User ID: {uid}\nChat ID: {cid}\nРоль: {role}")
-
-
-async def cmd_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    db.migrate_from_json("/app/allowed.json", DATA_DIR)
-    db.get_or_create_user(592441, full_name="Aleksei")
-    db.set_role(592441, "admin")
-    await update.message.reply_text("Миграция завершена.")
+    status = "проверенный" if is_user_verified(uid) else "непроверенный"
+    await update.message.reply_text(
+        f"User ID: {uid}\nChat ID: {cid}\nСтатус: {status}\nРежим чата: {_tier_label(cid)}"
+    )
 
 
 # --- Main message handler ---
+
+_known_groups: set[int] = set()  # группы, уже занесённые в allowed_chats в этом процессе
+
+
+async def _notify_new_group(chat_id: int, title: str, adder: str | None) -> None:
+    lines = ["🆕 Меня добавили в чат!", "", f"Чат: {title}", f"ID: {chat_id}"]
+    if adder:
+        lines.append(f"Добавил: {adder}")
+    row = db.get_chat_row(chat_id)
+    status = "проверена" if row and row["status"] == "approved" else "не проверена (лимиты непроверенных, бонуса нет)"
+    lines += ["", f"Статус: {status}", f"Проверить: /verify {chat_id}", f"Забанить: /ban {chat_id}"]
+    await notify_admins("\n".join(lines))
+
 
 async def handle_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.my_chat_member:
         chat = update.my_chat_member.chat
         # Telegram шлёт my_chat_member и в личке — когда пользователь запускает или
         # разблокирует бота, это моделируется тем же переходом статуса, что добавление
-        # в группу. Без этой проверки /start в личке уходил на одобрение как новый
-        # групповой чат (найдено на стенде 2026-09-19: "🆕 Меня добавили в чат! Чат:
-        # Без названия, ID: <user_id>"). "Меня удалили" для личных чатов тоже не нужно
+        # в группу. Без этой проверки /start в личке уходил бы как новый групповой чат
+        # (найдено на стенде 2026-09-19). "Меня удалили" для личных чатов тоже не нужно
         # — там это означает, что пользователь заблокировал бота, чистый шум админу.
         if chat.type not in ("group", "supergroup"):
             return
@@ -2576,28 +3048,17 @@ async def handle_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if new_status in ("member", "administrator"):
             chat_id = chat.id
             chat_title = chat.title or "Без названия"
-            adder_name = added_by.full_name or added_by.username or str(added_by.id)
-            for admin_id in ADMIN_IDS:
-                try:
-                    db.add_allowed_chat(chat_id, chat_title, added_by.id, status="pending")
-                    await context.bot.send_message(
-                        chat_id=admin_id,
-                        text=(
-                            f"🆕 Меня добавили в чат!\n\n"
-                            f"Чат: {chat_title}\nID: {chat_id}\nДобавил: {adder_name} ({added_by.id})\n\n"
-                            f"Подтвердить: /approve_chat {chat_id}\nОтклонить: /reject_chat {chat_id}"
-                        )
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to notify admin {admin_id}: {e}")
+            adder_name = f"{added_by.full_name or added_by.username or added_by.id} ({added_by.id})"
+            # Незнакомая группа — сразу pending и работаем (ТЗ v0.10: ответ всем, кроме banned).
+            # ensure_group НЕ перезаписывает строку: повторное добавление не сбрасывает
+            # approved/banned (раньше тут был INSERT OR REPLACE).
+            db.ensure_group(chat_id, chat_title, added_by.id)
+            _known_groups.add(chat_id)
+            await _notify_new_group(chat_id, chat_title, adder_name)
 
         elif new_status in ("left", "kicked"):
             chat_title = chat.title or "Без названия"
-            for admin_id in ADMIN_IDS:
-                try:
-                    await context.bot.send_message(chat_id=admin_id, text=f"👋 Меня удалили из чата: {chat_title} ({chat.id})")
-                except Exception as e:
-                    logger.error(f"Failed to notify admin: {e}")
+            await notify_admins(f"👋 Меня удалили из чата: {chat_title} ({chat.id})")
 
 
 async def handle_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2608,7 +3069,8 @@ async def handle_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
     new_status = result.new_chat_member.status
     if old_status in ("left", "kicked") and new_status == "member":
         chat_id = result.chat.id
-        if not db.is_chat_allowed(chat_id):
+        # Приветствие — незапрошенный расход: только проверенным или платным группам.
+        if db.is_chat_banned(chat_id) or not (db.is_group_verified(chat_id) or chat_tier(chat_id) == "paid"):
             return
         user = result.new_chat_member.user
         if user.is_bot:
@@ -2617,44 +3079,35 @@ async def handle_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         _spawn_background_task(greet_new_member(chat_id, user.id, user_name, context.bot))
 
 
-async def cmd_approve_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /approve_chat <chat_id>")
-        return
-    chat_id = int(context.args[0])
-    if not db.set_chat_status(chat_id, "approved", update.effective_user.id):
-        await update.message.reply_text(
-            f"Чата {chat_id} нет в базе — /approve_chat одобряет ТОЛЬКО уже известный "
-            f"боту чат (из /pending). Чтобы добавить новый чат с нуля — используй /allow_chat {chat_id} [имя]."
-        )
-        return
-    chats = db.get_allowed_chats()
-    chat_name = next((c["name"] for c in chats if c["chat_id"] == chat_id), f"chat_{chat_id}")
-    await update.message.reply_text(f"✅ Чат {chat_name} ({chat_id}) одобрен.")
-    try:
-        await context.bot.send_message(chat_id=chat_id, text="Админ подтвердил мой доступ. Готова к работе! 🤖")
-    except Exception:
-        pass
+async def gate_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Первый хендлер (group=-1) на КАЖДЫЙ апдейт: выставляет usage_ctx, регистрирует
+    неизвестную группу и режет забаненных.
 
+    usage_ctx выставляется ВСЕГДА, в т.ч. в None для апдейтов без чата: PTB обрабатывает
+    апдейты последовательно в одном task'е, и контекст предыдущего чата иначе протёк бы.
+    Бан режем только для апдейтов с сообщением: my_chat_member/chat_member — служебные."""
+    chat, user = update.effective_chat, update.effective_user
+    if chat is None:
+        usage_ctx.set(None)
+        return
+    is_group = chat.type in ("group", "supergroup")
+    usage_ctx.set((chat.id, "group" if is_group else "private", user.id if user else None))
+    if update.effective_message is None:
+        return
 
-async def cmd_reject_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /reject_chat <chat_id>")
-        return
-    chat_id = int(context.args[0])
-    if not db.set_chat_status(chat_id, "rejected"):
-        await update.message.reply_text(f"Чата {chat_id} нет в базе — нечего отклонять (если бот там всё же есть, выйти можно вручную).")
-        return
-    await update.message.reply_text(f"❌ Чат {chat_id} отклонён. Выхожу.")
-    try:
-        await context.bot.send_message(chat_id=chat_id, text="Извините, мой админ не одобрил этот чат. Пока! 👋")
-        await context.bot.leave_chat(chat_id)
-    except Exception as e:
-        logger.error(f"Failed to leave chat: {e}")
+    if is_group:
+        if chat.id not in _known_groups:
+            created = db.ensure_group(chat.id, chat.title, None)
+            _known_groups.add(chat.id)
+            if created:
+                await _notify_new_group(chat.id, chat.title or "Без названия", None)
+        if db.is_chat_banned(chat.id):
+            # Забаненная группа: тишина, в т.ч. на команды — кроме команд админов бота.
+            text = update.effective_message.text or ""
+            if not (user and is_admin(user.id) and text.startswith("/")):
+                raise ApplicationHandlerStop
+    if user and not is_admin(user.id) and db.is_user_banned(user.id):
+        raise ApplicationHandlerStop
 
 
 async def notify_admins(text: str) -> None:
@@ -2670,7 +3123,8 @@ async def notify_admins(text: str) -> None:
 
 
 async def post_init(application):
-    global context_bot_id, bot_username, _admin_bot
+    global context_bot_id, bot_username, _admin_bot, _main_loop
+    _main_loop = asyncio.get_running_loop()
     me = await application.bot.get_me()
     context_bot_id = me.id
     bot_username = me.username.lower()
@@ -2688,8 +3142,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = db.get_or_create_user(user_id, update.effective_user.username, update.effective_user.full_name)
 
-    if user["role"] == "banned":
+    if user.get("banned"):  # основной барьер — gate_update, это страховка
         return
+
+    # Стартовый бонус проверенным, у кого его ещё нет (миграция/`/verify` не выдали).
+    # chat_id в личке равен user_id, так что один вызов покрывает оба случая.
+    await _ensure_starter_bonus(chat_id)
 
     # Заполняются в пассивном блоке ниже (группа), чтобы не транскрибировать/распознавать
     # одно и то же аудио/видео дважды — один раз для лога, один раз для ответа адресату.
@@ -2699,9 +3157,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_group and update.message:
         sender = update.effective_user.first_name or "Unknown"
-        # Пассивное распознавание (стоит денег на каждое медиа) — только в approved-чатах,
-        # см. docs/claude/media.md. Дефолт WHITELIST_ENABLED=False — гейт большую часть времени неактивен.
-        media_gated = WHITELIST_ENABLED and not db.is_chat_allowed(chat_id)
+        # Пассивное распознавание (стоит денег на каждое медиа, а бот там даже не адресован) —
+        # только в проверенных или платных группах, см. docs/claude/media.md.
+        media_gated = not (db.is_group_verified(chat_id) or chat_tier(chat_id) == "paid")
         if update.message.text:
             db.save_group_message(chat_id, user_id, sender, update.message.text)
         elif update.message.photo:
@@ -2779,40 +3237,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if is_group:
-        # В группе гейтинг на уровне ЧАТА, а не пользователя: чат разрешён → пишут ВСЕ участники.
-        # Никакой персональной капчи/допуска/дневного лимита. Бан остаётся (проверен в начале хендлера).
-        if WHITELIST_ENABLED and not db.is_chat_allowed(chat_id):
-            return
         # Лимит частоты запросов per-user, выставляется чат-админами через /ratelimit.
         # Превышение — молчим, без сообщения об ошибке (см. cmd_ratelimit).
         if not db.check_group_rate_limit(chat_id, user_id):
             return
-    else:
-        # Личка — персональный гейтинг.
-        if needs_captcha(user):
-            uid = user["telegram_id"]
-            uname = update.effective_user.full_name or update.effective_user.username or str(uid)
-            for admin_id in ADMIN_IDS:
-                try:
-                    await context.bot.send_message(
-                        chat_id=admin_id,
-                        text=(
-                            f"👤 Новый пользователь хочет общаться:\n\n"
-                            f"Имя: {uname}\nID: {uid}\nUsername: @{update.effective_user.username or 'нет'}\n\n"
-                            f"/approve {uid} — допустить\n/ban {uid} — забанить"
-                        )
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to notify admin: {e}")
-            await update.message.reply_text("Привет! Я отправила запрос админу. Подожди немного, скоро тебя допустят.")
-            return
-
-        if not is_allowed_in_chat(user, chat_id):
-            return
-
-        if not check_daily_limit(user):
-            await update.message.reply_text(f"Лимит {STREET_DAILY_LIMIT} сообщений в день. Попроси реферальную ссылку для безлимита!")
-            return
+    # Дневной лимит непроверенных (личка: пользователь не проверен; группа: не проверены
+    # ни чат, ни автор). Сверх лимита — одно сообщение в сутки, дальше тишина.
+    if not await _check_message_limit(update, user_id, chat_id, is_group):
+        return
 
     user_text = update.message.text or update.message.caption or ""
     has_photo = bool(update.message.photo)
@@ -2934,10 +3366,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"system={len(system)} history_chars={_history_stats(doc_history)[0]} msgs={len(doc_history)}"
             )
             response = await call_claude(
-                context, chat_id, label=f"файл chat={chat_id}",
+                context, chat_id, label=f"файл chat={chat_id}", usage_label="dialog",
                 model=_model, max_tokens=4096, system=system, messages=doc_history,
             )
             answer = response_text(response)
+            _count_reply(user_id, chat_id)
             if not answer:
                 logger.warning(f"Пустой ответ модели (файл): {api_errors.response_debug(response)}")
                 answer = "Модель вернула пустой ответ. Попробуй ещё раз или смени модель через /models."
@@ -3001,10 +3434,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"system={len(system)} image_b64={len(image_b64)}"
             )
             response = await call_claude(
-                context, chat_id, label=f"фото chat={chat_id}",
+                context, chat_id, label=f"фото chat={chat_id}", usage_label="dialog",
                 model=_model, max_tokens=2048, system=system, messages=vision_messages,
             )
             answer = response_text(response)
+            _count_reply(user_id, chat_id)
             if not answer:
                 logger.warning(f"Пустой ответ модели (фото): {api_errors.response_debug(response)}")
                 answer = "Модель вернула пустой ответ. Попробуй ещё раз или смени модель через /models."
@@ -3050,6 +3484,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         author = update.effective_user.first_name or update.effective_user.username or "Unknown"
         success = await _draw_and_send(update, context, chat_id, is_group, draw_prompt, author=author)
+        if success:
+            # Ответ картинкой — тоже «реальный ответ»: считаем в дневной лимит непроверенных
+            # (обычные ответы считает _record_usage по метке dialog; здесь LLM-вызова нет).
+            _count_reply(user_id, chat_id)
         if not is_group:
             # Группа: юзер-текст уже сохранён пассивным блоком в начале handle_message,
             # факт рисования — самой _draw_and_send (см. её код). Личке эквивалента
@@ -3071,9 +3509,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
         search_context = ""
-        if can_search(user):
+        if tavily and _search_allowed(user_id, chat_id, is_group):
             search_input = f"{user_text}\nКонтекст реплая: {reply_context}".strip() if reply_context else user_text
-            search_query = await call_claude_aux(should_search, search_input, label="should_search") if tavily else None
+            search_query = await call_claude_aux(should_search, search_input, label="should_search")
             if search_query:
                 search_results = await call_claude_aux(web_search, search_query, label="web_search")
                 if search_results:
@@ -3103,7 +3541,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         try:
             response = await call_claude(
-                context, chat_id, label=f"диалог chat={chat_id}",
+                context, chat_id, label=f"диалог chat={chat_id}", usage_label="dialog",
                 model=_model, max_tokens=4096, system=system, messages=messages,
             )
         except anthropic.BadRequestError as e:
@@ -3148,7 +3586,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 response = await call_claude(
                     context, chat_id, label=f"диалог chat={chat_id} (аварийная обрезка)",
-                    model=_model, max_tokens=4096, system=retry_system, messages=retry_messages,
+                    usage_label="dialog", model=_model, max_tokens=4096, system=retry_system, messages=retry_messages,
                 )
             except anthropic.BadRequestError as e2:
                 if not api_errors.is_prompt_too_long(e2):
@@ -3180,6 +3618,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "или сменить модель через /models."
                 )
             return
+
+        _count_reply(user_id, chat_id)
 
         # Клодушка могла сама инициировать рисование маркером [[DRAW: ...]] внутри ответа.
         draw_match = DRAW_MARKER_RE.search(assistant_text)
@@ -3249,7 +3689,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             text=(
                                 f"🚶 Новый пользователь с улицы:\n\n"
                                 f"Имя: {uname}\nID: {user_id}\nUsername: {username_str}\n\n"
-                                f"/promote {user_id} → referral\n/premium {user_id} → premium\n/ban {user_id} → бан"
+                                f"/verify {user_id} → проверить\n/ban {user_id} → бан"
                             )
                         )
                     except Exception as e:
@@ -3278,7 +3718,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Клодушка сама попросила картинку — теперь реально рисуем и отправляем.
         if draw_en_prompt:
-            await _draw_and_send(update, context, chat_id, is_group, draw_en_prompt, en_prompt=draw_en_prompt)
+            await _draw_and_send(update, context, chat_id, is_group, draw_en_prompt,
+                                 en_prompt=draw_en_prompt, silent_limit=True)
 
     except Exception as e:
         await api_errors.reply_api_error(
@@ -3289,11 +3730,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     db.init_db()
-    db.get_or_create_user(592441, full_name="Aleksei")
-    db.set_role(592441, "admin")
+    # Строка и роль admin в БД — для ВСЕХ ADMIN_IDS (нужна /users и /chats; сами права даёт
+    # ADMIN_IDS, не БД). Без этого второй админ не появлялся в списке, пока не напишет боту.
+    for admin_id in ADMIN_IDS:
+        db.get_or_create_user(admin_id, full_name="Aleksei" if admin_id == 592441 else None)
+        db.set_role(admin_id, "admin")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
+    # group=-1 — раньше всех: usage_ctx, регистрация неизвестных групп, баны.
+    app.add_handler(TypeHandler(Update, gate_update), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("clear", clear))
@@ -3304,25 +3750,19 @@ def main():
     app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("id", show_id))
     app.add_handler(CommandHandler("version", cmd_version))
-    app.add_handler(CommandHandler("role", cmd_role))
     app.add_handler(CommandHandler("users", cmd_users))
-    app.add_handler(CommandHandler("whitelist", cmd_whitelist))
-    app.add_handler(CommandHandler("whitelist_on", cmd_whitelist_on))
-    app.add_handler(CommandHandler("whitelist_off", cmd_whitelist_off))
     app.add_handler(CommandHandler("captcha_on", cmd_captcha_on))
     app.add_handler(CommandHandler("captcha_off", cmd_captcha_off))
     app.add_handler(CommandHandler("captcha_unban", cmd_captcha_unban))
-    app.add_handler(CommandHandler("allow_chat", cmd_allow_chat))
-    app.add_handler(CommandHandler("deny_chat", cmd_deny_chat))
     app.add_handler(CommandHandler("chats", cmd_chats))
-    app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("review", cmd_review))
     app.add_handler(CommandHandler("review_on", cmd_review_on))
     app.add_handler(CommandHandler("review_off", cmd_review_off))
-    app.add_handler(CommandHandler("approve", cmd_approve))
-    app.add_handler(CommandHandler("promote", cmd_promote))
-    app.add_handler(CommandHandler("premium", cmd_premium))
+    app.add_handler(CommandHandler("verify", cmd_verify))
+    app.add_handler(CommandHandler("unverify", cmd_unverify))
     app.add_handler(CommandHandler("ban", cmd_ban))
+    app.add_handler(CommandHandler("unban", cmd_unban))
+    app.add_handler(CommandHandler("topup", cmd_topup))
     app.add_handler(CommandHandler("activity", cmd_activity))
     app.add_handler(CommandHandler("ratelimit", cmd_ratelimit))
     app.add_handler(CommandHandler("cost", cmd_cost))
@@ -3334,11 +3774,8 @@ def main():
     app.add_handler(CommandHandler("banana", cmd_banana))
     app.add_handler(CommandHandler("gptimage", cmd_gptimage))
     app.add_handler(CommandHandler("imagemodels", cmd_imagemodels))
-    app.add_handler(CommandHandler("approve_chat", cmd_approve_chat))
-    app.add_handler(CommandHandler("reject_chat", cmd_reject_chat))
     app.add_handler(ChatMemberHandler(handle_new_chat, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(handle_chat_member, ChatMemberHandler.CHAT_MEMBER))
-    app.add_handler(CommandHandler("migrate", cmd_migrate))
     app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_message))
