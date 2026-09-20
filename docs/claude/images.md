@@ -3,6 +3,14 @@
 Перед правкой `_try_gemini_image`, `_try_gpt_image`, `DRAW_MARKER_RE`, `LEAKED_DRAW_RE`,
 `LEAKED_DRAW_NOTE_RE`, `DRAW_SENT_LABEL`, `_draw_sent_note`, `_draw_and_send`,
 `IMAGE_PROVIDERS`, `/imagine`, `/banana`, `/gptimage`, `/imagemodels` — читай этот файл.
+
+**С ТЗ v0.10 (`docs/claude/billing.md`) провайдер зависит от тарифа чата:** free — всегда GPT
+(запись `chat_image_provider` не меняется, `/banana` отказывает «доступно в платном режиме»),
+paid — выбор чата, нет строки → **banana** (`db.DEFAULT_IMAGE_PROVIDER = "banana"`; дефолт «GPT для
+всех» от 2026-09-19 ниже — историческая справка, теперь GPT только у free). Стоимость картинки
+пишется в `usage_log` после успеха (`IMAGE_PRICES`). В free — дневной лимит (личка 10, группа 5 на
+участника), проверка первой строкой `_draw_and_send`/`cmd_imagine` (`_image_limit_blocked`); для
+спонтанного `[[DRAW]]` — молча (`silent_limit=True`).
 История багов маркера и провайдеров с датами — `docs/claude/incidents.md` (инциденты
 2026-09-07 ×2 и 2026-09-08 с повтором 2026-09-20, там же живёт полный разбор).
 
@@ -102,14 +110,15 @@ system-prompt).
 переиспользовать `chat_models`/`_set_chat_model` нельзя.
 
 - **`IMAGE_PROVIDERS`** (bot.py) — `{"banana": {...}, "gpt": {...}}`, только `label`,
-  без цен/окна/`admin_only` (решение сознательное: GPT Image 2 тратит общий баланс пула,
+  без цен/окна (решение сознательное: GPT Image 2 тратит общий баланс пула,
   но Алексей explicitly попросил не гейтить — доступно всем, кому доступно рисование
-  вообще, referral+, как сейчас `/imagine`).
+  вообще, referral+, как сейчас `/imagine`). **[До ТЗ v0.10; теперь `/banana` и дефолт banana —
+  только платный режим, рефералов и «referral+» больше нет.]**
 - **Хранение**: таблица `chat_image_provider(chat_id PRIMARY KEY, provider DEFAULT
   'gpt')`, `db.get_chat_image_provider_db`/`set_chat_image_provider_db`, обёртка
   `get_chat_image_provider(chat_id)` в bot.py — та же схема, что `chat_models`, но
   отдельная таблица: смешивать в одну означало бы городить составной ключ или второй
-  столбец в чужой по смыслу таблице. **`db.DEFAULT_IMAGE_PROVIDER = "gpt"`** (модульная
+  столбец в чужой по смыслу таблице. **`db.DEFAULT_IMAGE_PROVIDER = "gpt"`** [ТЗ v0.10: теперь `"banana"`, см. верх файла] (модульная
   константа в db.py, не bot.py — тот же паттерн, что `DEFAULT_MODEL_ID`/`chat_models`:
   db.py ниже bot.py в зависимостях, не может его импортировать) — единственное место,
   откуда берётся и SQL `DEFAULT`, и Python-фолбэк в `get_chat_image_provider_db`. Было

@@ -1,6 +1,5 @@
 import sqlite3
 import time
-import uuid
 import logging
 from pathlib import Path
 
@@ -8,13 +7,15 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = Path("/app/data/claudushka.db")
 
-# Дефолтный провайдер картинок для чатов, никогда не выставлявших /banana или /gpt.
-# Решение Алексея (2026-09-19): GPT Image 2 дешевле, banana дороже — по умолчанию и
-# для всех бесплатных чатов теперь GPT (медленнее, но это приемлемая цена). Строка в
-# chat_image_provider появляется только после явной команды — существующие явные
-# выборы (в любую сторону) эта константа не трогает и не мигрирует, см.
-# docs/claude/images.md.
-DEFAULT_IMAGE_PROVIDER = "gpt"
+# Дефолтный провайдер картинок для ПЛАТНЫХ чатов, никогда не выставлявших /banana или
+# /gptimage (ТЗ v0.10, docs/claude/billing.md). Бесплатные чаты всегда рисуют через GPT —
+# это решает bot.get_chat_image_provider по тарифу, а не эта константа. Строка в
+# chat_image_provider появляется только после явной команды.
+DEFAULT_IMAGE_PROVIDER = "banana"
+
+# Баланс ниже порога считается нулевым (тариф free). Порог, а не «> 0», чтобы пыль от
+# float-сложений (1e-9) не оставляла чат в платном режиме на один лишний вызов.
+PAID_MIN_BALANCE = 0.0001
 
 
 def get_conn() -> sqlite3.Connection:
@@ -23,6 +24,68 @@ def get_conn() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+# Значения на момент однократной миграции — заморожены; живой конфиг — bot.py.
+_MIG_BONUS_GROUP = 10.0
+_MIG_BONUS_PRIVATE = 5.0
+
+
+def _run_once(conn: sqlite3.Connection, name: str, fn) -> None:
+    """Однократная миграция данных: маркер в schema_migrations, откат при ошибке."""
+    if conn.execute("SELECT 1 FROM schema_migrations WHERE name = ?", (name,)).fetchone():
+        return
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        fn(conn)
+        conn.execute("INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+                     (name, int(time.time())))
+        conn.commit()
+        logger.info(f"Migration applied: {name}")
+    except Exception:
+        conn.rollback()
+        logger.exception(f"Migration FAILED (повторится при следующем старте): {name}")
+
+
+def _mig_access(conn: sqlite3.Connection) -> None:
+    """Очистка бан-листа и рефералов (ТЗ v0.10, п.10.2). Роли banned/referral и статус
+    rejected остаются валидными значениями CHECK, но больше никем не выставляются."""
+    conn.execute("UPDATE allowed_chats SET status = 'pending' WHERE status = 'rejected'")
+    conn.execute("UPDATE users SET role = 'street' WHERE role = 'banned'")
+    conn.execute("UPDATE users SET role = 'premium', verified = 1 WHERE role = 'referral'")
+
+
+def _mig_defaults(conn: sqlite3.Connection) -> None:
+    """Старые глобальные дефолты (haiku / gpt) писались явными строками — без их удаления
+    платные чаты остались бы на Haiku/GPT вместо нового дефолта Sonnet/banana."""
+    conn.execute("DELETE FROM chat_models WHERE model = 'claude-haiku-4-5-20251001'")
+    conn.execute("DELETE FROM chat_image_provider WHERE provider = 'gpt'")
+
+
+def _mig_starter_bonus(conn: sqlite3.Connection) -> None:
+    """Стартовый бонус проверенным (approved-группы, admin/premium) с активностью за 30 дней.
+    Остальные проверенные получат его при первом новом сообщении (bot.py)."""
+    now = int(time.time())
+    cutoff = now - 30 * 86400
+    groups = conn.execute(
+        "SELECT chat_id FROM allowed_chats WHERE status = 'approved' AND chat_id < 0 AND EXISTS "
+        "(SELECT 1 FROM group_messages g WHERE g.chat_id = allowed_chats.chat_id AND g.timestamp >= ?)",
+        (cutoff,)).fetchall()
+    users = conn.execute(
+        "SELECT telegram_id FROM users WHERE role IN ('admin', 'premium') AND EXISTS "
+        "(SELECT 1 FROM conversations c WHERE c.user_id = users.telegram_id AND c.timestamp >= ?)",
+        (cutoff,)).fetchall()
+    for row, amount in [(r, _MIG_BONUS_GROUP) for r in groups] + [(r, _MIG_BONUS_PRIVATE) for r in users]:
+        _grant_bonus_conn(conn, row[0], amount)
+
+
+def _grant_bonus_conn(conn: sqlite3.Connection, chat_id: int, amount: float) -> bool:
+    cur = conn.execute(
+        "INSERT INTO chat_credits (ts, chat_id, amount, kind, note, by_user) "
+        "SELECT ?, ?, ?, 'bonus', 'starter', NULL "
+        "WHERE NOT EXISTS (SELECT 1 FROM chat_credits WHERE chat_id = ? AND kind = 'bonus')",
+        (int(time.time()), chat_id, amount, chat_id))
+    return cur.rowcount > 0
 
 
 def init_db():
@@ -104,7 +167,48 @@ def init_db():
 
         CREATE TABLE IF NOT EXISTS chat_image_provider (
             chat_id INTEGER PRIMARY KEY,
-            provider TEXT NOT NULL DEFAULT 'gpt'
+            provider TEXT NOT NULL DEFAULT 'banana'
+        );
+
+        CREATE TABLE IF NOT EXISTS usage_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            chat_id INTEGER,
+            chat_type TEXT,
+            user_id INTEGER,
+            kind TEXT NOT NULL,
+            model TEXT,
+            label TEXT,
+            input INTEGER DEFAULT 0,
+            output INTEGER DEFAULT 0,
+            cache_write INTEGER DEFAULT 0,
+            cache_read INTEGER DEFAULT 0,
+            cost_usd REAL NOT NULL,
+            billed INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS chat_credits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            kind TEXT NOT NULL,
+            note TEXT,
+            by_user INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS daily_usage (
+            day TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            msgs INTEGER NOT NULL DEFAULT 0,
+            limit_notified INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (day, chat_id, user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            name TEXT PRIMARY KEY,
+            applied_at INTEGER NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS chat_extract_state (
@@ -124,6 +228,9 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_conv_ts ON conversations(user_id, timestamp);
         CREATE INDEX IF NOT EXISTS idx_memory_user ON memory(user_id);
         CREATE INDEX IF NOT EXISTS idx_group_chat ON group_messages(chat_id, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_usage_chat_ts ON usage_log(chat_id, ts);
+        CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_log(ts);
+        CREATE INDEX IF NOT EXISTS idx_credits_chat ON chat_credits(chat_id);
         CREATE INDEX IF NOT EXISTS idx_wa_conv_phone ON wa_conversations(phone, timestamp);
         CREATE INDEX IF NOT EXISTS idx_wa_memory_phone ON wa_memory(phone);
     """)
@@ -146,12 +253,25 @@ def init_db():
         # миграции чаты на старой строке попадут в model_meta() фолбэк на дефолт
         # (Haiku) и /cost посчитает их по ценам Haiku, а не Fable.
         "UPDATE chat_models SET model='claude-fable-5-1' WHERE model='claude-fable-5'",
+        # ТЗ v0.10: бан — отдельные колонки, не роль/статус (бан не трогает баланс и проверку).
+        "ALTER TABLE allowed_chats ADD COLUMN banned INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0",
     ]:
         try:
             conn.execute(migration)
             conn.commit()
         except Exception:
             pass  # Column already exists
+
+    _run_once(conn, "billing_access", _mig_access)
+    _run_once(conn, "billing_defaults", _mig_defaults)
+    _run_once(conn, "billing_starter_bonus", _mig_starter_bonus)
+    # daily_usage нужна только за сегодня; строки старше недели — мусор.
+    try:
+        conn.execute("DELETE FROM daily_usage WHERE day < date('now', '-7 days')")
+        conn.commit()
+    except Exception:
+        logger.exception("daily_usage cleanup failed")
 
     conn.close()
     logger.info("Database initialized")
@@ -169,16 +289,17 @@ def get_user(telegram_id: int) -> dict | None:
 
 
 def create_user(telegram_id: int, username: str = None, full_name: str = None,
-                role: str = "street", referred_by: int = None) -> dict:
+                role: str = "street") -> dict:
     conn = get_conn()
-    ref_code = uuid.uuid4().hex[:8]
     now = int(time.time())
     today = time.strftime("%Y-%m-%d")
+    # referral_code/referred_by/daily_messages/daily_reset — мёртвые колонки (ТЗ v0.10):
+    # таблицу не пересобирали (CHECK на role, UNIQUE на referral_code), NULL в UNIQUE безопасен.
     conn.execute(
-        "INSERT OR IGNORE INTO users (telegram_id, username, full_name, role, referred_by, "
-        "referral_code, verified, daily_messages, daily_reset, created_at, last_active) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
-        (telegram_id, username, full_name, role, referred_by, ref_code,
+        "INSERT OR IGNORE INTO users (telegram_id, username, full_name, role, "
+        "verified, daily_messages, daily_reset, created_at, last_active) "
+        "VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)",
+        (telegram_id, username, full_name, role,
          1 if role in ('admin', 'premium') else 0, today, now, now)
     )
     conn.commit()
@@ -216,18 +337,6 @@ def set_verified(telegram_id: int, verified: bool = True):
     conn.close()
 
 
-def get_referral_code(telegram_id: int) -> str | None:
-    user = get_user(telegram_id)
-    return user["referral_code"] if user else None
-
-
-def get_user_by_referral(code: str) -> dict | None:
-    conn = get_conn()
-    row = conn.execute("SELECT * FROM users WHERE referral_code = ?", (code,)).fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-
 def list_users_by_role(role: str) -> list[dict]:
     conn = get_conn()
     rows = conn.execute("SELECT * FROM users WHERE role = ? ORDER BY created_at", (role,)).fetchall()
@@ -240,25 +349,6 @@ def list_all_users() -> list[dict]:
     rows = conn.execute("SELECT * FROM users ORDER BY role, created_at").fetchall()
     conn.close()
     return [dict(r) for r in rows]
-
-
-def increment_daily_messages(telegram_id: int) -> int:
-    conn = get_conn()
-    today = time.strftime("%Y-%m-%d")
-    user = get_user(telegram_id)
-    if user and user["daily_reset"] != today:
-        conn.execute("UPDATE users SET daily_messages = 1, daily_reset = ? WHERE telegram_id = ?",
-                     (today, telegram_id))
-        conn.commit()
-        conn.close()
-        return 1
-    else:
-        conn.execute("UPDATE users SET daily_messages = daily_messages + 1 WHERE telegram_id = ?",
-                     (telegram_id,))
-        conn.commit()
-        row = conn.execute("SELECT daily_messages FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
-        conn.close()
-        return row["daily_messages"] if row else 0
 
 
 # --- Conversations ---
@@ -569,17 +659,32 @@ def get_all_chat_memory(chat_id: int) -> list[dict]:
 
 
 # --- Allowed chats ---
+# Статус проверки группы: approved = проверенная, pending = нет. Бан — отдельная колонка
+# banned и не трогает ни статус, ни баланс (docs/claude/billing.md).
 
-def add_allowed_chat(chat_id: int, name: str = None, added_by: int = None, status: str = "approved"):
+def get_chat_row(chat_id: int) -> dict | None:
     conn = get_conn()
-    now = int(time.time())
-    conn.execute(
-        "INSERT OR REPLACE INTO allowed_chats (chat_id, name, status, requested_by, approved_by, created_at, approved_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (chat_id, name, status, added_by, added_by if status == "approved" else None, now, now if status == "approved" else None)
+    row = conn.execute("SELECT * FROM allowed_chats WHERE chat_id = ?", (chat_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def ensure_group(chat_id: int, name: str = None, added_by: int = None) -> bool:
+    """Регистрирует неизвестную группу как pending (непроверенную). Существующую строку
+    не трогает (не сбрасывает approved/banned), только освежает имя. True — строка создана."""
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO allowed_chats (chat_id, name, status, requested_by, created_at) "
+        "VALUES (?, ?, 'pending', ?, ?)",
+        (chat_id, name, added_by, int(time.time()))
     )
+    created = cur.rowcount > 0
+    if not created and name:
+        conn.execute("UPDATE allowed_chats SET name = ? WHERE chat_id = ? AND (name IS NULL OR name != ?)",
+                     (name, chat_id, name))
     conn.commit()
     conn.close()
+    return created
 
 
 def set_chat_status(chat_id: int, status: str, approved_by: int = None) -> bool:
@@ -599,28 +704,19 @@ def set_chat_status(chat_id: int, status: str, approved_by: int = None) -> bool:
     return updated
 
 
-def get_pending_chats() -> list[dict]:
+def get_review_chats() -> list[dict]:
+    """Группы-кандидаты на ежедневный обзор: не забанены, флаг включён. Платность
+    (тариф) проверяет вызывающий — баланс живёт в chat_credits/usage_log."""
     conn = get_conn()
-    rows = conn.execute("SELECT * FROM allowed_chats WHERE status = 'pending'").fetchall()
+    rows = conn.execute(
+        "SELECT * FROM allowed_chats WHERE chat_id < 0 AND banned = 0 AND daily_review_enabled = 1"
+    ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-def remove_allowed_chat(chat_id: int):
-    conn = get_conn()
-    conn.execute("DELETE FROM allowed_chats WHERE chat_id = ?", (chat_id,))
-    conn.commit()
-    conn.close()
-
-
-def get_allowed_chats() -> list[dict]:
-    conn = get_conn()
-    rows = conn.execute("SELECT * FROM allowed_chats WHERE status = 'approved'").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def is_chat_allowed(chat_id: int) -> bool:
+def is_group_verified(chat_id: int) -> bool:
+    """Проверенная группа = allowed_chats.status='approved'."""
     conn = get_conn()
     row = conn.execute("SELECT 1 FROM allowed_chats WHERE chat_id = ? AND status = 'approved'", (chat_id,)).fetchone()
     conn.close()
@@ -642,11 +738,13 @@ def set_chat_review_enabled(chat_id: int, enabled: bool) -> bool:
 
 # --- Chat model settings ---
 
-def get_chat_model_db(chat_id: int) -> str:
+def get_chat_model_db(chat_id: int, default: str | None = None) -> str | None:
+    """Сохранённый выбор модели или default, если строки нет. Эффективную модель с учётом
+    тарифа (free → Haiku) решает bot.get_chat_model — здесь только хранилище."""
     conn = get_conn()
     row = conn.execute("SELECT model FROM chat_models WHERE chat_id = ?", (chat_id,)).fetchone()
     conn.close()
-    return row["model"] if row else "claude-haiku-4-5-20251001"
+    return row["model"] if row else default
 
 
 def set_chat_model_db(chat_id: int, model: str):
@@ -662,6 +760,8 @@ def set_chat_model_db(chat_id: int, model: str):
 # --- Chat image provider settings (banana / gpt, см. IMAGE_PROVIDERS в bot.py) ---
 
 def get_chat_image_provider_db(chat_id: int) -> str:
+    """Сохранённый выбор провайдера или DEFAULT_IMAGE_PROVIDER (дефолт ПЛАТНОГО чата);
+    в free bot.get_chat_image_provider всегда отдаёт gpt, не читая эту функцию."""
     conn = get_conn()
     row = conn.execute("SELECT provider FROM chat_image_provider WHERE chat_id = ?", (chat_id,)).fetchone()
     conn.close()
@@ -747,17 +847,284 @@ def check_group_rate_limit(chat_id: int, user_id: int) -> bool:
 
 
 def get_all_chats_for_status() -> list[dict]:
-    """Все чаты из allowed_chats с их моделью — для команды /chats."""
+    """Все группы из allowed_chats: сохранённая модель (None = не выбирали), бан, баланс —
+    для команды /chats. Эффективную модель считает вызывающий по тарифу."""
     conn = get_conn()
     rows = conn.execute("""
-        SELECT ac.chat_id, ac.name, ac.status,
-               COALESCE(cm.model, 'claude-haiku-4-5-20251001') AS model
+        SELECT ac.chat_id, ac.name, ac.status, ac.banned,
+               cm.model AS model,
+               COALESCE((SELECT SUM(amount) FROM chat_credits WHERE chat_id = ac.chat_id), 0)
+             - COALESCE((SELECT SUM(cost_usd) FROM usage_log
+                         WHERE chat_id = ac.chat_id AND billed = 1), 0) AS balance
         FROM allowed_chats ac
         LEFT JOIN chat_models cm ON cm.chat_id = ac.chat_id
         ORDER BY ac.status, ac.name
     """).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+# --- Бан (ТЗ v0.10) ---
+# Отдельные колонки users.banned / allowed_chats.banned. Бан НЕ трогает ни баланс, ни
+# статус проверки — разбан возвращает всё как было.
+
+def is_user_banned(telegram_id: int) -> bool:
+    conn = get_conn()
+    row = conn.execute("SELECT banned FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
+    conn.close()
+    return bool(row and row["banned"])
+
+
+def set_user_banned(telegram_id: int, banned: bool) -> bool:
+    conn = get_conn()
+    cur = conn.execute("UPDATE users SET banned = ? WHERE telegram_id = ?", (1 if banned else 0, telegram_id))
+    conn.commit()
+    updated = cur.rowcount > 0
+    conn.close()
+    return updated
+
+
+def is_chat_banned(chat_id: int) -> bool:
+    conn = get_conn()
+    row = conn.execute("SELECT banned FROM allowed_chats WHERE chat_id = ?", (chat_id,)).fetchone()
+    conn.close()
+    return bool(row and row["banned"])
+
+
+def set_chat_banned(chat_id: int, banned: bool) -> bool:
+    conn = get_conn()
+    cur = conn.execute("UPDATE allowed_chats SET banned = ? WHERE chat_id = ?", (1 if banned else 0, chat_id))
+    conn.commit()
+    updated = cur.rowcount > 0
+    conn.close()
+    return updated
+
+
+# --- Кредиты и баланс (ТЗ v0.10) ---
+# Баланс НЕ хранится: SUM(chat_credits.amount) - SUM(usage_log.cost_usd WHERE billed=1).
+# Для личных чатов chat_id = telegram_id пользователя.
+
+_BALANCE_SQL = (
+    "SELECT COALESCE((SELECT SUM(amount) FROM chat_credits WHERE chat_id = ?), 0) "
+    "- COALESCE((SELECT SUM(cost_usd) FROM usage_log WHERE chat_id = ? AND billed = 1), 0)"
+)
+
+
+def _balance_conn(conn: sqlite3.Connection, chat_id: int) -> float:
+    return round(conn.execute(_BALANCE_SQL, (chat_id, chat_id)).fetchone()[0], 8)
+
+
+def get_balance(chat_id: int) -> float:
+    conn = get_conn()
+    bal = _balance_conn(conn, chat_id)
+    conn.close()
+    return bal
+
+
+def get_total_balance() -> float:
+    """Сумма положительных балансов по всем чатам (для /cost админа)."""
+    conn = get_conn()
+    row = conn.execute("""
+        SELECT COALESCE(SUM(CASE WHEN b > 0 THEN b ELSE 0 END), 0) FROM (
+            SELECT chat_id, SUM(v) AS b FROM (
+                SELECT chat_id, amount AS v FROM chat_credits
+                UNION ALL
+                SELECT chat_id, -cost_usd FROM usage_log WHERE billed = 1 AND chat_id IS NOT NULL
+            ) GROUP BY chat_id
+        )
+    """).fetchone()
+    conn.close()
+    return round(row[0], 8)
+
+
+def add_credit(chat_id: int, amount: float, kind: str, note: str = None, by_user: int = None) -> None:
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO chat_credits (ts, chat_id, amount, kind, note, by_user) VALUES (?, ?, ?, ?, ?, ?)",
+        (int(time.time()), chat_id, amount, kind, note, by_user))
+    conn.commit()
+    conn.close()
+
+
+def topup_total(chat_id: int) -> float:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM chat_credits WHERE chat_id = ? AND kind = 'topup'",
+        (chat_id,)).fetchone()
+    conn.close()
+    return round(row[0], 8)
+
+
+def has_bonus(chat_id: int) -> bool:
+    conn = get_conn()
+    row = conn.execute("SELECT 1 FROM chat_credits WHERE chat_id = ? AND kind = 'bonus'", (chat_id,)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def grant_starter_bonus(chat_id: int, amount: float) -> bool:
+    """Идемпотентно: не выдаёт, если у chat_id уже есть kind='bonus'. True — выдан сейчас."""
+    conn = get_conn()
+    granted = _grant_bonus_conn(conn, chat_id, amount)
+    conn.commit()
+    conn.close()
+    return granted
+
+
+def settle_negative_balance(chat_id: int) -> float:
+    """Баланс не уходит в минус: если он <0 — пишет writeoff ровно на дефицит (note='auto').
+    Возвращает сумму списания (0.0 — ничего не делали)."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        bal = _balance_conn(conn, chat_id)
+        written = 0.0
+        if bal < 0:
+            written = -bal
+            conn.execute(
+                "INSERT INTO chat_credits (ts, chat_id, amount, kind, note, by_user) "
+                "VALUES (?, ?, ?, 'writeoff', 'auto', NULL)", (int(time.time()), chat_id, written))
+        conn.commit()
+        return written
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# --- Учёт использования (ТЗ v0.10) ---
+
+def record_usage(chat_id: int | None, chat_type: str | None, user_id: int | None, kind: str,
+                 model: str | None, label: str | None, cost_usd: float, billed: bool,
+                 inp: int = 0, out: int = 0, cache_write: int = 0, cache_read: int = 0,
+                 settle: bool = True) -> bool:
+    """Пишет строку usage_log. Для платной записи (billed and settle) в той же транзакции
+    добивает баланс до нуля writeoff-ом, если он ушёл в минус.
+
+    Возвращает True, если ЭТА запись перевела чат из paid во free (баланс был выше порога,
+    стал ниже) — ровно один раз на переход, сообщение о переходе шлёт вызывающий."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        before = _balance_conn(conn, chat_id) if (billed and settle and chat_id is not None) else None
+        conn.execute(
+            "INSERT INTO usage_log (ts, chat_id, chat_type, user_id, kind, model, label, input, output, "
+            "cache_write, cache_read, cost_usd, billed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (int(time.time()), chat_id, chat_type, user_id, kind, model, label,
+             inp, out, cache_write, cache_read, cost_usd, 1 if billed else 0))
+        went_free = False
+        if before is not None:
+            after = _balance_conn(conn, chat_id)
+            if after < 0:
+                conn.execute(
+                    "INSERT INTO chat_credits (ts, chat_id, amount, kind, note, by_user) "
+                    "VALUES (?, ?, ?, 'writeoff', 'auto', NULL)", (int(time.time()), chat_id, -after))
+                after = 0.0
+            went_free = before > PAID_MIN_BALANCE and after <= PAID_MIN_BALANCE
+        conn.commit()
+        return went_free
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def usage_count(kind: str, since_ts: int, chat_id: int, user_id: int = None, billed: bool = None) -> int:
+    """Число записей usage_log с since_ts — для дневных лимитов картинок и поиска."""
+    sql = "SELECT COUNT(*) FROM usage_log WHERE kind = ? AND ts >= ? AND chat_id = ?"
+    params: list = [kind, since_ts, chat_id]
+    if user_id is not None:
+        sql += " AND user_id = ?"
+        params.append(user_id)
+    if billed is not None:
+        sql += " AND billed = ?"
+        params.append(1 if billed else 0)
+    conn = get_conn()
+    n = conn.execute(sql, params).fetchone()[0]
+    conn.close()
+    return n
+
+
+_USAGE_GROUP_COLS = {"kind", "chat_type", "model", "label", "chat_id"}
+
+
+def usage_grouped(since_ts: int, until_ts: int, cols: tuple = (), *, chat_id: int = None,
+                  billed: bool = None, chat_null: bool = None) -> list[dict]:
+    """Сумма cost_usd (+ токены и число вызовов) по колонкам cols за [since_ts, until_ts).
+    chat_null=True — только служебное (chat_id IS NULL), False — только с чатом."""
+    bad = set(cols) - _USAGE_GROUP_COLS
+    if bad:
+        raise ValueError(f"недопустимые колонки группировки: {bad}")
+    select = "".join(f"{c}, " for c in cols)
+    sql = (f"SELECT {select}SUM(cost_usd) AS cost, COUNT(*) AS calls, SUM(input) AS input, "
+           f"SUM(output) AS output, SUM(cache_write) AS cache_write, SUM(cache_read) AS cache_read "
+           f"FROM usage_log WHERE ts >= ? AND ts < ?")
+    params: list = [since_ts, until_ts]
+    if chat_id is not None:
+        sql += " AND chat_id = ?"
+        params.append(chat_id)
+    if billed is not None:
+        sql += " AND billed = ?"
+        params.append(1 if billed else 0)
+    if chat_null is True:
+        sql += " AND chat_id IS NULL"
+    elif chat_null is False:
+        sql += " AND chat_id IS NOT NULL"
+    if cols:
+        sql += " GROUP BY " + ", ".join(cols)
+    conn = get_conn()
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows if r["cost"] is not None]
+
+
+def credits_sum(kind: str, since_ts: int, until_ts: int, chat_id: int = None) -> float:
+    sql = "SELECT COALESCE(SUM(amount), 0) FROM chat_credits WHERE kind = ? AND ts >= ? AND ts < ?"
+    params: list = [kind, since_ts, until_ts]
+    if chat_id is not None:
+        sql += " AND chat_id = ?"
+        params.append(chat_id)
+    conn = get_conn()
+    v = conn.execute(sql, params).fetchone()[0]
+    conn.close()
+    return round(v, 8)
+
+
+# --- Дневные счётчики сообщений непроверенных (ТЗ v0.10, замена daily_messages) ---
+# day — строка даты по BERLIN_TZ, считает bot.py. Считаются только сообщения, на которые
+# бот реально ответил (bump зовётся после успешного ответа модели).
+
+def daily_msgs_get(day: str, chat_id: int, user_id: int) -> int:
+    conn = get_conn()
+    row = conn.execute("SELECT msgs FROM daily_usage WHERE day = ? AND chat_id = ? AND user_id = ?",
+                       (day, chat_id, user_id)).fetchone()
+    conn.close()
+    return row["msgs"] if row else 0
+
+
+def daily_msgs_bump(day: str, chat_id: int, user_id: int) -> None:
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO daily_usage (day, chat_id, user_id, msgs) VALUES (?, ?, ?, 1) "
+        "ON CONFLICT(day, chat_id, user_id) DO UPDATE SET msgs = msgs + 1",
+        (day, chat_id, user_id))
+    conn.commit()
+    conn.close()
+
+
+def daily_limit_notice_claim(day: str, chat_id: int, user_id: int) -> bool:
+    """True — уведомление о лимите ещё не слали сегодня (и теперь помечено). Атомарно."""
+    conn = get_conn()
+    cur = conn.execute(
+        "UPDATE daily_usage SET limit_notified = 1 "
+        "WHERE day = ? AND chat_id = ? AND user_id = ? AND limit_notified = 0",
+        (day, chat_id, user_id))
+    conn.commit()
+    claimed = cur.rowcount > 0
+    conn.close()
+    return claimed
 
 
 # --- WhatsApp: conversations ---
@@ -806,69 +1173,3 @@ def add_memory_facts_by_key(phone: str, facts: list[str], context: str = "whatsa
             )
     conn.commit()
     conn.close()
-
-
-# --- Migration from JSON ---
-
-def migrate_from_json(allowed_file: str, data_dir: Path):
-    """One-time migration from JSON files to SQLite."""
-    import json
-
-    # Migrate allowed.json
-    try:
-        with open(allowed_file, "r") as f:
-            data = json.load(f)
-        for u in data.get("users", []):
-            user = get_user(u["id"])
-            if not user:
-                create_user(u["id"], full_name=u.get("name"), role="premium")
-            else:
-                set_role(u["id"], "premium")
-        for c in data.get("chats", []):
-            add_allowed_chat(c["id"], c.get("name"))
-        logger.info("Migrated allowed.json")
-    except FileNotFoundError:
-        pass
-
-    # Migrate memory.json
-    try:
-        mem_file = data_dir / "memory.json"
-        if mem_file.exists():
-            with open(mem_file, "r") as f:
-                mem_data = json.load(f)
-            for uid, facts in mem_data.items():
-                tid = int(uid)
-                get_or_create_user(tid)
-                add_memory_facts(tid, facts)
-            logger.info("Migrated memory.json")
-    except Exception as e:
-        logger.error(f"Memory migration error: {e}")
-
-    # Migrate conversations.json
-    try:
-        conv_file = data_dir / "conversations.json"
-        if conv_file.exists():
-            with open(conv_file, "r") as f:
-                conv_data = json.load(f)
-            for uid, messages in conv_data.items():
-                tid = int(uid)
-                get_or_create_user(tid)
-                for msg in messages:
-                    save_message(tid, msg["role"], msg["content"])
-            logger.info("Migrated conversations.json")
-    except Exception as e:
-        logger.error(f"Conversations migration error: {e}")
-
-    # Migrate verified_users.json
-    try:
-        ver_file = data_dir / "verified_users.json"
-        if ver_file.exists():
-            with open(ver_file, "r") as f:
-                ver_data = json.load(f)
-            for uid in ver_data:
-                tid = int(uid)
-                get_or_create_user(tid, full_name=ver_data[uid].get("name"))
-                set_verified(tid, True)
-            logger.info("Migrated verified_users.json")
-    except Exception as e:
-        logger.error(f"Verified migration error: {e}")
