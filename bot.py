@@ -1733,6 +1733,28 @@ def _money(x: float) -> str:
     return f"${x:.2f}" if x == 0 or abs(x) >= 0.005 else f"${x:.4f}"
 
 
+async def _reply_private(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Длинные админские списки (/users, /chats) — только в личку: в группе они светили бы
+    список пользователей и балансов всем участникам. Если бот не может написать админу в личку
+    (тот ни разу не открывал диалог — Telegram запрещает начинать первым), в группу список НЕ
+    выводим, а объясняем, что сделать."""
+    chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]
+    if update.effective_chat.type == "private":
+        for chunk in chunks:
+            await update.effective_message.reply_text(chunk)
+        return
+    try:
+        for chunk in chunks:
+            await context.bot.send_message(chat_id=update.effective_user.id, text=chunk)
+    except Exception as e:
+        logger.info(f"личка админа недоступна ({update.effective_user.id}): {e}")
+        await update.effective_message.reply_text(
+            "Не могу написать тебе в личку — открой диалог со мной, нажми /start и повтори команду."
+        )
+        return
+    await update.effective_message.reply_text("Отправила в личку.")
+
+
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -1749,8 +1771,7 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
             flags = " 🚫" if u.get("banned") else ""
             lines.append(f"{emoji} {name} ({uid}){flags}")
         text = "Пользователи (👑 админ, ⭐ проверенный, 🚶 непроверенный, 🚫 бан):\n\n" + "\n".join(lines)
-        for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
-            await update.effective_message.reply_text(chunk)
+        await _reply_private(update, context, text)
     except Exception as e:
         await api_errors.reply_api_error(
             update.effective_message.reply_text, e, context_label="/users",
@@ -1820,19 +1841,7 @@ async def cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             model = eff_model(uid, db.get_chat_model_db(uid), bal)
             lines.append(f"  {mark}{ban} {name} ({uid}) — {model} · {_money(bal)}")
 
-        text = "\n".join(lines)
-        sent_pm = False
-        if update.effective_user:
-            try:
-                await context.bot.send_message(chat_id=update.effective_user.id, text=text)
-                sent_pm = True
-            except Exception:
-                pass
-        if not sent_pm or update.effective_chat.id == update.effective_user.id:
-            for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
-                await update.effective_message.reply_text(chunk)
-        elif update.effective_chat.id != update.effective_user.id:
-            await update.effective_message.reply_text("Отправила в личку.")
+        await _reply_private(update, context, "\n".join(lines))
     except Exception as e:
         await api_errors.reply_api_error(
             update.effective_message.reply_text, e, context_label="/chats",
