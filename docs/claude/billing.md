@@ -56,6 +56,8 @@
 
 ## Конфиг (bot.py, рядом с MODELS)
 Цены сверены 2026-09-20: banana $0.067 (прайс Google, 1K), gpt $0.02 (себестоимость пула $0.01, решение Алексея — ×2), поиск $0.008 (Tavily, 1 кредит pay-as-you-go).
+GPT Image 2.5 Flare/Sunburst (добавлены 2026-09-22, `docs/claude/images.md`) — тот же пул,
+та же цена $0.02, что у gpt.
 `PRICE_MARKUP`, `IMAGE_PRICES`, `SEARCH_PRICE`, `STARTER_BONUS_*`, `FREE_IMAGES_*`,
 `UNVERIFIED_*`, `VERIFY_MIN_TOPUP`, `ADMIN_CONTACT`, `FABLE_CONFIRM_WINDOW`. Сутки/неделя —
 `BERLIN_TZ`, неделя с понедельника (`_day_start`, `_week_start`).
@@ -97,7 +99,7 @@
 `chat_tier(chat_id)` — `paid`/`free` по балансу (`is_admin(chat_id)` → всегда paid).
 - **free**: `get_chat_model` → Haiku, `get_chat_image_provider` → `gpt`, БЕЗ изменения строк
   `chat_models`/`chat_image_provider` — при возврате в paid прошлый выбор восстанавливается.
-  `/sonnet /opus /fable /banana` → «доступно в платном режиме»; `/haiku`, `/gptimage` — «уже так»,
+  `/sonnet /opus /fable /banana /flare /sunburst` → «доступно в платном режиме»; `/haiku`, `/gptimage` — «уже так»,
   без записи. Админ бота может менять настройки чужих free-чатов (запись без применения).
   Дневной лимит картинок (для ВСЕХ, включая проверенных): личка 10, группа 5 на `user_id`;
   считается по `usage_log kind='image' AND billed=0` с полуночи Берлина (`image_quota`).
