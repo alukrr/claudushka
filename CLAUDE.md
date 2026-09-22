@@ -29,8 +29,8 @@
 когда сам их откроешь). Перед правкой соответствующей области — сначала прочитай файл:
 
 - Рисование (`_try_gemini_image`, `_try_gpt_image`, `_draw_and_send`, `DRAW_MARKER_RE`,
-  `LEAKED_DRAW_RE`, `IMAGE_PROVIDERS`, `/imagine` `/banana` `/gptimage` `/imagemodels`) —
-  `docs/claude/images.md`
+  `LEAKED_DRAW_RE`, `IMAGE_PROVIDERS`, `/imagine` `/banana` `/gptimage` `/flare` `/sunburst`
+  `/imagemodels`) — `docs/claude/images.md`
 - Групповой чат (`build_group_messages`, `group_messages`, гейтинг доступа,
   `/ratelimit`, `is_chat_admin`) — `docs/claude/group-chat.md`
 - Голос/видео/кружочки/GIF (`_transcribe_audio_gemini`, `_extract_video_frames`,
@@ -67,8 +67,8 @@
   `MODELS` в bot.py, `/haiku /sonnet /opus /fable`. Подробности —
   `docs/claude/models-and-costs.md`.
 - tavily-python 0.8.4 — веб-поиск (`/search`)
-- Генерация изображений — `/imagine`, DRAW-маркер, провайдеры banana/GPT Image 2.
-  Подробности — `docs/claude/images.md`.
+- Генерация изображений — `/imagine`, DRAW-маркер, провайдеры banana/GPT Image 2/GPT Image
+  2.5 Flare/Sunburst. Подробности — `docs/claude/images.md`.
 - fastapi 0.141.1 + uvicorn 0.53.0 — WhatsApp webhook. Подробности — `.claude/rules/whatsapp.md`.
 - httpx 0.28.1 (для FastAPI/PTB/наших прямых вызовов — не путать с `httpx2`, отдельной
   зависимостью только anthropic SDK)

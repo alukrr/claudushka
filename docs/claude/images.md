@@ -2,7 +2,8 @@
 
 Перед правкой `_try_gemini_image`, `_try_gpt_image`, `DRAW_MARKER_RE`, `LEAKED_DRAW_RE`,
 `LEAKED_DRAW_NOTE_RE`, `DRAW_SENT_LABEL`, `_draw_sent_note`, `_draw_and_send`,
-`IMAGE_PROVIDERS`, `/imagine`, `/banana`, `/gptimage`, `/imagemodels` — читай этот файл.
+`IMAGE_PROVIDERS`, `/imagine`, `/banana`, `/gptimage`, `/flare`, `/sunburst`,
+`/imagemodels` — читай этот файл.
 
 **С ТЗ v0.10 (`docs/claude/billing.md`) провайдер зависит от тарифа чата:** free — всегда GPT
 (запись `chat_image_provider` не меняется, `/banana` отказывает «доступно в платном режиме»),
@@ -16,14 +17,22 @@ paid — выбор чата, нет строки → **banana** (`db.DEFAULT_IM
 
 ## Провайдеры и фоллбек
 
-Реестр `IMAGE_PROVIDERS` в bot.py: `/banana` (Nano Banana 2, прямой Google API,
-`GEMINI_API_KEY`) / `/gptimage` (**дефолт с 2026-09-19**, GPT Image 2, через пул
-`api.apitoken.sale`, `ANTHROPIC_API_KEY`) — решение Алексея: banana дороже, GPT дешевле
-(хоть и медленнее), по умолчанию платит более дешёвый канал. Явно выставленные строки
-(в любую сторону) эта смена дефолта не трогает и не мигрирует. При отказе провайдер
-переписывает промпт через Haiku и пробует
-снова СВОИМ же провайдером — фоллбека между banana и gpt нет (разные счета за баланс,
-молча подменять один другим значило бы незаметно для чата начать тратить деньги).
+Реестр `IMAGE_PROVIDERS` в bot.py, 4 ключа: `/banana` (Nano Banana 2, прямой Google API,
+`GEMINI_API_KEY`, `backend: "gemini"`) / `/gptimage` (**дефолт с 2026-09-19**, GPT Image 2,
+через пул `api.apitoken.sale`, `ANTHROPIC_API_KEY`, `backend: "pool"`) / `/flare` и
+`/sunburst` (GPT Image 2.5 Flare/Sunburst, добавлены 2026-09-22, тоже `backend: "pool"`,
+см. подсекцию ниже) — решение Алексея: banana дороже, GPT-семейство дешевле (хоть и
+медленнее), по умолчанию платит более дешёвый канал. Явно выставленные строки (в любую
+сторону) эта смена дефолта не трогает и не мигрирует.
+
+Диспетчеризация в `generate_image_with_error` идёт по `meta["backend"]`, не по ключу
+провайдера напрямую: `"pool"` → `_try_gpt_image(prompt, model_id=meta["model_id"],
+label=meta["label"])`, `"gemini"` → `_try_gemini_image(prompt)`. Любой третий backend —
+программная ошибка в реестре, лог + честная ошибка пользователю, **без фоллбека на
+другой провайдер** — молча подменять один другим при отказе значило бы незаметно для
+чата начать тратить деньги другим счётом. При отказе провайдер переписывает промпт через
+Haiku и пробует снова СВОИМ же провайдером — фоллбека между провайдерами нет вообще (у
+каждого свой счёт: banana не трогает баланс пула, все три "pool"-провайдера тратят его).
 Фоллбека на FLUX тоже нет (выпилен: качество + FLUX.1-schnell стал gated, а годные
 модели 2026 ушли с бесплатного hf-inference на платные провайдеры). При неудаче —
 честная ошибка пользователю.
@@ -109,11 +118,23 @@ system-prompt).
 но это ОТДЕЛЬНЫЙ реестр и ОТДЕЛЬНАЯ таблица — картинки не через `messages.create`,
 переиспользовать `chat_models`/`_set_chat_model` нельзя.
 
-- **`IMAGE_PROVIDERS`** (bot.py) — `{"banana": {...}, "gpt": {...}}`, только `label`,
-  без цен/окна (решение сознательное: GPT Image 2 тратит общий баланс пула,
-  но Алексей explicitly попросил не гейтить — доступно всем, кому доступно рисование
-  вообще, referral+, как сейчас `/imagine`). **[До ТЗ v0.10; теперь `/banana` и дефолт banana —
-  только платный режим, рефералов и «referral+» больше нет.]**
+- **`IMAGE_PROVIDERS`** (bot.py) — `{"banana": {...}, "gpt": {...}, "flare": {...},
+  "sunburst": {...}}`. Поля на ключ: `label` (отображаемое имя), `cmds` (список команд,
+  `cmds[0]` — основная, остальные алиасы, используется в `cmd_imagemodels` и хендлерах),
+  `backend` (`"gemini"` | `"pool"`, см. диспетчеризацию выше), `model_id` (только у
+  `backend: "pool"` — ID модели пула, НЕ отображаемое имя). Цены — отдельно, в
+  `IMAGE_PRICES` (не в самом реестре); при старте `assert` проверяет, что у каждого ключа
+  `IMAGE_PROVIDERS` есть цена в `IMAGE_PRICES` — иначе `KeyError` в `_record_usage` ПОСЛЕ
+  уже оплаченной генерации. **[Историческая справка: до ТЗ v0.10 доступ был не гейтирован
+  тарифом вообще, referral+, как сейчас `/imagine`; теперь `/banana`/`/flare`/`/sunburst`
+  и дефолт banana — только платный режим, рефералов и «referral+» больше нет.]**
+- **Команды регистрируются циклом** в `main()`, не вручную по функции на провайдер:
+  `_make_image_provider_cmd(key)` — фабрика, возвращающая хендлер, замкнутый на конкретный
+  ключ реестра; на каждый ключ `IMAGE_PROVIDERS` один `CommandHandler(meta["cmds"], ...)`
+  сразу на весь список его команд (`CommandHandler` принимает `str | Collection[str]`,
+  проверено по исходнику PTB 22.8). При регистрации — два `assert`: команды внутри
+  `IMAGE_PROVIDERS` не дублируют друг друга и не конфликтуют с остальными командами бота
+  (сверяется со статическим списком остальных команд там же, в `main()`).
 - **Хранение**: таблица `chat_image_provider(chat_id PRIMARY KEY, provider DEFAULT
   'gpt')`, `db.get_chat_image_provider_db`/`set_chat_image_provider_db`, обёртка
   `get_chat_image_provider(chat_id)` в bot.py — та же схема, что `chat_models`, но
@@ -126,9 +147,14 @@ system-prompt).
   сменилось на `'gpt'` решением Алексея — banana дороже. `CREATE TABLE IF NOT EXISTS`
   не пересоздаёт существующую таблицу — смена дефолта касается только новых установок
   и чатов, никогда не выставлявших `/banana`/`/gptimage`; явные выборы не мигрируют.
-- **`_try_gpt_image(prompt)`** — сигнатура и семантика возврата (`image, error,
-  provider_label`, `error == "__REFUSAL__"` при отказе) идентичны `_try_gemini_image`,
-  чтобы `generate_image_with_error` могла звать оба провайдера единообразно.
+- **`_try_gpt_image(prompt, model_id, label)`** — сигнатура и семантика возврата (`image,
+  error, provider_label`, `error == "__REFUSAL__"` при отказе) идентичны
+  `_try_gemini_image`, чтобы `generate_image_with_error` могла звать оба backend'а
+  единообразно. Параметризована `model_id`/`label` с 2026-09-22 (добавление Flare/Sunburst)
+  — раньше были модульные константы `GPT_IMAGE_MODEL_ID`/`GPT_IMAGE_MODEL_NAME`, теперь оба
+  значения приходят из `IMAGE_PROVIDERS[key]` вызывающей стороной (`generate_image_with_error`,
+  через `functools.partial`); все три "pool"-провайдера (GPT Image 2, Flare, Sunburst) идут
+  через одну и ту же функцию — отличается только `model_id`.
   **GPT Image 2 идёт через пул `api.apitoken.sale`** (`POOL_BASE_URL`,
   `POST {POOL_BASE_URL}/v1/images/generations`, `{"model": "gpt-image-2", "prompt": ...,
   "n": 1, "size": "1024x1024"}`, заголовок `Authorization: Bearer ANTHROPIC_API_KEY` —
@@ -169,6 +195,28 @@ system-prompt).
   Без аргумента — текущий чат, всем; с `chat_id` — любой чат, только админу (та же логика
   защиты от «переключил модель в чужом чате», что у `/haiku` и т.п.).
   `/imagemodels [chat_id]` — список провайдеров с пометкой текущего, аналог `/models`.
+
+## GPT Image 2.5 Flare / Sunburst (`/flare` `/gpt25f` `/sunburst` `/gpt25s`, 2026-09-22)
+
+Два новых провайдера, тот же пул `api.apitoken.sale`, тот же эндпоинт
+`{POOL_BASE_URL}/v1/images/generations`, тот же ключ/заголовок и формат ответа, что у
+GPT Image 2 — отличаются только `model_id`.
+
+- **ID моделей — С ПРЕФИКСОМ**: `openai/gpt-image-2.5-flare` и
+  `openai/gpt-image-2.5-sunburst` (взяты из `GET /v1/models` пула, живой запрос
+  22.09.2026). Обычный GPT Image 2 использует голое `gpt-image-2`, без префикса и даты —
+  **не менять его на префиксный вариант**, это разные записи каталога пула.
+- Ответ — тот же `{"data": [{"b64_json": ...}]}` (плюс поле `"background"`, не
+  используется), парсинг в `_try_gpt_image` не менялся.
+- Время генерации 32–40с, укладывается в существующий `GPT_IMAGE_TIMEOUT = 120` — отдельный
+  таймаут не заводили.
+- Цена пула — $0.02/картинка, как у GPT Image 2 (`IMAGE_PRICES["flare"] =
+  IMAGE_PRICES["sunburst"] = 0.02`).
+- При `size=1024x1024` пул отдаёт PNG **1254×1254** — не ошибка парсинга и не баг, просто
+  особенность модели, замечено на живых генерациях, чинить нечего.
+- Доступность по тарифу — как у banana: только платный режим (и админ бота), в free
+  `/flare`/`/sunburst` отказывают тем же путём, что `/banana` (`_set_image_provider`,
+  `FREE_IMAGE_PROVIDER` остаётся `"gpt"`).
 
 ## `_try_gemini_image` — не на пуле, ключ в заголовке
 
