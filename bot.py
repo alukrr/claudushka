@@ -9,6 +9,7 @@ import functools
 import contextvars
 from pathlib import Path
 from telegram import Update
+from telegram.error import BadRequest
 from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 from telegram.ext import (
@@ -1113,6 +1114,31 @@ async def _image_limit_blocked(update, chat_id: int, is_group: bool, user_id: in
     return True
 
 
+TG_CAPTION_LIMIT = 1024  # лимит подписи к фото в Telegram, в UTF-16 code units
+
+
+def _utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _photo_caption(draw_prompt: str, author: str | None, provider: str) -> str:
+    """Подпись к картинке, гарантированно в лимите Telegram: режется промпт, не хвост.
+
+    В ветке [[DRAW: ...]] draw_prompt — английский промпт, который написала модель; у
+    Opus 5.5 он бывает длиннее 1024 символов, и reply_photo падал с «Message caption is
+    too long» ПОСЛЕ оплаченной генерации (прод, 2026-09-23, docs/claude/incidents.md).
+    """
+    tail = (f"\n\nАвтор запроса: {author}" if author else "") + f"\nМодель: {provider}"
+    room = max(TG_CAPTION_LIMIT - _utf16_len('🎨 ""' + tail), 0)
+    prompt = draw_prompt
+    if _utf16_len(prompt) > room:
+        prompt = prompt[:room]
+        while prompt and _utf16_len(prompt.rstrip() + "…") > room:
+            prompt = prompt[:-1]
+        prompt = prompt.rstrip() + "…"
+    return f'🎨 "{prompt}"{tail}'
+
+
 async def _draw_and_send(update, context, chat_id: int, is_group: bool,
                          draw_prompt: str, en_prompt: str = None, author: str = None,
                          silent_limit: bool = False) -> bool:
@@ -1160,11 +1186,13 @@ async def _draw_and_send(update, context, chat_id: int, is_group: bool,
         from io import BytesIO
         bio = BytesIO(image_data)
         bio.name = "claudushka.png"
-        caption = f"🎨 \"{draw_prompt}\""
-        if author:
-            caption += f"\n\nАвтор запроса: {author}"
-        caption += f"\nМодель: {provider}"
-        await update.message.reply_photo(photo=bio, caption=caption)
+        try:
+            await update.message.reply_photo(photo=bio, caption=_photo_caption(draw_prompt, author, provider))
+        except BadRequest as e:
+            # Картинка уже сгенерирована и оплачена — не терять её из-за подписи.
+            logger.warning(f"reply_photo с подписью не прошёл ({e}), шлю с короткой подписью")
+            bio.seek(0)
+            await update.message.reply_photo(photo=bio, caption=f"🎨 Модель: {provider}")
         if is_group:
             # НЕ использовать слово "нарисовала" и квадратные скобки — модель имитирует
             # ЭТОТ формат в собственных живых ответах (см. LEAKED_DRAW_NOTE_RE/
