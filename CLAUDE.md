@@ -55,7 +55,8 @@
 - `docker-compose.yml` — `.claude/rules/docker-compose.md` (автоматически)
 - Тестовый стенд (`docker-compose.test.yml`, обновление зависимостей, рискованные
   правки перед продом) — `docs/claude/staging.md`; пошаговый чек-лист ТЗ v0.10 (с SELECT'ами) —
-  `docs/claude/staging-checklist-v0.10.md`
+  `docs/claude/staging-checklist-v0.10.md`; чек-лист ТЗ `feat/opus-5-5` (Opus 5.5, цена по
+  `response.model`, миграция `chat_models`) — `docs/claude/staging-checklist-opus-5-5.md`
 
 ## Стек
 - Python 3.12 (python:3.12-slim Docker image)
