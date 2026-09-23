@@ -101,21 +101,29 @@ captcha_state: dict[str, dict] = {}
 #   cache_write_5m_mult  — запись с TTL 5 минут, 1.25× у всех текущих;
 #   cache_write_1h_mult  — запись с TTL 1 час, 2× у всех текущих.
 # Модель без явного множителя берёт DEFAULT_CACHE_MULTS.
+# thinking_headroom — сколько токенов добавить к max_tokens под thinking (см. out_tokens).
+# У пятого поколения thinking включён по умолчанию (у Opus 5.5 — не выключается вовсе) и
+# расходует max_tokens: на /review с лимитом 500 Opus 5.5 потратил всё на thinking и не
+# вернул текста (стенд, 2026-09-23). Haiku 4.5 без явного параметра не думает — 0.
 # Окна контекста: у Haiku 200k, у пятого поколения 1M. Лимиты памяти и истории
 # калиброваны под МИНИМАЛЬНОЕ (200k) — не поднимать их, ссылаясь на 1M у Opus.
 MODELS = {
     "haiku":  {"id": "claude-haiku-4-5-20251001", "label": "Haiku 4.5",
                "in": 1.0,  "out": 5.0,  "cache_read_mult": 0.1,
-               "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context":   200_000},
+               "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context":   200_000,
+               "thinking_headroom": 0},
     "sonnet": {"id": "claude-sonnet-5",           "label": "Sonnet 5",
                "in": 2.0,  "out": 10.0, "cache_read_mult": 0.1,
-               "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context": 1_000_000},
+               "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context": 1_000_000,
+               "thinking_headroom": 8000},
     "opus":   {"id": "claude-opus-5-5",           "label": "Opus 5.5",
                "in": 4.0,  "out": 20.0, "cache_read_mult": 0.05,
-               "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context": 1_000_000},
+               "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context": 1_000_000,
+               "thinking_headroom": 8000},
     "fable":  {"id": "claude-fable-5-1",           "label": "Fable 5.1",
                "in": 10.0, "out": 50.0, "cache_read_mult": 0.025,
-               "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context": 1_000_000},
+               "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context": 1_000_000,
+               "thinking_headroom": 8000},
 }
 DEFAULT_MODEL_KEY = "haiku"
 DEFAULT_MODEL_ID = MODELS[DEFAULT_MODEL_KEY]["id"]
@@ -145,6 +153,16 @@ def model_meta(model_id: str) -> dict:
     Только выбираемые модели (MODELS) — для цены берите price_meta.
     """
     return _MODELS_BY_ID.get(model_id, MODELS[DEFAULT_MODEL_KEY])
+
+
+def out_tokens(model_id: str, visible: int) -> int:
+    """max_tokens для вызова: visible — бюджет на ВИДИМЫЙ ответ, плюс запас модели на thinking.
+
+    Обязательно для всех вызовов на модели чата (get_chat_model / DAILY_REVIEW_MODEL_ID):
+    иначе thinking съедает лимит и ответ приходит пустым или обрезанным. Запас ничего
+    не стоит сам по себе — платятся только реально сгенерированные токены.
+    """
+    return visible + model_meta(model_id).get("thinking_headroom", 0)
 
 
 def price_meta(model_id: str | None) -> dict | None:
@@ -1633,7 +1651,7 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
                 response = await aux_create(
                     label="daily_review",
                     model=DAILY_REVIEW_MODEL_ID,
-                    max_tokens=1000,
+                    max_tokens=out_tokens(DAILY_REVIEW_MODEL_ID, 1000),
                     system=(
                         "Ты Клодушка — AI с характером, которая считает себя умнее всех в чате (и не без оснований). "
                         "Напиши ироничный, остроумный обзор дня в чате — 3-4 абзаца, ОКОЛО 1000-1200 знаков суммарно. "
@@ -2110,7 +2128,7 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await call_claude(
             context, chat_id, label=f"/review chat={chat_id}",
             model=_model,
-            max_tokens=500,
+            max_tokens=out_tokens(_model, 500),
             system=(
                 "Ты Клодушка — AI с характером, которая считает себя умнее всех в чате (и не без оснований). "
                 "Напиши КОРОТКИЙ ироничный, саркастичный обзор дня в чате — 2-3 абзаца, не больше 600 знаков суммарно. "
@@ -3045,7 +3063,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await call_claude(
             context, update.effective_chat.id, label=f"/search uid={user_id}",
             model=get_chat_model(update.effective_chat.id),
-            max_tokens=2048,
+            max_tokens=out_tokens(get_chat_model(update.effective_chat.id), 2048),
             system="Ты Клодушка. Дай краткий ответ на основе результатов поиска. Отвечай на языке пользователя.",
             messages=[{"role": "user", "content": f"Вопрос: {query}\n\nРезультаты:\n{results}"}],
         )
@@ -3469,7 +3487,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             response = await call_claude(
                 context, chat_id, label=f"файл chat={chat_id}", usage_label="dialog",
-                model=_model, max_tokens=4096, system=system, messages=doc_history,
+                model=_model, max_tokens=out_tokens(_model, 4096), system=system, messages=doc_history,
             )
             answer = response_text(response)
             _count_reply(user_id, chat_id)
@@ -3537,7 +3555,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             response = await call_claude(
                 context, chat_id, label=f"фото chat={chat_id}", usage_label="dialog",
-                model=_model, max_tokens=2048, system=system, messages=vision_messages,
+                model=_model, max_tokens=out_tokens(_model, 2048), system=system, messages=vision_messages,
             )
             answer = response_text(response)
             _count_reply(user_id, chat_id)
@@ -3644,7 +3662,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             response = await call_claude(
                 context, chat_id, label=f"диалог chat={chat_id}", usage_label="dialog",
-                model=_model, max_tokens=4096, system=system, messages=messages,
+                model=_model, max_tokens=out_tokens(_model, 4096), system=system, messages=messages,
             )
         except anthropic.BadRequestError as e:
             # 400 prompt is too long: история не сохранится, следующее сообщение соберёт
@@ -3688,7 +3706,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 response = await call_claude(
                     context, chat_id, label=f"диалог chat={chat_id} (аварийная обрезка)",
-                    usage_label="dialog", model=_model, max_tokens=4096, system=retry_system, messages=retry_messages,
+                    usage_label="dialog", model=_model, max_tokens=out_tokens(_model, 4096), system=retry_system, messages=retry_messages,
                 )
             except anthropic.BadRequestError as e2:
                 if not api_errors.is_prompt_too_long(e2):

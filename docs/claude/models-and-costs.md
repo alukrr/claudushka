@@ -48,6 +48,14 @@ thinking выключить НЕЛЬЗЯ (`{type: "disabled"}` и `budget_tokens
 effort не задаёт; forced `tool_choice` (`any`/`tool`) → 400 — в коде не используется; thinking
 тратит `max_tokens`, текст ответа извлекается только `response_text()` — перебором блоков.
 
+**`max_tokens` на модели чата — только через `out_tokens(model, visible)`** = бюджет на видимый
+ответ + `MODELS[...]["thinking_headroom"]` (Haiku 0, Sonnet/Opus/Fable 8000). Найдено на стенде
+2026-09-23: `/review` с `max_tokens=500` на Opus 5.5 → `stop_reason=max_tokens blocks=['thinking']`,
+весь лимит ушёл на thinking, текста ноль. Касается всех вызовов на `get_chat_model` /
+`DAILY_REVIEW_MODEL_ID` (диалог, фото, документ, `/search`, `/review`, дневной обзор). Служебные
+вызовы на Haiku — голые числа, Haiku без явного `thinking` не думает. Запас сам не стоит денег,
+длину видимого текста держит промпт + `trim_to_last_sentence`.
+
 **Fable 5 → Fable 5.1 (`claude-fable-5-1`) — сделано 2026-09-19.** Пул `api.apitoken.sale`
 подтверждён живым запросом (200 на `claude-fable-5-1`, `claude-sonnet-5` в той же
 проверке — тоже 200). `MODELS["fable"]` теперь на `claude-fable-5-1`, миграция

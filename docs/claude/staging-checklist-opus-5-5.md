@@ -77,7 +77,7 @@ cost55() { q "SELECT id, label, model, input, output, thinking, cache_write, cac
 | 4 | Сервер | `logs 100 \| grep -iE "400\|invalid_request\|thinking\|Traceback"` | Пусто |
 | 5 | Сервер | `cost55 5` | Строки `dialog` с `model='claude-opus-5-5'`, цена в границах |
 | 6 | Группа | `/review` | Обзор пришёл целиком |
-| 7 | Сервер | `logs 60 \| grep "обрезан по max_tokens"` | Пусто. Если есть — thinking съедает лимит `/review` (500), прислать строку лога |
+| 7 | Сервер | `logs 60 \| grep -E "обрезан по max_tokens\|пуст:"` | Пусто. Было на первом прогоне: `/review пуст: stop_reason=max_tokens blocks=['thinking']` — исправлено `out_tokens` (запас 8000 под thinking). Проверить `cost55 1` у `/review`: `output` больше 500 — это и есть thinking |
 
 ## 4. Дневной обзор (ТЗ, проверка 3)
 
