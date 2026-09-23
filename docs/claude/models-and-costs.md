@@ -39,7 +39,9 @@ default)` теперь отдаёт только сохранённый выбо
 `CACHE_READ_MULTIPLIER`/`CACHE_WRITE_MULTIPLIER` больше нет). Чтение из кэша: 0.1× у Haiku/Sonnet/Opus 5,
 0.05× у Opus 5.5, 0.025× у Fable 5.1. Модель без явного поля — `DEFAULT_CACHE_MULTS` (0.1 / 1.25 / 2.0).
 
-**Opus 5 → Opus 5.5 (`claude-opus-5-5`) — 2026-09-23, ТЗ `feat/opus-5-5`.** `MODELS["opus"]`,
+**Opus 5 → Opus 5.5 (`claude-opus-5-5`) — 2026-09-23, ТЗ `feat/opus-5-5`.** Стенд пройден 2026-09-23 по
+`docs/claude/staging-checklist-opus-5-5.md`: пул принимает `claude-opus-5-5`, `response.model`
+совпадает с таблицей цен (warning'ов «нет в таблице цен» не было), миграция и `/cost` — ок. `MODELS["opus"]`,
 `/opus`, `DAILY_REVIEW_MODEL_ID` (берётся из `MODELS["opus"]`), `_probe_model` (получает id из
 реестра), справка — на 5.5. Миграция `chat_models` — в `init_db()` (точное сравнение
 `WHERE model='claude-opus-5'`, не `LIKE`). Особенности 5.5, которые касаются бота:
