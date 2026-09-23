@@ -183,6 +183,7 @@ def init_db():
             output INTEGER DEFAULT 0,
             cache_write INTEGER DEFAULT 0,
             cache_read INTEGER DEFAULT 0,
+            thinking INTEGER NOT NULL DEFAULT 0,
             cost_usd REAL NOT NULL,
             billed INTEGER NOT NULL DEFAULT 1
         );
@@ -250,7 +251,8 @@ def init_db():
         # Идемпотентно: после первого прогона строк под условие не остаётся.
         # Haiku не трогаем — claude-haiku-4-5-20251001 остаётся дефолтом.
         "UPDATE chat_models SET model='claude-sonnet-5' WHERE model LIKE 'claude-sonnet-4-%'",
-        "UPDATE chat_models SET model='claude-opus-5'   WHERE model LIKE 'claude-opus-4-%'",
+        # (с 2026-09-23 — сразу на Opus 5.5: claude-opus-5 из выбора убран, см. ниже)
+        "UPDATE chat_models SET model='claude-opus-5-5' WHERE model LIKE 'claude-opus-4-%'",
         "ALTER TABLE allowed_chats ADD COLUMN daily_review_enabled INTEGER NOT NULL DEFAULT 1",
         # 2026-09-19: Fable 5 -> Fable 5.1 (пул подтверждён живым запросом). Без этой
         # миграции чаты на старой строке попадут в model_meta() фолбэк на дефолт
@@ -259,6 +261,15 @@ def init_db():
         # ТЗ v0.10: бан — отдельные колонки, не роль/статус (бан не трогает баланс и проверку).
         "ALTER TABLE allowed_chats ADD COLUMN banned INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0",
+        # 2026-09-23 (ТЗ feat/opus-5-5): Opus 5 -> Opus 5.5. chat_models — единственное
+        # место, где хранится выбор модели чата, и оно же «прошлые платные настройки»:
+        # free-режим эту таблицу не трогает (get_chat_model подменяет на лету). Точное
+        # сравнение, не LIKE: claude-opus-5-5 и прочие строки не задеваем. usage_log —
+        # история по замороженной цене, НЕ мигрируется.
+        "UPDATE chat_models SET model='claude-opus-5-5' WHERE model='claude-opus-5'",
+        # Токены thinking (usage.output_tokens_details.thinking_tokens) — входят в output,
+        # отдельно только для видимости доли thinking в расходах.
+        "ALTER TABLE usage_log ADD COLUMN thinking INTEGER NOT NULL DEFAULT 0",
     ]:
         try:
             conn.execute(migration)
@@ -1003,7 +1014,7 @@ def settle_negative_balance(chat_id: int) -> float:
 def record_usage(chat_id: int | None, chat_type: str | None, user_id: int | None, kind: str,
                  model: str | None, label: str | None, cost_usd: float, billed: bool,
                  inp: int = 0, out: int = 0, cache_write: int = 0, cache_read: int = 0,
-                 settle: bool = True) -> bool:
+                 thinking: int = 0, settle: bool = True) -> bool:
     """Пишет строку usage_log. Для платной записи (billed and settle) в той же транзакции
     добивает баланс до нуля writeoff-ом, если он ушёл в минус.
 
@@ -1015,9 +1026,9 @@ def record_usage(chat_id: int | None, chat_type: str | None, user_id: int | None
         before = _balance_conn(conn, chat_id) if (billed and settle and chat_id is not None) else None
         conn.execute(
             "INSERT INTO usage_log (ts, chat_id, chat_type, user_id, kind, model, label, input, output, "
-            "cache_write, cache_read, cost_usd, billed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "cache_write, cache_read, thinking, cost_usd, billed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (int(time.time()), chat_id, chat_type, user_id, kind, model, label,
-             inp, out, cache_write, cache_read, cost_usd, 1 if billed else 0))
+             inp, out, cache_write, cache_read, thinking, cost_usd, 1 if billed else 0))
         went_free = False
         if before is not None:
             after = _balance_conn(conn, chat_id)
@@ -1064,7 +1075,8 @@ def usage_grouped(since_ts: int, until_ts: int, cols: tuple = (), *, chat_id: in
         raise ValueError(f"недопустимые колонки группировки: {bad}")
     select = "".join(f"{c}, " for c in cols)
     sql = (f"SELECT {select}SUM(cost_usd) AS cost, COUNT(*) AS calls, SUM(input) AS input, "
-           f"SUM(output) AS output, SUM(cache_write) AS cache_write, SUM(cache_read) AS cache_read "
+           f"SUM(output) AS output, SUM(cache_write) AS cache_write, SUM(cache_read) AS cache_read, "
+           f"SUM(thinking) AS thinking "
            f"FROM usage_log WHERE ts >= ? AND ts < ?")
     params: list = [since_ts, until_ts]
     if chat_id is not None:

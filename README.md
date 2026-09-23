@@ -68,7 +68,7 @@ GPT Image 2.5 Flare или Sunburst без дневного лимита, еже
 | `/imagine <описание>` | Генерация изображения |
 | `/models` | Какие модели доступны, цены, режим; ▸ = текущая |
 | `/haiku` | Haiku 4.5 (единственная в бесплатном режиме) |
-| `/sonnet` `/opus` | Sonnet 5 / Opus 5 (платный режим) |
+| `/sonnet` `/opus` | Sonnet 5 / Opus 5.5 (платный режим) |
 | `/fable` | Fable 5.1 (платный режим; просит подтверждения — повтор в течение 2 минут) |
 | `/imagemodels` | Какой провайдер картинок сейчас у чата |
 | `/banana` | Рисовать через Nano Banana 2 (платный режим) |
@@ -119,7 +119,7 @@ GPT Image 2.5 Flare или Sunburst без дневного лимита, еже
 | `/models [chat_id]` | Список моделей и текущая модель чата |
 | `/haiku [chat_id]` | Haiku 4.5 — $1/$5 за MTok, окно 200k (бесплатный режим) |
 | `/sonnet [chat_id]` | Sonnet 5 — $2/$10, окно 1M (дефолт платного режима) |
-| `/opus [chat_id]` | Opus 5 — $5/$25, окно 1M |
+| `/opus [chat_id]` | Opus 5.5 — $4/$20, окно 1M |
 | `/fable [chat_id]` | Fable 5.1 — $10/$50, окно 1M (с подтверждением) |
 
 **Провайдер картинок per-chat:**
@@ -153,7 +153,7 @@ GPT Image 2.5 Flare или Sunburst без дневного лимита, еже
 
 - Python 3.12
 - python-telegram-bot 22.8
-- Anthropic Claude API — Haiku 4.5 в бесплатном режиме; Sonnet 5 / Opus 5 / Fable 5.1 в платном (`/models`)
+- Anthropic Claude API — Haiku 4.5 в бесплатном режиме; Sonnet 5 / Opus 5.5 / Fable 5.1 в платном (`/models`)
 - Tavily API (веб-поиск)
 - Генерация изображений, переключаемый провайдер per-chat: Gemini «Nano Banana 2» (`gemini-3.1-flash-image-preview`, прямой Google API) или через пул api.apitoken.sale — GPT Image 2 (`gpt-image-2`), GPT Image 2.5 Flare (`openai/gpt-image-2.5-flare`) или Sunburst (`openai/gpt-image-2.5-sunburst`)
 - SQLite (пользователи, история, память, модели чатов, провайдер картинок, учёт расхода и балансы) через `db.py`

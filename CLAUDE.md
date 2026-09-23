@@ -114,7 +114,9 @@
 - Каждый вызов, стоящий денег (LLM/картинка/поиск), обязан попасть в `usage_log` через
   `_record_usage` (LLM — автоматически внутри `call_claude`/`sync_create`/`aux_create`, но
   ВСЕГДА с `label=`). Чат берётся из `usage_ctx` (contextvar, ставит `gate_update`; в джобах —
-  явно) — не передавать chat_id руками и не писать в `usage_log` в обход. `docs/claude/billing.md`.
+  явно) — не передавать chat_id руками и не писать в `usage_log` в обход. Цена LLM — по
+  `response.model` (фактической), множители кэша — поля модели в `MODELS`/`LEGACY_PRICES`,
+  глобальных констант нет. `docs/claude/billing.md`, `docs/claude/models-and-costs.md`.
 - Тариф чата — `chat_tier(chat_id)`; модель/провайдер — только через `get_chat_model` /
   `get_chat_image_provider` (учитывают free), не читать `chat_models`/`chat_image_provider`
   напрямую. В free записи этих таблиц не менять. `docs/claude/billing.md`.
