@@ -27,11 +27,13 @@
 ## Схема (db.py, `init_db`)
 - `usage_log` — по строке на каждый успешный вызов (LLM / картинка / поиск). `chat_id NULL`
   = служебное вне чата (`billed=0`). `cost_usd` заморожена при записи, уже с `PRICE_MARKUP`.
-  `model`: для LLM — API-строка, для картинок — ключ провайдера (`gpt`/`banana`), для
+  `model`: для LLM — API-строка ФАКТИЧЕСКОЙ модели из `response.model` (с 2026-09-23, см.
+  `docs/claude/models-and-costs.md` → «Учёт токенов»), для картинок — ключ провайдера (`gpt`/`banana`), для
   поиска — `tavily`. `label`: `dialog` (ответ на реплику: диалог/фото/файл), `should_search`,
   `search`, `image`, `draw_translate`, `extract_memory`, `extract_chat_memory`,
   `media_describe`, `daily_review`, `greet`, `greet_filter`, `captcha_*`, `/review`, `/search`,
-  `проверка` (пробный запрос `_probe_model`) и т.д. Индексы `(chat_id, ts)`, `(ts)` и покрывающие `usage_log(chat_id, billed, cost_usd)`, `chat_credits(chat_id, amount)` — баланс считается полным SUM по чату (не хранится), индекс не даёт читать таблицу.
+  `проверка` (пробный запрос `_probe_model`) и т.д. `thinking` — токены thinking, входят в
+  `output` (с 2026-09-23, старые строки 0). Индексы `(chat_id, ts)`, `(ts)` и покрывающие `usage_log(chat_id, billed, cost_usd)`, `chat_credits(chat_id, amount)` — баланс считается полным SUM по чату (не хранится), индекс не даёт читать таблицу.
 - `chat_credits` — `bonus` / `topup` / `adjust` / `writeoff`.
 - **Баланс не хранится**: `SUM(chat_credits.amount) − SUM(usage_log.cost_usd WHERE billed=1)`
   (`db.get_balance`, округляется до 8 знаков). Retention `usage_log` не делали.

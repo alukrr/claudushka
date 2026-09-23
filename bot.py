@@ -92,30 +92,57 @@ captcha_state: dict[str, dict] = {}
 
 # Единственный источник правды по моделям: команды, цены, гейтинг, /models — отсюда.
 # Пул api.apitoken.sale принимает эти строки (проверено живым запросом 29.07.2026).
-# Цены — официальный прайс Anthropic в $/MTok (in/out), сверено 2026-09-19 по
-# https://platform.claude.com/docs/en/about-claude/models/overview и .../pricing,
-# прокси даёт скидку сверху. Sonnet 5: вводная цена $2/$10 стала ПОСТОЯННОЙ — доки
-# Anthropic прямо говорят, что запланированное повышение до $3/$15 отменено (не
-# «станет верным само после 31.08», как считалось раньше — тот комментарий был ошибкой).
-# "cache_read_mult" — множитель цены input для чтения из prompt cache (см.
-# CACHE_READ_MULTIPLIER ниже): у всех текущих моделей 0.1x, КРОМЕ Fable 5.1/Mythos —
-# у них 0.025x, поэтому множитель — поле реестра, не глобальная константа.
+# Цены — официальный прайс Anthropic в $/MTok (in/out), сверено 2026-09-23 по
+# https://platform.claude.com/docs/en/about-claude/pricing (ТЗ feat/opus-5-5),
+# прокси даёт скидку сверху. Sonnet 5: $2/$10 — постоянная цена (повышение до $3/$15
+# отменено Anthropic).
+# Множители prompt cache — ПОЛЯ МОДЕЛИ, не глобальные константы (ТЗ feat/opus-5-5):
+#   cache_read_mult      — чтение из кэша: 0.1× у большинства, Opus 5.5 — 0.05×, Fable 5.1 — 0.025×;
+#   cache_write_5m_mult  — запись с TTL 5 минут, 1.25× у всех текущих;
+#   cache_write_1h_mult  — запись с TTL 1 час, 2× у всех текущих.
+# Модель без явного множителя берёт DEFAULT_CACHE_MULTS.
+# thinking_headroom — сколько токенов добавить к max_tokens под thinking (см. out_tokens).
+# У пятого поколения thinking включён по умолчанию (у Opus 5.5 — не выключается вовсе) и
+# расходует max_tokens: на /review с лимитом 500 Opus 5.5 потратил всё на thinking и не
+# вернул текста (стенд, 2026-09-23). Haiku 4.5 без явного параметра не думает — 0.
 # Окна контекста: у Haiku 200k, у пятого поколения 1M. Лимиты памяти и истории
 # калиброваны под МИНИМАЛЬНОЕ (200k) — не поднимать их, ссылаясь на 1M у Opus.
 MODELS = {
     "haiku":  {"id": "claude-haiku-4-5-20251001", "label": "Haiku 4.5",
-               "in": 1.0,  "out": 5.0,  "cache_read_mult": 0.1, "context":   200_000},
+               "in": 1.0,  "out": 5.0,  "cache_read_mult": 0.1,
+               "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context":   200_000,
+               "thinking_headroom": 0},
     "sonnet": {"id": "claude-sonnet-5",           "label": "Sonnet 5",
-               "in": 2.0,  "out": 10.0, "cache_read_mult": 0.1, "context": 1_000_000},
-    "opus":   {"id": "claude-opus-5",             "label": "Opus 5",
-               "in": 5.0,  "out": 25.0, "cache_read_mult": 0.1, "context": 1_000_000},
+               "in": 2.0,  "out": 10.0, "cache_read_mult": 0.1,
+               "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context": 1_000_000,
+               "thinking_headroom": 8000},
+    "opus":   {"id": "claude-opus-5-5",           "label": "Opus 5.5",
+               "in": 4.0,  "out": 20.0, "cache_read_mult": 0.05,
+               "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context": 1_000_000,
+               "thinking_headroom": 8000},
     "fable":  {"id": "claude-fable-5-1",           "label": "Fable 5.1",
-               "in": 10.0, "out": 50.0, "cache_read_mult": 0.025, "context": 1_000_000},
+               "in": 10.0, "out": 50.0, "cache_read_mult": 0.025,
+               "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context": 1_000_000,
+               "thinking_headroom": 8000},
 }
 DEFAULT_MODEL_KEY = "haiku"
 DEFAULT_MODEL_ID = MODELS[DEFAULT_MODEL_KEY]["id"]
 
+# Модели, которых нет в выборе пользователя, но которые встречаются в ответах API или в
+# истории usage_log — только для цены и подписи в /cost. claude-opus-5 — прошлый /opus
+# (до 2026-09-23); claude-opus-4-8 — модель, на которую Opus 5.5 может прозрачно отдать
+# запрос при срабатывании safeguards (стоимость считаем по response.model, см. _track_response).
+LEGACY_PRICES = {
+    "claude-opus-5":   {"label": "Opus 5",   "in": 5.0, "out": 25.0, "cache_read_mult": 0.1,
+                        "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0},
+    "claude-opus-4-8": {"label": "Opus 4.8", "in": 5.0, "out": 25.0, "cache_read_mult": 0.1,
+                        "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0},
+}
+DEFAULT_CACHE_MULTS = {"cache_read_mult": 0.1, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0}
+
 _MODELS_BY_ID = {m["id"]: m for m in MODELS.values()}
+# Всё, у чего есть цена: выбираемые модели + легаси. Выбираемые перекрывают легаси.
+_PRICES_BY_ID = {**LEGACY_PRICES, **_MODELS_BY_ID}
 
 
 def model_meta(model_id: str) -> dict:
@@ -123,38 +150,49 @@ def model_meta(model_id: str) -> dict:
 
     В chat_models могут лежать строки прошлых поколений (мигрируются в init_db),
     поэтому падать здесь нельзя: чат просто поедет на дефолтных метаданных.
+    Только выбираемые модели (MODELS) — для цены берите price_meta.
     """
     return _MODELS_BY_ID.get(model_id, MODELS[DEFAULT_MODEL_KEY])
 
 
-# Стандартные множители Anthropic для prompt caching (5-минутный ephemeral). Найдено
-# 2026-08-31 при разборе dedup_memory.py: пул этого ключа кеширует любой достаточно
-# большой вход, не только системные промпты — а у больших групповых system-prompt'ов
-# (20-30k+ символов, см. PROMPT в логах) это ровно наш случай. При этом usage.input_tokens
-# сам по себе почти пустой, реальный вес — в cache_creation_input_tokens/cache_read_input_tokens,
-# которые /cost раньше вообще не видел — расход занижался (порядок величины подтверждён
-# в dedup_memory.py: 40690 символов -> input_tokens=2, cache_creation_input_tokens=16186).
-CACHE_WRITE_MULTIPLIER = 1.25
-# Дефолт для моделей БЕЗ своего "cache_read_mult" в MODELS (например, легаси-строка в
-# chat_models, не найденная в реестре — см. model_meta). Для моделей из реестра
-# фактический множитель берётся из meta["cache_read_mult"], не отсюда напрямую.
-CACHE_READ_MULTIPLIER = 0.1
+def out_tokens(model_id: str, visible: int) -> int:
+    """max_tokens для вызова: visible — бюджет на ВИДИМЫЙ ответ, плюс запас модели на thinking.
+
+    Обязательно для всех вызовов на модели чата (get_chat_model / DAILY_REVIEW_MODEL_ID):
+    иначе thinking съедает лимит и ответ приходит пустым или обрезанным. Запас ничего
+    не стоит сам по себе — платятся только реально сгенерированные токены.
+    """
+    return visible + model_meta(model_id).get("thinking_headroom", 0)
 
 
-def calc_llm_cost(model: str, inp: int, out: int, cache_write: int = 0, cache_read: int = 0) -> float:
+def price_meta(model_id: str | None) -> dict | None:
+    """Цена модели по API-строке (выбираемые + LEGACY_PRICES) или None, если строки нет."""
+    return _PRICES_BY_ID.get(model_id or "")
+
+
+# Про кэш в формуле: пул этого ключа кеширует любой достаточно большой вход, не только
+# системные промпты (найдено 2026-08-31 при разборе dedup_memory.py). usage.input_tokens
+# при этом почти пустой, реальный вес — в cache_creation_input_tokens/cache_read_input_tokens
+# (40690 символов -> input_tokens=2, cache_creation_input_tokens=16186). Запись в кэш
+# делится по TTL: usage.cache_creation.ephemeral_5m/1h_input_tokens, у каждого свой множитель.
+
+
+def calc_llm_cost(model: str, inp: int, out: int, cache_write_5m: int = 0,
+                  cache_write_1h: int = 0, cache_read: int = 0) -> float:
     """Стоимость одного LLM-вызова в $ БЕЗ наценки (наценку добавляет _record_usage).
 
-    cache_write/cache_read — см. CACHE_WRITE_MULTIPLIER выше: без них цифра занижена на
-    порядки на большом system-prompt'е, не на проценты (найдено 2026-08-31).
-    cache_read_mult — из реестра, не общая константа: у Fable 5.1/Mythos 0.025x вместо 0.1x.
+    Без кэша цифра занижена на порядки на большом system-prompt'е (найдено 2026-08-31).
+    Множители — из цены модели (price_meta), с фолбэком на DEFAULT_CACHE_MULTS; модель
+    без цены вовсе — по дефолтной модели реестра (вызывающий должен был это отловить).
     """
-    meta = model_meta(model)
+    meta = price_meta(model) or MODELS[DEFAULT_MODEL_KEY]
+    mult = lambda k: meta.get(k, DEFAULT_CACHE_MULTS[k])
     price_in, price_out = meta["in"], meta["out"]
-    cache_read_mult = meta.get("cache_read_mult", CACHE_READ_MULTIPLIER)
     return (
         (inp / 1_000_000 * price_in)
-        + (cache_write / 1_000_000 * price_in * CACHE_WRITE_MULTIPLIER)
-        + (cache_read / 1_000_000 * price_in * cache_read_mult)
+        + (cache_write_5m / 1_000_000 * price_in * mult("cache_write_5m_mult"))
+        + (cache_write_1h / 1_000_000 * price_in * mult("cache_write_1h_mult"))
+        + (cache_read / 1_000_000 * price_in * mult("cache_read_mult"))
         + (out / 1_000_000 * price_out)
     )
 
@@ -183,7 +221,8 @@ def _fire(coro) -> None:
 
 
 def _record_usage(kind: str, model: str | None, label: str, base_cost: float,
-                  inp: int = 0, out: int = 0, cache_write: int = 0, cache_read: int = 0) -> None:
+                  inp: int = 0, out: int = 0, cache_write: int = 0, cache_read: int = 0,
+                  thinking: int = 0) -> None:
     """Единственная точка записи usage_log. Не роняет ответ: любая ошибка — в лог.
 
     billed=1 только если чат в платном тарифе на момент вызова (chat_id NULL → 0).
@@ -196,7 +235,7 @@ def _record_usage(kind: str, model: str | None, label: str, base_cost: float,
         billed = chat_id is not None and chat_tier(chat_id) == "paid"
         went_free = db.record_usage(
             chat_id, chat_type, user_id, kind, model, label, base_cost * PRICE_MARKUP, billed,
-            inp, out, cache_write, cache_read, settle=not is_admin(chat_id or 0),
+            inp, out, cache_write, cache_read, thinking=thinking, settle=not is_admin(chat_id or 0),
         )
         if went_free:
             _fire(_send_chat_notice(chat_id, TIER_FREE_MSG))
@@ -214,20 +253,54 @@ def _count_reply(user_id: int, chat_id: int) -> None:
         logger.exception("daily_usage: не удалось увеличить счётчик")
 
 
+# Пары (запрошенная, фактическая) модель без цены — warning один раз на пару за процесс,
+# иначе при систематическом расхождении (прокси переименовал модель) лог забьётся.
+_unknown_model_warned: set[tuple[str, str]] = set()
+
+
+def _billed_model(requested: str, response) -> str:
+    """Модель, по которой считать стоимость: поле model ИЗ ОТВЕТА, не запрошенная.
+
+    Opus 5.5 может прозрачно отдать запрос другой модели при срабатывании safeguards
+    (ТЗ feat/opus-5-5). Нет цены для модели из ответа → считаем по запрошенной + warning.
+    """
+    actual = getattr(response, "model", None) or requested
+    if price_meta(actual) is not None:
+        return actual
+    pair = (requested, actual)
+    if pair not in _unknown_model_warned:
+        _unknown_model_warned.add(pair)
+        logger.warning(f"usage_log: модели из ответа API нет в таблице цен — считаю по "
+                       f"запрошенной. requested={requested!r} response.model={actual!r}")
+    return requested
+
+
 def _track_response(model: str, response, label: str = "aux") -> None:
     """Учёт токенов по ответу API (пишет в usage_log).
 
     Зовётся из обёрток (sync_create / call_claude), а НЕ по месту: раньше половина
     путей — should_search, перевод, капча, extract_*, /search — не считалась вовсе,
     и /cost занижал расход. Новый вызов API автоматически попадает в учёт.
+    model — запрошенная; в usage_log пишется фактическая (см. _billed_model).
     """
     usage = getattr(response, "usage", None)
     if usage is None:
         return
+    model = _billed_model(model, response)
     inp, out = usage.input_tokens or 0, usage.output_tokens or 0
     cw = getattr(usage, "cache_creation_input_tokens", 0) or 0
     cr = getattr(usage, "cache_read_input_tokens", 0) or 0
-    _record_usage("llm", model, label, calc_llm_cost(model, inp, out, cw, cr), inp, out, cw, cr)
+    # Разбивка записи в кэш по TTL. Нет cache_creation в ответе — всё считаем как 5m.
+    cc = getattr(usage, "cache_creation", None)
+    if cc is not None:
+        cw_5m = getattr(cc, "ephemeral_5m_input_tokens", 0) or 0
+        cw_1h = getattr(cc, "ephemeral_1h_input_tokens", 0) or 0
+    else:
+        cw_5m, cw_1h = cw, 0
+    details = getattr(usage, "output_tokens_details", None)
+    thinking = (getattr(details, "thinking_tokens", 0) or 0) if details is not None else 0
+    _record_usage("llm", model, label, calc_llm_cost(model, inp, out, cw_5m, cw_1h, cr),
+                  inp, out, cw, cr, thinking=thinking)
 
 
 # --- Фоновые fire-and-forget задачи ---
@@ -1578,7 +1651,7 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
                 response = await aux_create(
                     label="daily_review",
                     model=DAILY_REVIEW_MODEL_ID,
-                    max_tokens=1000,
+                    max_tokens=out_tokens(DAILY_REVIEW_MODEL_ID, 1000),
                     system=(
                         "Ты Клодушка — AI с характером, которая считает себя умнее всех в чате (и не без оснований). "
                         "Напиши ироничный, остроумный обзор дня в чате — 3-4 абзаца, ОКОЛО 1000-1200 знаков суммарно. "
@@ -2055,7 +2128,7 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await call_claude(
             context, chat_id, label=f"/review chat={chat_id}",
             model=_model,
-            max_tokens=500,
+            max_tokens=out_tokens(_model, 500),
             system=(
                 "Ты Клодушка — AI с характером, которая считает себя умнее всех в чате (и не без оснований). "
                 "Напиши КОРОТКИЙ ироничный, саркастичный обзор дня в чате — 2-3 абзаца, не больше 600 знаков суммарно. "
@@ -2215,7 +2288,8 @@ def _usage_model_label(kind: str, model: str | None) -> str:
     """Подпись «модели» строки usage_log: LLM — из реестра; картинки хранят ключ провайдера,
     поиск — 'tavily'. Модель вне реестра показываем как есть (цена по дефолту, см. model_meta)."""
     if kind == "llm":
-        return model_meta(model or "")["label"] if model in _MODELS_BY_ID else f"{model} (нет в реестре)"
+        meta = price_meta(model)
+        return meta["label"] if meta else f"{model} (нет в реестре)"
     if kind == "image":
         return IMAGE_PROVIDERS.get(model, {}).get("label", model or "?")
     return "Tavily" if model == "tavily" else (model or "?")
@@ -2331,6 +2405,8 @@ def _cost_detail(target: int) -> str:
             tokens = ""
             if r["kind"] == "llm":
                 tokens = f", вх {r['input'] or 0:,} / вых {r['output'] or 0:,}"
+                if r.get("thinking"):
+                    tokens += f" (из них thinking {r['thinking']:,})"
                 if r["cache_write"] or r["cache_read"]:
                     tokens += f", кэш зап {r['cache_write']:,} / чтен {r['cache_read']:,}"
             lines.append(f"  {_usage_model_label(r['kind'], r['model'])}: {r['calls']} выз.{tokens} — {_money(r['cost'])}")
@@ -2657,7 +2733,7 @@ USER_HELP = """\
   /models        — модели, режим (платный/бесплатный) и что сейчас у чата
   /haiku         — Haiku 4.5 (дёшево и быстро; единственная в бесплатном режиме)
   /sonnet        — Sonnet 5 (платный режим)
-  /opus          — Opus 5 (платный режим)
+  /opus          — Opus 5.5 (платный режим)
   /fable         — Fable 5.1 (платный режим, просит подтверждения — очень дорогая)
   /imagemodels   — какой провайдер картинок сейчас у чата
   /banana        — рисовать через Nano Banana 2 (платный режим)
@@ -2688,7 +2764,7 @@ ADMIN_HELP = """\
   /models [chat_id]        — список моделей, цены, окно; ▸ = текущая
   /haiku [chat_id]         — Haiku 4.5 — $1/$5, окно 200k (бесплатный режим)
   /sonnet [chat_id]        — Sonnet 5 — $2/$10, окно 1M (дефолт платного режима)
-  /opus [chat_id]          — Opus 5 — $5/$25, окно 1M
+  /opus [chat_id]          — Opus 5.5 — $4/$20, окно 1M
   /fable [chat_id]         — Fable 5.1 — $10/$50, окно 1M (повтор в течение 2 минут = подтверждение)
   chat_id — число с минусом, например: /opus -1001109809707
   Не-Haiku модели — админу или чату в платном режиме. Выбор постоянный (chat_models),
@@ -2987,7 +3063,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await call_claude(
             context, update.effective_chat.id, label=f"/search uid={user_id}",
             model=get_chat_model(update.effective_chat.id),
-            max_tokens=2048,
+            max_tokens=out_tokens(get_chat_model(update.effective_chat.id), 2048),
             system="Ты Клодушка. Дай краткий ответ на основе результатов поиска. Отвечай на языке пользователя.",
             messages=[{"role": "user", "content": f"Вопрос: {query}\n\nРезультаты:\n{results}"}],
         )
@@ -3411,7 +3487,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             response = await call_claude(
                 context, chat_id, label=f"файл chat={chat_id}", usage_label="dialog",
-                model=_model, max_tokens=4096, system=system, messages=doc_history,
+                model=_model, max_tokens=out_tokens(_model, 4096), system=system, messages=doc_history,
             )
             answer = response_text(response)
             _count_reply(user_id, chat_id)
@@ -3479,7 +3555,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             response = await call_claude(
                 context, chat_id, label=f"фото chat={chat_id}", usage_label="dialog",
-                model=_model, max_tokens=2048, system=system, messages=vision_messages,
+                model=_model, max_tokens=out_tokens(_model, 2048), system=system, messages=vision_messages,
             )
             answer = response_text(response)
             _count_reply(user_id, chat_id)
@@ -3586,7 +3662,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             response = await call_claude(
                 context, chat_id, label=f"диалог chat={chat_id}", usage_label="dialog",
-                model=_model, max_tokens=4096, system=system, messages=messages,
+                model=_model, max_tokens=out_tokens(_model, 4096), system=system, messages=messages,
             )
         except anthropic.BadRequestError as e:
             # 400 prompt is too long: история не сохранится, следующее сообщение соберёт
@@ -3630,7 +3706,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 response = await call_claude(
                     context, chat_id, label=f"диалог chat={chat_id} (аварийная обрезка)",
-                    usage_label="dialog", model=_model, max_tokens=4096, system=retry_system, messages=retry_messages,
+                    usage_label="dialog", model=_model, max_tokens=out_tokens(_model, 4096), system=retry_system, messages=retry_messages,
                 )
             except anthropic.BadRequestError as e2:
                 if not api_errors.is_prompt_too_long(e2):

@@ -55,7 +55,8 @@
 - `docker-compose.yml` — `.claude/rules/docker-compose.md` (автоматически)
 - Тестовый стенд (`docker-compose.test.yml`, обновление зависимостей, рискованные
   правки перед продом) — `docs/claude/staging.md`; пошаговый чек-лист ТЗ v0.10 (с SELECT'ами) —
-  `docs/claude/staging-checklist-v0.10.md`
+  `docs/claude/staging-checklist-v0.10.md`; чек-лист ТЗ `feat/opus-5-5` (Opus 5.5, цена по
+  `response.model`, миграция `chat_models`) — `docs/claude/staging-checklist-opus-5-5.md`
 
 ## Стек
 - Python 3.12 (python:3.12-slim Docker image)
@@ -114,7 +115,9 @@
 - Каждый вызов, стоящий денег (LLM/картинка/поиск), обязан попасть в `usage_log` через
   `_record_usage` (LLM — автоматически внутри `call_claude`/`sync_create`/`aux_create`, но
   ВСЕГДА с `label=`). Чат берётся из `usage_ctx` (contextvar, ставит `gate_update`; в джобах —
-  явно) — не передавать chat_id руками и не писать в `usage_log` в обход. `docs/claude/billing.md`.
+  явно) — не передавать chat_id руками и не писать в `usage_log` в обход. Цена LLM — по
+  `response.model` (фактической), множители кэша — поля модели в `MODELS`/`LEGACY_PRICES`,
+  глобальных констант нет. `docs/claude/billing.md`, `docs/claude/models-and-costs.md`.
 - Тариф чата — `chat_tier(chat_id)`; модель/провайдер — только через `get_chat_model` /
   `get_chat_image_provider` (учитывают free), не читать `chat_models`/`chat_image_provider`
   напрямую. В free записи этих таблиц не менять. `docs/claude/billing.md`.
