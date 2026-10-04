@@ -40,8 +40,8 @@ WHATSAPP_API_URL = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_NUMBER_ID}
 
 # Модель для ответов пользователю (whatsapp.py вне реестра MODELS из bot.py — см.
 # docs/claude/models-and-costs.md). Было claude-sonnet-4-6, переведено на claude-sonnet-5
-# 2026-09-19 — тот же ID, которым bot.py уже пользуется для /sonnet в проде.
-WA_MODEL = "claude-sonnet-5"
+# 2026-09-19, на claude-sonnet-5-5 — 2026-10-04 (тот же ID, что у /sonnet в bot.py).
+WA_MODEL = "claude-sonnet-5-5"
 # Служебные вызовы (should_search, extract_memory) — только Haiku, никогда модель ответа.
 WA_AUX_MODEL = "claude-haiku-4-5-20251001"
 

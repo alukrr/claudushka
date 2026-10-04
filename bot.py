@@ -113,7 +113,7 @@ MODELS = {
                "in": 1.0,  "out": 5.0,  "cache_read_mult": 0.1,
                "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context":   200_000,
                "thinking_headroom": 0},
-    "sonnet": {"id": "claude-sonnet-5",           "label": "Sonnet 5",
+    "sonnet": {"id": "claude-sonnet-5-5",         "label": "Sonnet 5.5",
                "in": 2.0,  "out": 10.0, "cache_read_mult": 0.1,
                "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context": 1_000_000,
                "thinking_headroom": 8000},
@@ -133,7 +133,10 @@ DEFAULT_MODEL_ID = MODELS[DEFAULT_MODEL_KEY]["id"]
 # истории usage_log — только для цены и подписи в /cost. claude-opus-5 — прошлый /opus
 # (до 2026-09-23); claude-opus-4-8 — модель, на которую Opus 5.5 может прозрачно отдать
 # запрос при срабатывании safeguards (стоимость считаем по response.model, см. _track_response).
+# claude-sonnet-5 — прошлый /sonnet (до 2026-10-04), для подписи старых строк usage_log.
 LEGACY_PRICES = {
+    "claude-sonnet-5": {"label": "Sonnet 5", "in": 2.0, "out": 10.0, "cache_read_mult": 0.1,
+                        "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0},
     "claude-opus-5":   {"label": "Opus 5",   "in": 5.0, "out": 25.0, "cache_read_mult": 0.1,
                         "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0},
     "claude-opus-4-8": {"label": "Opus 4.8", "in": 5.0, "out": 25.0, "cache_read_mult": 0.1,
@@ -2774,7 +2777,7 @@ USER_HELP = """\
   /imagine <q>   — генерация изображения
   /models        — модели, режим (платный/бесплатный) и что сейчас у чата
   /haiku         — Haiku 4.5 (дёшево и быстро; единственная в бесплатном режиме)
-  /sonnet        — Sonnet 5 (платный режим)
+  /sonnet        — Sonnet 5.5 (платный режим)
   /opus          — Opus 5.5 (платный режим)
   /fable         — Fable 5.1 (платный режим, просит подтверждения — очень дорогая)
   /imagemodels   — какой провайдер картинок сейчас у чата
@@ -2805,7 +2808,7 @@ ADMIN_HELP = """\
 Модели (без аргумента — текущий чат; с chat_id — любой, только админу):
   /models [chat_id]        — список моделей, цены, окно; ▸ = текущая
   /haiku [chat_id]         — Haiku 4.5 — $1/$5, окно 200k (бесплатный режим)
-  /sonnet [chat_id]        — Sonnet 5 — $2/$10, окно 1M (дефолт платного режима)
+  /sonnet [chat_id]        — Sonnet 5.5 — $2/$10, окно 1M (дефолт платного режима)
   /opus [chat_id]          — Opus 5.5 — $4/$20, окно 1M
   /fable [chat_id]         — Fable 5.1 — $10/$50, окно 1M (повтор в течение 2 минут = подтверждение)
   chat_id — число с минусом, например: /opus -1001109809707

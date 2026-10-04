@@ -10,11 +10,12 @@
 | ключ | id | label | $/MTok in/out | cache read | запись 5m / 1h | окно | кому |
 |---|---|---|---|---|---|---|---|
 | `haiku` | `claude-haiku-4-5-20251001` | Haiku 4.5 | 1 / 5 | 0.1× | 1.25× / 2× | 200k | всем (free-режим — только она) |
-| `sonnet` | `claude-sonnet-5` | Sonnet 5 | 2 / 10 | 0.1× | 1.25× / 2× | 1M | админ ИЛИ платный чат (дефолт платного) |
+| `sonnet` | `claude-sonnet-5-5` | Sonnet 5.5 | 2 / 10 | 0.1× | 1.25× / 2× | 1M | админ ИЛИ платный чат (дефолт платного) |
 | `opus` | `claude-opus-5-5` | Opus 5.5 | 4 / 20 | **0.05×** | 1.25× / 2× | 1M | админ ИЛИ платный чат |
 | `fable` | `claude-fable-5-1` | Fable 5.1 | 10 / 50 | **0.025×** | 1.25× / 2× | 1M | админ ИЛИ платный чат, с подтверждением |
 
-**`LEGACY_PRICES`** (bot.py) — модели с ценой, но БЕЗ выбора пользователем: `claude-opus-5`
+**`LEGACY_PRICES`** (bot.py) — модели с ценой, но БЕЗ выбора пользователем: `claude-sonnet-5`
+(прошлый `/sonnet`, 2 / 10, 0.1×), `claude-opus-5`
 (прошлый `/opus`, 5 / 25, 0.1× — для подписи старых строк `usage_log` в `/cost`) и
 `claude-opus-4-8` (5 / 25, 0.1× — фолбэк safeguards Opus 5.5, см. «Учёт токенов»).
 `price_meta(id)` ищет в `MODELS` + `LEGACY_PRICES` (для цены и подписи), `model_meta(id)` — только
@@ -31,7 +32,7 @@ default)` теперь отдаёт только сохранённый выбо
 прайс Anthropic, прокси даёт скидку сверху; **сверено 2026-09-19** по
 [models/overview](https://platform.claude.com/docs/en/about-claude/models/overview) и
 [pricing](https://platform.claude.com/docs/en/about-claude/pricing).
-**Sonnet 5: цена $2/$10 постоянная** — доки Anthropic прямо говорят, что запланированное
+**Sonnet 5 / 5.5: цена $2/$10 постоянная** — доки Anthropic прямо говорят, что запланированное
 повышение до $3/$15 (1.09.2026) отменено. Старый комментарий в реестре («после 31.08
 станет верным само») был ошибкой — цена и так стоит правильно, `/cost` больше не завышает.
 
@@ -50,8 +51,16 @@ thinking выключить НЕЛЬЗЯ (`{type: "disabled"}` и `budget_tokens
 effort не задаёт; forced `tool_choice` (`any`/`tool`) → 400 — в коде не используется; thinking
 тратит `max_tokens`, текст ответа извлекается только `response_text()` — перебором блоков.
 
+**Sonnet 5 → Sonnet 5.5 (`claude-sonnet-5-5`) — 2026-10-04, ТЗ `feat/sonnet-5-5`**, по образцу Opus.
+Пул принимает строку (проверено). Цена $2/$10, кэш 0.1× / 1.25× / 2× — как у Sonnet 5 (сверено с pricing на
+2026-10-04). `MODELS["sonnet"]`, `WA_MODEL` (whatsapp.py), `MODEL_ALIASES`/`PRICING` в `dedup_memory.py` — на 5.5;
+`claude-sonnet-5` остался в `LEGACY_PRICES` и `PRICING` для старых строк `usage_log`. Миграция `chat_models` —
+точное `WHERE model='claude-sonnet-5'` (идемпотентна, проверена на временной БД); `claude-sonnet-4-%` теперь
+мигрируют сразу в 5.5. Таблицы цен в bot.py и dedup_memory.py дублируются — сверены построчно, в общий
+модуль не выносили.
+
 **`max_tokens` на модели чата — только через `out_tokens(model, visible)`** = бюджет на видимый
-ответ + `MODELS[...]["thinking_headroom"]` (Haiku 0, Sonnet/Opus/Fable 8000). Найдено на стенде
+ответ + `MODELS[...]["thinking_headroom"]` (Haiku 0, Sonnet/Opus/Fable 8000; Sonnet 5.5 — тот же запас, что у 5). Найдено на стенде
 2026-09-23: `/review` с `max_tokens=500` на Opus 5.5 → `stop_reason=max_tokens blocks=['thinking']`,
 весь лимит ушёл на thinking, текста ноль. Касается всех вызовов на `get_chat_model` /
 `DAILY_REVIEW_MODEL_ID` (диалог, фото, документ, `/search`, `/review`, дневной обзор). Служебные
@@ -86,8 +95,8 @@ effort не задаёт; forced `tool_choice` (`any`/`tool`) → 400 — в к�
   своей природе обязан тестировать ИМЕННО ту модель, на которую переключаются
   (`/haiku /sonnet /opus /fable`), это не подпадает под классификацию «служебный/ответ».
 - whatsapp.py собственного реестра `MODELS` не имеет, но своих моделей теперь две
-  константы: `WA_MODEL = "claude-sonnet-5"` (ответы пользователю, было
-  `claude-sonnet-4-6` — переведено 2026-09-19, тот же ID, что и `/sonnet` в bot.py) и
+  константы: `WA_MODEL = "claude-sonnet-5-5"` (ответы пользователю, было
+  `claude-sonnet-4-6` → `claude-sonnet-5` 2026-09-19 → 5.5 2026-10-04, тот же ID, что и `/sonnet` в bot.py) и
   `WA_AUX_MODEL = "claude-haiku-4-5-20251001"` (служебные `should_search`/
   `extract_memory`, тот же принцип «служебное — только Haiku»). Появится третья точка
   с похожей логикой — тогда осмысленно выносить `MODELS` в общий модуль.
@@ -145,9 +154,9 @@ cache_write_1h, cache_read)` (без наценки; `PRICE_MARKUP` примен
 
 ## Миграция chat_models
 В `init_db()`, идемпотентная, вместе с остальными:
-`UPDATE chat_models SET model='claude-sonnet-5' WHERE model LIKE 'claude-sonnet-4-%'`
-и то же для `claude-opus-4-%` → `claude-opus-5-5` (с 2026-09-23 сразу на 5.5). Плюс
-`UPDATE chat_models SET model='claude-opus-5-5' WHERE model='claude-opus-5'` (точное сравнение).
+`UPDATE chat_models SET model='claude-sonnet-5-5' WHERE model LIKE 'claude-sonnet-4-%'`
+(с 2026-10-04 сразу на 5.5) и то же для `claude-opus-4-%` → `claude-opus-5-5` (с 2026-09-23 сразу на 5.5). Плюс
+`UPDATE chat_models SET model='claude-opus-5-5' WHERE model='claude-opus-5'` (точное сравнение) и `... SET model='claude-sonnet-5-5' WHERE model='claude-sonnet-5'` (с 2026-10-04).
 `chat_models` — единственное место выбора модели, оно же хранит «прошлый платный выбор» для
 возврата из free (free-режим таблицу не трогает). `usage_log` НЕ мигрируется: это история,
 `cost_usd` заморожен при вставке, старые строки Opus 5 остаются по $5/$25. Haiku не трогается.
