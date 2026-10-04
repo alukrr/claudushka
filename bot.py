@@ -92,11 +92,10 @@ FABLE_CONFIRM_WINDOW = 120  # секунд на повтор /fable
 captcha_state: dict[str, dict] = {}
 
 # Единственный источник правды по моделям: команды, цены, гейтинг, /models — отсюда.
-# Пул api.apitoken.sale принимает эти строки (проверено живым запросом 29.07.2026).
-# Цены — официальный прайс Anthropic в $/MTok (in/out), сверено 2026-09-23 по
-# https://platform.claude.com/docs/en/about-claude/pricing (ТЗ feat/opus-5-5),
-# прокси даёт скидку сверху. Sonnet 5: $2/$10 — постоянная цена (повышение до $3/$15
-# отменено Anthropic).
+# Пул router.apitoken.sale принимает эти строки: Sonnet 5.5 проверен 2026-10-04, остальные —
+# ранее живыми запросами. Цены — официальный прайс Anthropic в $/MTok (in/out), сверены
+# 2026-10-04 по https://platform.claude.com/docs/en/about-claude/pricing; прокси даёт скидку
+# сверху. Sonnet 5/5.5: $2/$10 — постоянная цена (повышение до $3/$15 отменено Anthropic).
 # Множители prompt cache — ПОЛЯ МОДЕЛИ, не глобальные константы (ТЗ feat/opus-5-5):
 #   cache_read_mult      — чтение из кэша: 0.1× у большинства, Opus 5.5 — 0.05×, Fable 5.1 — 0.025×;
 #   cache_write_5m_mult  — запись с TTL 5 минут, 1.25× у всех текущих;
