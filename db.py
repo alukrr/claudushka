@@ -250,7 +250,8 @@ def init_db():
         # v0.9.0: чаты, залипшие на четвёртом поколении, переезжают на пятое.
         # Идемпотентно: после первого прогона строк под условие не остаётся.
         # Haiku не трогаем — claude-haiku-4-5-20251001 остаётся дефолтом.
-        "UPDATE chat_models SET model='claude-sonnet-5' WHERE model LIKE 'claude-sonnet-4-%'",
+        # (с 2026-10-04 — сразу на Sonnet 5.5, как и с Opus: claude-sonnet-5 из выбора убран, см. ниже)
+        "UPDATE chat_models SET model='claude-sonnet-5-5' WHERE model LIKE 'claude-sonnet-4-%'",
         # (с 2026-09-23 — сразу на Opus 5.5: claude-opus-5 из выбора убран, см. ниже)
         "UPDATE chat_models SET model='claude-opus-5-5' WHERE model LIKE 'claude-opus-4-%'",
         "ALTER TABLE allowed_chats ADD COLUMN daily_review_enabled INTEGER NOT NULL DEFAULT 1",
@@ -267,6 +268,9 @@ def init_db():
         # сравнение, не LIKE: claude-opus-5-5 и прочие строки не задеваем. usage_log —
         # история по замороженной цене, НЕ мигрируется.
         "UPDATE chat_models SET model='claude-opus-5-5' WHERE model='claude-opus-5'",
+        # 2026-10-04 (ТЗ feat/sonnet-5-5): Sonnet 5 -> Sonnet 5.5, по образцу Opus выше.
+        # Точное сравнение; usage_log не мигрируется (цена заморожена в cost_usd).
+        "UPDATE chat_models SET model='claude-sonnet-5-5' WHERE model='claude-sonnet-5'",
         # Токены thinking (usage.output_tokens_details.thinking_tokens) — входят в output,
         # отдельно только для видимости доли thinking в расходах.
         "ALTER TABLE usage_log ADD COLUMN thinking INTEGER NOT NULL DEFAULT 0",
