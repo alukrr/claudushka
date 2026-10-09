@@ -56,7 +56,9 @@
 - Тестовый стенд (`docker-compose.test.yml`, обновление зависимостей, рискованные
   правки перед продом) — `docs/claude/staging.md`; пошаговый чек-лист ТЗ v0.10 (с SELECT'ами) —
   `docs/claude/staging-checklist-v0.10.md`; чек-лист ТЗ `feat/opus-5-5` (Opus 5.5, цена по
-  `response.model`, миграция `chat_models`) — `docs/claude/staging-checklist-opus-5-5.md`
+  `response.model`, миграция `chat_models`) — `docs/claude/staging-checklist-opus-5-5.md`;
+  чек-лист ТЗ `feat/haiku-5-5` (Haiku 5.5, thinking/effort, ступенчатая цена >100k) —
+  `docs/claude/staging-checklist-haiku-5-5.md`
 
 ## Стек
 - Python 3.12 (python:3.12-slim Docker image)
@@ -109,7 +111,9 @@
 - Уровень логов httpx не поднимать до INFO — токен бота утекает в URL.
 - Пользователь никогда не видит сырой текст исключения — только `api_errors.reply_api_error`.
 - Служебные вызовы (капча, поиск, перевод промпта, извлечение памяти, описание медиа) —
-  только `DEFAULT_MODEL_ID`; ответы пользователю — `get_chat_model(chat_id)`.
+  только `DEFAULT_MODEL_ID` и ВСЕГДА с `**aux_params()` (у Haiku 5.5 thinking иначе съест
+  `max_tokens` и ответ придёт пустым); ответы пользователю — `get_chat_model(chat_id)` с
+  `**dialog_params(model)` и `out_tokens(...)`.
   `MODELS["..."]["id"]` в новых вызовах не хардкодить (единственное сознательное исключение —
   `daily_chat_review` на Opus, платная фича). `docs/claude/models-and-costs.md`.
 - Каждый вызов, стоящий денег (LLM/картинка/поиск), обязан попасть в `usage_log` через
