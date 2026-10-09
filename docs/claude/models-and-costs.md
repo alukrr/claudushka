@@ -9,12 +9,13 @@
 
 | ключ | id | label | $/MTok in/out | cache read | запись 5m / 1h | окно | кому |
 |---|---|---|---|---|---|---|---|
-| `haiku` | `claude-haiku-4-5-20251001` | Haiku 4.5 | 1 / 5 | 0.1× | 1.25× / 2× | 200k | всем (free-режим — только она) |
+| `haiku` | `claude-haiku-5-5` | Haiku 5.5 | **0.10 / 0.50** (промпт >100k: 0.50 / 2.50) | 0.1× | 1.25× / 2× | 1M | всем (free-режим — только она) |
 | `sonnet` | `claude-sonnet-5-5` | Sonnet 5.5 | 2 / 10 | **0.05×** | 1.25× / 2× | 1M | админ ИЛИ платный чат (дефолт платного) |
 | `opus` | `claude-opus-5-5` | Opus 5.5 | 4 / 20 | **0.05×** | 1.25× / 2× | 1M | админ ИЛИ платный чат |
 | `fable` | `claude-fable-5-1` | Fable 5.1 | 10 / 50 | **0.025×** | 1.25× / 2× | 1M | админ ИЛИ платный чат, с подтверждением |
 
-**`LEGACY_PRICES`** (bot.py) — модели с ценой, но БЕЗ выбора пользователем: `claude-sonnet-5`
+**`LEGACY_PRICES`** (bot.py) — модели с ценой, но БЕЗ выбора пользователем: `claude-haiku-4-5-20251001`
+(прошлый `/haiku`, 1 / 5, 0.1×), `claude-sonnet-5`
 (прошлый `/sonnet`, 2 / 10, 0.1×), `claude-opus-5`
 (прошлый `/opus`, 5 / 25, 0.1× — для подписи старых строк `usage_log` в `/cost`) и
 `claude-opus-4-8` (5 / 25, 0.1× — фолбэк safeguards Opus 5.5, см. «Учёт токенов»).
@@ -37,8 +38,44 @@ default)` теперь отдаёт только сохранённый выбо
 станет верным само») был ошибкой — цена и так стоит правильно, `/cost` больше не завышает.
 
 `cache_read_mult`, `cache_write_5m_mult`, `cache_write_1h_mult` — поля модели (с 2026-09-23 глобальных
-`CACHE_READ_MULTIPLIER`/`CACHE_WRITE_MULTIPLIER` больше нет). Чтение из кэша: 0.1× у Haiku 4.5/Sonnet 5/Opus 5,
+`CACHE_READ_MULTIPLIER`/`CACHE_WRITE_MULTIPLIER` больше нет). Чтение из кэша: 0.1× у Haiku 5.5/Haiku 4.5/Sonnet 5/Opus 5,
 0.05× у Opus 5.5 и Sonnet 5.5 (до 2026-10-09 у Sonnet 5.5 по ошибке стояло 0.1× — `/cost` завышал чтение кэша вдвое; старые строки `usage_log` остаются как есть), 0.025× у Fable 5.1. Модель без явного поля — `DEFAULT_CACHE_MULTS` (0.1 / 1.25 / 2.0).
+
+**Haiku 4.5 → Haiku 5.5 (`claude-haiku-5-5`) — 2026-10-09, ТЗ `feat/haiku-5-5`.** Дефолтная/free-модель и
+ВСЕ служебные вызовы. Сверено по докам Anthropic (overview, migration-guide, prompting-claude-haiku-5-5, pricing)
+2026-10-09; `anthropic==1.7.0` принимает `thinking=` и `output_config=` именованными аргументами (проверено
+mock-транспортом в venv, тело запроса содержит оба). Что важно:
+- **Thinking по умолчанию включён** (adaptive, effort `medium`) и тратит `max_tokens`. Служебные вызовы имеют лимиты
+  30–512 → без правки ответ был бы пуст. Решение — два хелпера в bot.py, оба смотрят на флаг `"effort": True` в
+  записи `MODELS` (у других моделей возвращают `{}`; НЕ через `model_meta` — тот фолбэчит на дефолт и выдал бы чужой
+  модели параметры Haiku):
+  - `aux_params()` — `thinking={"type":"disabled"}` + `output_config={"effort":"low"}` на ВСЕХ служебных вызовах
+    (should_search, rewrite, translate, media_describe, captcha×2, extract_memory, extract_chat_memory, greet_filter,
+    greet) и в `_probe_model`. `disabled` допустим только на low/medium/high (на xhigh/max — 400).
+  - `dialog_params(model)` — `thinking={"type":"adaptive"}` + `effort=HAIKU_DIALOG_EFFORT` (env, дефолт `low`;
+    допустимы low/medium/high, иначе warning и `low`) на ответах пользователю: диалог (+аварийная обрезка), фото, файл,
+    `/search`, `/review`. `thinking_headroom` Haiku = 4000 (стартовое значение, уточнить по `usage_log.thinking` на стенде).
+  - Риск из гайда: на `low` рассуждения могут протекать в видимый текст → `HAIKU_DIALOG_EFFORT=medium` в `.env` (нужен
+    `docker compose up -d --force-recreate`, `restart` env не перечитывает), без правки кода.
+- **Ступенчатая цена.** Промпт >100 000 токенов — in 0.50 / out 2.50 (×5), множители кэша те же. По доке pricing
+  («Long context pricing») длина промпта = ВЕСЬ вход: `input + cache write + cache read`; каждый запрос считается
+  отдельно, попадание части в кэш от верхней ступени не спасает (в ТЗ это было допущением — подтверждено). В записи
+  модели: `tier_threshold/tier_in/tier_out`, учтено в `calc_llm_cost`; `_track_response` пишет `warning`, если вход
+  Haiku >100k. Лимиты памяти/истории НЕ поднимали — прежняя причина (инцидент 2026-07-26) + ×5 выше 100k.
+- Токенизатор даёт ~+30% токенов на тот же текст; изображения — тарифицируются в более высоком разрешении (до ~2.5× токенов
+  на крупном фото; касается `media_describe`). Экономия ожидается ~7–8×, а не 10× (проверить по `usage_log`).
+- Отказы: у Haiku 5.5 safety-классификаторы без fallback (`stop_reason="refusal"`), повтор даёт тот же отказ. Диалог
+  отвечает пользователю (`bot.py` «Отказалась отвечать…»); служебные вызовы трактуют пустой текст как «нечего делать»
+  (should_search → нет поиска, память → ничего не пишем, rewrite → без повтора). Закрыто попутно: `draw_translate` при
+  пустом ответе рисует по исходному тексту, `captcha_gen` — запасной вопрос.
+- Миграция `chat_models`: `claude-haiku-4-5-20251001` → `claude-haiku-5-5` (точное сравнение, идемпотентна, проверена на
+  временной БД). Именно UPDATE, а не DELETE: запись Haiku в платном чате — осознанный `/haiku`, удаление молча перевело бы
+  чат на дорогой Sonnet. `_mig_defaults` (`billing_defaults`) — одноразовая, не трогали. SQL-дефолт колонки — 5.5.
+- `WA_AUX_MODEL` (whatsapp.py), `MODEL_ALIASES`/`PRICING`/`TIERS`/`AUX_PARAMS` (dedup_memory.py) синхронизированы;
+  в dedup цена теперь считается по запросу (ступень зависит от каждого запроса, а не от суммы). Диалог WhatsApp идёт на
+  Sonnet (`WA_MODEL`), ему параметры Haiku не нужны.
+- Откат: вернуть запись `MODELS["haiku"]` на `claude-haiku-4-5-20251001` (цены 1/5, окно 200k, headroom 0, убрать `effort` и
+  `tier_*`) — хелперы вернут `{}`, параметры уйдут сами. Миграцию `chat_models` назад придётся делать руками.
 
 **Opus 5 → Opus 5.5 (`claude-opus-5-5`) — 2026-09-23, ТЗ `feat/opus-5-5`.** Стенд пройден 2026-09-23 по
 `docs/claude/staging-checklist-opus-5-5.md`: пул принимает `claude-opus-5-5`, `response.model`
@@ -60,11 +97,11 @@ effort не задаёт; forced `tool_choice` (`any`/`tool`) → 400 — в к�
 модуль не выносили.
 
 **`max_tokens` на модели чата — только через `out_tokens(model, visible)`** = бюджет на видимый
-ответ + `MODELS[...]["thinking_headroom"]` (Haiku 0, Sonnet/Opus/Fable 8000; Sonnet 5.5 — тот же запас, что у 5). Найдено на стенде
+ответ + `MODELS[...]["thinking_headroom"]` (Haiku 5.5 — 4000 для диалога, Sonnet/Opus/Fable 8000; Sonnet 5.5 — тот же запас, что у 5). Найдено на стенде
 2026-09-23: `/review` с `max_tokens=500` на Opus 5.5 → `stop_reason=max_tokens blocks=['thinking']`,
 весь лимит ушёл на thinking, текста ноль. Касается всех вызовов на `get_chat_model` /
 `DAILY_REVIEW_MODEL_ID` (диалог, фото, документ, `/search`, `/review`, дневной обзор). Служебные
-вызовы на Haiku — голые числа, Haiku без явного `thinking` не думает. Запас сам не стоит денег,
+вызовы на Haiku — голые числа, но с `**aux_params()` (thinking выключен). Запас сам не стоит денег,
 длину видимого текста держит промпт + `trim_to_last_sentence`.
 
 **Fable 5 → Fable 5.1 (`claude-fable-5-1`) — сделано 2026-09-19.** Пул `api.apitoken.sale`
@@ -77,11 +114,11 @@ effort не задаёт; forced `tool_choice` (`any`/`tool`) → 400 — в к�
   без исключения (в `chat_models` могли остаться строки прошлых поколений).
   В `/cost` такая модель помечается «нет в реестре» — иначе цифра выглядела бы точной.
 - `db.get_chat_model_db / set_chat_model_db`, обёртка `get_chat_model(chat_id)` в bot.py.
-- **Окна различаются: Haiku 200k, пятое поколение 1M. Лимиты памяти/истории калиброваны
-  под МИНИМАЛЬНОЕ (200k) — не поднимать их, ссылаясь на 1M.** Дефолт остаётся Haiku;
-  поднять потолок значит вернуть июльский инцидент всем, кто сидит на `/haiku`.
+- **Окна: у Haiku 5.5 и пятого поколения 1M, но лимиты памяти/истории калиброваны под 200k —
+  не поднимать их, ссылаясь на 1M.** Дефолт остаётся Haiku; поднять потолок значит вернуть июльский
+  инцидент всем на `/haiku`, а у Haiku 5.5 вход >100k ещё и в 5 раз дороже.
   См. «Потолок на чтении» в `docs/claude/memory.md`.
-- **Служебные вызовы — ТОЛЬКО `DEFAULT_MODEL_ID` (Haiku), без исключений** (правило
+- **Служебные вызовы — ТОЛЬКО `DEFAULT_MODEL_ID` (Haiku) и всегда с `**aux_params()`, без исключений** (правило
   Алексея, 2026-09-19): капча, `should_search`, перевод промпта рисования,
   `greet_new_member`, извлечение памяти (и `extract_memory` в личке, и
   `extract_all_participants_memory` в группе — раньше `extract_memory` в личке шёл на
@@ -97,7 +134,7 @@ effort не задаёт; forced `tool_choice` (`any`/`tool`) → 400 — в к�
 - whatsapp.py собственного реестра `MODELS` не имеет, но своих моделей теперь две
   константы: `WA_MODEL = "claude-sonnet-5-5"` (ответы пользователю, было
   `claude-sonnet-4-6` → `claude-sonnet-5` 2026-09-19 → 5.5 2026-10-04, тот же ID, что и `/sonnet` в bot.py) и
-  `WA_AUX_MODEL = "claude-haiku-4-5-20251001"` (служебные `should_search`/
+  `WA_AUX_MODEL = "claude-haiku-5-5"` + `WA_AUX_PARAMS` (служебные `should_search`/
   `extract_memory`, тот же принцип «служебное — только Haiku»). Появится третья точка
   с похожей логикой — тогда осмысленно выносить `MODELS` в общий модуль.
 
@@ -159,4 +196,5 @@ cache_write_1h, cache_read)` (без наценки; `PRICE_MARKUP` примен
 `UPDATE chat_models SET model='claude-opus-5-5' WHERE model='claude-opus-5'` (точное сравнение) и `... SET model='claude-sonnet-5-5' WHERE model='claude-sonnet-5'` (с 2026-10-04).
 `chat_models` — единственное место выбора модели, оно же хранит «прошлый платный выбор» для
 возврата из free (free-режим таблицу не трогает). `usage_log` НЕ мигрируется: это история,
-`cost_usd` заморожен при вставке, старые строки Opus 5 остаются по $5/$25. Haiku не трогается.
+`cost_usd` заморожен при вставке, старые строки Opus 5 остаются по $5/$25. Строки Haiku 4.5 в `usage_log` тоже остаются (цена 1/5 заморожена; подпись — через `LEGACY_PRICES`).
+В `chat_models` Haiku 4.5 мигрируется в 5.5 (`UPDATE ... WHERE model='claude-haiku-4-5-20251001'`, с 2026-10-09).
