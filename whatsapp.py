@@ -43,7 +43,12 @@ WHATSAPP_API_URL = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_NUMBER_ID}
 # 2026-09-19, на claude-sonnet-5-5 — 2026-10-04 (тот же ID, что у /sonnet в bot.py).
 WA_MODEL = "claude-sonnet-5-5"
 # Служебные вызовы (should_search, extract_memory) — только Haiku, никогда модель ответа.
-WA_AUX_MODEL = "claude-haiku-4-5-20251001"
+# Haiku 5.5 с 2026-10-09: thinking по умолчанию включён и съедает max_tokens (лимиты 30/300),
+# поэтому для служебных вызовов — thinking disabled + effort low (аналог aux_params в bot.py;
+# disabled допустим только на low/medium/high). Диалог WhatsApp идёт на WA_MODEL (Sonnet) —
+# ему параметры не нужны. Сервис на паузе, но держим в том же состоянии, что bot.py.
+WA_AUX_MODEL = "claude-haiku-5-5"
+WA_AUX_PARAMS = {"thinking": {"type": "disabled"}, "output_config": {"effort": "low"}}
 
 # SDK-ретраи — для синхронных вспомогательных вызовов (should_search, extract_memory).
 # Основной диалог идёт через api_errors.call_with_retry на client_noretry.
@@ -191,6 +196,7 @@ def should_search(text: str) -> str | None:
     try:
         response = client.messages.create(
             model=WA_AUX_MODEL,
+            **WA_AUX_PARAMS,
             max_tokens=30,
             system=(
                 "Определи, нужен ли веб-поиск для ответа на вопрос пользователя. "
@@ -248,6 +254,7 @@ def extract_memory(phone: str, messages: list):
         recent = messages[-6:]
         response = client.messages.create(
             model=WA_AUX_MODEL,
+            **WA_AUX_PARAMS,
             max_tokens=300,
             system=(
                 "Извлеки важные факты о пользователе из диалога. "

@@ -92,7 +92,8 @@ FABLE_CONFIRM_WINDOW = 120  # секунд на повтор /fable
 captcha_state: dict[str, dict] = {}
 
 # Единственный источник правды по моделям: команды, цены, гейтинг, /models — отсюда.
-# Пул router.apitoken.sale принимает эти строки: Sonnet 5.5 проверен 2026-10-04, остальные —
+# Пул router.apitoken.sale принимает эти строки: Sonnet 5.5 проверен 2026-10-04, Haiku 5.5 — СТЕНД (см.
+# docs/claude/staging-checklist-haiku-5-5.md), остальные —
 # ранее живыми запросами. Цены — официальный прайс Anthropic в $/MTok (in/out), сверены
 # 2026-10-04 по https://platform.claude.com/docs/en/about-claude/pricing; прокси даёт скидку
 # сверху. Sonnet 5/5.5: $2/$10 — постоянная цена (повышение до $3/$15 отменено Anthropic).
@@ -104,14 +105,24 @@ captcha_state: dict[str, dict] = {}
 # thinking_headroom — сколько токенов добавить к max_tokens под thinking (см. out_tokens).
 # У пятого поколения thinking включён по умолчанию (у Opus 5.5 — не выключается вовсе) и
 # расходует max_tokens: на /review с лимитом 500 Opus 5.5 потратил всё на thinking и не
-# вернул текста (стенд, 2026-09-23). Haiku 4.5 без явного параметра не думает — 0.
-# Окна контекста: у Haiku 200k, у пятого поколения 1M. Лимиты памяти и истории
-# калиброваны под МИНИМАЛЬНОЕ (200k) — не поднимать их, ссылаясь на 1M у Opus.
+# вернул текста (стенд, 2026-09-23). У Haiku 5.5 (с 2026-10-09) thinking тоже по умолчанию
+# включён (adaptive, effort medium), но управляем: диалог идёт на adaptive + HAIKU_DIALOG_EFFORT
+# (запас 4000, стартовое значение — уточнить по usage_log.thinking), служебные — thinking
+# disabled + effort low (aux_params), поэтому им запас не нужен.
+# effort — флаг «модель принимает thinking/output_config.effort»: только у Haiku 5.5.
+# Откат на Haiku 4.5 — правка этой записи (id/цены/context/headroom 0, убрать effort и tier_*).
+# tier_* — ступенчатая цена: промпт > tier_threshold токенов (input + cache read + cache write
+# ВМЕСТЕ — так прямо сказано в доке pricing, «Long context pricing») тарифицируется по
+# tier_in/tier_out, множители кэша те же. Остальные модели ступеней не имеют.
+# Окна контекста: у Haiku 5.5 и пятого поколения 1M. Лимиты памяти и истории
+# калиброваны под 200k и НЕ поднимаются: прежний инцидент (2026-07-26) и, кроме того,
+# у Haiku 5.5 вход > 100k стоит в 5 раз дороже (см. warning в _track_response).
 MODELS = {
-    "haiku":  {"id": "claude-haiku-4-5-20251001", "label": "Haiku 4.5",
-               "in": 1.0,  "out": 5.0,  "cache_read_mult": 0.1,
-               "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context":   200_000,
-               "thinking_headroom": 0},
+    "haiku":  {"id": "claude-haiku-5-5",          "label": "Haiku 5.5",
+               "in": 0.10, "out": 0.50, "cache_read_mult": 0.1,
+               "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context": 1_000_000,
+               "thinking_headroom": 4000, "effort": True,
+               "tier_threshold": 100_000, "tier_in": 0.50, "tier_out": 2.50},
     "sonnet": {"id": "claude-sonnet-5-5",         "label": "Sonnet 5.5",
                "in": 2.0,  "out": 10.0, "cache_read_mult": 0.05,
                "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context": 1_000_000,
@@ -132,8 +143,11 @@ DEFAULT_MODEL_ID = MODELS[DEFAULT_MODEL_KEY]["id"]
 # истории usage_log — только для цены и подписи в /cost. claude-opus-5 — прошлый /opus
 # (до 2026-09-23); claude-opus-4-8 — модель, на которую Opus 5.5 может прозрачно отдать
 # запрос при срабатывании safeguards (стоимость считаем по response.model, см. _track_response).
-# claude-sonnet-5 — прошлый /sonnet (до 2026-10-04), для подписи старых строк usage_log.
+# claude-sonnet-5 — прошлый /sonnet (до 2026-10-04), claude-haiku-4-5-20251001 — прошлый /haiku
+# (до 2026-10-09), для подписи старых строк usage_log.
 LEGACY_PRICES = {
+    "claude-haiku-4-5-20251001": {"label": "Haiku 4.5", "in": 1.0, "out": 5.0, "cache_read_mult": 0.1,
+                                  "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0},
     "claude-sonnet-5": {"label": "Sonnet 5", "in": 2.0, "out": 10.0, "cache_read_mult": 0.1,
                         "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0},
     "claude-opus-5":   {"label": "Opus 5",   "in": 5.0, "out": 25.0, "cache_read_mult": 0.1,
@@ -168,6 +182,42 @@ def out_tokens(model_id: str, visible: int) -> int:
     return visible + model_meta(model_id).get("thinking_headroom", 0)
 
 
+HAIKU_DIALOG_EFFORT = os.environ.get("HAIKU_DIALOG_EFFORT", "low").strip().lower()
+if HAIKU_DIALOG_EFFORT not in ("low", "medium", "high"):
+    # xhigh/max для диалога Haiku бессмысленно дороги (док: «much longer thinking»), а на
+    # xhigh в многоходовом чате модель иногда пишет весь ответ в thinking и отдаёт пустой текст.
+    logger.warning(
+        f"HAIKU_DIALOG_EFFORT={HAIKU_DIALOG_EFFORT!r} не из low/medium/high — беру low")
+    HAIKU_DIALOG_EFFORT = "low"
+
+
+def aux_params(model_id: str = DEFAULT_MODEL_ID) -> dict:
+    """Параметры thinking/effort для СЛУЖЕБНОГО вызова (JSON/NO/YES/короткая строка).
+
+    Haiku 5.5 по умолчанию думает (adaptive, medium), а thinking съедает max_tokens: при
+    лимитах 30–512 служебный ответ пришёл бы пустым (stop_reason=max_tokens после
+    thinking-блока). Поэтому thinking выключаем, effort low (disabled допустим только на
+    low/medium/high; на xhigh/max — 400). Только для моделей с флагом effort в MODELS —
+    у остальных {} (откат на Haiku 4.5 = правка реестра). Без fallback на дефолтную
+    модель, в отличие от model_meta: неизвестная строка не должна получить чужие параметры.
+    """
+    if not _MODELS_BY_ID.get(model_id, {}).get("effort"):
+        return {}
+    return {"thinking": {"type": "disabled"}, "output_config": {"effort": "low"}}
+
+
+def dialog_params(model_id: str) -> dict:
+    """Параметры thinking/effort для ОТВЕТА пользователю (диалог, фото, файл, /search, /review).
+
+    Haiku 5.5: adaptive thinking + effort из HAIKU_DIALOG_EFFORT (дефолт low — рекомендация
+    доков для чата). Известный риск из гайда: на low рассуждения могут протекать в видимый
+    текст — тогда HAIKU_DIALOG_EFFORT=medium в .env, без правки кода. Остальные модели — {}.
+    """
+    if not _MODELS_BY_ID.get(model_id, {}).get("effort"):
+        return {}
+    return {"thinking": {"type": "adaptive"}, "output_config": {"effort": HAIKU_DIALOG_EFFORT}}
+
+
 def price_meta(model_id: str | None) -> dict | None:
     """Цена модели по API-строке (выбираемые + LEGACY_PRICES) или None, если строки нет."""
     return _PRICES_BY_ID.get(model_id or "")
@@ -191,6 +241,11 @@ def calc_llm_cost(model: str, inp: int, out: int, cache_write_5m: int = 0,
     meta = price_meta(model) or MODELS[DEFAULT_MODEL_KEY]
     mult = lambda k: meta.get(k, DEFAULT_CACHE_MULTS[k])
     price_in, price_out = meta["in"], meta["out"]
+    # Ступень: длина промпта = ВЕСЬ вход запроса (input + запись + чтение кэша) — прямо по
+    # доке pricing («Long context pricing», сверено 2026-10-09). Каждый запрос тарифицируется
+    # отдельно; попадание части промпта в кэш от верхней ступени не спасает.
+    if meta.get("tier_threshold") and inp + cache_write_5m + cache_write_1h + cache_read > meta["tier_threshold"]:
+        price_in, price_out = meta["tier_in"], meta["tier_out"]
     return (
         (inp / 1_000_000 * price_in)
         + (cache_write_5m / 1_000_000 * price_in * mult("cache_write_5m_mult"))
@@ -302,6 +357,10 @@ def _track_response(model: str, response, label: str = "aux") -> None:
         cw_5m, cw_1h = cw, 0
     details = getattr(usage, "output_tokens_details", None)
     thinking = (getattr(details, "thinking_tokens", 0) or 0) if details is not None else 0
+    tier_limit = (price_meta(model) or {}).get("tier_threshold")
+    if tier_limit and inp + cw + cr > tier_limit:
+        logger.warning(f"{model}: промпт {inp + cw + cr:,} токенов > {tier_limit:,} — верхняя ступень "
+                       f"цены (x5), label={label}")
     _record_usage("llm", model, label, calc_llm_cost(model, inp, out, cw_5m, cw_1h, cr),
                   inp, out, cw, cr, thinking=thinking)
 
@@ -715,6 +774,7 @@ def should_search(text: str) -> str | None:
         response = sync_create(
             label="should_search",
             model=DEFAULT_MODEL_ID,
+            **aux_params(),
             max_tokens=30,
             system=(
                 "Определи, нужен ли веб-поиск для ответа на вопрос пользователя. "
@@ -1039,6 +1099,7 @@ async def _rewrite_prompt(prompt: str) -> str | None:
         resp = await aux_create(
             label="image_prompt_rewrite",
             model=DEFAULT_MODEL_ID,
+            **aux_params(),
             max_tokens=150,
             system=(
                 "You are a prompt engineer for image generation models. "
@@ -1161,6 +1222,7 @@ async def _draw_and_send(update, context, chat_id: int, is_group: bool,
             translate_resp = await aux_create(
                 label="draw_translate",
                 model=DEFAULT_MODEL_ID,
+                **aux_params(),
                 max_tokens=200,
                 system=(
                     "Convert the user's image request to a direct English image-generation prompt. "
@@ -1169,7 +1231,9 @@ async def _draw_and_send(update, context, chat_id: int, is_group: bool,
                 ),
                 messages=[{"role": "user", "content": draw_prompt}],
             )
-            en_prompt = response_text(translate_resp)
+            # Пусто = отказ классификатора Haiku 5.5 (stop_reason=refusal): не отдавать
+            # генератору пустой промпт — рисуем по исходному тексту.
+            en_prompt = response_text(translate_resp) or draw_prompt
         except Exception:
             en_prompt = draw_prompt
 
@@ -1256,6 +1320,7 @@ async def _describe_media_haiku(images_b64: list[str], hint: str) -> str | None:
         response = await aux_create(
             label="media_describe",
             model=DEFAULT_MODEL_ID,
+            **aux_params(),
             max_tokens=MEDIA_DESCRIPTION_MAX_TOKENS,
             system=(
                 "Опиши коротко, 1-2 предложения, только суть — это уйдёт в контекст "
@@ -1318,6 +1383,7 @@ def generate_captcha_question(user_text: str) -> str:
     response = sync_create(
         label="captcha_gen",
         model=DEFAULT_MODEL_ID,
+        **aux_params(),
         max_tokens=200,
         system=(
             "Определи язык сообщения пользователя и сгенерируй один короткий вопрос-загадку НА ЭТОМ ЖЕ ЯЗЫКЕ. "
@@ -1331,13 +1397,15 @@ def generate_captcha_question(user_text: str) -> str:
         ),
         messages=[{"role": "user", "content": f"Язык пользователя определи по этому сообщению: '{user_text}'\nСгенерируй вопрос."}],
     )
-    return response_text(response)
+    # Пусто = отказ модели (refusal) — пустой вопрос капчи нельзя показать, берём запасной.
+    return response_text(response) or "Закончи поговорку: тише едешь — ..."
 
 
 def check_captcha_answer(question: str, answer: str) -> bool:
     response = sync_create(
         label="captcha_check",
         model=DEFAULT_MODEL_ID,
+        **aux_params(),
         max_tokens=50,
         system=(
             "Ты проверяешь ответ на вопрос-загадку. "
@@ -1465,6 +1533,7 @@ def extract_memory(user_id: int, messages: list, is_group: bool = False, chat_id
             # сообщений в личке и не должно платить по цене Sonnet. См.
             # docs/claude/models-and-costs.md.
             model=DEFAULT_MODEL_ID,
+            **aux_params(),
             max_tokens=512,
             system=(
                 "Извлеки важные факты о пользователе из диалога. "
@@ -1510,6 +1579,7 @@ def extract_all_participants_memory(chat_id: int):
         response = sync_create(
             label="extract_chat_memory",
             model=DEFAULT_MODEL_ID,
+            **aux_params(),
             # 4096, а не 1024: на 12 участников с двумя массивами фактов на каждого
             # 1024 не хватало, ответ обрывался на полуслове и разбор терял ВСЁ окно
             # памяти по всем участникам сразу (11% извлечений, инцидент 2026-08-03).
@@ -1739,6 +1809,7 @@ async def greet_new_member(chat_id: int, user_id: int, user_name: str, bot):
             filter_resp = await aux_create(
                 label="greet_filter",
                 model=DEFAULT_MODEL_ID,
+                **aux_params(),
                 max_tokens=300,
                 system=(
                     "Тебе дан список фактов о пользователе. "
@@ -1759,6 +1830,7 @@ async def greet_new_member(chat_id: int, user_id: int, user_name: str, bot):
         response = await aux_create(
             label="greet",
             model=DEFAULT_MODEL_ID,
+            **aux_params(),
             max_tokens=150,
             system=(
                 "Ты Клодушка — остроумный AI-бот в групповом чате. "
@@ -2172,6 +2244,7 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await call_claude(
             context, chat_id, label=f"/review chat={chat_id}",
             model=_model,
+            **dialog_params(_model),
             max_tokens=out_tokens(_model, 500),
             system=(
                 "Ты Клодушка — AI с характером, которая считает себя умнее всех в чате (и не без оснований). "
@@ -2527,7 +2600,7 @@ async def _probe_model(context, chat_id: int, model_id: str) -> None:
     """
     await call_claude(
         context, chat_id, label=f"проверка модели {model_id}",
-        model=model_id, max_tokens=1,
+        model=model_id, max_tokens=1, **aux_params(model_id),
         messages=[{"role": "user", "content": "hi"}],
     )
 
@@ -3107,6 +3180,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await call_claude(
             context, update.effective_chat.id, label=f"/search uid={user_id}",
             model=get_chat_model(update.effective_chat.id),
+            **dialog_params(get_chat_model(update.effective_chat.id)),
             max_tokens=out_tokens(get_chat_model(update.effective_chat.id), 2048),
             system="Ты Клодушка. Дай краткий ответ на основе результатов поиска. Отвечай на языке пользователя.",
             messages=[{"role": "user", "content": f"Вопрос: {query}\n\nРезультаты:\n{results}"}],
@@ -3531,7 +3605,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             response = await call_claude(
                 context, chat_id, label=f"файл chat={chat_id}", usage_label="dialog",
-                model=_model, max_tokens=out_tokens(_model, 4096), system=system, messages=doc_history,
+                model=_model, **dialog_params(_model), max_tokens=out_tokens(_model, 4096), system=system, messages=doc_history,
             )
             answer = response_text(response)
             _count_reply(user_id, chat_id)
@@ -3599,7 +3673,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             response = await call_claude(
                 context, chat_id, label=f"фото chat={chat_id}", usage_label="dialog",
-                model=_model, max_tokens=out_tokens(_model, 2048), system=system, messages=vision_messages,
+                model=_model, **dialog_params(_model), max_tokens=out_tokens(_model, 2048), system=system, messages=vision_messages,
             )
             answer = response_text(response)
             _count_reply(user_id, chat_id)
@@ -3706,7 +3780,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             response = await call_claude(
                 context, chat_id, label=f"диалог chat={chat_id}", usage_label="dialog",
-                model=_model, max_tokens=out_tokens(_model, 4096), system=system, messages=messages,
+                model=_model, **dialog_params(_model), max_tokens=out_tokens(_model, 4096), system=system, messages=messages,
             )
         except anthropic.BadRequestError as e:
             # 400 prompt is too long: история не сохранится, следующее сообщение соберёт
@@ -3750,7 +3824,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 response = await call_claude(
                     context, chat_id, label=f"диалог chat={chat_id} (аварийная обрезка)",
-                    usage_label="dialog", model=_model, max_tokens=out_tokens(_model, 4096), system=retry_system, messages=retry_messages,
+                    usage_label="dialog", model=_model, **dialog_params(_model), max_tokens=out_tokens(_model, 4096), system=retry_system, messages=retry_messages,
                 )
             except anthropic.BadRequestError as e2:
                 if not api_errors.is_prompt_too_long(e2):

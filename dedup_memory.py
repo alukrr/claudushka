@@ -74,7 +74,7 @@ DB_PATH = Path(__file__).resolve().parent / "data" / "claudushka.db"
 
 # Короткие имена — как в реестре MODELS в bot.py, чтобы не помнить точные API-строки.
 MODEL_ALIASES = {
-    "haiku": "claude-haiku-4-5-20251001",
+    "haiku": "claude-haiku-5-5",
     "sonnet": "claude-sonnet-5-5",
     "opus": "claude-opus-5-5",
     "fable": "claude-fable-5-1",
@@ -85,6 +85,7 @@ MODEL_ALIASES = {
 # Кортеж: (in, out, cache_read_mult, cache_write_5m_mult, cache_write_1h_mult).
 # cache_read_mult: 0.1 у большинства, Opus 5.5 и Sonnet 5.5 — 0.05, Fable 5.1 — 0.025.
 PRICING = {
+    "claude-haiku-5-5": (0.10, 0.50, 0.1, 1.25, 2.0),
     "claude-haiku-4-5-20251001": (1.0, 5.0, 0.1, 1.25, 2.0),
     "claude-sonnet-5-5": (2.0, 10.0, 0.05, 1.25, 2.0),
     "claude-sonnet-5": (2.0, 10.0, 0.1, 1.25, 2.0),
@@ -93,6 +94,32 @@ PRICING = {
     "claude-opus-4-8": (5.0, 25.0, 0.1, 1.25, 2.0),
     "claude-fable-5-1": (10.0, 50.0, 0.025, 1.25, 2.0),
 }
+
+# Ступенчатая цена (Haiku 5.5): промпт > порога токенов (input + запись + чтение кэша вместе,
+# док pricing «Long context pricing») тарифицируется по (in, out) верхней ступени, множители
+# кэша те же. На группах в тысячи фактов вход может перевалить за 100k. Считается ПО ЗАПРОСУ.
+TIERS = {"claude-haiku-5-5": (100_000, 0.50, 2.50)}
+
+# Haiku 5.5 по умолчанию думает (adaptive) и съедает max_tokens: thinking выключаем, effort low
+# (disabled допустим только на low/medium/high). Как aux_params() в bot.py; другие модели — без.
+AUX_PARAMS = {"claude-haiku-5-5": {"thinking": {"type": "disabled"}, "output_config": {"effort": "low"}}}
+
+
+def request_cost(model, inp, out, cw_5m, cw_1h, cr):
+    """$ за один запрос по PRICING/TIERS; None — модели нет в PRICING."""
+    if model not in PRICING:
+        return None
+    price_in, price_out, read_mult, cw5_mult, cw1h_mult = PRICING[model]
+    tier = TIERS.get(model)
+    if tier and inp + cw_5m + cw_1h + cr > tier[0]:
+        price_in, price_out = tier[1], tier[2]
+    return (
+        inp / 1_000_000 * price_in
+        + cw_5m / 1_000_000 * price_in * cw5_mult
+        + cw_1h / 1_000_000 * price_in * cw1h_mult
+        + cr / 1_000_000 * price_in * read_mult
+        + out / 1_000_000 * price_out
+    )
 
 
 def get_conn(writable: bool) -> tuple[sqlite3.Connection, str | None]:
@@ -212,7 +239,7 @@ def _groups_for_llm(conn, user_id, chat_id, tier):
 
 
 def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
-              model="claude-haiku-4-5-20251001", limit_groups=None, verbose=False):
+              model="claude-haiku-5-5", limit_groups=None, verbose=False):
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         sys.exit("ANTHROPIC_API_KEY не задан в окружении — source .env (и sudo -E, если apply), "
@@ -242,6 +269,7 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
 
     total_before = total_after = 0
     total_in_tok = total_cache_write_tok = total_cache_read_tok = total_out_tok = 0
+    total_cost = 0.0
     total_cache_write_5m_tok = total_cache_write_1h_tok = 0
     started = time.monotonic()
     for (uid, ctx, cid, grp_tier), rows in candidates.items():
@@ -257,6 +285,7 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
             resp = client.messages.create(
                 model=model,
                 max_tokens=8192,
+                **AUX_PARAMS.get(model, {}),
                 system=(
                     "Тебе дан список фактов об одном человеке — часть из них дубли или "
                     "перефразировки одного и того же. Объедини по смыслу, убери повторы, "
@@ -298,6 +327,9 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
             total_cache_write_5m_tok += cw_5m
             total_cache_write_1h_tok += cw_1h
             out_tok = getattr(usage, "output_tokens", 0) or 0
+            req_cost = request_cost(model, in_tok, out_tok, cw_5m, cw_1h, cache_read_tok)
+            if req_cost is not None:
+                total_cost += req_cost
             total_in_tok += in_tok
             total_cache_write_tok += cache_write_tok
             total_cache_read_tok += cache_read_tok
@@ -334,18 +366,7 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
             conn.commit()
 
     elapsed = time.monotonic() - started
-    price_in, price_out, cache_read_mult, cw5_mult, cw1h_mult = PRICING.get(model, (None,) * 5)
-    cost = None
-    if price_in is not None:
-        # Запись в кэш — по TTL (5m/1h, свои множители), чтение — множитель модели (для
-        # дедупа почти всегда 0: каждый вход уникален, читать из кэша нечего).
-        cost = (
-            total_in_tok / 1_000_000 * price_in
-            + total_cache_write_5m_tok / 1_000_000 * price_in * cw5_mult
-            + total_cache_write_1h_tok / 1_000_000 * price_in * cw1h_mult
-            + total_cache_read_tok / 1_000_000 * price_in * cache_read_mult
-            + total_out_tok / 1_000_000 * price_out
-        )
+    cost = total_cost if model in PRICING else None
     cost_str = f"${cost:.4f}" if cost is not None else "? (модель не в PRICING — сверься с /cost в боте)"
     n_groups = len(candidates)
     per_group = elapsed / n_groups if n_groups else 0

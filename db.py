@@ -162,7 +162,7 @@ def init_db():
 
         CREATE TABLE IF NOT EXISTS chat_models (
             chat_id INTEGER PRIMARY KEY,
-            model TEXT NOT NULL DEFAULT 'claude-haiku-4-5-20251001'
+            model TEXT NOT NULL DEFAULT 'claude-haiku-5-5'
         );
 
         CREATE TABLE IF NOT EXISTS chat_image_provider (
@@ -249,7 +249,6 @@ def init_db():
         "ALTER TABLE memory ADD COLUMN expires_at INTEGER",
         # v0.9.0: чаты, залипшие на четвёртом поколении, переезжают на пятое.
         # Идемпотентно: после первого прогона строк под условие не остаётся.
-        # Haiku не трогаем — claude-haiku-4-5-20251001 остаётся дефолтом.
         # (с 2026-10-04 — сразу на Sonnet 5.5, как и с Opus: claude-sonnet-5 из выбора убран, см. ниже)
         "UPDATE chat_models SET model='claude-sonnet-5-5' WHERE model LIKE 'claude-sonnet-4-%'",
         # (с 2026-09-23 — сразу на Opus 5.5: claude-opus-5 из выбора убран, см. ниже)
@@ -271,6 +270,12 @@ def init_db():
         # 2026-10-04 (ТЗ feat/sonnet-5-5): Sonnet 5 -> Sonnet 5.5, по образцу Opus выше.
         # Точное сравнение; usage_log не мигрируется (цена заморожена в cost_usd).
         "UPDATE chat_models SET model='claude-sonnet-5-5' WHERE model='claude-sonnet-5'",
+        # 2026-10-09 (ТЗ feat/haiku-5-5): Haiku 4.5 -> Haiku 5.5. Явная запись Haiku в
+        # chat_models — осознанный выбор платного чата (/haiku), поэтому мигрируем, а не
+        # удаляем (иначе чат молча уехал бы на дорогой Sonnet). Старые дефолтные записи
+        # убрала ещё _mig_defaults (billing_defaults, ТЗ v0.10) — повторять её не нужно.
+        # Точное сравнение; usage_log не мигрируется (цена заморожена в cost_usd).
+        "UPDATE chat_models SET model='claude-haiku-5-5' WHERE model='claude-haiku-4-5-20251001'",
         # Токены thinking (usage.output_tokens_details.thinking_tokens) — входят в output,
         # отдельно только для видимости доли thinking в расходах.
         "ALTER TABLE usage_log ADD COLUMN thinking INTEGER NOT NULL DEFAULT 0",
