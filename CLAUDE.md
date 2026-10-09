@@ -56,7 +56,9 @@
 - Тестовый стенд (`docker-compose.test.yml`, обновление зависимостей, рискованные
   правки перед продом) — `docs/claude/staging.md`; пошаговый чек-лист ТЗ v0.10 (с SELECT'ами) —
   `docs/claude/staging-checklist-v0.10.md`; чек-лист ТЗ `feat/opus-5-5` (Opus 5.5, цена по
-  `response.model`, миграция `chat_models`) — `docs/claude/staging-checklist-opus-5-5.md`
+  `response.model`, миграция `chat_models`) — `docs/claude/staging-checklist-opus-5-5.md`;
+  чек-лист ТЗ `feat/haiku-5-5` (Haiku 5.5, thinking/effort, ступенчатая цена >100k) —
+  `docs/claude/staging-checklist-haiku-5-5.md`
 
 ## Стек
 - Python 3.12 (python:3.12-slim Docker image)
