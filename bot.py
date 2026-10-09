@@ -92,7 +92,7 @@ FABLE_CONFIRM_WINDOW = 120  # секунд на повтор /fable
 captcha_state: dict[str, dict] = {}
 
 # Единственный источник правды по моделям: команды, цены, гейтинг, /models — отсюда.
-# Пул router.apitoken.sale принимает эти строки: Sonnet 5.5 проверен 2026-10-04, Haiku 5.5 — СТЕНД (см.
+# Пул router.apitoken.sale принимает эти строки: Sonnet 5.5 проверен 2026-10-04, Haiku 5.5 — curl на сервере 2026-10-09: end_turn, text (стенд — см.
 # docs/claude/staging-checklist-haiku-5-5.md), остальные —
 # ранее живыми запросами. Цены — официальный прайс Anthropic в $/MTok (in/out), сверены
 # 2026-10-04 по https://platform.claude.com/docs/en/about-claude/pricing; прокси даёт скидку
@@ -111,9 +111,11 @@ captcha_state: dict[str, dict] = {}
 # disabled + effort low (aux_params), поэтому им запас не нужен.
 # effort — флаг «модель принимает thinking/output_config.effort»: только у Haiku 5.5.
 # Откат на Haiku 4.5 — правка этой записи (id/цены/context/headroom 0, убрать effort и tier_*).
-# tier_* — ступенчатая цена: промпт > tier_threshold токенов (input + cache read + cache write
-# ВМЕСТЕ — так прямо сказано в доке pricing, «Long context pricing») тарифицируется по
-# tier_in/tier_out, множители кэша те же. Остальные модели ступеней не имеют.
+# tier_* — ступенчатая цена: промпт > tier_threshold токенов тарифицируется по tier_in/tier_out,
+# множители кэша те же. ДОПУЩЕНИЕ: длина промпта = input + cache read + cache write ВМЕСТЕ. Дока
+# уверенно говорит только «prompts over 100,000 tokens cost more»; про кэш WebFetch-вывод страницы
+# pricing фразу содержал, но ручная проверка её не нашла — считаем недоказанным. Выбрано как
+# консервативное: если неверно, /cost спишет БОЛЬШЕ реального, а не меньше. Остальные модели ступеней не имеют.
 # Окна контекста: у Haiku 5.5 и пятого поколения 1M. Лимиты памяти и истории
 # калиброваны под 200k и НЕ поднимаются: прежний инцидент (2026-07-26) и, кроме того,
 # у Haiku 5.5 вход > 100k стоит в 5 раз дороже (см. warning в _track_response).
@@ -241,9 +243,10 @@ def calc_llm_cost(model: str, inp: int, out: int, cache_write_5m: int = 0,
     meta = price_meta(model) or MODELS[DEFAULT_MODEL_KEY]
     mult = lambda k: meta.get(k, DEFAULT_CACHE_MULTS[k])
     price_in, price_out = meta["in"], meta["out"]
-    # Ступень: длина промпта = ВЕСЬ вход запроса (input + запись + чтение кэша) — прямо по
-    # доке pricing («Long context pricing», сверено 2026-10-09). Каждый запрос тарифицируется
-    # отдельно; попадание части промпта в кэш от верхней ступени не спасает.
+    # Ступень: ДОПУЩЕНИЕ — длина промпта = ВЕСЬ вход запроса (input + запись + чтение кэша); в доке
+    # это не уточнено (см. комментарий у MODELS). Консервативно: при ошибке допущения мы завышаем
+    # цену, не занижаем. Юнит-тест проверяет только эту формулу, а не расчёт Anthropic.
+    # Сверить с реальным счётом/прайсом при первом входе >100k.
     if meta.get("tier_threshold") and inp + cache_write_5m + cache_write_1h + cache_read > meta["tier_threshold"]:
         price_in, price_out = meta["tier_in"], meta["tier_out"]
     return (
