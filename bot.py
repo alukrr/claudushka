@@ -97,7 +97,7 @@ captcha_state: dict[str, dict] = {}
 # 2026-10-04 по https://platform.claude.com/docs/en/about-claude/pricing; прокси даёт скидку
 # сверху. Sonnet 5/5.5: $2/$10 — постоянная цена (повышение до $3/$15 отменено Anthropic).
 # Множители prompt cache — ПОЛЯ МОДЕЛИ, не глобальные константы (ТЗ feat/opus-5-5):
-#   cache_read_mult      — чтение из кэша: 0.1× у большинства, Opus 5.5 — 0.05×, Fable 5.1 — 0.025×;
+#   cache_read_mult      — чтение из кэша: 0.1× у большинства, Opus 5.5 и Sonnet 5.5 — 0.05×, Fable 5.1 — 0.025×;
 #   cache_write_5m_mult  — запись с TTL 5 минут, 1.25× у всех текущих;
 #   cache_write_1h_mult  — запись с TTL 1 час, 2× у всех текущих.
 # Модель без явного множителя берёт DEFAULT_CACHE_MULTS.
@@ -113,7 +113,7 @@ MODELS = {
                "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context":   200_000,
                "thinking_headroom": 0},
     "sonnet": {"id": "claude-sonnet-5-5",         "label": "Sonnet 5.5",
-               "in": 2.0,  "out": 10.0, "cache_read_mult": 0.1,
+               "in": 2.0,  "out": 10.0, "cache_read_mult": 0.05,
                "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context": 1_000_000,
                "thinking_headroom": 8000},
     "opus":   {"id": "claude-opus-5-5",           "label": "Opus 5.5",

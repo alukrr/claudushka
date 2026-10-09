@@ -83,10 +83,10 @@ MODEL_ALIASES = {
 # $/MTok in,out + множители кэша — дубль MODELS/LEGACY_PRICES из bot.py, менять
 # синхронно (сверено 2026-10-04 по https://platform.claude.com/docs/en/about-claude/pricing).
 # Кортеж: (in, out, cache_read_mult, cache_write_5m_mult, cache_write_1h_mult).
-# cache_read_mult: 0.1 у большинства, Opus 5.5 — 0.05, Fable 5.1 — 0.025.
+# cache_read_mult: 0.1 у большинства, Opus 5.5 и Sonnet 5.5 — 0.05, Fable 5.1 — 0.025.
 PRICING = {
     "claude-haiku-4-5-20251001": (1.0, 5.0, 0.1, 1.25, 2.0),
-    "claude-sonnet-5-5": (2.0, 10.0, 0.1, 1.25, 2.0),
+    "claude-sonnet-5-5": (2.0, 10.0, 0.05, 1.25, 2.0),
     "claude-sonnet-5": (2.0, 10.0, 0.1, 1.25, 2.0),
     "claude-opus-5-5": (4.0, 20.0, 0.05, 1.25, 2.0),
     "claude-opus-5": (5.0, 25.0, 0.1, 1.25, 2.0),

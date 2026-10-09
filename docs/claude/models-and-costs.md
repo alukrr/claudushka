@@ -10,7 +10,7 @@
 | ключ | id | label | $/MTok in/out | cache read | запись 5m / 1h | окно | кому |
 |---|---|---|---|---|---|---|---|
 | `haiku` | `claude-haiku-4-5-20251001` | Haiku 4.5 | 1 / 5 | 0.1× | 1.25× / 2× | 200k | всем (free-режим — только она) |
-| `sonnet` | `claude-sonnet-5-5` | Sonnet 5.5 | 2 / 10 | 0.1× | 1.25× / 2× | 1M | админ ИЛИ платный чат (дефолт платного) |
+| `sonnet` | `claude-sonnet-5-5` | Sonnet 5.5 | 2 / 10 | **0.05×** | 1.25× / 2× | 1M | админ ИЛИ платный чат (дефолт платного) |
 | `opus` | `claude-opus-5-5` | Opus 5.5 | 4 / 20 | **0.05×** | 1.25× / 2× | 1M | админ ИЛИ платный чат |
 | `fable` | `claude-fable-5-1` | Fable 5.1 | 10 / 50 | **0.025×** | 1.25× / 2× | 1M | админ ИЛИ платный чат, с подтверждением |
 
@@ -37,8 +37,8 @@ default)` теперь отдаёт только сохранённый выбо
 станет верным само») был ошибкой — цена и так стоит правильно, `/cost` больше не завышает.
 
 `cache_read_mult`, `cache_write_5m_mult`, `cache_write_1h_mult` — поля модели (с 2026-09-23 глобальных
-`CACHE_READ_MULTIPLIER`/`CACHE_WRITE_MULTIPLIER` больше нет). Чтение из кэша: 0.1× у Haiku/Sonnet/Opus 5,
-0.05× у Opus 5.5, 0.025× у Fable 5.1. Модель без явного поля — `DEFAULT_CACHE_MULTS` (0.1 / 1.25 / 2.0).
+`CACHE_READ_MULTIPLIER`/`CACHE_WRITE_MULTIPLIER` больше нет). Чтение из кэша: 0.1× у Haiku 4.5/Sonnet 5/Opus 5,
+0.05× у Opus 5.5 и Sonnet 5.5 (до 2026-10-09 у Sonnet 5.5 по ошибке стояло 0.1× — `/cost` завышал чтение кэша вдвое; старые строки `usage_log` остаются как есть), 0.025× у Fable 5.1. Модель без явного поля — `DEFAULT_CACHE_MULTS` (0.1 / 1.25 / 2.0).
 
 **Opus 5 → Opus 5.5 (`claude-opus-5-5`) — 2026-09-23, ТЗ `feat/opus-5-5`.** Стенд пройден 2026-09-23 по
 `docs/claude/staging-checklist-opus-5-5.md`: пул принимает `claude-opus-5-5`, `response.model`
