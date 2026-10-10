@@ -29,7 +29,7 @@
   = служебное вне чата (`billed=0`). `cost_usd` заморожена при записи, уже с `PRICE_MARKUP`.
   `model`: для LLM — API-строка ФАКТИЧЕСКОЙ модели из `response.model` (с 2026-09-23, см.
   `docs/claude/models-and-costs.md` → «Учёт токенов»), для картинок — ключ провайдера (`gpt`/`banana`), для
-  поиска — `tavily`. `label`: `dialog` (ответ на реплику: диалог/фото/файл), `should_search`,
+  поиска — `tavily` (бесплатный режим) или `anthropic` (нативный `web_search` в платном, `label=native_search`, `docs/claude/native-search.md`). `label`: `dialog` (ответ на реплику: диалог/фото/файл), `should_search`,
   `search`, `image`, `draw_translate`, `extract_memory`, `extract_chat_memory`,
   `media_describe`, `daily_review`, `greet`, `greet_filter`, `captcha_*`, `/review`, `/search`,
   `проверка` (пробный запрос `_probe_model`) и т.д. `thinking` — токены thinking, входят в
@@ -83,7 +83,8 @@ GPT Image 2.5 Flare/Sunburst (добавлены 2026-09-22, `docs/claude/images
   `usage_label` или первое слово `label`) и `sync_create` (`label=` kwarg, не уходит в API).
   Новый вызов — всегда с `label=`. Ответы на реплики (диалог/фото/файл) — `usage_label="dialog"`.
 - Картинки — после УСПЕШНОЙ генерации (`generate_image_with_error`), поиск — после успешного
-  `tavily.search` (в `web_search`, Tavily берёт деньги и за пустую выдачу).
+  `tavily.search` (в `web_search`, Tavily берёт деньги и за пустую выдачу). Нативный поиск — по строке на каждый
+  `usage.server_tool_use.web_search_requests` (`NATIVE_SEARCH_PRICE`, `call_dialog_native`).
 - `billed = (chat_tier(chat_id) == 'paid')`, `chat_id NULL → 0`.
 - `db.record_usage` в одной транзакции (`BEGIN IMMEDIATE`) пишет строку и, если баланс ушёл
   ниже нуля, — `writeoff` на дефицит (`note='auto'`); возвращает `True`, только если ЭТА

@@ -57,7 +57,10 @@ clear_hint=...)`: полный traceback (`exc_info=True`) в `logger.error`, п
 | Синхронная функция целиком (`should_search`, `web_search`, `check_captcha_answer`) | `await call_claude_aux(fn, *args)` | SDK-шные внутри |
 | `messages.create` внутри синхронной функции | `sync_create(**kwargs)` | SDK-шные |
 
-`call_claude` и `sync_create` — единственные две точки входа в API; обе считают токены.
+`call_claude` и `sync_create` — единственные две точки входа в API; обе считают токены. Исключение по форме, не по
+учёту: `call_claude_stream` (диалог с нативным поиском, стриминг) — тот же `call_with_retry` и `_track_response`.
+Ошибка ПОСРЕДИ стрима приходит HTTP 200 с телом `{"error": {"type": ...}}`: `is_retryable` смотрит на
+`stream_error_type` (`overloaded_error`/`api_error`/`rate_limit_error`), не только на `status_code`.
 
 Фоновые (`extract_memory`, `extract_all_participants_memory`, `greet_new_member`) —
 `_spawn_background_task(asyncio.to_thread(...))`, НЕ голый `asyncio.create_task`: без

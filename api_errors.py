@@ -105,6 +105,21 @@ def is_insufficient_balance(exc: BaseException) -> bool:
     )
 
 
+# Ошибка ПОСРЕДИ стрима приходит SSE-событием `error` при HTTP 200: SDK 1.7.0 (проверено) бросает
+# обычный APIStatusError со status_code=200 и телом {"error": {"type": ...}} — по status_code её не
+# отличить от успеха, поэтому смотрим на тип в теле.
+_STREAM_RETRYABLE_ERRORS = ("overloaded_error", "api_error", "rate_limit_error")
+
+
+def stream_error_type(exc: BaseException) -> str | None:
+    """Тип ошибки из тела APIStatusError ('overloaded_error' и т.п.) или None."""
+    if not isinstance(exc, anthropic.APIStatusError):
+        return None
+    body = getattr(exc, "body", None)
+    err = body.get("error") if isinstance(body, dict) else None
+    return err.get("type") if isinstance(err, dict) else None
+
+
 def is_retryable(exc: BaseException) -> bool:
     """Переживаемые сами по себе: перегруз сервиса, рейт-лимит, сетевой обрыв/таймаут.
 
@@ -117,6 +132,8 @@ def is_retryable(exc: BaseException) -> bool:
     """
     if isinstance(exc, anthropic.APIStatusError) and (getattr(exc, "status_code", 0) or 0) >= 500:
         return True
+    if stream_error_type(exc) in _STREAM_RETRYABLE_ERRORS:
+        return True
     return isinstance(exc, (anthropic.RateLimitError, anthropic.APIConnectionError))
 
 
@@ -126,7 +143,8 @@ def user_message(exc: BaseException, default: str | None = None, clear_hint: str
     clear_hint — как пользователю сбросить историю. В Telegram это /clear,
     в WhatsApp команд нет, поэтому текст задаёт вызывающая сторона.
     """
-    if isinstance(exc, anthropic.APIStatusError) and (getattr(exc, "status_code", 0) or 0) >= 500:
+    if (isinstance(exc, anthropic.APIStatusError) and (getattr(exc, "status_code", 0) or 0) >= 500) \
+            or stream_error_type(exc) in ("overloaded_error", "api_error"):
         return "Сервис перегружен, я не виновата. Попробуй через минуту."
     if isinstance(exc, anthropic.RateLimitError):
         return "Слишком часто. Притормози на минутку — я не резиновая."
