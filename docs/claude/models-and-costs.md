@@ -41,6 +41,8 @@ default)` теперь отдаёт только сохранённый выбо
 `CACHE_READ_MULTIPLIER`/`CACHE_WRITE_MULTIPLIER` больше нет). Чтение из кэша: 0.1× у Haiku 5.5/Haiku 4.5/Sonnet 5/Opus 5,
 0.05× у Opus 5.5 и Sonnet 5.5 (до 2026-10-09 у Sonnet 5.5 по ошибке стояло 0.1× — `/cost` завышал чтение кэша вдвое; старые строки `usage_log` остаются как есть), 0.025× у Fable 5.1. Модель без явного поля — `DEFAULT_CACHE_MULTS` (0.1 / 1.25 / 2.0).
 
+**Prompt caching (v1.1.4)** — как собирается префикс диалога и почему `cache_read` был 0: `docs/claude/prompt-cache.md`.
+
 **Haiku 4.5 → Haiku 5.5 (`claude-haiku-5-5`) — 2026-10-09, ТЗ `feat/haiku-5-5`.** Дефолтная/free-модель и
 ВСЕ служебные вызовы. Сверено по докам Anthropic (overview, migration-guide, prompting-claude-haiku-5-5, pricing)
 2026-10-09; пул принимает `claude-haiku-5-5` — проверено curl на сервере 2026-10-09 (`end_turn`, `text`, thinking_tokens=0); `anthropic==1.7.0` принимает `thinking=` и `output_config=` именованными аргументами (проверено

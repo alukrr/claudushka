@@ -66,7 +66,7 @@ Telegram-чата — переиспользован `is_chat_admin()` (`docs/cl
 ## Часовой пояс (`BERLIN_TZ`)
 Дневной обзор запускается через `app.job_queue.run_daily(daily_chat_review, time=dt_time(hour=22, minute=0, tzinfo=BERLIN_TZ), ...)` в `main()`. `BERLIN_TZ = ZoneInfo("Europe/Berlin")` —
 единственный источник правды для часового пояса во всём проекте (используется и здесь,
-и в `get_system_prompt` для текущей даты/времени). До фикса 2026-09-19 (`b72e96e`) было
+и в `service_block` для текущей даты/времени — служебный блок последнего user-turn, `docs/claude/prompt-cache.md`). До фикса 2026-09-19 (`b72e96e`) было
 жёсткое `timezone(timedelta(hours=2))` — не учитывало переход CET/CEST, обзор съехал бы
 на час после 25.10.2026. `ZoneInfo` в `tzinfo` параметра `datetime.time` для
 `JobQueue.run_daily` — штатный способ, PTB сам пересчитывает следующий запуск с учётом

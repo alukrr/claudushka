@@ -41,6 +41,9 @@ db.py используется отовсюду, поэтому полная с�
 `daily_chat_review` и `cmd_review` (`docs/claude/daily-review.md`). `get_group_transcript()`
 кормит `build_group_messages()` для основного диалога (`docs/claude/group-chat.md`).
 Разные форматы для разных потребителей — не сливать в одну функцию и не удалять первую.
+`get_group_transcript()` отдаёт и `id` строки, а `get_conversation_rows()` (личка, порядок по `id`) — строки с `id`:
+по ним якорь окна истории шагами (`pick_history_window`, `docs/claude/prompt-cache.md`). `get_conversation()` (без id)
+остался для счётчика сообщений.
 
 ## Паттерн: `UPDATE`-функция обязана возвращать `bool` (нашлась ли строка)
 `db.set_chat_status()` раньше делала голый `UPDATE allowed_chats SET status=... WHERE
