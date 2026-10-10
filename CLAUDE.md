@@ -142,8 +142,9 @@
 `/help` показывает всем пользователям базовые команды, adminам — полный список из двух блоков (`USER_HELP` + `ADMIN_HELP` в bot.py). При добавлении новой команды обновлять оба константы.
 
 ## Версионность
-Текущая версия: v1.1.5 (реакции 👀/✍ вместо служебных сообщений, снимаются по окончании, 2026-10-10,
-`docs/claude/images.md`; предыдущие: v1.1.4 — prompt cache, `docs/claude/prompt-cache.md`, v1.1.3 — Haiku 5.5, v1.1.2 — Sonnet 5.5, v1.1.1 — Opus 5.5, v1.1.0 — GPT Image 2.5 Flare/Sunburst, v1.0.0 — учёт стоимости,
+Текущая версия: v1.2.0 (нативный web_search Anthropic в платном режиме, 2026-10-10,
+`docs/claude/native-search.md`; предыдущие: v1.1.5 — реакции 👀/✍, `docs/claude/images.md`, v1.1.4 — prompt cache,
+`docs/claude/prompt-cache.md`, v1.1.3 — Haiku 5.5, v1.1.2 — Sonnet 5.5, v1.1.1 — Opus 5.5, v1.1.0 — GPT Image 2.5 Flare/Sunburst, v1.0.0 — учёт стоимости,
 тарифы paid/free, ТЗ v0.10, `docs/claude/billing.md`). Теги обычно ставит Алексей вручную:
 `git tag -a vX.Y.Z -m "..."`. Клод тоже может создать тег и запушить его — когда Алексей
 явно попросил об этом в моменте (например, «поставь тег сам, я в дороге»), а не по
