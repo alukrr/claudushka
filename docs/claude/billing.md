@@ -57,7 +57,7 @@
 Ошибка миграции → откат, маркер не ставится, повтор при следующем старте (лог `Migration FAILED`).
 
 ## Конфиг (bot.py, рядом с MODELS)
-Цены сверены 2026-09-20: banana $0.067 (прайс Google, 1K), gpt $0.02 (себестоимость пула $0.01, решение Алексея — ×2), поиск $0.008 (Tavily, 1 кредит pay-as-you-go).
+Цены сверены 2026-09-20 (banana переведена на Nano Banana 2.1 2026-10-10: $0.0336 за 1K / $0.0504 за 2K + thinking/вход по `usageMetadata`, Pro $0.134 — `docs/claude/images.md`), gpt $0.02 (себестоимость пула $0.01, решение Алексея — ×2), поиск $0.008 (Tavily, 1 кредит pay-as-you-go).
 GPT Image 2.5 Flare/Sunburst (добавлены 2026-09-22, `docs/claude/images.md`) — тот же пул,
 та же цена $0.02, что у gpt.
 `PRICE_MARKUP`, `IMAGE_PRICES`, `SEARCH_PRICE`, `STARTER_BONUS_*`, `FREE_IMAGES_*`,
@@ -96,13 +96,13 @@ GPT Image 2.5 Flare/Sunburst (добавлены 2026-09-22, `docs/claude/images
   `_record_usage`: на реплику может приходиться несколько LLM-вызовов (аварийная обрезка) — иначе
   непроверенный терял бы лишнее сообщение из лимита.
 - Не учитывается: Gemini-транскрипция аудио (`_transcribe_audio_gemini`, POOL) и картинки banana
-  как внешний расход — ТЗ описывает только kind `llm|image|search`; цена картинки — из `IMAGE_PRICES`.
+  как внешний расход — ТЗ описывает только kind `llm|image|search`; цена картинки — `IMAGE_PRICES` (pool) или `gemini_image_cost` (banana/bananapro).
 
 ## Тарифы
 `chat_tier(chat_id)` — `paid`/`free` по балансу (`is_admin(chat_id)` → всегда paid).
 - **free**: `get_chat_model` → Haiku, `get_chat_image_provider` → `gpt`, БЕЗ изменения строк
   `chat_models`/`chat_image_provider` — при возврате в paid прошлый выбор восстанавливается.
-  `/sonnet /opus /fable /banana /flare /sunburst` → «доступно в платном режиме»; `/haiku`, `/gptimage` — «уже так»,
+  `/sonnet /opus /fable /banana /bananapro /flare /sunburst` → «доступно в платном режиме»; `/haiku`, `/gptimage` — «уже так»,
   без записи. Админ бота может менять настройки чужих free-чатов (запись без применения).
   Дневной лимит картинок (для ВСЕХ, включая проверенных): личка 10, группа 5 на `user_id`;
   считается по `usage_log kind='image' AND billed=0` с полуночи Берлина (`image_quota`).

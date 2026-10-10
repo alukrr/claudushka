@@ -110,7 +110,9 @@ CAPTCHA_ENABLED = False
 # Все суммы в $. PRICE_MARKUP умножается на КАЖДУЮ запись usage_log при вставке (цена
 # заморожена в строке, пересчёта задним числом нет).
 PRICE_MARKUP = 1.0
-IMAGE_PRICES = {"gpt": 0.02, "banana": 0.067, "flare": 0.02, "sunburst": 0.02}
+# Цена картинки для pool-провайдеров (константа). У gemini-провайдеров цена зависит от модели и разрешения и
+# считается по usageMetadata ответа — GEMINI_IMAGE_PRICING / gemini_image_cost (рядом с IMAGE_PROVIDERS).
+IMAGE_PRICES = {"gpt": 0.02, "flare": 0.02, "sunburst": 0.02}
 SEARCH_PRICE = 0.008
 STARTER_BONUS_GROUP = 10.0
 STARTER_BONUS_PRIVATE = 5.0
@@ -1054,7 +1056,6 @@ def should_search(text: str) -> str | None:
 GEMINI_TIMEOUT = 60
 GEMINI_MAX_RETRIES = 1
 GEMINI_RETRY_DELAY = 2
-GEMINI_MODEL_NAME = "Nano Banana 2"
 
 # GPT Image 2, добавлен 2026-09: идёт через пул api.apitoken.sale (POOL_BASE_URL,
 # заголовок Authorization: Bearer ANTHROPIC_API_KEY — тот же ключ, что и Claude/аудио),
@@ -1092,8 +1093,37 @@ GPT_IMAGE_RETRY_DELAY = 2
 #
 # cmds[0] — основная команда чата (используется в текстах/ошибках), остальные — алиасы;
 # все команды здесь и по всему боту должны быть уникальны (см. assert ниже).
+# Nano Banana (gemini): модель banana — env BANANA_MODEL (откат на gemini-3.1-flash-image без правки кода),
+# уровень thinking — env BANANA_THINKING_LEVEL (minimal/medium/high; дефолт minimal — промпт и так пишет
+# Claude). bananapro — gemini-3-pro-image, thinking у неё выключить нельзя, thinkingConfig не шлём; по умолчанию
+# 2K (стоит как 1K). Цена — GEMINI_IMAGE_PRICING по ID модели, чтобы откат BANANA_MODEL считался верно.
+# Страница цен Google, сверено 2026-10-10. 4K не делаем (дорого, Telegram всё равно пережимает).
+BANANA_DEFAULT_MODEL = "gemini-nano-banana-2.1"
+BANANA_MODEL = os.environ.get("BANANA_MODEL", BANANA_DEFAULT_MODEL).strip() or BANANA_DEFAULT_MODEL
+BANANAPRO_MODEL = "gemini-3-pro-image"
+# size -> $ за картинку; in/out — $/MTok за промпт и за thinking-токены (по ставке текстового выхода).
+GEMINI_IMAGE_PRICING = {
+    "gemini-nano-banana-2.1":         {"sizes": {"1K": 0.0336, "2K": 0.0504}, "in": 1.50, "out": 7.50},
+    "gemini-3.1-flash-image":         {"sizes": {"1K": 0.067,  "2K": 0.101},  "in": 0.50, "out": 3.00},
+    "gemini-3.1-flash-image-preview": {"sizes": {"1K": 0.067,  "2K": 0.101},  "in": 0.50, "out": 3.00},
+    "gemini-3-pro-image":             {"sizes": {"1K": 0.134,  "2K": 0.134},  "in": 2.00, "out": 12.00},
+}
+if BANANA_MODEL not in GEMINI_IMAGE_PRICING:
+    logger.error(f"BANANA_MODEL={BANANA_MODEL!r} нет в GEMINI_IMAGE_PRICING — использую {BANANA_DEFAULT_MODEL}")
+    BANANA_MODEL = BANANA_DEFAULT_MODEL
+BANANA_THINKING_LEVELS = ("minimal", "medium", "high")
+BANANA_THINKING_LEVEL = os.environ.get("BANANA_THINKING_LEVEL", "minimal").strip().lower()
+if BANANA_THINKING_LEVEL not in BANANA_THINKING_LEVELS:
+    logger.error(f"BANANA_THINKING_LEVEL={BANANA_THINKING_LEVEL!r} не из {BANANA_THINKING_LEVELS} — беру minimal")
+    BANANA_THINKING_LEVEL = "minimal"
+# У gemini-3.1-flash-image уровня medium нет (minimal/high) — при откате на неё medium не слать.
+IMAGE_SIZES = ("1K", "2K")
+
 IMAGE_PROVIDERS = {
-    "banana":   {"label": "Nano Banana 2",       "cmds": ["banana"],          "backend": "gemini"},
+    "banana":   {"label": "Nano Banana 2.1",     "cmds": ["banana"],          "backend": "gemini", "model_id": BANANA_MODEL,
+                 "thinking": True, "default_size": "1K"},
+    "bananapro": {"label": "Nano Banana Pro",    "cmds": ["bananapro"],       "backend": "gemini", "model_id": BANANAPRO_MODEL,
+                 "thinking": False, "default_size": "2K"},
     "gpt":      {"label": "GPT Image 2",         "cmds": ["gptimage"],        "backend": "pool", "model_id": "gpt-image-2"},
     "flare":    {"label": "GPT Image 2.5 Flare",    "cmds": ["flare", "gpt25f"], "backend": "pool", "model_id": "openai/gpt-image-2.5-flare"},
     "sunburst": {"label": "GPT Image 2.5 Sunburst", "cmds": ["sunburst", "gpt25s"], "backend": "pool", "model_id": "openai/gpt-image-2.5-sunburst"},
@@ -1109,8 +1139,31 @@ IMAGE_PROVIDERS = {
 
 # У каждого провайдера обязана быть цена — иначе KeyError в _record_usage ПОСЛЕ уже
 # оплаченной генерации (деньги списаны через пул/Google, а usage_log не записался).
-assert set(IMAGE_PROVIDERS) <= set(IMAGE_PRICES), \
-    f"IMAGE_PROVIDERS без цены в IMAGE_PRICES: {set(IMAGE_PROVIDERS) - set(IMAGE_PRICES)}"
+assert all(
+    (m["model_id"] in GEMINI_IMAGE_PRICING) if m["backend"] == "gemini" else (k in IMAGE_PRICES)
+    for k, m in IMAGE_PROVIDERS.items()
+), "У каждого провайдера картинок должна быть цена: pool — IMAGE_PRICES, gemini — GEMINI_IMAGE_PRICING по model_id"
+
+
+def gemini_image_cost(model_id: str, size: str, usage: dict) -> float:
+    """Цена gemini-картинки: цена за разрешение + thoughtsTokenCount × ставка выхода + promptTokenCount ×
+    ставка входа (usageMetadata ответа). «Thought images» (промежуточные, их токены сидят в
+    candidatesTokenCount сверх картинки) по доке Google не тарифицируются — не считаем."""
+    p = GEMINI_IMAGE_PRICING.get(model_id) or GEMINI_IMAGE_PRICING[BANANA_DEFAULT_MODEL]
+    base = p["sizes"].get(size) or p["sizes"]["1K"]
+    thoughts = usage.get("thoughtsTokenCount", 0) or 0
+    prompt = usage.get("promptTokenCount", 0) or 0
+    return base + (thoughts * p["out"] + prompt * p["in"]) / 1e6
+
+
+def image_price_text(key: str) -> str:
+    """Цена для /imagemodels и справки: «$0.0336 (2K — $0.0504)» / «$0.02»."""
+    meta = IMAGE_PROVIDERS[key]
+    if meta["backend"] != "gemini":
+        return f"${IMAGE_PRICES[key] * PRICE_MARKUP:g}"
+    sizes = GEMINI_IMAGE_PRICING[meta["model_id"]]["sizes"]
+    a, b = sizes["1K"] * PRICE_MARKUP, sizes["2K"] * PRICE_MARKUP
+    return f"${a:g} (1K и 2K)" if a == b else f"${a:g} (2K — ${b:g})"
 
 # --- Голос/видео: расшифровка и фоновое распознавание (v0.11.0) ---
 # Модель для аудио-транскрипции. Проверено живым запросом 31.08.2026: gemini-2.5-flash
@@ -1142,11 +1195,23 @@ VIDEO_FRAME_COUNT = 3
 MEDIA_DESCRIPTION_MAX_TOKENS = 250  # короткое описание — тоже копируется в каждый промпт чата
 
 
-async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str | None]:
+def _gemini_thinking_level(model_id: str) -> str:
+    """Уровень thinking для banana: у gemini-3.1-flash-image (откат BANANA_MODEL) только minimal/high."""
+    level = BANANA_THINKING_LEVEL
+    if level == "medium" and model_id != BANANA_DEFAULT_MODEL:
+        return "minimal"
+    return level
+
+
+async def _try_gemini_image(prompt: str, *, provider_key: str, size: str = "1K"):
+    """Прямой Google API generateContent. Возвращает (image, error, label, info): info — dict
+    {size, ext, cost, prompt_tokens, thoughts} при успехе (cost — по usageMetadata, см. gemini_image_cost)."""
     import base64
     if not GEMINI_API_KEY:
-        return None, None, None
+        return None, None, None, None
 
+    meta = IMAGE_PROVIDERS[provider_key]
+    model_id, label = meta["model_id"], meta["label"]
     normalized = prompt.strip()
     lower = normalized.lower()
     action_starters = (
@@ -1157,11 +1222,14 @@ async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str 
     if not any(lower.startswith(s) for s in action_starters):
         normalized = f"A picture of {normalized}"
 
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent"
-    payload = {
-        "contents": [{"parts": [{"text": normalized}]}],
-        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
-    }
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
+    # Имена параметров generateContent проверены живыми запросами 2026-10-10 (docs/claude/images.md):
+    # generationConfig.imageConfig.imageSize ("1K"/"2K"; размер реально применяется) и
+    # generationConfig.thinkingConfig.thinkingLevel. У Pro thinking выключить нельзя — не шлём.
+    gen_cfg: dict = {"responseModalities": ["TEXT", "IMAGE"], "imageConfig": {"imageSize": size}}
+    if meta.get("thinking"):
+        gen_cfg["thinkingConfig"] = {"thinkingLevel": _gemini_thinking_level(model_id)}
+    payload = {"contents": [{"parts": [{"text": normalized}]}], "generationConfig": gen_cfg}
     headers = {"x-goog-api-key": GEMINI_API_KEY}
 
     last_error_msg: str | None = None
@@ -1187,16 +1255,23 @@ async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str 
 
             text_parts: list[str] = []
             for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []):
-                if "inlineData" in part:
-                    logger.info(f"Image generated via {GEMINI_MODEL_NAME} (attempt {attempt})")
-                    return base64.b64decode(part["inlineData"]["data"]), None, GEMINI_MODEL_NAME
+                if "inlineData" in part and not part.get("thought"):
+                    usage = data.get("usageMetadata", {})
+                    cost = gemini_image_cost(model_id, size, usage)
+                    mime = part["inlineData"].get("mimeType", "image/png")
+                    info = {"size": size, "ext": "jpg" if "jpeg" in mime else "png", "cost": cost,
+                            "prompt_tokens": usage.get("promptTokenCount", 0) or 0,
+                            "thoughts": usage.get("thoughtsTokenCount", 0) or 0}
+                    logger.info(f"Image generated via {label} {size} (attempt {attempt}): thoughts={info['thoughts']} "
+                                f"prompt={info['prompt_tokens']} cost=${cost:.4f}")
+                    return base64.b64decode(part["inlineData"]["data"]), None, label, info
                 if "text" in part:
                     text_parts.append(part["text"])
 
             if text_parts:
                 refusal = "\n".join(text_parts)
                 logger.warning(f"Gemini returned text instead of image: {refusal[:200]}")
-                return None, "__REFUSAL__", None
+                return None, "__REFUSAL__", None, None
             logger.warning("Gemini returned 200 with no image and no text")
             last_error_msg = "Gemini вернул пустой ответ"
             break
@@ -1219,9 +1294,9 @@ async def _try_gemini_image(prompt: str) -> tuple[bytes | None, str | None, str 
         except Exception:
             error_msg = f"HTTP {resp.status_code}"
         logger.warning(f"Gemini non-retryable error: {error_msg}")
-        return None, f"Gemini ответил: {error_msg}", None
+        return None, f"Gemini ответил: {error_msg}", None, None
 
-    return None, last_error_msg, None
+    return None, last_error_msg, None, None
 
 
 async def _transcribe_audio_gemini(audio_bytes: bytes, mime_type: str) -> str | None:
@@ -1362,12 +1437,22 @@ async def _rewrite_prompt(prompt: str) -> str | None:
         return None
 
 
-async def generate_image_with_error(prompt: str, chat_id: int) -> tuple[bytes | None, str | None, str | None]:
+async def _try_pool_image(prompt: str, *, model_id: str, label: str):
+    """_try_gpt_image в общем 4-элементном виде (info=None: у pool-провайдеров цена — константа)."""
+    image, error, provider = await _try_gpt_image(prompt, model_id=model_id, label=label)
+    return image, error, provider, None
+
+
+async def generate_image_with_error(prompt: str, chat_id: int, size: str | None = None):
     """Провайдер выбирается per-chat (IMAGE_PROVIDERS/chat_image_provider). Между собой НЕ
     фоллбечат: разный провайдер — разный счёт (gemini не трогает баланс пула, pool тратит
     его), молча подменять один другим при отказе значило бы незаметно для чата начать
     тратить деньги. Retry-с-переформулировкой при отказе — свой для каждого провайдера,
     второй не пробуем.
+
+    size — "2K" по запросу (маркер [[DRAW 2K: ...]], «2к», /imagine 2k); None — дефолт провайдера
+    (1K, у bananapro 2K). Для pool-провайдеров (gpt/flare/sunburst) игнорируется.
+    Возвращает (image, error, provider_label, imeta); imeta = {"size": "1K"|"2K", "ext": "jpg"|"png"}.
     """
     provider_key = get_chat_image_provider(chat_id)
     meta = IMAGE_PROVIDERS[provider_key]
@@ -1375,35 +1460,70 @@ async def generate_image_with_error(prompt: str, chat_id: int) -> tuple[bytes | 
     backend = meta["backend"]
 
     if backend == "pool":
-        try_fn = functools.partial(_try_gpt_image, model_id=meta["model_id"], label=meta["label"])
+        try_fn = functools.partial(_try_pool_image, model_id=meta["model_id"], label=meta["label"])
+        eff_size = "1K"
     elif backend == "gemini":
-        try_fn = _try_gemini_image
+        eff_size = size if size in IMAGE_SIZES else meta.get("default_size", "1K")
+        try_fn = functools.partial(_try_gemini_image, provider_key=provider_key, size=eff_size)
     else:
         # Неизвестный backend — программная ошибка в реестре, не тихий фоллбек на другой
         # провайдер (см. docstring выше про разный счёт).
         logger.error(f"Unknown image provider backend {backend!r} for key {provider_key!r}")
-        return None, "Генератор картинок сейчас недоступен. Попробуй позже.", None
+        return None, "Генератор картинок сейчас недоступен. Попробуй позже.", None, {}
 
-    image, error, provider = await try_fn(prompt)
+    def _record(info: dict | None) -> dict:
+        if info is None:   # pool: цена — константа
+            _record_usage("image", provider_key, "image", IMAGE_PRICES[provider_key])
+            return {"size": "1K", "ext": "png"}
+        # В usage_log: разрешение — в label (image / image_2k), thinking-токены — в thinking (и в output,
+        # как у LLM: thinking входит в output), промпт — в input.
+        label = "image" if info["size"] == "1K" else f"image_{info['size'].lower()}"
+        _record_usage("image", provider_key, label, info["cost"],
+                      inp=info["prompt_tokens"], out=info["thoughts"], thinking=info["thoughts"])
+        return {"size": info["size"], "ext": info["ext"]}
+
+    image, error, provider, info = await try_fn(prompt)
     if image:
-        _record_usage("image", provider_key, "image", IMAGE_PRICES[provider_key])
-        return image, None, provider
+        return image, None, provider, _record(info)
 
     if error == "__REFUSAL__":
         logger.info(f"{provider_label} refused, rewriting prompt...")
         rewritten = await _rewrite_prompt(prompt)
         if rewritten:
-            image, error, provider = await try_fn(rewritten)
+            image, error, provider, info = await try_fn(rewritten)
             if image:
-                _record_usage("image", provider_key, "image", IMAGE_PRICES[provider_key])
-                return image, None, provider
+                return image, None, provider, _record(info)
 
     if error == "__REFUSAL__":
         final_error = f"{provider_label} отказался это рисовать, даже после переформулировки."
     else:
         final_error = error or "Генератор картинок сейчас недоступен. Попробуй позже."
     logger.error(f"Image generation failed ({provider_label}): {error}")
-    return None, final_error, None
+    return None, final_error, None, {}
+
+
+async def _send_image(message, image: bytes, imeta: dict, caption: str, short_caption: str | None = None):
+    """Отправка картинки: 1K — фото, 2K — ДОКУМЕНТОМ (без пережатия Telegram). Подпись не прошла
+    (BadRequest) — картинка уже оплачена, шлём с short_caption."""
+    from io import BytesIO
+    is_doc = imeta.get("size") == "2K"
+
+    async def _send(cap: str):
+        bio = BytesIO(image)
+        if is_doc:
+            bio.name = f"claudushka_2k.{imeta.get('ext', 'png')}"
+            await message.reply_document(document=bio, caption=cap)
+        else:
+            bio.name = "claudushka.png"
+            await message.reply_photo(photo=bio, caption=cap)
+
+    try:
+        await _send(caption)
+    except BadRequest as e:
+        if short_caption is None:
+            raise
+        logger.warning(f"отправка картинки с подписью не прошла ({e}), шлю с короткой подписью")
+        await _send(short_caption)
 
 
 async def _image_limit_blocked(update, chat_id: int, is_group: bool, user_id: int,
@@ -1449,19 +1569,19 @@ def _photo_caption(draw_prompt: str, author: str | None, provider: str) -> str:
 
 async def _draw_and_send(update, context, chat_id: int, is_group: bool,
                          draw_prompt: str, en_prompt: str = None, author: str = None,
-                         silent_limit: bool = False) -> bool:
+                         silent_limit: bool = False, size: str | None = None) -> bool:
     """Рисует и отправляет (см. _draw_and_send_impl); реакцию ✍, поставленную внутри, снимает на любом
     исходе — картинка ушла, не получилась или упало исключение."""
     try:
         return await _draw_and_send_impl(update, context, chat_id, is_group, draw_prompt,
-                                         en_prompt, author, silent_limit)
+                                         en_prompt, author, silent_limit, size)
     finally:
         unreact(update.message)
 
 
 async def _draw_and_send_impl(update, context, chat_id: int, is_group: bool,
                               draw_prompt: str, en_prompt: str = None, author: str = None,
-                              silent_limit: bool = False) -> bool:
+                              silent_limit: bool = False, size: str | None = None) -> bool:
     """Генерирует картинку и отправляет в чат. Возвращает True при успехе.
 
     Первым делом — дневной лимит free-режима (до дорогого перевода промпта и генерации);
@@ -1499,7 +1619,7 @@ async def _draw_and_send_impl(update, context, chat_id: int, is_group: bool,
     stop_event = asyncio.Event()
     keepalive_task = asyncio.create_task(_keep_chat_action(context.bot, chat_id, "upload_photo", stop_event))
     try:
-        image_data, error_msg, provider = await generate_image_with_error(en_prompt, chat_id)
+        image_data, error_msg, provider, imeta = await generate_image_with_error(en_prompt, chat_id, size)
     finally:
         stop_event.set()
         try:
@@ -1508,16 +1628,9 @@ async def _draw_and_send_impl(update, context, chat_id: int, is_group: bool,
             pass
 
     if image_data:
-        from io import BytesIO
-        bio = BytesIO(image_data)
-        bio.name = "claudushka.png"
-        try:
-            await update.message.reply_photo(photo=bio, caption=_photo_caption(draw_prompt, author, provider))
-        except BadRequest as e:
-            # Картинка уже сгенерирована и оплачена — не терять её из-за подписи.
-            logger.warning(f"reply_photo с подписью не прошёл ({e}), шлю с короткой подписью")
-            bio.seek(0)
-            await update.message.reply_photo(photo=bio, caption=f"🎨 Модель: {provider}")
+        # Картинка уже сгенерирована и оплачена — не терять её из-за подписи (short_caption). 2K — документом.
+        await _send_image(update.message, image_data, imeta, _photo_caption(draw_prompt, author, provider),
+                          short_caption=f"🎨 Модель: {provider}")
         if is_group:
             # НЕ использовать слово "нарисовала" и квадратные скобки — модель имитирует
             # ЭТОТ формат в собственных живых ответах (см. LEAKED_DRAW_NOTE_RE/
@@ -1723,6 +1836,7 @@ def _persona_text(is_group: bool) -> str:
         "Чтобы картинка реально сгенерировалась и отправилась, добавь в самый конец ответа маркер на отдельной строке: [[DRAW: подробный промпт на английском]]. "
         "Маркер невидим пользователю, картинка отправится автоматически отдельным сообщением. Промпт в маркере пиши на английском, подробно и конкретно. "
         "Пример: пользователь просит нарисовать кота — ты отвечаешь «Щас будет!» и добавляешь новой строкой [[DRAW: a fluffy orange cat sitting on a windowsill, soft light]]. "
+        "Картинка по умолчанию обычного размера; если пользователь прямо просит высокое качество, обои, печать или «в 2к» — пиши [[DRAW 2K: ...]], в остальных случаях только [[DRAW: ...]]. "
         f"В истории чата ты можешь увидеть свои прошлые сообщения вида «{_draw_sent_note('...')}» — это служебная пометка о том, что картинка УЖЕ была отправлена раньше, а не образец, который надо копировать. "
         "Чтобы нарисовать картинку СЕЙЧАС, нужен именно маркер [[DRAW: ...]] в двойных квадратных скобках — никогда не пиши «Нарисовала картинку: <промпт>» обычным текстом вместо маркера, иначе промпт по-английски утечёт в чат, а картинка не появится вообще. "
         "Не отрицай эти возможности и не говори что не можешь работать с изображениями — это неправда. "
@@ -2266,7 +2380,10 @@ DRAW_TRIGGERS = {"нарисуй", "нарисуй-ка", "draw", "zeichne", "р
 # скобку и/или забывает закрыть маркер ("[DRAW: ..." до конца строки) — без этого
 # сбойный маркер вываливался в чат текстом вместо того, чтобы вырезаться (см.
 # docs/claude/images.md).
-DRAW_MARKER_RE = re.compile(r"\[{1,2}DRAW:\s*(.+?)(?:\]{1,2}|$)", re.IGNORECASE | re.DOTALL)
+# Размер 2K — необязательное слово после DRAW: [[DRAW 2K: ...]]. Группы: size (может быть None), prompt.
+DRAW_MARKER_RE = re.compile(r"\[{1,2}DRAW(?:\s+(?P<size>2[KК]))?:\s*(?P<prompt>.+?)(?:\]{1,2}|$)", re.IGNORECASE | re.DOTALL)
+# «нарисуй 2к закат», /imagine 2k ... — первое слово после триггера (латинская k и кириллическая к).
+IMAGE_2K_WORDS = {"2k", "2к"}
 
 # Служебная пометка о уже отправленной картинке — единый источник текста для истории
 # (group_messages/conversations, оба пути входа «нарисуй»/маркер, оба контекста
@@ -3232,7 +3349,7 @@ async def cmd_imagemodels(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tail = "  (платный режим)" if key != FREE_IMAGE_PROVIDER and tier == "free" else ""
         cmd = "/" + meta["cmds"][0]
         aliases = " (" + ", ".join("/" + c for c in meta["cmds"][1:]) + ")" if len(meta["cmds"]) > 1 else ""
-        lines.append(f"{mark} {cmd}{aliases} {meta['label']} — ~${IMAGE_PRICES[key] * PRICE_MARKUP:g} за картинку{tail}")
+        lines.append(f"{mark} {cmd}{aliases} {meta['label']} — ~{image_price_text(key)} за картинку{tail}")
     lines.append("")
     if tier == "free":
         lines.append("В бесплатном режиме — только GPT Image 2 и лимит картинок в сутки "
@@ -3257,14 +3374,15 @@ USER_HELP = """\
   /version       — версия бота
   /cost          — баланс, режим и расход (в группе — для админов группы)
   /search <q>    — веб-поиск
-  /imagine <q>   — генерация изображения
+  /imagine <q>   — генерация изображения (/imagine 2k <q> — в 2K, документом)
   /models        — модели, режим (платный/бесплатный) и что сейчас у чата
   /haiku         — Haiku 5.5 (дёшево и быстро; единственная в бесплатном режиме)
   /sonnet        — Sonnet 5.5 (платный режим)
   /opus          — Opus 5.5 (платный режим)
   /fable         — Fable 5.1 (платный режим, просит подтверждения — очень дорогая)
   /imagemodels   — какой провайдер картинок сейчас у чата
-  /banana        — рисовать через Nano Banana 2 (платный режим)
+  /banana        — рисовать через Nano Banana 2.1 (платный режим)
+  /bananapro     — рисовать через Nano Banana Pro (платный режим, 2K)
   /gptimage      — рисовать через GPT Image 2 (единственный в бесплатном режиме)
   /flare (/gpt25f)    — рисовать через GPT Image 2.5 Flare (платный режим)
   /sunburst (/gpt25s) — рисовать через GPT Image 2.5 Sunburst (платный режим)
@@ -3300,7 +3418,8 @@ ADMIN_HELP = """\
 
 Провайдер картинок (без аргумента — текущий чат; с chat_id — любой, только админу):
   /imagemodels [chat_id]   — текущий провайдер картинок чата
-  /banana [chat_id]        — Nano Banana 2 (~$0.067, дефолт платного режима)
+  /banana [chat_id]        — Nano Banana 2.1 (~$0.034 за 1K, $0.05 за 2K; дефолт платного режима)
+  /bananapro [chat_id]     — Nano Banana Pro (~$0.134 за 2K, платный режим)
   /gptimage [chat_id]      — GPT Image 2 (~$0.02; в бесплатном режиме единственный)
   /flare [chat_id] (/gpt25f)      — GPT Image 2.5 Flare (~$0.02, платный режим)
   /sunburst [chat_id] (/gpt25s)   — GPT Image 2.5 Sunburst (~$0.02, платный режим)
@@ -3529,10 +3648,14 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # команды, ограничивать имеет смысл в первую очередь их.
     if is_group and not db.check_group_rate_limit(update.effective_chat.id, user_id):
         return
-    if not context.args:
-        await update.message.reply_text("Использование: /imagine <описание картинки>")
+    args = list(context.args or [])
+    size = None
+    if args and args[0].lower() in IMAGE_2K_WORDS:   # /imagine 2k <промпт>
+        size, args = "2K", args[1:]
+    if not args:
+        await update.message.reply_text("Использование: /imagine [2k] <описание картинки>")
         return
-    prompt = " ".join(context.args)
+    prompt = " ".join(args)
     chat_id = update.effective_chat.id
     if await _image_limit_blocked(update, chat_id, is_group, user_id):
         return
@@ -3542,7 +3665,7 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stop_event = asyncio.Event()
     keepalive_task = asyncio.create_task(_keep_chat_action(context.bot, chat_id, "upload_photo", stop_event))
     try:
-        image_data, error_msg, provider = await generate_image_with_error(prompt, chat_id)
+        image_data, error_msg, provider, imeta = await generate_image_with_error(prompt, chat_id, size)
     except BaseException:
         unreact(update.message)
         raise
@@ -3554,15 +3677,12 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     if image_data:
-        from io import BytesIO
-        bio = BytesIO(image_data)
-        bio.name = "claudushka.png"
         author = update.effective_user.first_name or update.effective_user.username or "Unknown"
         caption = f"🎨 \"{prompt}\"\n\nАвтор запроса: {author}\nМодель: {provider}"
         try:
             if msg:
                 await msg.delete()
-            await update.message.reply_photo(photo=bio, caption=caption)
+            await _send_image(update.message, image_data, imeta, caption)
         finally:
             unreact(update.message)
     else:
@@ -4138,6 +4258,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     first_word = user_text.split()[0].lower().rstrip(",:.!?") if user_text else ""
     if first_word in DRAW_TRIGGERS:
         draw_prompt = user_text[len(user_text.split()[0]):].strip()
+        draw_size = None
+        words = draw_prompt.split(None, 1)
+        if words and words[0].lower().rstrip(",:.!?") in IMAGE_2K_WORDS:   # «нарисуй 2к закат»
+            draw_size = "2K"
+            draw_prompt = words[1].strip() if len(words) > 1 else ""
 
         if not draw_prompt and update.message.reply_to_message:
             source_msg = update.message.reply_to_message
@@ -4151,7 +4276,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         author = update.effective_user.first_name or update.effective_user.username or "Unknown"
-        success = await _draw_and_send(update, context, chat_id, is_group, draw_prompt, author=author)
+        success = await _draw_and_send(update, context, chat_id, is_group, draw_prompt, author=author, size=draw_size)
         if success:
             # Ответ картинкой — тоже «реальный ответ»: считаем в дневной лимит непроверенных
             # (обычные ответы считает _record_usage по метке dialog; здесь LLM-вызова нет).
@@ -4314,7 +4439,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Клодушка могла сама инициировать рисование маркером [[DRAW: ...]] внутри ответа.
         draw_match = DRAW_MARKER_RE.search(assistant_text)
-        draw_en_prompt = draw_match.group(1).strip() if draw_match else None
+        draw_en_prompt = draw_match.group("prompt").strip() if draw_match else None
+        draw_size = "2K" if draw_match and draw_match.group("size") else None
         if draw_match:
             assistant_text = DRAW_MARKER_RE.sub("", assistant_text).strip()
         if draw_en_prompt and len(re.sub(r"[^\w]", "", draw_en_prompt, flags=re.UNICODE)) < 3:
@@ -4418,7 +4544,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Клодушка сама попросила картинку — теперь реально рисуем и отправляем.
         if draw_en_prompt:
             await _draw_and_send(update, context, chat_id, is_group, draw_en_prompt,
-                                 en_prompt=draw_en_prompt, silent_limit=True)
+                                 en_prompt=draw_en_prompt, silent_limit=True, size=draw_size)
 
     except Exception as e:
         await api_errors.reply_api_error(
