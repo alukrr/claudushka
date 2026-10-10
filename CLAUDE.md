@@ -28,7 +28,7 @@
 Это ядро; подробности вынесены в тематические файлы (не `@`-импорты — грузятся только
 когда сам их откроешь). Перед правкой соответствующей области — сначала прочитай файл:
 
-- Рисование (`_try_gemini_image`, `_try_gpt_image`, `_draw_and_send`, `DRAW_MARKER_RE`,
+- Рисование (`react`/`REACTIONS`, `_try_gemini_image`, `_try_gpt_image`, `_draw_and_send`, `DRAW_MARKER_RE`,
   `LEAKED_DRAW_RE`, `IMAGE_PROVIDERS`, `/imagine` `/banana` `/gptimage` `/flare` `/sunburst`
   `/imagemodels`) — `docs/claude/images.md`
 - Групповой чат (`build_group_messages`, `group_messages`, гейтинг доступа,
@@ -61,7 +61,8 @@
   `response.model`, миграция `chat_models`) — `docs/claude/staging-checklist-opus-5-5.md`;
   чек-лист ТЗ `feat/haiku-5-5` (Haiku 5.5, thinking/effort, ступенчатая цена >100k) —
   `docs/claude/staging-checklist-haiku-5-5.md`; чек-лист ТЗ `feat/prompt-cache` (кэш префикса, окно
-  истории шагами) — `docs/claude/staging-checklist-prompt-cache.md`
+  истории шагами) — `docs/claude/staging-checklist-prompt-cache.md`; чек-лист ТЗ `feat/reactions`
+  (реакции 👀/✍ вместо «Рисую…»/«ищу…») — `docs/claude/staging-checklist-reactions.md`
 
 ## Стек
 - Python 3.12 (python:3.12-slim Docker image)

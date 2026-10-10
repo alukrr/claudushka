@@ -9,6 +9,7 @@ import functools
 import contextvars
 from pathlib import Path
 from telegram import Update
+from telegram.constants import ReactionEmoji
 from telegram.error import BadRequest
 from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
@@ -63,6 +64,13 @@ client_noretry = client.with_options(max_retries=0)  # переиспользу�
 
 MAX_HISTORY = 40
 GROUP_TRANSCRIPT_LIMIT = 50   # сколько реплик группового транскрипта тащить в messages
+
+# Реакции на сообщение пользователя вместо служебных текстов («Рисую…», «ищу…»). Боту доступен только
+# фиксированный набор эмодзи (telegram.constants.ReactionEmoji): 🔍/🖌 в нём нет. REACTIONS=0 — выкл.
+# (тогда у /imagine возвращается текст «Рисую…»).
+REACTIONS = os.environ.get("REACTIONS", "1").strip() != "0"
+REACTION_SEARCH = ReactionEmoji.EYES.value          # 👀
+REACTION_DRAW = ReactionEmoji.WRITING_HAND.value    # ✍
 
 # --- Prompt caching (ТЗ feat/prompt-cache, docs/claude/prompt-cache.md) ---
 # PROMPT_CACHE=0 — откат без правки кода: system снова одной строкой без cache_control,
@@ -393,6 +401,24 @@ def _spawn_background_task(coro) -> asyncio.Task:
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     return task
+
+
+async def _set_reaction(message, emoji: str) -> None:
+    try:
+        await message.set_reaction(emoji)
+    except Exception as e:
+        # Реакции запрещены в группе, сообщение удалено, нет прав — не повод ломать ответ.
+        logger.warning(f"Не удалось поставить реакцию {emoji}: {type(e).__name__}: {e}")
+
+
+def react(message, emoji: str) -> bool:
+    """Поставить реакцию на сообщение пользователя ФОНОМ (ответ реакцию не ждёт). Ошибки — только в лог.
+    Возвращает False, если реакции выключены (REACTIONS=0) или сообщения нет: тогда вызывающий код
+    должен дать обратную связь текстом, как раньше. True не гарантирует, что реакция встала."""
+    if not REACTIONS or message is None:
+        return False
+    _spawn_background_task(_set_reaction(message, emoji))
+    return True
 
 
 # --- Вызов Anthropic API из async-хендлеров ---
@@ -1232,6 +1258,8 @@ async def _draw_and_send(update, context, chat_id: int, is_group: bool,
     """
     if await _image_limit_blocked(update, chat_id, is_group, update.effective_user.id, silent_limit):
         return False
+
+    react(update.message, REACTION_DRAW)
 
     if en_prompt is None:
         try:
@@ -3290,7 +3318,8 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if await _image_limit_blocked(update, chat_id, is_group, user_id):
         return
-    msg = await update.message.reply_text("Рисую... это может занять пару минут.")
+    # Реакция вместо текста; без неё (REACTIONS=0 или нет сообщения) — текст, как раньше.
+    msg = None if react(update.message, REACTION_DRAW) else await update.message.reply_text("Рисую... это может занять пару минут.")
 
     stop_event = asyncio.Event()
     keepalive_task = asyncio.create_task(_keep_chat_action(context.bot, chat_id, "upload_photo", stop_event))
@@ -3309,10 +3338,12 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bio.name = "claudushka.png"
         author = update.effective_user.first_name or update.effective_user.username or "Unknown"
         caption = f"🎨 \"{prompt}\"\n\nАвтор запроса: {author}\nМодель: {provider}"
-        await msg.delete()
+        if msg:
+            await msg.delete()
         await update.message.reply_photo(photo=bio, caption=caption)
     else:
-        await msg.delete()
+        if msg:
+            await msg.delete()
         await update.message.reply_text(f"Не смогла нарисовать: {error_msg}" if error_msg else "Не смогла нарисовать. Попробуй другой промпт.")
 
 
@@ -3333,6 +3364,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     query = " ".join(context.args)
+    react(update.message, REACTION_SEARCH)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     results = await call_claude_aux(web_search, query, label="web_search")
     if not results:
@@ -3917,6 +3949,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             search_input = f"{user_text}\nКонтекст реплая: {reply_context}".strip() if reply_context else user_text
             search_query = await call_claude_aux(should_search, search_input, label="should_search")
             if search_query:
+                react(update.message, REACTION_SEARCH)
                 search_results = await call_claude_aux(web_search, search_query, label="web_search") or ""
 
         system = build_system(user_id, is_group, chat_id if is_group else None)
