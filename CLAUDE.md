@@ -42,6 +42,8 @@
   `docs/claude/models-and-costs.md`
 - Prompt caching (`build_system`, `service_block`, `mark_cache_tail`, `pick_history_window`,
   `PROMPT_CACHE`, `HISTORY_STEP`, `CACHE_TTL_PERSONA`) — `docs/claude/prompt-cache.md`
+- Нативный веб-поиск Anthropic в платном режиме (`call_dialog_native`, `call_claude_stream`, `native_answer`,
+  `sources_line`, `NATIVE_SEARCH*`, `pause_turn`, реакция по событию стрима) — `docs/claude/native-search.md`
 - Деньги и доступ (`usage_log`, `chat_credits`, баланс, тарифы paid/free, `usage_ctx`,
   `_record_usage`, `gate_update`, `/cost`, `/topup`, `/verify /unverify /ban /unban`,
   лимиты непроверенных, стартовый бонус, `/fable`-подтверждение) — `docs/claude/billing.md`
@@ -62,7 +64,8 @@
   чек-лист ТЗ `feat/haiku-5-5` (Haiku 5.5, thinking/effort, ступенчатая цена >100k) —
   `docs/claude/staging-checklist-haiku-5-5.md`; чек-лист ТЗ `feat/prompt-cache` (кэш префикса, окно
   истории шагами) — `docs/claude/staging-checklist-prompt-cache.md`; чек-лист ТЗ `feat/reactions`
-  (реакции 👀/✍ вместо «Рисую…»/«ищу…») — `docs/claude/staging-checklist-reactions.md`
+  (реакции 👀/✍ вместо «Рисую…»/«ищу…») — `docs/claude/staging-checklist-reactions.md`; чек-лист ТЗ `feat/native-search` (нативный
+  `web_search` в платном режиме) — `docs/claude/staging-checklist-native-search.md`
 
 ## Стек
 - Python 3.12 (python:3.12-slim Docker image)
@@ -73,7 +76,8 @@
   `docs/claude/api-errors.md` про смену иерархии исключений 5xx) — реестр моделей
   `MODELS` в bot.py, `/haiku /sonnet /opus /fable`. Подробности —
   `docs/claude/models-and-costs.md`.
-- tavily-python 0.8.4 — веб-поиск (`/search`)
+- tavily-python 0.8.4 — веб-поиск в бесплатном режиме и `/search`; платный режим — нативный `web_search`
+  Anthropic (`docs/claude/native-search.md`)
 - Генерация изображений — `/imagine`, DRAW-маркер, провайдеры banana/GPT Image 2/GPT Image
   2.5 Flare/Sunburst. Подробности — `docs/claude/images.md`.
 - fastapi 0.141.1 + uvicorn 0.53.0 — WhatsApp webhook. Подробности — `.claude/rules/whatsapp.md`.

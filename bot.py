@@ -2,13 +2,14 @@ import os
 import re
 import json
 import html
+from urllib.parse import urlparse
 import logging
 import time
 import asyncio
 import functools
 import contextvars
 from pathlib import Path
-from telegram import Update
+from telegram import LinkPreviewOptions, Update
 from telegram.constants import ReactionEmoji
 from telegram.error import BadRequest
 from datetime import datetime, timedelta, time as dt_time
@@ -71,6 +72,19 @@ GROUP_TRANSCRIPT_LIMIT = 50   # сколько реплик группового
 REACTIONS = os.environ.get("REACTIONS", "1").strip() != "0"
 REACTION_SEARCH = ReactionEmoji.EYES.value          # 👀
 REACTION_DRAW = ReactionEmoji.WRITING_HAND.value    # ✍
+
+# --- Нативный веб-поиск Anthropic в платном режиме (ТЗ feat/native-search, docs/claude/native-search.md) ---
+# Платный чат: серверный инструмент web_search, модель сама решает, искать ли; should_search+Tavily не
+# вызываются. Бесплатный чат — как раньше (Tavily). NATIVE_SEARCH=0 — откат на Tavily без правки кода.
+NATIVE_SEARCH = os.environ.get("NATIVE_SEARCH", "1").strip() != "0"
+# Версия инструмента. Через пул apitoken работает ТОЛЬКО web_search_20250305: 20260209 (динамическая
+# фильтрация через code_execution) пул не пропускает — гейт 2026-10-10, docs/claude/native-search.md.
+NATIVE_SEARCH_TOOL = os.environ.get("NATIVE_SEARCH_TOOL", "web_search_20250305").strip()
+NATIVE_SEARCH_MAX_USES = int(os.environ.get("NATIVE_SEARCH_MAX_USES", "3") or 3)
+NATIVE_SEARCH_MAX_PAUSE = 3   # сколько раз продолжаем ответ при stop_reason=pause_turn
+# Цена одного поиска, $: официальный прайс Anthropic $10 за 1000 запросов — та же база, что у токенов в usage_log.
+# Сверено с балансом пула 2026-10-10: пул берёт 40% от официальной цены (скидка 60% и на поиск, и на токены).
+NATIVE_SEARCH_PRICE = 0.01
 
 # --- Prompt caching (ТЗ feat/prompt-cache, docs/claude/prompt-cache.md) ---
 # PROMPT_CACHE=0 — откат без правки кода: system снова одной строкой без cache_control,
@@ -379,6 +393,12 @@ def _track_response(model: str, response, label: str = "aux") -> None:
         cw_1h = getattr(cc, "ephemeral_1h_input_tokens", 0) or 0
     else:
         cw_5m, cw_1h = cw, 0
+    # Разбивка не может быть меньше итога. В финальном сообщении СТРИМА с серверным поиском
+    # `cache_creation` остаётся от message_start (нули), а cache_creation_input_tokens уже обновлён —
+    # без этой подстраховки запись в кэш выпадает из цены (стенд 2026-10-10: dialog с поиском в 1.5–2.7×
+    # дешевле формулы). Недостающее считаем как 5m (дефолт, 1h не используется для нативного поиска).
+    if cw_5m + cw_1h < cw:
+        cw_5m = cw - cw_1h
     details = getattr(usage, "output_tokens_details", None)
     thinking = (getattr(details, "thinking_tokens", 0) or 0) if details is not None else 0
     tier_limit = (price_meta(model) or {}).get("tier_threshold")
@@ -534,6 +554,39 @@ async def call_claude(context, chat_id: int | None, *, label: str, usage_label: 
 
     response = await api_errors.call_with_retry(
         functools.partial(client_noretry.messages.create, **kwargs),
+        label=label,
+        keepalive=keepalive,
+    )
+    _track_response(kwargs.get("model", ""), response, usage_label or label.split()[0])
+    return response
+
+
+def _stream_final_message(kwargs: dict, on_search):
+    """СИНХРОННО (звать из потока): открыть стрим, дочитать, вернуть финальное сообщение. on_search()
+    вызывается один раз, когда модель начала серверный web_search (событие content_block_start)."""
+    fired = False
+    with client_noretry.messages.stream(**kwargs) as stream:
+        for event in stream:
+            if on_search and not fired and getattr(event, "type", "") == "content_block_start":
+                block = getattr(event, "content_block", None)
+                if getattr(block, "type", "") == "server_tool_use" and getattr(block, "name", "") == "web_search":
+                    fired = True
+                    on_search()
+        return stream.get_final_message()
+
+
+async def call_claude_stream(context, chat_id: int | None, *, label: str, usage_label: str | None = None,
+                             on_search=None, **kwargs):
+    """call_claude через стриминг: бот узнаёт о поиске в момент его начала, а не когда ответ готов.
+
+    Ретраи и «печатает…» — те же (api_errors.call_with_retry, клиент без SDK-ретраев). Ошибка посреди
+    потока приходит HTTP 200 — её ловит api_errors.is_retryable по типу в теле. on_search вызывается из
+    ПОТОКА: ставить реакцию только через loop.call_soon_threadsafe."""
+    keepalive = None
+    if context is not None and chat_id is not None:
+        keepalive = functools.partial(_keep_chat_action, context.bot, chat_id, "typing")
+    response = await api_errors.call_with_retry(
+        functools.partial(_stream_final_message, kwargs, on_search),
         label=label,
         keepalive=keepalive,
     )
@@ -817,6 +870,127 @@ def image_quota(chat_id: int, is_group: bool, user_id: int) -> tuple[int, int] |
         return (db.usage_count("image", since, chat_id, user_id=user_id, billed=False),
                 FREE_IMAGES_GROUP_PER_USER_PER_DAY)
     return db.usage_count("image", since, chat_id, billed=False), FREE_IMAGES_PRIVATE_PER_DAY
+
+
+# --- Нативный поиск Anthropic ---
+
+def _native_search_on(user_id: int, chat_id: int, is_group: bool) -> bool:
+    """Нативный поиск — только в платном режиме (и в пределах дневного лимита поиска непроверенных)."""
+    return NATIVE_SEARCH and chat_tier(chat_id) == "paid" and _search_allowed(user_id, chat_id, is_group)
+
+
+async def _tavily_search(update, user_id: int, chat_id: int, is_group: bool, user_text: str,
+                         reply_context: str) -> tuple[str, str]:
+    """Схема бесплатного режима: should_search (Haiku) → Tavily. Возвращает (запрос, результаты);
+    пустые, если поиск не нужен/не разрешён/Tavily не настроен. 👀 — только когда реально ищем."""
+    if not (tavily and _search_allowed(user_id, chat_id, is_group)):
+        return "", ""
+    search_input = f"{user_text}\nКонтекст реплая: {reply_context}".strip() if reply_context else user_text
+    search_query = await call_claude_aux(should_search, search_input, label="should_search")
+    if not search_query:
+        return "", ""
+    react(update.message, REACTION_SEARCH)
+    return search_query, await call_claude_aux(web_search, search_query, label="web_search") or ""
+
+
+def native_answer(response) -> tuple[str, list[str]]:
+    """(текст, url источников) из ответа с серверным поиском.
+
+    Текст — только text-блоки ПОСЛЕ последнего web_search_tool_result («сейчас поищу» до поиска
+    отбрасываем). Блоки склеиваем БЕЗ разделителя: цитата рвёт предложение посередине на 2–3 блока.
+    Поиска не было — обычный response_text. url — из citations всех text-блоков, без дублей."""
+    blocks = list(getattr(response, "content", None) or [])
+    last = max((i for i, b in enumerate(blocks) if getattr(b, "type", "") == "web_search_tool_result"), default=-1)
+    urls: list[str] = []
+    for b in blocks:
+        if getattr(b, "type", "") == "text":
+            for c in getattr(b, "citations", None) or []:
+                u = getattr(c, "url", None)
+                if u and u not in urls:
+                    urls.append(u)
+    if last < 0:
+        return response_text(response), urls
+    text = "".join(getattr(b, "text", "") for b in blocks[last + 1:] if getattr(b, "type", "") == "text").strip()
+    return text or response_text(response), urls
+
+
+def _md_escape(text: str) -> str:
+    return re.sub(r"([_*`\[\]])", r"\\\1", text)
+
+
+def _md_url(url: str) -> str:
+    """URL внутри (...) legacy-Markdown: ( ) _ * ` [ ] и пробел ломают разбор — кодируем процентами."""
+    enc = lambda x: re.sub(r"[()_*`\[\]\s\\]", lambda m: "%%%02X" % ord(m.group(0)), x)
+    parts = urlparse(url)
+    head = f"{parts.scheme}://{parts.netloc}"   # хост НЕ кодируем: %5F в имени хоста ссылку ломает
+    return head + enc(url[len(head):]) if url.startswith(head) else enc(url)
+
+
+def sources_line(urls: list[str], limit: int = 3) -> tuple[str, str]:
+    """Строка источников под ответом: (Markdown, plain). Домен как текст ссылки, не больше `limit`
+    разных доменов. Plain — фолбэк, если Telegram не принял Markdown (без ссылок, только домены)."""
+    items: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for u in urls:
+        host = (urlparse(u).netloc or "").lower().removeprefix("www.")
+        if host and host not in seen:
+            seen.add(host)
+            items.append((host, u))
+            if len(items) == limit:
+                break
+    if not items:
+        return "", ""
+    md = "🔗 " + " · ".join(f"[{_md_escape(h)}]({_md_url(u)})" for h, u in items)
+    return md, "🔗 " + " · ".join(h for h, _ in items)
+
+
+def _native_search_rejected(exc: BaseException) -> bool:
+    """400 от пула/API из-за самого инструмента поиска (не включён, не поддерживается моделью)."""
+    if not isinstance(exc, anthropic.BadRequestError) or api_errors.is_prompt_too_long(exc):
+        return False
+    msg = str(exc).lower()
+    return "web search" in msg or "web_search" in msg
+
+
+async def call_dialog_native(context, chat_id: int, message, *, label: str, **kwargs):
+    """Ответ диалога с серверным web_search. Возвращает (response, text, urls, searches).
+
+    Через стриминг: реакция 👀 ставится, когда модель РЕАЛЬНО начала искать. stop_reason=pause_turn —
+    продолжаем тем же запросом, добавив полученный assistant-контент как есть (encrypted_content
+    нужен API), не больше NATIVE_SEARCH_MAX_PAUSE раз; каждая итерация — отдельная строка usage_log
+    (dialog_pause). Поиски пишутся в usage_log по одному (kind=search, model=anthropic,
+    label=native_search)."""
+    loop = asyncio.get_running_loop()
+    on_search = lambda: loop.call_soon_threadsafe(react, message, REACTION_SEARCH)
+    tools = [{"type": NATIVE_SEARCH_TOOL, "name": "web_search", "max_uses": NATIVE_SEARCH_MAX_USES}]
+    messages = list(kwargs.pop("messages"))
+    urls: list[str] = []
+    searches = 0
+    text = ""
+    response = None
+    for i in range(NATIVE_SEARCH_MAX_PAUSE + 1):
+        response = await call_claude_stream(
+            context, chat_id, label=label if i == 0 else f"{label} (pause {i})",
+            usage_label="dialog" if i == 0 else "dialog_pause",
+            on_search=on_search, tools=tools, messages=messages, **kwargs,
+        )
+        su = getattr(response.usage, "server_tool_use", None)
+        searches += getattr(su, "web_search_requests", 0) or 0
+        for b in response.content:
+            if getattr(b, "type", "") == "web_search_tool_result" and not isinstance(b.content, list):
+                logger.warning(f"web_search: {getattr(b.content, 'error_code', b.content)} ({label})")
+        text, new_urls = native_answer(response)
+        urls += [u for u in new_urls if u not in urls]
+        if response.stop_reason != "pause_turn":
+            break
+        if i == NATIVE_SEARCH_MAX_PAUSE:
+            logger.warning(f"pause_turn: {NATIVE_SEARCH_MAX_PAUSE} продолжения не хватило, беру что есть ({label})")
+            break
+        messages = messages + [{"role": "assistant",
+                                "content": [b.model_dump(mode="json", exclude_none=True) for b in response.content]}]
+    for _ in range(searches):
+        _record_usage("search", "anthropic", "native_search", NATIVE_SEARCH_PRICE)
+    return response, text, urls, searches
 
 
 # --- Web search ---
@@ -1533,7 +1707,8 @@ def _persona_text(is_group: bool) -> str:
         "Если не уверена в факте — скажи об этом ДО ответа, не после. Лучше 'не знаю точно, но думаю что...' чем уверенная чушь. "
         "Точность информации важнее красивого ответа. Лучше сказать 'не знаю' чем придумать. "
         "Если пользователь упоминает событие о котором ты не знаешь — НЕ объясняй как устроена твоя память и обучение. "
-        "Просто скажи что сейчас поищешь (или уже нашла, если в служебном блоке последнего сообщения есть результаты поиска). "
+        "Если нужны свежие данные или событие тебе незнакомо — ищешь и отвечаешь по найденному (результаты могут прийти "
+        "в служебном блоке последнего сообщения). "
         "Не читай лекций про архитектуру LLM — пользователь пришёл за информацией, а не за объяснениями. "
         "Отвечай на языке пользователя. "
         "ГЛАВНОЕ ПРАВИЛО СТИЛЯ: отвечай как живой человек в мессенджере, не как ChatGPT. "
@@ -2637,12 +2812,14 @@ async def cmd_ratelimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _usage_model_label(kind: str, model: str | None) -> str:
     """Подпись «модели» строки usage_log: LLM — из реестра; картинки хранят ключ провайдера,
-    поиск — 'tavily'. Модель вне реестра показываем как есть (цена по дефолту, см. model_meta)."""
+    поиск — 'tavily' (бесплатный режим) / 'anthropic' (нативный, платный). Модель вне реестра показываем как есть (цена по дефолту, см. model_meta)."""
     if kind == "llm":
         meta = price_meta(model)
         return meta["label"] if meta else f"{model} (нет в реестре)"
     if kind == "image":
         return IMAGE_PROVIDERS.get(model, {}).get("label", model or "?")
+    if model == "anthropic":
+        return "Anthropic web_search"
     return "Tavily" if model == "tavily" else (model or "?")
 
 
@@ -3999,13 +4176,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
+        # Платный режим: нативный web_search внутри самого запроса (should_search+Tavily не нужны).
+        # Бесплатный: should_search → Tavily → результаты в служебный блок.
+        use_native = _native_search_on(user_id, chat_id, is_group)
         search_query = search_results = ""
-        if tavily and _search_allowed(user_id, chat_id, is_group):
-            search_input = f"{user_text}\nКонтекст реплая: {reply_context}".strip() if reply_context else user_text
-            search_query = await call_claude_aux(should_search, search_input, label="should_search")
-            if search_query:
-                react(update.message, REACTION_SEARCH)
-                search_results = await call_claude_aux(web_search, search_query, label="web_search") or ""
+        if not use_native:
+            search_query, search_results = await _tavily_search(
+                update, user_id, chat_id, is_group, user_text, reply_context)
 
         system = build_system(user_id, is_group, chat_id if is_group else None)
 
@@ -4021,10 +4198,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Изменчивое (время, поиск, reply в личке) — служебным блоком в последний user-turn, не в
         # system: в БД не пишется (там остаётся только user_text). Точка кэша №3 — на последнем
         # assistant перед ним. В группе reply_context уже inline в build_group_messages.
-        messages = mark_cache_tail(with_service_block(messages, service_block(
-            reply_context="" if is_group else reply_context,
-            search_query=search_query, search_results=search_results,
-        )))
+        base_messages = messages
+
+        def compose(sq: str, sr: str) -> list:
+            return mark_cache_tail(with_service_block(base_messages, service_block(
+                reply_context="" if is_group else reply_context,
+                search_query=sq, search_results=sr,
+            )))
+
+        messages = compose(search_query, search_results)
 
         _model = get_chat_model(chat_id)
         hist_chars, hist_imgs = _history_stats(messages)
@@ -4032,11 +4214,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"PROMPT uid={user_id} chat={chat_id} model={_model} "
             f"system={system_chars(system)} history_chars={hist_chars} msgs={len(messages)} imgs={hist_imgs}"
         )
+        native_text, native_urls = None, []
         try:
-            response = await call_claude(
-                context, chat_id, label=f"диалог chat={chat_id}", usage_label="dialog",
-                model=_model, **dialog_params(_model), max_tokens=out_tokens(_model, 4096), system=system, messages=messages,
-            )
+            if use_native:
+                try:
+                    response, native_text, native_urls, _ = await call_dialog_native(
+                        context, chat_id, update.message, label=f"диалог chat={chat_id}",
+                        model=_model, **dialog_params(_model), max_tokens=out_tokens(_model, 4096),
+                        system=system, messages=messages,
+                    )
+                except anthropic.BadRequestError as e_native:
+                    if not _native_search_rejected(e_native):
+                        raise
+                    # Пул/модель не принимает инструмент — этот же запрос по старой схеме (Tavily).
+                    logger.warning(f"native web_search отклонён ({_model}), перехожу на Tavily: {e_native}")
+                    use_native, native_text, native_urls = False, None, []
+                    search_query, search_results = await _tavily_search(
+                        update, user_id, chat_id, is_group, user_text, reply_context)
+                    messages = compose(search_query, search_results)
+            if not use_native:
+                response = await call_claude(
+                    context, chat_id, label=f"диалог chat={chat_id}", usage_label="dialog",
+                    model=_model, **dialog_params(_model), max_tokens=out_tokens(_model, 4096), system=system, messages=messages,
+                )
         except anthropic.BadRequestError as e:
             # 400 prompt is too long: история не сохранится, следующее сообщение соберёт
             # тот же промпт и упадёт снова — чат заклинит навсегда (инцидент 2026-07-26).
@@ -4090,7 +4290,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-        assistant_text = response_text(response)
+        assistant_text = native_text or response_text(response)
         if not assistant_text:
             # Запрос прошёл, но текста нет: отказ модели, только thinking, или упёрлись
             # в max_tokens. Молчать нельзя — пользователь решит, что бот сломался.
@@ -4195,17 +4395,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     messages + [{"role": "assistant", "content": assistant_text}], False, None))
 
         if assistant_text:
-            if len(assistant_text) <= 4096:
+            # Источники нативного поиска (требование доки Anthropic к показу цитат) — строкой под ответом,
+            # только в сообщении пользователю: в БД (saved_text выше) их нет. Превью ссылок выключено.
+            src_md, src_plain = sources_line(native_urls)
+            send_kw = {"link_preview_options": LinkPreviewOptions(is_disabled=True)} if src_md else {}
+            chunks = [assistant_text[i:i + 4096] for i in range(0, len(assistant_text), 4096)]
+            src_separate = bool(src_md) and len(chunks[-1]) + 2 + len(src_md) > 4096
+            for n, chunk in enumerate(chunks):
+                md_chunk = plain_chunk = chunk
+                if src_md and n == len(chunks) - 1 and not src_separate:
+                    md_chunk, plain_chunk = f"{chunk}\n\n{src_md}", f"{chunk}\n\n{src_plain}"
                 try:
-                    await update.message.reply_text(assistant_text, parse_mode="Markdown")
+                    await update.message.reply_text(md_chunk, parse_mode="Markdown", **send_kw)
                 except Exception:
-                    await update.message.reply_text(assistant_text)
-            else:
-                for i in range(0, len(assistant_text), 4096):
-                    try:
-                        await update.message.reply_text(assistant_text[i:i + 4096], parse_mode="Markdown")
-                    except Exception:
-                        await update.message.reply_text(assistant_text[i:i + 4096])
+                    await update.message.reply_text(plain_chunk, **send_kw)
+            if src_separate:
+                try:
+                    await update.message.reply_text(src_md, parse_mode="Markdown", **send_kw)
+                except Exception:
+                    await update.message.reply_text(src_plain, **send_kw)
 
         # Клодушка сама попросила картинку — теперь реально рисуем и отправляем.
         if draw_en_prompt:
