@@ -73,7 +73,7 @@ GPT Image 2.5 Flare или Sunburst без дневного лимита, еже
 | `/fable` | Fable 5.1 (платный режим; просит подтверждения — повтор в течение 2 минут) |
 | `/imagemodels` | Какой провайдер картинок сейчас у чата |
 | `/banana` | Рисовать через Nano Banana 2.1 (платный режим) |
-| `/bananapro` | Рисовать через Nano Banana Pro (платный режим, сразу 2K) |
+| `/bananapro` | Рисовать через Nano Banana Pro (платный режим, сразу 2K; в группе — только админы чата и бота) |
 | `/gptimage` | Рисовать через GPT Image 2 (единственный в бесплатном режиме) |
 | `/flare` (`/gpt25f`) | Рисовать через GPT Image 2.5 Flare (платный режим) |
 | `/sunburst` (`/gpt25s`) | Рисовать через GPT Image 2.5 Sunburst (платный режим) |
@@ -136,7 +136,7 @@ GPT Image 2.5 Flare или Sunburst без дневного лимита, еже
 |---------|----------|
 | `/imagemodels [chat_id]` | Текущий провайдер картинок чата |
 | `/banana [chat_id]` | Nano Banana 2.1 (~$0.034 за 1K, $0.05 за 2K) — дефолт платного режима |
-| `/bananapro [chat_id]` | Nano Banana Pro (~$0.134 за 2K) — платный режим |
+| `/bananapro [chat_id]` | Nano Banana Pro (~$0.134 за 2K) — платный режим; в группе переключают админы чата и бота |
 | `/gptimage [chat_id]` | GPT Image 2 (~$0.02) — через пул api.apitoken.sale, единственный в бесплатном режиме |
 | `/flare [chat_id]` (`/gpt25f`) | GPT Image 2.5 Flare (~$0.02) — через пул api.apitoken.sale |
 | `/sunburst [chat_id]` (`/gpt25s`) | GPT Image 2.5 Sunburst (~$0.02) — через пул api.apitoken.sale |

@@ -1091,11 +1091,10 @@ GPT_IMAGE_RETRY_DELAY = 2
 # Цена пула — $0.02/картинка, как у GPT Image 2. При size=1024x1024 пул отдаёт PNG
 # 1254×1254 — не баг, наблюдение с той же проверки, чинить нечего.
 #
-# cmds[0] — основная команда чата (используется в текстах/ошибках), остальные — алиасы;
-# все команды здесь и по всему боту должны быть уникальны (см. assert ниже).
 # Nano Banana (gemini): модель banana — env BANANA_MODEL (откат на gemini-3.1-flash-image без правки кода),
-# уровень thinking — env BANANA_THINKING_LEVEL (minimal/medium/high; дефолт minimal — промпт и так пишет
-# Claude). bananapro — gemini-3-pro-image, thinking у неё выключить нельзя, thinkingConfig не шлём; по умолчанию
+# уровень thinking — env BANANA_THINKING_LEVEL (minimal/medium/high; дефолт medium — решение Алексея
+# 2026-10-10: качество важнее ~$0.008 за картинку; minimal дешевле и быстрее). bananapro — gemini-3-pro-image,
+# thinking у неё выключить нельзя, thinkingConfig не шлём; по умолчанию
 # 2K (стоит как 1K). Цена — GEMINI_IMAGE_PRICING по ID модели, чтобы откат BANANA_MODEL считался верно.
 # Страница цен Google, сверено 2026-10-10. 4K не делаем (дорого, Telegram всё равно пережимает).
 BANANA_DEFAULT_MODEL = "gemini-nano-banana-2.1"
@@ -1112,18 +1111,21 @@ if BANANA_MODEL not in GEMINI_IMAGE_PRICING:
     logger.error(f"BANANA_MODEL={BANANA_MODEL!r} нет в GEMINI_IMAGE_PRICING — использую {BANANA_DEFAULT_MODEL}")
     BANANA_MODEL = BANANA_DEFAULT_MODEL
 BANANA_THINKING_LEVELS = ("minimal", "medium", "high")
-BANANA_THINKING_LEVEL = os.environ.get("BANANA_THINKING_LEVEL", "minimal").strip().lower()
+BANANA_THINKING_LEVEL = os.environ.get("BANANA_THINKING_LEVEL", "medium").strip().lower()
 if BANANA_THINKING_LEVEL not in BANANA_THINKING_LEVELS:
-    logger.error(f"BANANA_THINKING_LEVEL={BANANA_THINKING_LEVEL!r} не из {BANANA_THINKING_LEVELS} — беру minimal")
-    BANANA_THINKING_LEVEL = "minimal"
+    logger.error(f"BANANA_THINKING_LEVEL={BANANA_THINKING_LEVEL!r} не из {BANANA_THINKING_LEVELS} — беру medium")
+    BANANA_THINKING_LEVEL = "medium"
 # У gemini-3.1-flash-image уровня medium нет (minimal/high) — при откате на неё medium не слать.
 IMAGE_SIZES = ("1K", "2K")
 
+# cmds[0] — основная команда чата (используется в текстах/ошибках), остальные — алиасы;
+# все команды здесь и по всему боту должны быть уникальны (см. assert ниже).
+# restricted — переключать в группе только админы чата и бота (дорогой провайдер).
 IMAGE_PROVIDERS = {
     "banana":   {"label": "Nano Banana 2.1",     "cmds": ["banana"],          "backend": "gemini", "model_id": BANANA_MODEL,
                  "thinking": True, "default_size": "1K"},
     "bananapro": {"label": "Nano Banana Pro",    "cmds": ["bananapro"],       "backend": "gemini", "model_id": BANANAPRO_MODEL,
-                 "thinking": False, "default_size": "2K"},
+                 "thinking": False, "default_size": "2K", "restricted": True},
     "gpt":      {"label": "GPT Image 2",         "cmds": ["gptimage"],        "backend": "pool", "model_id": "gpt-image-2"},
     "flare":    {"label": "GPT Image 2.5 Flare",    "cmds": ["flare", "gpt25f"], "backend": "pool", "model_id": "openai/gpt-image-2.5-flare"},
     "sunburst": {"label": "GPT Image 2.5 Sunburst", "cmds": ["sunburst", "gpt25s"], "backend": "pool", "model_id": "openai/gpt-image-2.5-sunburst"},
@@ -3307,6 +3309,15 @@ async def _set_image_provider(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"{meta['label']} — доступно в платном режиме. Баланс — /cost, пополнить — {ADMIN_CONTACT}.")
         return
 
+    # Дорогой провайдер (restricted, Nano Banana Pro ~$0.134): в группе переключают только админы бота и
+    # админы этой группы; в личке пользователь сам себе хозяин. С chat_id — только админ бота (_parse_target_chat).
+    if meta.get("restricted") and not admin and update.effective_chat.type in ("group", "supergroup"):
+        if not await is_chat_admin(context, update.effective_chat.id, update.effective_user.id):
+            await update.effective_message.reply_text(
+                f"{meta['label']} дорогая (~{image_price_text(key)} за картинку) — переключать её могут "
+                "только админы чата и админы бота.")
+            return
+
     known, label = _chat_display(update, chat_id)
     warn = "" if known or not context.args else \
         "\n⚠️ Такого чата нет среди разрешённых — записала, но проверь ID."
@@ -3382,7 +3393,7 @@ USER_HELP = """\
   /fable         — Fable 5.1 (платный режим, просит подтверждения — очень дорогая)
   /imagemodels   — какой провайдер картинок сейчас у чата
   /banana        — рисовать через Nano Banana 2.1 (платный режим)
-  /bananapro     — рисовать через Nano Banana Pro (платный режим, 2K)
+  /bananapro     — рисовать через Nano Banana Pro (платный режим, 2K; в группе — админам чата и бота)
   /gptimage      — рисовать через GPT Image 2 (единственный в бесплатном режиме)
   /flare (/gpt25f)    — рисовать через GPT Image 2.5 Flare (платный режим)
   /sunburst (/gpt25s) — рисовать через GPT Image 2.5 Sunburst (платный режим)
@@ -3419,7 +3430,7 @@ ADMIN_HELP = """\
 Провайдер картинок (без аргумента — текущий чат; с chat_id — любой, только админу):
   /imagemodels [chat_id]   — текущий провайдер картинок чата
   /banana [chat_id]        — Nano Banana 2.1 (~$0.034 за 1K, $0.05 за 2K; дефолт платного режима)
-  /bananapro [chat_id]     — Nano Banana Pro (~$0.134 за 2K, платный режим)
+  /bananapro [chat_id]     — Nano Banana Pro (~$0.134 за 2K, платный режим; в группе — админам чата и бота)
   /gptimage [chat_id]      — GPT Image 2 (~$0.02; в бесплатном режиме единственный)
   /flare [chat_id] (/gpt25f)      — GPT Image 2.5 Flare (~$0.02, платный режим)
   /sunburst [chat_id] (/gpt25s)   — GPT Image 2.5 Sunburst (~$0.02, платный режим)

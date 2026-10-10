@@ -144,14 +144,17 @@ system-prompt).
   `gemini-3.1-flash-image` на 2026-10-10 ещё отвечали; Google пишет, что `gemini-3.1-flash-image` закрывается
   29.10.2026. Ключ провайдера и `/banana` прежние — чаты с banana переехали сами, миграции нет.
 - **`bananapro`** (`gemini-3-pro-image`, `/bananapro`): платный режим, по умолчанию 2K (стоит как 1K — $0.134).
+  Флаг реестра `restricted`: в ГРУППЕ переключать могут только админы бота и админы этой группы (`is_chat_admin`),
+  остальным — отказ с ценой; в личке — любой пользователь платного чата; `/bananapro <chat_id>` — только админ бота.
+  `/banana`, `/gptimage`, `/flare`, `/sunburst` без этого ограничения (как `/opus` `/fable`: гейтинг по тарифу, не по роли).
 - **Параметры `generateContent`** (проверено живыми запросами 2026-10-10; дока описывает `interactions`):
   `generationConfig.imageConfig.imageSize` = `"1K"`/`"2K"` (применяется: 1K → 1376×768, 2K → 2752×1536; 4K у нас нет;
   регистр не важен, `"3K"` → 400) и `generationConfig.thinkingConfig.thinkingLevel` = `minimal`/`medium`/`high`
   (мусор → 400). Аспект модель выбирает сама (портрет/пейзаж). **Pro** принимает `thinkingLevel` без ошибки, но
   thinking не выключается (~150–270 thought-токенов при любом значении) → для Pro `thinkingConfig` не шлём. Pro без
   `imageSize` отдаёт 1K — 2K ставим явно. Картинка приходит JPEG (не PNG): расширение берётся из `mimeType`.
-- **Thinking-уровень** — env `BANANA_THINKING_LEVEL` (дефолт `minimal`: промпт пишет Claude, подробный). У
-  `gemini-3.1-flash-image` (откат) `medium` нет — подставляется `minimal`. Замер на сложном промпте (текст на
+- **Thinking-уровень** — env `BANANA_THINKING_LEVEL`, **дефолт `medium`** (решение Алексея 2026-10-10; `minimal` дешевле
+  и быстрее). У `gemini-3.1-flash-image` (откат) `medium` нет — подставляется `minimal`. Замер на сложном промпте (текст на
   картинке, 4 объекта, 1K): `minimal` — 0 thought-токенов; `medium` (дефолт Google) — 1082 (+$0.0081, +24%); `high` —
   1335 (+$0.0100, +30%). Время: `minimal` ~10 с, `medium`/`high` ~15–16 с.
 - **Разрешение по запросу:** 2K включают маркер `[[DRAW 2K: prompt]]` (персона: только если просят высокое
