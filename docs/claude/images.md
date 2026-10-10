@@ -2,14 +2,14 @@
 
 Перед правкой `_try_gemini_image`, `_try_gpt_image`, `DRAW_MARKER_RE`, `LEAKED_DRAW_RE`,
 `LEAKED_DRAW_NOTE_RE`, `DRAW_SENT_LABEL`, `_draw_sent_note`, `_draw_and_send`,
-`IMAGE_PROVIDERS`, `/imagine`, `/banana`, `/gptimage`, `/flare`, `/sunburst`,
+`IMAGE_PROVIDERS`, `GEMINI_IMAGE_PRICING`, `/imagine`, `/banana`, `/bananapro`, `/gptimage`, `/flare`, `/sunburst`,
 `/imagemodels` — читай этот файл.
 
 **С ТЗ v0.10 (`docs/claude/billing.md`) провайдер зависит от тарифа чата:** free — всегда GPT
-(запись `chat_image_provider` не меняется, `/banana` отказывает «доступно в платном режиме»),
+(запись `chat_image_provider` не меняется, `/banana` и `/bananapro` отказывают «доступно в платном режиме»),
 paid — выбор чата, нет строки → **banana** (`db.DEFAULT_IMAGE_PROVIDER = "banana"`; дефолт «GPT для
 всех» от 2026-09-19 ниже — историческая справка, теперь GPT только у free). Стоимость картинки
-пишется в `usage_log` после успеха (`IMAGE_PRICES`). В free — дневной лимит (личка 10, группа 5 на
+пишется в `usage_log` после успеха (pool — `IMAGE_PRICES`, gemini — по `usageMetadata`, см. раздел Nano Banana 2.1). В free — дневной лимит (личка 10, группа 5 на
 участника), проверка первой строкой `_draw_and_send`/`cmd_imagine` (`_image_limit_blocked`); для
 спонтанного `[[DRAW]]` — молча (`silent_limit=True`).
 История багов маркера и провайдеров с датами — `docs/claude/incidents.md` (инциденты
@@ -137,6 +137,41 @@ system-prompt).
 - `REACTIONS=0` — хелпер ничего не делает (`react()` возвращает `False`), `/imagine` снова шлёт «Рисую…»,
   чтобы у пользователя всегда была обратная связь. Применяется `docker compose up -d --force-recreate`.
 - Текст модели («Щас будет!» в персоне) и `send_chat_action` не трогали.
+
+## Nano Banana 2.1, /bananapro, 2K по запросу (`feat/banana-21`, v1.3.0)
+- **banana = `gemini-nano-banana-2.1`** (GA, 2026-10-06, `-preview` убран), ID — env `BANANA_MODEL` (откат без правки
+  кода на `gemini-3.1-flash-image`; цена считается по ID модели, `GEMINI_IMAGE_PRICING`). Старый preview-ID и
+  `gemini-3.1-flash-image` на 2026-10-10 ещё отвечали; Google пишет, что `gemini-3.1-flash-image` закрывается
+  29.10.2026. Ключ провайдера и `/banana` прежние — чаты с banana переехали сами, миграции нет.
+- **`bananapro`** (`gemini-3-pro-image`, `/bananapro`): платный режим, по умолчанию 2K (стоит как 1K — $0.134).
+  Флаг реестра `restricted` (общий `_deny_restricted`, тот же, что у `/opus` и `/fable`): в ГРУППЕ переключать могут только
+  админы бота и админы этой группы (`is_chat_admin`), остальным — отказ с ценой; в личке — любой пользователь платного
+  чата; `/bananapro <chat_id>` — только админ бота. `/banana`, `/gptimage`, `/flare`, `/sunburst` без этого ограничения.
+  Секция «Генерация картинок» с ценами есть в `/models` (кратко) и в `/imagemodels` (подробно).
+- **Параметры `generateContent`** (проверено живыми запросами 2026-10-10; дока описывает `interactions`):
+  `generationConfig.imageConfig.imageSize` = `"1K"`/`"2K"` (применяется: 1K → 1376×768, 2K → 2752×1536; 4K у нас нет;
+  регистр не важен, `"3K"` → 400) и `generationConfig.thinkingConfig.thinkingLevel` = `minimal`/`medium`/`high`
+  (мусор → 400). Аспект модель выбирает сама (портрет/пейзаж). **Pro** принимает `thinkingLevel` без ошибки, но
+  thinking не выключается (~150–270 thought-токенов при любом значении) → для Pro `thinkingConfig` не шлём. Pro без
+  `imageSize` отдаёт 1K — 2K ставим явно. Картинка приходит JPEG (не PNG): расширение берётся из `mimeType`.
+- **Thinking-уровень** — env `BANANA_THINKING_LEVEL`, **дефолт `medium`** (решение Алексея 2026-10-10; `minimal` дешевле
+  и быстрее). У `gemini-3.1-flash-image` (откат) `medium` нет — подставляется `minimal`. Замер на сложном промпте (текст на
+  картинке, 4 объекта, 1K): `minimal` — 0 thought-токенов; `medium` (дефолт Google) — 1082 (+$0.0081, +24%); `high` —
+  1335 (+$0.0100, +30%). Время: `minimal` ~10 с, `medium`/`high` ~15–16 с.
+- **Разрешение по запросу:** 2K включают маркер `[[DRAW 2K: prompt]]` (персона: только если просят высокое
+  качество / обои / печать / «в 2к»; старый `[[DRAW: ...]]` = 1K; `DRAW_MARKER_RE` с именованными группами
+  `size`/`prompt`), «нарисуй 2к …» и `/imagine 2k …` (слово после триггера, `2k`/`2к` любой регистр). Для
+  `gpt`/`flare`/`sunburst` и в free флаг молча игнорируется (1K). **2K уходит ДОКУМЕНТОМ** (без пережатия
+  Telegram), 1K — фото; подпись та же (`_send_image`).
+- **Учёт:** цена = цена за разрешение (`GEMINI_IMAGE_PRICING[model]["sizes"]`) + `thoughtsTokenCount` × ставка
+  выхода + `promptTokenCount` × ставка входа (`gemini_image_cost`, по `usageMetadata`). В `usage_log`: label
+  `image` (1K) / `image_2k`, `input` = промпт, `thinking` и `output` = thought-токены. «Thought images»
+  (промежуточные, ~150–420 токенов сидят в `candidatesTokenCount` сверх картинки) по доке Google не тарифицируются —
+  не считаем; **не сверено с реальным списанием Google** (шаг чек-листа).
+  Цены ($ за картинку, 1K/2K/4K; вход/выход $/MTok): 2.1 — 0.0336/0.0504/0.113 (1.50/7.50); 2 — 0.067/0.101/0.151
+  (0.50/3.00); Pro — 0.134/0.134/0.24 (2.00/12.00). Проверка: 1K = 1120 image-токенов × $30/MTok, 2K = 1680.
+- Не делали: 4K, search grounding, batch, Nano Banana 2 Lite (1K стоит как 2.1, умеет меньше), смену дефолта free
+  (остаётся GPT $0.02).
 
 ## Провайдер картинок per-chat (`/banana` `/gptimage` `/imagemodels`, v0.12.0)
 Второй провайдер добавлен по образцу переключения моделей LLM (`MODELS`/`/haiku` и т.п.),

@@ -29,8 +29,8 @@
 когда сам их откроешь). Перед правкой соответствующей области — сначала прочитай файл:
 
 - Рисование (`react`/`REACTIONS`, `_try_gemini_image`, `_try_gpt_image`, `_draw_and_send`, `DRAW_MARKER_RE`,
-  `LEAKED_DRAW_RE`, `IMAGE_PROVIDERS`, `/imagine` `/banana` `/gptimage` `/flare` `/sunburst`
-  `/imagemodels`) — `docs/claude/images.md`
+  `LEAKED_DRAW_RE`, `IMAGE_PROVIDERS`, `GEMINI_IMAGE_PRICING`, `/imagine [2k]` `/banana` `/bananapro` `/gptimage` `/flare`
+  `/sunburst` `/imagemodels`) — `docs/claude/images.md`
 - Групповой чат (`build_group_messages`, `group_messages`, гейтинг доступа,
   `/ratelimit`, `is_chat_admin`) — `docs/claude/group-chat.md`
 - Голос/видео/кружочки/GIF (`_transcribe_audio_gemini`, `_extract_video_frames`,
@@ -65,7 +65,8 @@
   `docs/claude/staging-checklist-haiku-5-5.md`; чек-лист ТЗ `feat/prompt-cache` (кэш префикса, окно
   истории шагами) — `docs/claude/staging-checklist-prompt-cache.md`; чек-лист ТЗ `feat/reactions`
   (реакции 👀/✍ вместо «Рисую…»/«ищу…») — `docs/claude/staging-checklist-reactions.md`; чек-лист ТЗ `feat/native-search` (нативный
-  `web_search` в платном режиме) — `docs/claude/staging-checklist-native-search.md`
+  `web_search` в платном режиме) — `docs/claude/staging-checklist-native-search.md`; чек-лист ТЗ `feat/banana-21` (Nano Banana 2.1,
+  `/bananapro`, 2K) — `docs/claude/staging-checklist-banana-21.md`
 
 ## Стек
 - Python 3.12 (python:3.12-slim Docker image)
