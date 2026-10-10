@@ -82,7 +82,8 @@ NATIVE_SEARCH = os.environ.get("NATIVE_SEARCH", "1").strip() != "0"
 NATIVE_SEARCH_TOOL = os.environ.get("NATIVE_SEARCH_TOOL", "web_search_20250305").strip()
 NATIVE_SEARCH_MAX_USES = int(os.environ.get("NATIVE_SEARCH_MAX_USES", "3") or 3)
 NATIVE_SEARCH_MAX_PAUSE = 3   # сколько раз продолжаем ответ при stop_reason=pause_turn
-# Цена одного поиска, $: прайс Anthropic $10 за 1000 запросов. НЕ сверено с реальным списанием пула.
+# Цена одного поиска, $: официальный прайс Anthropic $10 за 1000 запросов — та же база, что у токенов в usage_log.
+# Сверено с балансом пула 2026-10-10: пул берёт 40% от официальной цены (скидка 60% и на поиск, и на токены).
 NATIVE_SEARCH_PRICE = 0.01
 
 # --- Prompt caching (ТЗ feat/prompt-cache, docs/claude/prompt-cache.md) ---
