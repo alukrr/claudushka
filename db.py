@@ -394,6 +394,20 @@ def get_conversation(user_id: int, limit: int = 40) -> list[dict]:
     return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
 
+def get_conversation_rows(user_id: int, limit: int) -> list[dict]:
+    """Последние limit строк треда С id (старые->новые). Для окна истории шагами
+    (prompt cache, docs/claude/prompt-cache.md): якорь окна — id строки, а не счёт.
+    Порядок по id (вставка), а не по timestamp: пара user/assistant в одну секунду
+    иначе меняется местами непредсказуемо."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, role, content FROM conversations WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+        (user_id, limit)
+    ).fetchall()
+    conn.close()
+    return [{"id": r["id"], "role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+
 def clear_conversation(user_id: int):
     conn = get_conn()
     conn.execute("DELETE FROM conversations WHERE user_id = ?", (user_id,))
@@ -558,16 +572,17 @@ def get_group_history(chat_id: int, limit: int = 30, since_ts: int = 0) -> list[
 
 def get_group_transcript(chat_id: int, limit: int = 40) -> list[dict]:
     """Групповая история для многоголосого messages-контекста.
-    Возвращает старые->новые: [{"sender", "text", "is_bot", "ts"}]."""
+    Возвращает старые->новые: [{"id", "sender", "text", "is_bot", "ts"}]."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT sender_name, content, is_bot, timestamp FROM group_messages "
+        "SELECT id, sender_name, content, is_bot, timestamp FROM group_messages "
         "WHERE chat_id = ? ORDER BY timestamp DESC, id DESC LIMIT ?",
         (chat_id, limit)
     ).fetchall()
     conn.close()
     return [
-        {"sender": r["sender_name"], "text": r["content"], "is_bot": bool(r["is_bot"]), "ts": r["timestamp"]}
+        {"id": r["id"], "sender": r["sender_name"], "text": r["content"], "is_bot": bool(r["is_bot"]),
+         "ts": r["timestamp"]}
         for r in reversed(rows)
     ]
 
