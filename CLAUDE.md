@@ -40,6 +40,8 @@
   `run_daily`, `BERLIN_TZ`) — `docs/claude/daily-review.md`
 - Модели и цены (`MODELS`, `/haiku /sonnet /opus /fable`, `/models`, `calc_llm_cost`) —
   `docs/claude/models-and-costs.md`
+- Prompt caching (`build_system`, `service_block`, `mark_cache_tail`, `pick_history_window`,
+  `PROMPT_CACHE`, `HISTORY_STEP`, `CACHE_TTL_PERSONA`) — `docs/claude/prompt-cache.md`
 - Деньги и доступ (`usage_log`, `chat_credits`, баланс, тарифы paid/free, `usage_ctx`,
   `_record_usage`, `gate_update`, `/cost`, `/topup`, `/verify /unverify /ban /unban`,
   лимиты непроверенных, стартовый бонус, `/fable`-подтверждение) — `docs/claude/billing.md`
@@ -58,7 +60,8 @@
   `docs/claude/staging-checklist-v0.10.md`; чек-лист ТЗ `feat/opus-5-5` (Opus 5.5, цена по
   `response.model`, миграция `chat_models`) — `docs/claude/staging-checklist-opus-5-5.md`;
   чек-лист ТЗ `feat/haiku-5-5` (Haiku 5.5, thinking/effort, ступенчатая цена >100k) —
-  `docs/claude/staging-checklist-haiku-5-5.md`
+  `docs/claude/staging-checklist-haiku-5-5.md`; чек-лист ТЗ `feat/prompt-cache` (кэш префикса, окно
+  истории шагами) — `docs/claude/staging-checklist-prompt-cache.md`
 
 ## Стек
 - Python 3.12 (python:3.12-slim Docker image)
@@ -116,6 +119,10 @@
   `**dialog_params(model)` и `out_tokens(...)`.
   `MODELS["..."]["id"]` в новых вызовах не хардкодить (единственное сознательное исключение —
   `daily_chat_review` на Opus, платная фича). `docs/claude/models-and-costs.md`.
+- Начало запроса к модели (system) — СТАТИЧНО: изменчивое (время, результаты поиска, reply-контекст)
+  только в `service_block` последнего user-turn, не в system, и не в БД. Система собирается через
+  `build_system` (блоки с `cache_control`), длина — `system_chars`, не `len`. Окно истории — шагами
+  (`pick_history_window`), не скользящее. `docs/claude/prompt-cache.md`.
 - Каждый вызов, стоящий денег (LLM/картинка/поиск), обязан попасть в `usage_log` через
   `_record_usage` (LLM — автоматически внутри `call_claude`/`sync_create`/`aux_create`, но
   ВСЕГДА с `label=`). Чат берётся из `usage_ctx` (contextvar, ставит `gate_update`; в джобах —
