@@ -175,6 +175,10 @@ cache_write_1h, cache_read)` (без наценки; `PRICE_MARKUP` примен
 пишется та же фактическая. Модели из ответа нет в `price_meta` → цена по запрошенной +
 `logger.warning` с обеими строками (один раз на пару за процесс, `_unknown_model_warned`).
 
+**Подстраховка разбивки:** если `cache_creation.ephemeral_5m + ephemeral_1h` меньше `cache_creation_input_tokens`,
+остаток считается как 5m (`_track_response`). Нужна для СТРИМА с серверным поиском: там разбивка остаётся нулевой
+от `message_start` (см. `docs/claude/native-search.md`, «Грабля учёта»).
+
 **Запись в кэш — раздельно по TTL:** `usage.cache_creation.ephemeral_5m_input_tokens` ×
 `cache_write_5m_mult`, `ephemeral_1h_input_tokens` × `cache_write_1h_mult`. Нет `cache_creation` в
 ответе — весь `cache_creation_input_tokens` считается как 5m. В `usage_log.cache_write` по-прежнему

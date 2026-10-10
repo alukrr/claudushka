@@ -393,6 +393,12 @@ def _track_response(model: str, response, label: str = "aux") -> None:
         cw_1h = getattr(cc, "ephemeral_1h_input_tokens", 0) or 0
     else:
         cw_5m, cw_1h = cw, 0
+    # Разбивка не может быть меньше итога. В финальном сообщении СТРИМА с серверным поиском
+    # `cache_creation` остаётся от message_start (нули), а cache_creation_input_tokens уже обновлён —
+    # без этой подстраховки запись в кэш выпадает из цены (стенд 2026-10-10: dialog с поиском в 1.5–2.7×
+    # дешевле формулы). Недостающее считаем как 5m (дефолт, 1h не используется для нативного поиска).
+    if cw_5m + cw_1h < cw:
+        cw_5m = cw - cw_1h
     details = getattr(usage, "output_tokens_details", None)
     thinking = (getattr(details, "thinking_tokens", 0) or 0) if details is not None else 0
     tier_limit = (price_meta(model) or {}).get("tier_threshold")
