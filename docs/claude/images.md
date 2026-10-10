@@ -144,9 +144,10 @@ system-prompt).
   `gemini-3.1-flash-image` на 2026-10-10 ещё отвечали; Google пишет, что `gemini-3.1-flash-image` закрывается
   29.10.2026. Ключ провайдера и `/banana` прежние — чаты с banana переехали сами, миграции нет.
 - **`bananapro`** (`gemini-3-pro-image`, `/bananapro`): платный режим, по умолчанию 2K (стоит как 1K — $0.134).
-  Флаг реестра `restricted`: в ГРУППЕ переключать могут только админы бота и админы этой группы (`is_chat_admin`),
-  остальным — отказ с ценой; в личке — любой пользователь платного чата; `/bananapro <chat_id>` — только админ бота.
-  `/banana`, `/gptimage`, `/flare`, `/sunburst` без этого ограничения (как `/opus` `/fable`: гейтинг по тарифу, не по роли).
+  Флаг реестра `restricted` (общий `_deny_restricted`, тот же, что у `/opus` и `/fable`): в ГРУППЕ переключать могут только
+  админы бота и админы этой группы (`is_chat_admin`), остальным — отказ с ценой; в личке — любой пользователь платного
+  чата; `/bananapro <chat_id>` — только админ бота. `/banana`, `/gptimage`, `/flare`, `/sunburst` без этого ограничения.
+  Секция «Генерация картинок» с ценами есть в `/models` (кратко) и в `/imagemodels` (подробно).
 - **Параметры `generateContent`** (проверено живыми запросами 2026-10-10; дока описывает `interactions`):
   `generationConfig.imageConfig.imageSize` = `"1K"`/`"2K"` (применяется: 1K → 1376×768, 2K → 2752×1536; 4K у нас нет;
   регистр не важен, `"3K"` → 400) и `generationConfig.thinkingConfig.thinkingLevel` = `minimal`/`medium`/`high`

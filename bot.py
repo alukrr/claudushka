@@ -169,11 +169,13 @@ MODELS = {
     "opus":   {"id": "claude-opus-5-5",           "label": "Opus 5.5",
                "in": 4.0,  "out": 20.0, "cache_read_mult": 0.05,
                "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context": 1_000_000,
-               "thinking_headroom": 8000},
+               "thinking_headroom": 8000,
+               "restricted": True},
     "fable":  {"id": "claude-fable-5-1",           "label": "Fable 5.1",
                "in": 10.0, "out": 50.0, "cache_read_mult": 0.025,
                "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context": 1_000_000,
-               "thinking_headroom": 8000},
+               "thinking_headroom": 8000,
+               "restricted": True},
 }
 DEFAULT_MODEL_KEY = "haiku"
 DEFAULT_MODEL_ID = MODELS[DEFAULT_MODEL_KEY]["id"]
@@ -3154,10 +3156,25 @@ def _parse_target_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: 
         return None, f"ID чата — это число (обычно с минусом). Формат: /{cmd} -1001234567890"
 
 
+async def _deny_restricted(update: Update, context: ContextTypes.DEFAULT_TYPE, what: str, hint: str) -> bool:
+    """Дорогие вещи (restricted: Opus, Fable, Nano Banana Pro) в ГРУППЕ переключают только админы бота и админы
+    этой группы; в личке пользователь сам себе хозяин. Нельзя ни обычному участнику группы, ни чужой чат без
+    chat_id (чужой чат и так только админ бота — _parse_target_chat). True — отказали и ответили."""
+    chat = update.effective_chat
+    if is_admin(update.effective_user.id) or chat.type not in ("group", "supergroup"):
+        return False
+    if await is_chat_admin(context, chat.id, update.effective_user.id):
+        return False
+    await update.effective_message.reply_text(
+        f"{what} дорогая ({hint}) — переключать её могут только админы чата и админы бота.")
+    return True
+
+
 async def _set_chat_model(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str):
     """Переключение модели чата. key — ключ реестра MODELS, не API-строка.
 
-    Гейтинг: не-Haiku модели — «админ ИЛИ платный режим». В free запись chat_models не
+    Гейтинг: не-Haiku модели — «админ ИЛИ платный режим»; restricted (Opus, Fable) в группе — ещё и только
+    админы чата/бота (_deny_restricted). В free запись chat_models не
     меняем вовсе (get_chat_model и так отдаёт Haiku) — прошлый платный выбор дождётся
     возвращения в paid."""
     meta = MODELS[key]
@@ -3178,6 +3195,10 @@ async def _set_chat_model(update: Update, context: ContextTypes.DEFAULT_TYPE, ke
                 f"(${meta['in']:g}/${meta['out']:g} за миллион токенов). "
                 f"Баланс — /cost, пополнить — {ADMIN_CONTACT}."
             )
+        return
+
+    if meta.get("restricted") and await _deny_restricted(
+            update, context, meta["label"], f"${meta['in']:g}/${meta['out']:g} за MTok"):
         return
 
     known, label = _chat_display(update, chat_id)
@@ -3265,11 +3286,24 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mark = "▸" if meta["id"] == current else " "
         window = f"{meta['context'] // 1000}k" if meta["context"] < 1_000_000 else "1M"
         tail = "  (платный режим)" if key != DEFAULT_MODEL_KEY and tier == "free" else ""
+        if meta.get("restricted"):
+            tail += "  (админы)"
         lines.append(
             f"{mark} /{key:6} {meta['label']:10} ${meta['in']:g}/${meta['out']:g} за MTok, окно {window}{tail}"
         )
     lines.append("")
     lines.append("Цены — прайс Anthropic за миллион токенов (вход/выход).")
+    # Генерация картинок — те же провайдеры, что в /imagemodels, но компактно и с ценами за картинку.
+    current_img = get_chat_image_provider(chat_id)
+    lines += ["", "Генерация картинок:"]
+    for ikey, imeta in IMAGE_PROVIDERS.items():
+        imark = "▸" if ikey == current_img else " "
+        itail = "  (платный режим)" if ikey != FREE_IMAGE_PROVIDER and tier == "free" else ""
+        if imeta.get("restricted"):
+            itail += "  (админы)"
+        lines.append(f"{imark} /{imeta['cmds'][0]:9} {imeta['label']:24} ~{image_price_text(ikey)} за картинку{itail}")
+    lines.append("Nano Banana — 2K по запросу («нарисуй 2к …», /imagine 2k …), приходит документом. Подробнее — /imagemodels.")
+    lines.append("(админы) — в группе переключают только админы чата и бота.")
     if tier == "free":
         lines.append("В бесплатном режиме работает только Haiku; остальные — после пополнения баланса (/cost).")
         saved = db.get_chat_model_db(chat_id)
@@ -3309,14 +3343,9 @@ async def _set_image_provider(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"{meta['label']} — доступно в платном режиме. Баланс — /cost, пополнить — {ADMIN_CONTACT}.")
         return
 
-    # Дорогой провайдер (restricted, Nano Banana Pro ~$0.134): в группе переключают только админы бота и
-    # админы этой группы; в личке пользователь сам себе хозяин. С chat_id — только админ бота (_parse_target_chat).
-    if meta.get("restricted") and not admin and update.effective_chat.type in ("group", "supergroup"):
-        if not await is_chat_admin(context, update.effective_chat.id, update.effective_user.id):
-            await update.effective_message.reply_text(
-                f"{meta['label']} дорогая (~{image_price_text(key)} за картинку) — переключать её могут "
-                "только админы чата и админы бота.")
-            return
+    if meta.get("restricted") and await _deny_restricted(
+            update, context, meta["label"], f"~{image_price_text(key)} за картинку"):
+        return
 
     known, label = _chat_display(update, chat_id)
     warn = "" if known or not context.args else \
@@ -3389,8 +3418,8 @@ USER_HELP = """\
   /models        — модели, режим (платный/бесплатный) и что сейчас у чата
   /haiku         — Haiku 5.5 (дёшево и быстро; единственная в бесплатном режиме)
   /sonnet        — Sonnet 5.5 (платный режим)
-  /opus          — Opus 5.5 (платный режим)
-  /fable         — Fable 5.1 (платный режим, просит подтверждения — очень дорогая)
+  /opus          — Opus 5.5 (платный режим; в группе — админам чата и бота)
+  /fable         — Fable 5.1 (платный режим, в группе — админам чата и бота; просит подтверждения — очень дорогая)
   /imagemodels   — какой провайдер картинок сейчас у чата
   /banana        — рисовать через Nano Banana 2.1 (платный режим)
   /bananapro     — рисовать через Nano Banana Pro (платный режим, 2K; в группе — админам чата и бота)
@@ -3421,8 +3450,8 @@ ADMIN_HELP = """\
   /models [chat_id]        — список моделей, цены, окно; ▸ = текущая
   /haiku [chat_id]         — Haiku 5.5 — $0.10/$0.50 (×5 при промпте >100k), окно 1M (бесплатный режим)
   /sonnet [chat_id]        — Sonnet 5.5 — $2/$10, окно 1M (дефолт платного режима)
-  /opus [chat_id]          — Opus 5.5 — $4/$20, окно 1M
-  /fable [chat_id]         — Fable 5.1 — $10/$50, окно 1M (повтор в течение 2 минут = подтверждение)
+  /opus [chat_id]          — Opus 5.5 — $4/$20, окно 1M (в группе — админам чата и бота)
+  /fable [chat_id]         — Fable 5.1 — $10/$50, окно 1M (в группе — админам чата и бота; повтор в течение 2 минут = подтверждение)
   chat_id — число с минусом, например: /opus -1001109809707
   Не-Haiku модели — админу или чату в платном режиме. Выбор постоянный (chat_models),
   в бесплатном режиме не применяется, но и не стирается. Перед записью — пробный запрос.

@@ -19,7 +19,9 @@ img() { q "SELECT id, model, label, input, thinking, cost_usd FROM usage_log WHE
 | 7 | TG-юзер | `/gptimage`, «нарисуй 2к …» | Картинка 1K фото (флаг игнорируется), ничего не сломалось |
 | 8 | TG-юзер | Запрос, который Gemini отказывается рисовать | Как раньше: переформулировка → «… отказался это рисовать» |
 | 9 | Free-чат | «нарисуй 2к …» | GPT, 1K, дневной лимит как раньше; `/banana` и `/bananapro` → «доступно в платном режиме» |
-| 10 | TG-админ | `/imagemodels` | Строки «Nano Banana 2.1 — ~$0.0336 (2K — $0.0504)» и «Nano Banana Pro — ~$0.134 (1K и 2K)»; справка `/help` с `/bananapro` |
+| 9a | TG-юзер, группа | `/opus` и `/fable` от НЕ-админа группы | Отказ «переключать её могут только админы чата и админы бота», модель не меняется; от админа группы и в личке — как раньше (`/fable` — с подтверждением) |
+| 10 | TG-админ | `/models` и `/imagemodels` | В `/models` секция «Генерация картинок» с ценами, у `/opus` `/fable` `/bananapro` пометка «(админы)» |
+| 10a | TG-админ | `/imagemodels` | Строки «Nano Banana 2.1 — ~$0.0336 (2K — $0.0504)» и «Nano Banana Pro — ~$0.134 (1K и 2K)»; справка `/help` с `/bananapro` |
 | 11 | Сервер | Откат: `BANANA_MODEL=gemini-3.1-flash-image` в `.env.test`, force-recreate, «нарисуй кота» | Картинка есть, цена ≈ 0.067 (а не 0.0336); потом вернуть |
 | 12 | Сервер | Средняя реальная цена 1K на выбранном уровне thinking: `q "SELECT AVG(cost_usd), COUNT(*) FROM usage_log WHERE kind='image' AND model='banana' AND label='image'"` | Решение по free-режиму (сейчас GPT $0.02) |
 | 13 | Google Cloud Billing / AI Studio | Сверить списание за этот день с суммой `cost_usd` по banana/bananapro | Расхождение ≤ нескольких процентов (проверить, что thought-images действительно не тарифицируются) |
