@@ -48,6 +48,9 @@ n = c.execute(sys.argv[1]).rowcount; c.commit(); print('изменено стр�
 logs() { docker logs claudushka-test 2>&1 | tail -${1:-60}; }
 ```
 
+**Или один раз в профиль** (вместе с `logs`, `cache`, `bychat`, `cost55*`): `echo 'source ~/claudushka-test/docs/claude/staging-aliases.sh' >> ~/.bashrc` —
+файл `docs/claude/staging-aliases.sh`, контейнер по умолчанию `claudushka-test` (другой — `export STAGE_CT=...`).
+
 Проверка, что всё работает: `q "SELECT COUNT(*) AS n FROM usage_log"` → выведет `{'n': 0}` или число.
 Если ошибка «no such table» — бот ещё не стартовал полностью (`logs 30`). «No such container» — стенд не поднят.
 

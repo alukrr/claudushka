@@ -4,6 +4,9 @@
 `q` / `qw` / `logs` — как в `docs/claude/staging-checklist-v0.10.md`, раздел 0.2. Формула цены Haiku 5.5 — `cost55h` из
 `docs/claude/staging-checklist-haiku-5-5.md`.
 
+Функции `q`, `qw`, `logs`, `cache`, `bychat`, `cost55h`, `cost55s` лежат в `docs/claude/staging-aliases.sh` (подключение
+в `~/.bashrc` — там же, в шапке). Ниже — те же `cache` и `bychat` для справки:
+
 ```bash
 # Кэш последних диалоговых вызовов (все чаты стенда; личка = положительный chat_id, группа = отрицательный)
 cache() { q "SELECT id, chat_id, model, input, cache_write, cache_read, output, cost_usd FROM usage_log
