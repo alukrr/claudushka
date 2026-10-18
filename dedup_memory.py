@@ -17,6 +17,10 @@ F7 цены, F8 применить, F1 полная помощь, F10 выход
 группа пишется, только если все её строки из снимка ещё на месте. Журнал каждого прогона —
 data/dedup_runs/, калибровка оценок — data/dedup_calibration.json. Без TTY — код выхода 2.
 
+Просроченные (medium старше 7 дней) факты: бот их не читает и сам удаляет раз в сутки; dedup по умолчанию
+видит только живые. Большие группы идут по частям (куски + слияние). Обрезанные в прошлый раз при тех же
+данных группы пропускаются (--force-retry — гнать).
+
 Режимы CLI:
   --mode exact   Убирает строго идентичные (user_id, context, chat_id, fact) — дёшево,
                  без обращения к API, безопасно. Оставляет самую РАННЮЮ запись из дублей.
@@ -50,6 +54,8 @@ data/dedup_runs/, калибровка оценок — data/dedup_calibration.j
   --user-id ID        только этот пользователь (обязателен для --mode delete)
   --chat-id ID        только этот чат (для context=group)
   --tier long|medium  только этот tier
+  --force-retry       (только --mode llm) гнать и группы, обрезанные в прошлый раз при тех же данных
+                       (иначе пропускаются — повтор потратит деньги зря)
   --include-expired   не прятать просроченные строки (дефолт для exact/delete/llm — только живые,
                        как видит память бот)
   --limit-groups N    (только --mode llm) не более N групп за один запуск —
@@ -779,6 +785,50 @@ def save_run(model, results: list[GroupResult], runs_dir: Path | None = None, su
     return path
 
 
+def previously_truncated(groups, calib: dict | None = None, runs_dir: Path | None = None) -> dict:
+    """Группы, которые повтор прогона заведомо сожжёт зря: -> {GroupKey: {"date": ..., "chunks": n}}.
+
+    Условия (по журналу data/dedup_runs/): ПОСЛЕДНИЙ прогон группы был `truncated`, набор row_ids с тех пор
+    не менялся, и стратегия та же — сколько кусков запланировано сейчас, столько было и тогда. Последнее
+    условие важно: журналы до v1.4.3 — это прогоны БЕЗ нарезки, а сейчас такая группа пойдёт по частям и
+    может получиться; блокировать её нельзя. Если же уже резали (chunks>0) и всё равно обрезало, или
+    резать нечего (малая группа), повтор даст то же самое.
+    """
+    runs_dir = runs_dir or RUNS_DIR
+    wanted = {g.key: g for g in groups}
+    seen: dict = {}
+    try:
+        files = sorted(runs_dir.glob("*.json"), reverse=True)
+    except OSError:
+        return {}
+    for f in files:
+        if len(seen) == len(wanted):
+            break
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for e in data.get("groups", []):
+            try:
+                key = GroupKey(**e["key"])
+            except (TypeError, KeyError):
+                continue
+            if key in wanted and key not in seen:
+                seen[key] = (f.name, e)
+    out = {}
+    for key, (fname, e) in seen.items():
+        g = wanted[key]
+        if e.get("status") != "truncated" or set(e.get("row_ids", [])) != set(g.row_ids):
+            continue
+        parts = plan_chunks(g.facts, calib)
+        planned = len(parts) if len(parts) > 1 else 0
+        if e.get("chunks", 0) != planned:
+            continue
+        d = fname[:15]
+        out[key] = {"date": f"{d[:4]}-{d[4:6]}-{d[6:8]} {d[9:11]}:{d[11:13]}", "chunks": planned}
+    return out
+
+
 def finish_run(model, results: list[GroupResult]):
     """После любого реального прогона: журнал + калибровка. -> (путь журнала, запись калибровки)."""
     if not results:
@@ -859,7 +909,7 @@ def fmt_dur(sec: float) -> str:
 
 
 def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
-              model="claude-haiku-5-5", limit_groups=None, verbose=False):
+              model="claude-haiku-5-5", limit_groups=None, verbose=False, force_retry=False):
     """CLI-обёртка над run_llm: печатает прогресс, при apply пишет каждую группу сразу."""
     try:
         client = make_client()
@@ -871,6 +921,15 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
     total_candidate_groups = len(candidates)  # до обрезки --limit-groups — нужно для экстраполяции ниже
     print(f"[llm] групп (user,context,chat,tier) в фильтре: {len(all_groups)}, "
           f"с 2+ фактами: {total_candidate_groups}", flush=True)
+    calib = load_calibration().get(model)
+    stale = previously_truncated(candidates, calib)
+    if stale and not force_retry:
+        for k, info in stale.items():
+            print(f"[llm] пропуск: user={k.user_id} chat={k.chat_id} tier={k.tier} — в прошлый раз ({info['date']}) "
+                  f"обрезано, данные те же (повтор потратит деньги зря); --force-retry — гнать всё равно", flush=True)
+        candidates = [g for g in candidates if g.key not in stale]
+    elif stale:
+        print(f"[llm] --force-retry: гоню {len(stale)} групп, обрезанных в прошлый раз", flush=True)
     if limit_groups:
         candidates = candidates[:limit_groups]
         print(f"[llm] ограничено --limit-groups до {len(candidates)} групп", flush=True)
@@ -888,7 +947,7 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
     total_cost = 0.0
     truncated_groups = errors = 0
     started = time.monotonic()
-    for i, res in enumerate(run_llm(candidates, model, client, calib=load_calibration().get(model)), 1):
+    for i, res in enumerate(run_llm(candidates, model, client, calib=calib), 1):
         results.append(res)
         k = res.key
         tag = f"[{i}/{n}] user={k.user_id} chat={k.chat_id} tier={k.tier}"
@@ -932,8 +991,8 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
         print(f"[llm]   прошло {fmt_dur(elapsed)} · ETA {fmt_dur(eta)} · потрачено ${total_cost:.4f}", flush=True)
 
     if truncated_groups:
-        print(f"[llm] обрезано, не применено: {truncated_groups} групп — сузь фильтр "
-              f"(--user-id/--chat-id/--tier) и прогони по частям", flush=True)
+        print(f"[llm] обрезано, не применено: {truncated_groups} групп (большие группы идут по частям сами; "
+              f"раз не влезло и так — сузь фильтр --user-id/--chat-id/--tier)", flush=True)
     if errors:
         print(f"[llm] ошибок: {errors} групп (не применены)", flush=True)
     elapsed = time.monotonic() - started
@@ -981,6 +1040,9 @@ def main():
     p.add_argument("--like", action="store_true",
                     help="только для --mode delete — --fact ищется как подстрока (LIKE %%...%%), "
                          "не точным совпадением")
+    p.add_argument("--force-retry", action="store_true",
+                   help="только для --mode llm — гнать и группы, обрезанные в прошлый раз при тех же данных "
+                        "(по умолчанию пропускаются: повтор потратит деньги зря)")
     p.add_argument("--include-expired", action="store_true",
                    help="не прятать просроченные строки (по умолчанию exact/delete/llm видят только живые)")
     p.add_argument("--apply", action="store_true", help="реально писать в БД (иначе dry-run)")
@@ -1020,7 +1082,7 @@ def main():
             dedup_delete(conn, args.user_id, args.chat_id, args.tier, args.fact, args.like, args.apply)
         else:
             dedup_llm(conn, args.user_id, args.chat_id, args.tier, args.apply,
-                      args.model, args.limit_groups, args.verbose)
+                      args.model, args.limit_groups, args.verbose, args.force_retry)
     finally:
         conn.close()
         if tmp_path:

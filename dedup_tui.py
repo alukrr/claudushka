@@ -81,6 +81,7 @@ class App:
         self.groups, self.nodes, self.chats, self.users = [], {}, {}, {}
         self.snapshot_at = ""
         self.expired_n = 0
+        self.prev_trunc = {}
         self.calibs = dm.load_calibration()
         self.est_cache = {}
         # состояние списка
@@ -167,6 +168,7 @@ class App:
             if tmp:
                 os.remove(tmp)
         self.snapshot_at = time.strftime("%H:%M:%S")
+        self.refresh_prev_trunc()
         self.nodes = {}
         for g in self.groups:
             k = g.key
@@ -182,6 +184,10 @@ class App:
         self.selected &= keys
         self.est_cache.clear()
         self.rebuild()
+
+    def refresh_prev_trunc(self):
+        """Группы, которые в прошлый раз обрезало при тех же данных (по журналу прогонов)."""
+        self.prev_trunc = dm.previously_truncated(self.groups, self.calibs.get(self.model))
 
     def user_label(self, uid):
         return self.users.get(uid) or str(uid)
@@ -285,6 +291,8 @@ class App:
                     "empty": ("пусто", self.A["warn"])}[r.status]
         if g.key in self.applied_keys:
             return "применено", self.A["ok"]
+        if g.key in self.prev_trunc:
+            return "обрез.ранее", self.A["warn"]
         return "—", 0
 
     # ------------------------------------------------------------ рисование
@@ -937,7 +945,7 @@ class App:
             lines += textwrap.wrap(ln, 70) or [""]
         if m["type"] == "input":
             lines += ["", m["prompt"] + m["buf"] + "_"]
-        elif m["type"] == "confirm":
+        elif m["type"] in ("confirm", "choice"):
             lines += ["", m.get("hint") or "y — да, n / Esc — нет"]
         else:
             lines += ["", "любая клавиша — закрыть"]
@@ -956,6 +964,10 @@ class App:
 
     def confirm(self, lines, on_yes, hint=None, enter_ok=False):
         self.modal = {"type": "confirm", "lines": lines, "on_yes": on_yes, "hint": hint, "enter_ok": enter_ok}
+        self.dirty = True
+
+    def choose(self, lines, options, hint):
+        self.modal = {"type": "choice", "lines": lines, "options": options, "hint": hint}
         self.dirty = True
 
     def ask(self, lines, prompt, on_ok, danger=False):
@@ -991,6 +1003,13 @@ class App:
         t = m["type"]
         if t == "info":
             self.modal = None
+        elif t == "choice":
+            kk = "ENTER" if k == K_ENTER else self.cmd(k)
+            if k == K_ESC:
+                self.modal = None
+            elif kk in m["options"]:
+                self.modal = None
+                m["options"][kk]()
         elif t == "confirm":
             kk = self.cmd(k)
             if kk in ("y", "Y") or (k == K_ENTER and m.get("enter_ok")):
@@ -1176,6 +1195,7 @@ class App:
         elif k == K_ENTER:
             self.model = rows[self.pop_cur]
             self.est_cache.clear()
+            self.refresh_prev_trunc()
             self.rebuild()
             self.screen = "main"
         elif k == K_ESC:
@@ -1270,6 +1290,22 @@ class App:
         except dm.DedupEnvError as e:
             self.info(*str(e).split("\n"))
             return
+        flagged = [g for g in gs if g.key in self.prev_trunc]
+        if not flagged:
+            self._confirm_run(gs, client)
+            return
+        names = [f"  · {self.group_title(g)} · {g.key.tier} · {len(g.facts)} ф. ({self.prev_trunc[g.key]['date']})"
+                 for g in flagged[:8]]
+        if len(flagged) > 8:
+            names.append(f"  · … и ещё {len(flagged) - 8}")
+        rest = [g for g in gs if g.key not in self.prev_trunc]
+        self.choose([f"В прошлый раз обрезано при тех же данных: {len(flagged)} групп.", *names,
+                     "Повтор даст то же самое и снова потратит деньги."],
+                    {"ENTER": lambda: (self._confirm_run(rest, client) if rest else self.info("Все выбранные группы пропущены.")),
+                     "f": lambda: self._confirm_run(gs, client)},
+                    hint="Enter — пропустить их · f — всё равно гнать · Esc — отмена")
+
+    def _confirm_run(self, gs, client):
         t = self.est_total(gs)
         hid = self.hidden_selected(gs)
         self.confirm([f"Пробный прогон: {len(gs)} групп, {fnum(sum(len(g.facts) for g in gs))} фактов, модель {self.short_model()}.",
@@ -1338,6 +1374,7 @@ class App:
             self.calibs = dm.load_calibration()
             self.est_cache.clear()
         self.run_log_path = path
+        self.refresh_prev_trunc()
         if kept:
             self.info(f"{kept} групп с вашими правками не перезаписаны новым прогоном.",
                       "Новый ответ модели по ним — в журнале прогона (data/dedup_runs/).")
