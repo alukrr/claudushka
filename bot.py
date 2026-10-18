@@ -3974,6 +3974,16 @@ async def notify_admins(text: str) -> None:
             logger.error(f"Failed to notify admin {admin_id}: {e}")
 
 
+async def memory_purge_job(context: ContextTypes.DEFAULT_TYPE = None):
+    """Чистка просроченных medium-фактов (db.purge_expired_memory). Раз в сутки и один раз на старте.
+    Денег не стоит, usage_ctx не нужен. Блокирующий SQLite — в потоке, не в event loop."""
+    try:
+        n = await asyncio.to_thread(db.purge_expired_memory)
+        logger.info(f"memory_purge: удалено просроченных фактов: {n}")
+    except Exception:
+        logger.exception("memory_purge: не удалось почистить просроченные факты")
+
+
 async def post_init(application):
     global context_bot_id, bot_username, _admin_bot, _main_loop
     _main_loop = asyncio.get_running_loop()
@@ -3985,6 +3995,7 @@ async def post_init(application):
     _admin_bot = application.bot
     api_errors.set_admin_notifier(notify_admins)
     logger.info(f"Bot: @{bot_username} (ID: {context_bot_id})")
+    _spawn_background_task(memory_purge_job())  # разовая чистка на старте, не блокируя запуск
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4698,6 +4709,12 @@ def main():
         name="daily_review"
     )
     logger.info("Daily review scheduled at 22:00 Berlin time")
+    app.job_queue.run_daily(
+        memory_purge_job,
+        time=dt_time(hour=4, minute=30, tzinfo=BERLIN_TZ),
+        name="memory_purge"
+    )
+    logger.info("Memory purge scheduled at 04:30 Berlin time")
     logger.info("Клодушка started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

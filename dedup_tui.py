@@ -80,6 +80,8 @@ class App:
         # данные
         self.groups, self.nodes, self.chats, self.users = [], {}, {}, {}
         self.snapshot_at = ""
+        self.expired_n = 0
+        self.prev_trunc = {}
         self.calibs = dm.load_calibration()
         self.est_cache = {}
         # состояние списка
@@ -160,11 +162,13 @@ class App:
         try:
             self.groups = dm.load_groups(conn)
             self.chats, self.users = dm.load_directory(conn)
+            self.expired_n = dm.count_expired(conn)
         finally:
             conn.close()
             if tmp:
                 os.remove(tmp)
         self.snapshot_at = time.strftime("%H:%M:%S")
+        self.refresh_prev_trunc()
         self.nodes = {}
         for g in self.groups:
             k = g.key
@@ -180,6 +184,10 @@ class App:
         self.selected &= keys
         self.est_cache.clear()
         self.rebuild()
+
+    def refresh_prev_trunc(self):
+        """Группы, которые в прошлый раз обрезало при тех же данных (по журналу прогонов)."""
+        self.prev_trunc = dm.previously_truncated(self.groups, self.calibs.get(self.model))
 
     def user_label(self, uid):
         return self.users.get(uid) or str(uid)
@@ -278,11 +286,13 @@ class App:
             if r.status in ("ok", "manual"):
                 if not r.applicable:
                     return f"{mark}{'пусто' if r.status == 'ok' else 'без изм.'}", self.A["warn"]
-                return f"{mark}{'ok' if r.status == 'ok' else 'ручн'} {cnt}", self.A["ok"]
+                return f"{mark}{'ok' if r.status == 'ok' else 'ручн'} {cnt}{' ÷' + str(r.chunks) if r.chunks else ''}", self.A["ok"]
             return {"truncated": ("обрезано", self.A["bad"]), "error": ("ошибка", self.A["bad"]),
                     "empty": ("пусто", self.A["warn"])}[r.status]
         if g.key in self.applied_keys:
             return "применено", self.A["ok"]
+        if g.key in self.prev_trunc:
+            return "обрез.ранее", self.A["warn"]
         return "—", 0
 
     # ------------------------------------------------------------ рисование
@@ -366,7 +376,7 @@ class App:
         rg = self.sel_groups()
         risky = sum(1 for g in rg if self.est(g).risk)
         self.put(3, 1, dm.calibration_source(self.model, self.calibs) +
-                 (f"   ! риск обрезки: {risky} гр." if risky else ""), self.A["warn"] if risky else 0)
+                 (f"   ÷ по частям (не влезают в один ответ): {risky} гр." if risky else ""), self.A["warn"] if risky else 0)
         mode, attr = ("[ APPLY ]", self.A["apply"]) if self.applying else ("[ DRY-RUN ]", self.A["dry"])
         self.put(4, 1, "Режим: ")
         self.put(4, 8, mode, attr)
@@ -374,6 +384,9 @@ class App:
         s = f"поиск «{self.search}» {self.match_i + 1 if self.matches else 0}/{len(self.matches)}  " if self.search else ""
         self.put(4, 20, f"Снимок БД {self.snapshot_at}  {s}{flt}")
         self.put(5, 1, "Пробный прогон тоже вызывает API и стоит денег — в БД не пишет", self.A["warn"])
+        if self.expired_n:
+            self.put(6, 1, f"Просрочено medium: {fnum(self.expired_n)} (бот их не читает, dedup не видит) — x: удалить",
+                     self.A["warn"])
 
     def col_layout(self, w):
         # sel(4) arrow(2) name(*) id(14) kind(7) facts(8) cost(8) flag(2) status(13)
@@ -384,21 +397,21 @@ class App:
         self.draw_header(h, w)
         nw = self.col_layout(w)
         hdr = f"{'':8}{'Название':<{nw}} {'ID':<14} {'Тип':<7} {'Фактов':>8} {'$':>8} {'':2} {'Статус':<13}"
-        self.put(6, 0, hdr.ljust(w), self.A["colhdr"])
-        area = h - 8
+        self.put(7, 0, hdr.ljust(w), self.A["colhdr"])
+        area = h - 9
         if self.cur < self.top:
             self.top = self.cur
         if self.cur >= self.top + area:
             self.top = self.cur - area + 1
         mset = set(self.matches)
         if not self.rows:
-            self.put(7, 2, "Нет групп с 2+ фактами под текущий фильтр.")
+            self.put(8, 2, "Нет групп с 2+ живыми фактами под текущий фильтр.")
         for i in range(area):
             idx = self.top + i
             if idx >= len(self.rows):
                 break
             r = self.rows[idx]
-            y = 7 + i
+            y = 8 + i
             gs = self.row_groups(r)
             nf = sum(len(g.facts) for g in gs)
             ec = [self.est(g).cost for g in gs]
@@ -417,7 +430,7 @@ class App:
                 kind = r.group.key.tier if r.node.kind == "group" else ""
                 status, sattr = self.group_status(r.group)
             line = (f" [{sel}] {arrow} {clip(name, nw):<{nw}} {clip(ident, 14):<14} {kind:<7} "
-                    f"{fnum(nf):>8} {fcost(cost):>8} {'!' if risk else ' ':<2} ")
+                    f"{fnum(nf):>8} {fcost(cost):>8} {'÷' if risk else ' ':<2} ")
             base = self.A["sel"] if idx == self.cur else (self.A["hl"] if idx in mset else 0)
             self.put(y, 0, line.ljust(w) if idx == self.cur else line, base)
             if status:
@@ -478,9 +491,10 @@ class App:
         c = f"${r.cost:.4f}" if r.cost is not None else "$?"
         pre = f"{g_title} {r.key.tier}: "
         if r.status == "ok":
-            return pre + f"ok {len(r.facts_before)}→{len(r.facts_after)} {c} {r.seconds:.1f}с", self.A["ok"]
+            parts = f" ({dm.chunk_label(r)})" if r.chunks else ""
+            return pre + f"ok {len(r.facts_before)}→{len(r.facts_after)}{parts} {c} {r.seconds:.1f}с", self.A["ok"]
         if r.status == "truncated":
-            return pre + f"ОБРЕЗАНО — не будет применено {c}", self.A["bad"]
+            return pre + f"ОБРЕЗАНО{' (даже по частям)' if r.chunks else ''} — не будет применено {c}", self.A["bad"]
         if r.status == "empty":
             return pre + f"пустой ответ — не будет применено {c}", self.A["warn"]
         return pre + f"ошибка: {r.error}", self.A["bad"]
@@ -511,7 +525,7 @@ class App:
                 break
             r = rs[idx]
             box = "[x]" if (r.applicable and r.key in self.included) else ("[ ]" if r.applicable else "[-]")
-            st = (EDIT_MARK + " " if r.edited else "") + self.res_label(r)
+            st = (EDIT_MARK + " " if r.edited else "") + self.res_label(r) + (f" ÷{r.chunks}" if r.chunks else "")
             line = f" {box}  {clip(self.group_title(r), w - 52):<{w - 52}} {r.key.tier:<7} " \
                    f"{(str(len(r.facts_before)) + '→' + (str(len(r.facts_after)) if r.applicable else '—')):>12} " \
                    f"{('$%.3f' % r.cost) if r.cost is not None else '$?':>8} {st:<12}"
@@ -563,7 +577,8 @@ class App:
         two = after is not None and self.show_before(w)
         title = f"{self.group_title(r or g)} · {g.key.tier}"
         if r:
-            title += f" · {self.res_label(r)}" + (f" {EDIT_MARK}" if r.edited else "")
+            title += f" · {self.res_label(r)}" + (f" ({dm.chunk_label(r)})" if r.chunks else "") + \
+                (f" {EDIT_MARK}" if r.edited else "")
             if r.status in ("ok", "manual"):
                 title += f" · правок: {len(self.undo.get(r.key, []))}"
         if vw["edit"]:
@@ -860,18 +875,19 @@ class App:
         basis = "по выбору" if sg else "по ВСЕМ видимым (ничего не выбрано)"
         sg = sg or self.visible_groups()
         self.put(0, 1, f"Сравнение стоимости по моделям — {len(sg)} групп, {basis}", self.A["title"])
-        self.put(2, 0, f" {'Модель':<8}{'≈вход ток':>11}{'≈выход ток':>12}{'≈$':>10}{'≈время':>10}{'риск':>6}  Источник".ljust(w), self.A["colhdr"])
+        self.put(2, 0, f" {'Модель':<8}{'≈вход ток':>11}{'≈выход ток':>12}{'≈$':>10}{'≈время':>10}{'по частям':>10}  Источник".ljust(w), self.A["colhdr"])
         for i, (alias, mid, t) in enumerate(self.model_rows()):
             risk = sum(1 for g in sg if self.est(g, mid).risk)
             mark = "▸" if mid == self.model else " "
             line = (f"{mark}{alias:<8}{fnum(t.in_tok):>11}{fnum(t.out_tok):>12}{fcost(t.cost):>10}"
-                    f"{fdur(t.seconds):>10}{risk:>6}  {dm.calibration_source(mid, self.calibs)}")
+                    f"{fdur(t.seconds):>10}{risk:>10}  {dm.calibration_source(mid, self.calibs)}")
             self.put(3 + i, 0, clip(line, w).ljust(w) if i == self.pop_cur else clip(line, w),
                      self.A["sel"] if i == self.pop_cur else 0)
         notes = [f"Допущения: {dm.CHARS_PER_TOKEN} симв./токен (одна точка замера — грубо); выход = токены фактов × "
                  f"{dm.OUT_RATIO} (верхняя граница: «ничего не слилось»); вход тарифицируется как запись кэша 5m "
-                 f"(×1.25); у Haiku — ступень >100k токенов; потолок ответа {dm.MAX_OUT_TOKENS}, 'риск' — группы, "
-                 "где ответ, вероятно, обрежется. Время — только из калибровки."]
+                 f"(×1.25); у Haiku — ступень >100k токенов; потолок ответа {dm.MAX_OUT_TOKENS}, 'по частям' — группы, "
+                 "которые не влезают в один ответ: идут по частям (куски + слияние, вызовов больше — оценка грубая). "
+                 "Время — только из калибровки."]
         for i, ln in enumerate(textwrap.wrap(notes[0], w - 2)):
             self.put(9 + i, 1, ln)
         self.fbar(h, w, [("Enter", "Сделать текущей"), ("x", "Сбросить калибровку"), ("Esc", "Назад")])
@@ -891,6 +907,7 @@ class App:
         ("F5 / d", "пробный прогон выбранного (СТОИТ ДЕНЕГ, в БД не пишет)"),
         ("l", "лимит групп для прогона (0 — без лимита)"),
         ("e", "правка группы БЕЗ модели (на строке группы): удалить/поправить/добавить факты, бесплатно"),
+        ("x", "удалить просроченные medium-факты (бэкап + ввод APPLY; бот чистит их и сам раз в сутки)"),
         ("r", "перечитать снимок БД"),
         ("v", "экран результатов прогона"),
         ("Просмотр группы", "e — режим правки «стало»; b — показать/скрыть «было» (запоминается)"),
@@ -928,7 +945,7 @@ class App:
             lines += textwrap.wrap(ln, 70) or [""]
         if m["type"] == "input":
             lines += ["", m["prompt"] + m["buf"] + "_"]
-        elif m["type"] == "confirm":
+        elif m["type"] in ("confirm", "choice"):
             lines += ["", m.get("hint") or "y — да, n / Esc — нет"]
         else:
             lines += ["", "любая клавиша — закрыть"]
@@ -947,6 +964,10 @@ class App:
 
     def confirm(self, lines, on_yes, hint=None, enter_ok=False):
         self.modal = {"type": "confirm", "lines": lines, "on_yes": on_yes, "hint": hint, "enter_ok": enter_ok}
+        self.dirty = True
+
+    def choose(self, lines, options, hint):
+        self.modal = {"type": "choice", "lines": lines, "options": options, "hint": hint}
         self.dirty = True
 
     def ask(self, lines, prompt, on_ok, danger=False):
@@ -982,6 +1003,13 @@ class App:
         t = m["type"]
         if t == "info":
             self.modal = None
+        elif t == "choice":
+            kk = "ENTER" if k == K_ENTER else self.cmd(k)
+            if k == K_ESC:
+                self.modal = None
+            elif kk in m["options"]:
+                self.modal = None
+                m["options"][kk]()
         elif t == "confirm":
             kk = self.cmd(k)
             if kk in ("y", "Y") or (k == K_ENTER and m.get("enter_ok")):
@@ -1033,7 +1061,7 @@ class App:
     NAV = (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END)
 
     def keys_main(self, k):
-        area = self.scr.getmaxyx()[0] - 8
+        area = self.scr.getmaxyx()[0] - 9
         if k in self.NAV:
             self.cur = self.move(k, self.cur, len(self.rows), area)
             return False
@@ -1097,6 +1125,8 @@ class App:
             if self.results:
                 self.screen = "results"
             self.start_apply()
+        elif k == "x":
+            self.start_purge()
         elif k == "e":
             if r and r.kind == "group":
                 self.start_manual(r.group)
@@ -1111,6 +1141,29 @@ class App:
         elif k in ("?", curses.KEY_F1):
             self.screen = "help"
         return False
+
+    def start_purge(self):
+        if not self.expired_n:
+            self.info("Просроченных строк нет.")
+            return
+        self.applying = True
+        self.ask([f"УДАЛЕНИЕ ПРОСРОЧЕННЫХ ФАКТОВ ИЗ БОЕВОЙ БД: {fnum(self.expired_n)} строк (expires_at <= now).",
+                  "Бот их не читает и dedup не видит; long не затрагивается. Модель не вызывается.",
+                  f"Перед удалением будет сделан бэкап: {dm.BACKUPS_DIR}/claudushka-dedup-<время>.db",
+                  "Введите APPLY и Enter (пусто / Esc — отмена)."], "> ", self._purge, danger=True)
+
+    def _purge(self, text):
+        self.applying = False
+        if text.strip() != "APPLY":
+            self.info("Отменено — ничего не удалено.")
+            return
+        try:
+            n, backup = dm.purge_expired_reviewed()
+        except dm.BackupError as e:
+            self.info(f"Не удалено: {e}", "В БД ничего не изменено.")
+            return
+        self.load_data()
+        self.info(f"Удалено просроченных строк: {fnum(n)}.", f"Бэкап: {backup}")
 
     def do_search(self, text):
         self.search = text.strip()
@@ -1142,6 +1195,7 @@ class App:
         elif k == K_ENTER:
             self.model = rows[self.pop_cur]
             self.est_cache.clear()
+            self.refresh_prev_trunc()
             self.rebuild()
             self.screen = "main"
         elif k == K_ESC:
@@ -1236,10 +1290,26 @@ class App:
         except dm.DedupEnvError as e:
             self.info(*str(e).split("\n"))
             return
+        flagged = [g for g in gs if g.key in self.prev_trunc]
+        if not flagged:
+            self._confirm_run(gs, client)
+            return
+        names = [f"  · {self.group_title(g)} · {g.key.tier} · {len(g.facts)} ф. ({self.prev_trunc[g.key]['date']})"
+                 for g in flagged[:8]]
+        if len(flagged) > 8:
+            names.append(f"  · … и ещё {len(flagged) - 8}")
+        rest = [g for g in gs if g.key not in self.prev_trunc]
+        self.choose([f"В прошлый раз обрезано при тех же данных: {len(flagged)} групп.", *names,
+                     "Повтор даст то же самое и снова потратит деньги."],
+                    {"ENTER": lambda: (self._confirm_run(rest, client) if rest else self.info("Все выбранные группы пропущены.")),
+                     "f": lambda: self._confirm_run(gs, client)},
+                    hint="Enter — пропустить их · f — всё равно гнать · Esc — отмена")
+
+    def _confirm_run(self, gs, client):
         t = self.est_total(gs)
         hid = self.hidden_selected(gs)
         self.confirm([f"Пробный прогон: {len(gs)} групп, {fnum(sum(len(g.facts) for g in gs))} фактов, модель {self.short_model()}.",
-                      f"Оценка: {fcost(t.cost)} · {fdur(t.seconds)}" + ("  (есть группы с риском обрезки)" if t.risk else ""),
+                      f"Оценка: {fcost(t.cost)} · {fdur(t.seconds)}" + (f"  · вызовов модели: {t.calls}, большие группы идут по частям" if t.risk else ""),
                       *([f"Из них скрыто фильтром: {len(hid)} групп."] if hid else []),
                       "Это вызывает API и СТОИТ ДЕНЕГ; в БД ничего не пишется."],
                      lambda: self._launch(gs, client), hint="Enter — запустить, Esc — отмена", enter_ok=True)
@@ -1251,15 +1321,15 @@ class App:
         self.run_started, self.run_ended, self.log_off = time.monotonic(), 0.0, 0
         self.q = queue.Queue()
 
-        def work(groups, model, stop, q):
+        def work(groups, model, stop, q, calib):
             try:
-                for res in dm.run_llm(groups, model, client, stop):
+                for res in dm.run_llm(groups, model, client, stop, calib):
                     q.put(("res", res))
                 q.put(("done", None))
             except Exception as e:  # noqa: BLE001 — любой сбой потока показываем, не роняем curses
                 q.put(("fail", f"{type(e).__name__}: {e}"))
 
-        self.worker = threading.Thread(target=work, args=(gs, self.model, self.stop_event, self.q), daemon=True)
+        self.worker = threading.Thread(target=work, args=(gs, self.model, self.stop_event, self.q, self.calibs.get(self.model)), daemon=True)
         self.worker.start()
         self.screen = "run"
         self.dirty = True
@@ -1304,6 +1374,7 @@ class App:
             self.calibs = dm.load_calibration()
             self.est_cache.clear()
         self.run_log_path = path
+        self.refresh_prev_trunc()
         if kept:
             self.info(f"{kept} групп с вашими правками не перезаписаны новым прогоном.",
                       "Новый ответ модели по ним — в журнале прогона (data/dedup_runs/).")
