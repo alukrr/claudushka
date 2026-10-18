@@ -517,22 +517,41 @@ def calibration_source(model, calibs: dict) -> str:
     return f"калибровка {short} от {c.get('date', '?')} ({c.get('groups', '?')} гр.)"
 
 
+def _derive_calibration(e: dict) -> dict:
+    """Коэффициенты из сумм-аккумуляторов (взвешены по объёму, без выдуманных констант)."""
+    if e.get("sum_in_tok"):
+        e["chars_per_token"] = round(e["sum_chars"] / e["sum_in_tok"], 3)
+    if e.get("sum_out_ok") and e.get("sum_facts_chars_ok") and e.get("chars_per_token"):
+        e["out_ratio"] = round(e["sum_out_ok"] / (e["sum_facts_chars_ok"] / e["chars_per_token"]), 3)
+        e["sec_per_1k_out"] = round(e["sum_sec_ok"] / (e["sum_out_ok"] / 1000), 2)
+    return e
+
+
 def update_calibration(model, results: list[GroupResult], path: Path | None = None) -> dict | None:
-    """Пересчёт калибровки модели по реальному прогону; None — нечего считать."""
+    """Прибавляет реальный прогон к накопленным суммам модели; None — нечего считать.
+
+    Старый формат записи (только готовые коэффициенты, без sum_*) при первом обновлении
+    заменяется новым — коэффициенты без сумм взвесить нельзя.
+    """
     done = [r for r in results if r.status in ("ok", "truncated") and (r.in_tok + r.cw_5m + r.cw_1h + r.cache_read)]
     if not done:
         return None
-    in_all = sum(r.in_tok + r.cw_5m + r.cw_1h + r.cache_read for r in done)
-    chars_all = sum(len(SYSTEM_PROMPT) + facts_chars(r.facts_before) for r in done)
-    cpt = chars_all / in_all
     oks = [r for r in done if r.status == "ok" and r.out_tok]
-    entry = {"chars_per_token": round(cpt, 3), "date": time.strftime("%Y-%m-%d"), "groups": len(done)}
-    if oks:
-        facts_tok = sum(facts_chars(r.facts_before) for r in oks) / cpt
-        entry["out_ratio"] = round(sum(r.out_tok for r in oks) / facts_tok, 3)
-        entry["sec_per_1k_out"] = round(sum(r.seconds for r in oks) / (sum(r.out_tok for r in oks) / 1000), 2)
     p = path or CALIBRATION_PATH
     data = load_calibration(p)
+    old = data.get(model) or {}
+    if "sum_in_tok" not in old:
+        old = {}
+    e = {
+        "sum_chars": old.get("sum_chars", 0) + sum(len(SYSTEM_PROMPT) + facts_chars(r.facts_before) for r in done),
+        "sum_in_tok": old.get("sum_in_tok", 0) + sum(r.in_tok + r.cw_5m + r.cw_1h + r.cache_read for r in done),
+        "sum_facts_chars_ok": old.get("sum_facts_chars_ok", 0) + sum(facts_chars(r.facts_before) for r in oks),
+        "sum_out_ok": old.get("sum_out_ok", 0) + sum(r.out_tok for r in oks),
+        "sum_sec_ok": round(old.get("sum_sec_ok", 0) + sum(r.seconds for r in oks), 2),
+        "groups": old.get("groups", 0) + len(done),
+        "date": time.strftime("%Y-%m-%d"),
+    }
+    entry = _derive_calibration(e)
     data[model] = entry
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -540,6 +559,20 @@ def update_calibration(model, results: list[GroupResult], path: Path | None = No
     except OSError:
         return None
     return entry
+
+
+def reset_calibration(model, path: Path | None = None) -> bool:
+    """Удалить калибровку модели (оценки вернутся к дефолтам)."""
+    p = path or CALIBRATION_PATH
+    data = load_calibration(p)
+    if model not in data:
+        return False
+    del data[model]
+    try:
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------- бэкап, журнал прогонов, применение
