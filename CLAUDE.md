@@ -102,7 +102,8 @@
   на паузе) — `.claude/rules/docker-compose.md`
 - .env — секреты (не в git)
 - requirements.txt — все зависимости
-- dedup_memory.py — ручная дедупликация фактов памяти, см. `docs/claude/open-tasks.md`
+- dedup_memory.py — ручная дедупликация фактов памяти (CLI + интерактивный TUI `dedup_tui.py`, оценка стоимости
+  без API, бэкап перед apply, обрезанные группы не применяются), см. `docs/claude/open-tasks.md`
 
 ## Инварианты (коротко — подробности в тематических файлах)
 - Никаких блокирующих вызовов API/HTTP из event loop — `await asyncio.to_thread(...)`
