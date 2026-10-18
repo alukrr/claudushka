@@ -308,6 +308,10 @@ class GroupResult:
     seconds: float = 0.0
     # Ответ модели как он пришёл (до правок человека); у manual пусто. facts_after — итог после правок.
     facts_model: list[str] = field(default_factory=list)
+    # Большая группа идёт по частям: chunks — число кусков первого уровня (0 — одним вызовом),
+    # calls — всего вызовов модели (куски + слияния). Токены/стоимость/секунды — суммы по всем вызовам.
+    chunks: int = 0
+    calls: int = 1
 
     @property
     def edited(self) -> bool:
@@ -397,10 +401,14 @@ def _usage_numbers(resp):
     return in_tok, cw_5m, cw_1h, cache_read, out_tok
 
 
-def run_llm(groups, model, client, stop_event=None) -> Iterator[GroupResult]:
+def run_llm(groups, model, client, stop_event=None, calib: dict | None = None) -> Iterator[GroupResult]:
     """Прогон: читает снимок (groups), зовёт API, НИЧЕГО не пишет и не печатает.
 
-    stop_event проверяется между группами; идущий HTTP-запрос не прерывается.
+    stop_event проверяется между группами (и не прерывает идущую группу — часть вызовов уже оплачена);
+    идущий HTTP-запрос не прерывается. Группа, не влезающая в один ответ (estimate_group.risk), режется
+    на куски (plan_chunks), результаты кусков сливаются повторным вызовом, при необходимости — ещё
+    проход, до MAX_CHUNK_LEVELS. Обрезан/упал любой вызов -> вся группа не применяется.
+    calib — запись калибровки модели (для оценки размера кусков), None — дефолты.
     """
     import api_errors  # общий с bot.py/whatsapp.py: response_text / parse_json_lenient / was_truncated
     for g in groups:
@@ -408,33 +416,67 @@ def run_llm(groups, model, client, stop_event=None) -> Iterator[GroupResult]:
             return
         k = g.key
         t0 = time.monotonic()
-        res = GroupResult(k, g.row_ids, g.facts, list(g.facts), g.expires_at, "error")
-        try:
+        res = GroupResult(k, g.row_ids, g.facts, list(g.facts), g.expires_at, "error", cost=0.0, calls=0)
+        cost_unknown = False
+
+        def call(facts):
+            """Один вызов модели -> (status, merged). Токены и деньги копятся в res."""
+            nonlocal cost_unknown
             resp = client.messages.create(
                 model=model,
                 max_tokens=MAX_OUT_TOKENS,
                 **AUX_PARAMS.get(model, {}),
                 system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": json.dumps(g.facts, ensure_ascii=False)}],
+                messages=[{"role": "user", "content": json.dumps(facts, ensure_ascii=False)}],
             )
+            res.calls += 1
+            i, w5, w1, cr, o = _usage_numbers(resp)
+            res.in_tok, res.cw_5m, res.cw_1h, res.cache_read, res.out_tok = (
+                res.in_tok + i, res.cw_5m + w5, res.cw_1h + w1, res.cache_read + cr, res.out_tok + o)
+            c = request_cost(model, i, o, w5, w1, cr)
+            if c is None:
+                cost_unknown = True
+            else:
+                res.cost += c
             # response_text/parse_json_lenient, не голый content[0].text/find+rfind: у пятого
             # поколения content[0] может быть thinking-блоком без текста, а обрезанный по
             # max_tokens JSON рвёт наивный find/rfind (docs/claude/api-errors.md).
-            res.in_tok, res.cw_5m, res.cw_1h, res.cache_read, res.out_tok = _usage_numbers(resp)
-            res.cost = request_cost(model, res.in_tok, res.out_tok, res.cw_5m, res.cw_1h, res.cache_read)
             text = api_errors.response_text(resp)
             data = api_errors.parse_json_lenient(text, "{", label=f"dedup user={k.user_id} chat={k.chat_id}")
             merged = [f.strip() for f in (data or {}).get("facts", []) if isinstance(f, str) and f.strip()]
             if api_errors.was_truncated(resp):
                 # Обрезанный ответ = частичный список; применить его значило бы удалить ВСЮ
                 # группу и вставить огрызок (тихая потеря данных). Не применяется никогда.
-                res.status = "truncated"
-            elif not merged:
-                res.status = "empty"
-            else:
-                res.status, res.facts_after, res.facts_model = "ok", merged, list(merged)
+                return "truncated", []
+            return ("ok", merged) if merged else ("empty", [])
+
+        def process(facts, level):
+            if not estimate_group(facts, model, calib).risk:
+                return call(facts)
+            if level >= MAX_CHUNK_LEVELS:
+                return "truncated", []  # и после трёх проходов не влезает — как раньше, не применяем
+            parts = plan_chunks(facts, calib)
+            if len(parts) < 2:
+                return call(facts)
+            if level == 0:
+                res.chunks = len(parts)
+            outs = []
+            for part in parts:
+                st, m = call(part)
+                if st != "ok":
+                    return st, []
+                outs += m
+            return process(outs, level + 1)  # слияние результатов кусков
+
+        try:
+            status, merged = process(list(g.facts), 0)
+            res.status = status
+            if status == "ok":
+                res.facts_after, res.facts_model = merged, list(merged)
         except Exception as e:
             res.status, res.error = "error", f"{type(e).__name__}: {e}"
+        if cost_unknown:
+            res.cost = None
         res.seconds = time.monotonic() - t0
         yield res
 
@@ -505,13 +547,56 @@ RUNS_DIR = DATA_DIR / "dedup_runs"
 BACKUPS_DIR = DATA_DIR / "backups"
 
 
+# Кусок большой группы режется так, чтобы ОЦЕНОЧНЫЙ выход куска был <= этой доли MAX_OUT_TOKENS
+# (запас на то, что реальный out/in выше оценки). Результаты кусков сливаются повторным вызовом;
+# если и суммарный результат велик — ещё проход, до MAX_CHUNK_LEVELS уровней, дальше truncated.
+CHUNK_OUT_FRAC = 0.6
+MAX_CHUNK_LEVELS = 3
+
+
+def ru_plural(n: int, one: str, few: str, many: str) -> str:
+    n10, n100 = n % 10, n % 100
+    if n10 == 1 and n100 != 11:
+        return one
+    return few if 2 <= n10 <= 4 and not 12 <= n100 <= 14 else many
+
+
+def chunk_label(res) -> str:
+    """'4 части + слияние' для группы, шедшей по частям; '' — одним вызовом."""
+    if not getattr(res, "chunks", 0):
+        return ""
+    return f"{res.chunks} {ru_plural(res.chunks, 'часть', 'части', 'частей')} + слияние"
+
+
+def plan_chunks(facts, calib: dict | None = None) -> list[list[str]]:
+    """Нарезка по фактам: оценочный выход куска <= CHUNK_OUT_FRAC * MAX_OUT_TOKENS. Один кусок — не режем."""
+    calib = calib or {}
+    cpt = calib.get("chars_per_token") or CHARS_PER_TOKEN
+    ratio = calib.get("out_ratio") or OUT_RATIO
+    limit_chars = CHUNK_OUT_FRAC * MAX_OUT_TOKENS * cpt / ratio
+    if facts_chars(facts) / cpt * ratio <= MAX_OUT_TOKENS:
+        return [list(facts)]
+    chunks, cur, cur_chars = [], [], 2
+    for f in facts:
+        c = len(json.dumps(f, ensure_ascii=False)) + 2
+        if cur and cur_chars + c > limit_chars:
+            chunks.append(cur)
+            cur, cur_chars = [], 2
+        cur.append(f)
+        cur_chars += c
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 @dataclass
 class Estimate:
     in_tok: float
     out_tok: float
     cost: float | None      # None — модели нет в PRICING
     seconds: float | None   # None — нет калибровки модели
-    risk: bool              # ответ, вероятно, обрежется по MAX_OUT_TOKENS
+    risk: bool              # не влезет в один ответ (MAX_OUT_TOKENS) -> группа пойдёт по частям
+    calls: int = 1          # сколько вызовов модели (куски + слияние)
 
 
 def load_calibration(path: Path | None = None) -> dict:
@@ -525,21 +610,39 @@ def facts_chars(facts) -> int:
     return len(json.dumps(facts, ensure_ascii=False))
 
 
-def estimate_group(facts, model, calib: dict | None = None) -> Estimate:
-    """Оценка одной группы. calib — запись load_calibration()[model] или None (дефолты)."""
-    calib = calib or {}
+def _estimate_single(facts_chars_n: int, model, calib: dict, n_sys: int | None = None):
     cpt = calib.get("chars_per_token") or CHARS_PER_TOKEN
     ratio = calib.get("out_ratio") or OUT_RATIO
-    fch = facts_chars(facts)
-    facts_tok = fch / cpt
-    in_tok = (len(SYSTEM_PROMPT) + fch) / cpt
+    facts_tok = facts_chars_n / cpt
+    in_tok = (len(SYSTEM_PROMPT) + facts_chars_n) / cpt
     want_out = facts_tok * ratio
     out_tok = min(MAX_OUT_TOKENS, want_out)
     # Вход всегда уникален -> пул кеширует автоматически -> тарифицируется как запись 5m.
-    cost = request_cost(model, 0, out_tok, in_tok, 0, 0)
+    return in_tok, out_tok, request_cost(model, 0, out_tok, in_tok, 0, 0), want_out
+
+
+def estimate_group(facts, model, calib: dict | None = None) -> Estimate:
+    """Оценка одной группы. calib — запись load_calibration()[model] или None (дефолты).
+
+    Если группа не влезает в один ответ — оценка по частям: сумма кусков + ОДИН вызов слияния
+    (грубо; реальное слияние может потребовать ещё прохода, см. MAX_CHUNK_LEVELS).
+    """
+    calib = calib or {}
+    ratio = calib.get("out_ratio") or OUT_RATIO
     sec_per_1k = calib.get("sec_per_1k_out")
+    fch = facts_chars(facts)
+    in_tok, out_tok, cost, want_out = _estimate_single(fch, model, calib)
+    risk = want_out > MAX_OUT_TOKENS
+    calls = 1
+    if risk:
+        parts = [facts_chars(c) for c in plan_chunks(facts, calib)]
+        ests = [_estimate_single(c, model, calib) for c in parts]
+        ests.append(_estimate_single(int(fch * ratio), model, calib))  # слияние: вход = выходы кусков
+        in_tok, out_tok = sum(e[0] for e in ests), sum(e[1] for e in ests)
+        cost = None if any(e[2] is None for e in ests) else sum(e[2] for e in ests)
+        calls = len(ests)
     seconds = out_tok / 1000 * sec_per_1k if sec_per_1k else None
-    return Estimate(in_tok, out_tok, cost, seconds, want_out > MAX_OUT_TOKENS)
+    return Estimate(in_tok, out_tok, cost, seconds, risk, calls)
 
 
 def estimate_total(groups_facts, model, calib: dict | None = None) -> Estimate:
@@ -551,6 +654,7 @@ def estimate_total(groups_facts, model, calib: dict | None = None) -> Estimate:
         None if any(c is None for c in costs) else sum(costs),
         None if (not secs or any(s is None for s in secs)) else sum(secs),
         any(e.risk for e in ests),
+        sum(e.calls for e in ests),
     )
 
 
@@ -578,7 +682,10 @@ def update_calibration(model, results: list[GroupResult], path: Path | None = No
     Старый формат записи (только готовые коэффициенты, без sum_*) при первом обновлении
     заменяется новым — коэффициенты без сумм взвесить нельзя.
     """
-    done = [r for r in results if r.status in ("ok", "truncated") and (r.in_tok + r.cw_5m + r.cw_1h + r.cache_read)]
+    # Группы по частям не идут в калибровку: их токены — сумма нескольких вызовов (куски + слияния),
+    # соотношение с объёмом исходных фактов уже не chars/token и не out/in одного вызова.
+    done = [r for r in results if r.status in ("ok", "truncated") and not r.chunks
+            and (r.in_tok + r.cw_5m + r.cw_1h + r.cache_read)]
     if not done:
         return None
     oks = [r for r in done if r.status == "ok" and r.out_tok]
@@ -661,7 +768,7 @@ def save_run(model, results: list[GroupResult], runs_dir: Path | None = None, su
             "edited": r.edited,
             "tokens": {"in": r.in_tok, "cw_5m": r.cw_5m, "cw_1h": r.cw_1h,
                        "cache_read": r.cache_read, "out": r.out_tok},
-            "cost": r.cost, "seconds": round(r.seconds, 2),
+            "cost": r.cost, "seconds": round(r.seconds, 2), "chunks": r.chunks, "calls": r.calls,
         } for r in results],
     }
     try:
@@ -781,7 +888,7 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
     total_cost = 0.0
     truncated_groups = errors = 0
     started = time.monotonic()
-    for i, res in enumerate(run_llm(candidates, model, client), 1):
+    for i, res in enumerate(run_llm(candidates, model, client, calib=load_calibration().get(model)), 1):
         results.append(res)
         k = res.key
         tag = f"[{i}/{n}] user={k.user_id} chat={k.chat_id} tier={k.tier}"
@@ -794,7 +901,8 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
         total_cost += res.cost or 0.0
         cost_s = f"${res.cost:.4f}" if res.cost is not None else "$?"
         if res.status == "ok":
-            print(f"{tag}: {len(res.facts_before)} -> {len(res.facts_after)} ok {cost_s} {res.seconds:.1f}с", flush=True)
+            parts = f" ({chunk_label(res)}, {res.calls} вызовов)" if res.chunks else ""
+            print(f"{tag}: {len(res.facts_before)} -> {len(res.facts_after)} ok{parts} {cost_s} {res.seconds:.1f}с", flush=True)
         elif res.status == "truncated":
             truncated_groups += 1
             print(f"{tag}: {len(res.facts_before)} -> ОБРЕЗАНО по max_tokens, НЕ применяется {cost_s} "
