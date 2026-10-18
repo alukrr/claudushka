@@ -270,6 +270,7 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
     total_before = total_after = 0
     total_in_tok = total_cache_write_tok = total_cache_read_tok = total_out_tok = 0
     total_cost = 0.0
+    truncated_groups = 0
     total_cache_write_5m_tok = total_cache_write_1h_tok = 0
     started = time.monotonic()
     for (uid, ctx, cid, grp_tier), rows in candidates.items():
@@ -299,8 +300,7 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
             # не голый content[0].text/find+rfind: у пятого поколения content[0] может
             # быть thinking-блоком без текста, а обрезанный по max_tokens JSON рвёт
             # наивный find/rfind (оба класса багов задокументированы в docs/claude/api-errors.md).
-            if api_errors.was_truncated(resp):
-                print(f"[llm] user={uid} chat={cid} tier={grp_tier}: ответ обрезан по max_tokens")
+            truncated = api_errors.was_truncated(resp)
             text = api_errors.response_text(resp)
             data = api_errors.parse_json_lenient(text, "{", label=f"dedup user={uid} chat={cid}")
             merged = [f.strip() for f in (data or {}).get("facts", []) if isinstance(f, str) and f.strip()]
@@ -342,6 +342,15 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
             total_after += len(facts)
             continue
 
+        if truncated:
+            # Обрезанный ответ = частичный список; применить его значило бы удалить ВСЮ группу
+            # и вставить огрызок (тихая потеря данных). Такая группа не применяется никогда.
+            truncated_groups += 1
+            total_after += len(facts)
+            print(f"[llm] user={uid} chat={cid} tier={grp_tier}: {len(facts)} -> ОБРЕЗАНО по max_tokens, "
+                  f"НЕ применяется")
+            continue
+
         print(f"[llm] user={uid} chat={cid} tier={grp_tier}: {len(facts)} -> {len(merged)}")
         if verbose:
             print(f"[llm][было] user={uid} chat={cid} tier={grp_tier}:")
@@ -365,6 +374,9 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
             )
             conn.commit()
 
+    if truncated_groups:
+        print(f"[llm] обрезано, не применено: {truncated_groups} групп — сузь фильтр "
+              f"(--user-id/--chat-id/--tier) и прогони по частям")
     elapsed = time.monotonic() - started
     cost = total_cost if model in PRICING else None
     cost_str = f"${cost:.4f}" if cost is not None else "? (модель не в PRICING — сверься с /cost в боте)"
