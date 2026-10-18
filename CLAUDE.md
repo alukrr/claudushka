@@ -102,7 +102,7 @@
   на паузе) — `.claude/rules/docker-compose.md`
 - .env — секреты (не в git)
 - requirements.txt — все зависимости
-- dedup_memory.py — ручная дедупликация фактов памяти (CLI + интерактивный TUI `dedup_tui.py`, оценка стоимости
+- dedup_memory.py — ручная дедупликация фактов памяти (CLI + интерактивный TUI `dedup_tui.py` с построчной правкой фактов, оценка стоимости
   без API, бэкап перед apply, обрезанные группы не применяются), см. `docs/claude/open-tasks.md`;
   на сервере запускается функцией `dedup` из `docs/claude/prod-aliases.sh`
 
@@ -145,8 +145,8 @@
 `/help` показывает всем пользователям базовые команды, adminам — полный список из двух блоков (`USER_HELP` + `ADMIN_HELP` в bot.py). При добавлении новой команды обновлять оба константы.
 
 ## Версионность
-Текущая версия: v1.4.1 (dedup_memory: TUI, фикс применения обрезанных групп, видимость скрытого выбора,
-накопительная калибровка, функция `dedup`, `docs/claude/open-tasks.md`; предыдущие: v1.4.0 — dedup TUI, v1.3.0 — Nano Banana 2.1, `/bananapro`, 2K по запросу, `/opus` `/fable` `/bananapro` в группе только
+Текущая версия: v1.4.2 (dedup TUI: построчная правка фактов в «было | стало», ручная правка без модели, одноколоночный
+режим; `docs/claude/open-tasks.md`; предыдущие: v1.4.1 — видимость скрытого выбора, накопительная калибровка, функция `dedup`, v1.4.0 — dedup TUI, v1.3.0 — Nano Banana 2.1, `/bananapro`, 2K по запросу, `/opus` `/fable` `/bananapro` в группе только
 админам, 2026-10-10, `docs/claude/images.md`; предыдущие: v1.2.0 — нативный web_search, `docs/claude/native-search.md`, v1.1.5 — реакции 👀/✍, `docs/claude/images.md`, v1.1.4 — prompt cache,
 `docs/claude/prompt-cache.md`, v1.1.3 — Haiku 5.5, v1.1.2 — Sonnet 5.5, v1.1.1 — Opus 5.5, v1.1.0 — GPT Image 2.5 Flare/Sunburst, v1.0.0 — учёт стоимости,
 тарифы paid/free, ТЗ v0.10, `docs/claude/billing.md`). Теги обычно ставит Алексей вручную:

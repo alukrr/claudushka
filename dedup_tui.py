@@ -4,7 +4,9 @@
 Вся логика (прогон, оценка, применение) — в dedup_memory.py; здесь только экран.
 curses трогает ТОЛЬКО главный поток; API-вызовы идут в рабочем потоке, связь — queue.Queue.
 """
+import collections
 import curses
+import json
 import locale
 import logging
 import os
@@ -24,6 +26,7 @@ _EN = "qwertyuiop[]asdfghjkl;'zxcvbnm,."
 RU2EN = {**dict(zip(_RU, _EN)), **dict(zip(_RU.upper(), _EN.upper()))}
 
 K_ENTER, K_ESC, K_BS = "ENTER", "ESC", "BS"
+EDIT_MARK = "✎"  # метка «правил человек»; если глиф ломает ширину в терминале — заменить на "*"
 
 
 def fnum(n) -> str:
@@ -100,8 +103,18 @@ class App:
         self.run_error = None
         self.log_off = 0
         self.res_cur = self.res_top = 0
-        self.view_lines, self.view_off = [], 0
-        self.view_title = ""
+        self.vw = {}
+        self.help_off = 0
+        self.undo = {}            # key -> стек снимков «стало» (отмена правок группы)
+        self.lined = None         # строчный редактор
+        self.cursor_pos = None
+        self.prefs_path = dm.DATA_DIR / "dedup_tui.json"
+        try:
+            self.prefs = json.loads(self.prefs_path.read_text(encoding="utf-8"))
+            if not isinstance(self.prefs, dict):
+                self.prefs = {}
+        except (OSError, ValueError):
+            self.prefs = {}
         self.pop_cur = 0
         self.applying = False
         self.status_msg = ""
@@ -260,8 +273,13 @@ class App:
         if self.screen == "run" and self.worker and g in self.run_groups and g.key not in {x.key for x in self.run_results}:
             return "…", 0
         if r:
-            return {"ok": (f"ok {len(r.facts_before)}→{len(r.facts_after)}", self.A["ok"]),
-                    "truncated": ("обрезано", self.A["bad"]), "error": ("ошибка", self.A["bad"]),
+            mark = EDIT_MARK if r.edited else ""
+            cnt = f"{len(r.facts_before)}→{len(r.facts_after)}"
+            if r.status in ("ok", "manual"):
+                if not r.applicable:
+                    return f"{mark}{'пусто' if r.status == 'ok' else 'без изм.'}", self.A["warn"]
+                return f"{mark}{'ok' if r.status == 'ok' else 'ручн'} {cnt}", self.A["ok"]
+            return {"truncated": ("обрезано", self.A["bad"]), "error": ("ошибка", self.A["bad"]),
                     "empty": ("пусто", self.A["warn"])}[r.status]
         if g.key in self.applied_keys:
             return "применено", self.A["ok"]
@@ -291,6 +309,15 @@ class App:
             getattr(self, "draw_" + self.screen)(h, w)
             if self.modal:
                 self.draw_modal(h, w)
+        try:
+            curses.curs_set(1 if (self.lined and self.cursor_pos and self.screen == "view") else 0)
+        except curses.error:
+            pass
+        if self.lined and self.cursor_pos and self.screen == "view" and not self.modal:
+            try:
+                self.scr.move(*self.cursor_pos)
+            except curses.error:
+                pass
         self.scr.noutrefresh()
         curses.doupdate()
         self.dirty = False
@@ -326,6 +353,9 @@ class App:
         hid = self.hidden_selected(sg)
         if hid:
             self.put(1, 2 + len(sel_txt), f"(скрыто фильтром: {len(hid)} гр.)", self.A["warn"])
+        nman = sum(1 for r in self.result_list() if r.status == "manual")
+        if nman:
+            self.put(1, w - 22, f"ручных правок: {nman} гр.", self.A["ok"])
         # Оценка — по ВСЕМУ выбранному (как и прогон), не по видимому.
         t = self.est_total(self.sel_groups())
         mid = dm.MODEL_ALIASES.get(self.short_model(), self.model)
@@ -463,7 +493,7 @@ class App:
         return [r for r in self.result_list() if r.applicable and r.key in self.included]
 
     def draw_results(self, h, w):
-        self.put(0, 1, "Результаты прогона (ещё не применённые)", self.A["title"])
+        self.put(0, 1, "Результаты прогона и ручных правок (ещё не применённые)", self.A["title"])
         self.put(1, 1, "Пробел — включить/исключить группу, Enter — просмотр «было | стало»", 0)
         self.put(3, 0, f" {'':4}{'Группа':<{w - 52}} {'Тип':<7} {'Было→стало':>12} {'$':>8} {'Статус':<12}".ljust(w), self.A["colhdr"])
         rs = self.result_list()
@@ -481,7 +511,7 @@ class App:
                 break
             r = rs[idx]
             box = "[x]" if (r.applicable and r.key in self.included) else ("[ ]" if r.applicable else "[-]")
-            st = {"ok": "ok", "truncated": "обрезано", "error": "ошибка", "empty": "пусто"}[r.status]
+            st = (EDIT_MARK + " " if r.edited else "") + self.res_label(r)
             line = f" {box}  {clip(self.group_title(r), w - 52):<{w - 52}} {r.key.tier:<7} " \
                    f"{(str(len(r.facts_before)) + '→' + (str(len(r.facts_after)) if r.applicable else '—')):>12} " \
                    f"{('$%.3f' % r.cost) if r.cost is not None else '$?':>8} {st:<12}"
@@ -491,41 +521,314 @@ class App:
         b = sum(len(r.facts_before) for r in inc)
         a = sum(len(r.facts_after) for r in inc)
         self.put(h - 2, 1, f"К применению: {len(inc)} групп, {fnum(b)} → {fnum(a)} фактов", self.A["title"])
-        self.fbar(h, w, [("Space", "Вкл/выкл"), ("Enter", "Просмотр"), ("F8", "Применить"), ("Esc", "Назад")])
+        self.fbar(h, w, [("Space", "Вкл/выкл"), ("Enter", "Просмотр"), ("e", "Править"), ("F8", "Применить"), ("Esc", "Назад")])
 
-    # ---- просмотр группы
-    def open_view(self, g, r=None):
-        w = self.scr.getmaxyx()[1]
-        self.view_title = f"{self.group_title(g if r is None else r)} · {g.key.tier}" if r is None else \
-            f"{self.group_title(r)} · {r.key.tier} · {r.status}"
-        before = g.facts if r is None else r.facts_before
-        after = r.facts_after if (r is not None and r.applicable) else []
-        lines = []
-        if r is not None and after and w >= 100:
-            cw = (w - 5) // 2
-            L = [x for f in before for x in (textwrap.wrap("• " + f, cw) or ["•"])]
-            R = [x for f in after for x in (textwrap.wrap("• " + f, cw) or ["•"])]
-            lines.append((f"{'БЫЛО (' + str(len(before)) + ')':<{cw}} │ СТАЛО ({len(after)})", self.A["colhdr"]))
-            for i in range(max(len(L), len(R))):
-                lines.append((f"{(L[i] if i < len(L) else ''):<{cw}} │ {R[i] if i < len(R) else ''}", 0))
-        else:
-            lines.append((f"БЫЛО ({len(before)})", self.A["colhdr"]))
-            lines += [(x, 0) for f in before for x in (textwrap.wrap("• " + f, w - 4) or ["•"])]
-            if r is not None:
-                lines.append((f"СТАЛО ({len(after)})" + ("" if after else " — нет (не будет применено)"), self.A["colhdr"]))
-                lines += [(x, 0) for f in after for x in (textwrap.wrap("• " + f, w - 4) or ["•"])]
-        self.view_lines, self.view_off = lines, 0
+    # ---- просмотр группы и построчная правка
+    def show_before(self, w):
+        """Колонка «было»: выбор пользователя (запоминается), иначе по ширине окна (<100 — одна колонка)."""
+        v = self.prefs.get("show_before")
+        return (w >= 100) if v is None else bool(v)
+
+    def save_prefs(self):
+        try:
+            self.prefs_path.write_text(json.dumps(self.prefs), encoding="utf-8")
+        except OSError:
+            pass
+
+    def open_view(self, g, r=None, edit=False):
+        self.vw = {"g": g, "r": r, "edit": False, "cur": 0, "bcur": 0, "col": "after", "top": 0, "msg": ""}
         self.prev_screen = self.screen
         self.screen = "view"
+        if edit:
+            self.begin_edit()
+
+    def vw_lists(self):
+        """(было, стало|None): «стало» есть только у результатов ok/manual."""
+        r = self.vw["r"]
+        before = r.facts_before if r else self.vw["g"].facts
+        return before, (r.facts_after if (r and r.status in ("ok", "manual")) else None)
+
+    @staticmethod
+    def wrap_facts(facts, width):
+        out = []
+        for i, f in enumerate(facts):
+            parts = textwrap.wrap(f, max(8, width - 2)) or [""]
+            out += [(i, ("• " if j == 0 else "  ") + p) for j, p in enumerate(parts)]
+        return out
 
     def draw_view(self, h, w):
-        self.put(0, 1, clip(self.view_title, w - 2), self.A["title"])
-        area = h - 3
-        self.view_off = max(0, min(self.view_off, max(0, len(self.view_lines) - area)))
-        for i, (t, a) in enumerate(self.view_lines[self.view_off:self.view_off + area]):
-            self.put(1 + i, 1, (t.ljust(w - 2) if a else t)[:w - 2], a)
-        self.put(h - 2, 1, f"{self.view_off + 1}-{min(len(self.view_lines), self.view_off + area)}/{len(self.view_lines)}")
-        self.fbar(h, w, [("↑↓ PgUp PgDn", "Прокрутка"), ("Esc", "Назад")])
+        vw = self.vw
+        r, g = vw["r"], vw["g"]
+        before, after = self.vw_lists()
+        two = after is not None and self.show_before(w)
+        title = f"{self.group_title(r or g)} · {g.key.tier}"
+        if r:
+            title += f" · {self.res_label(r)}" + (f" {EDIT_MARK}" if r.edited else "")
+            if r.status in ("ok", "manual"):
+                title += f" · правок: {len(self.undo.get(r.key, []))}"
+        if vw["edit"]:
+            title += "  [ ПРАВКА ]"
+        self.put(0, 1, clip(title, w - 2), self.A["title"])
+        cw = (w - 5) // 2 if two else w - 3
+        L = self.wrap_facts(before, cw) if (two or after is None) else []
+        R = self.wrap_facts(after, cw) if after is not None else []
+        rows = max(len(L), len(R))
+        area = h - 4
+        # заголовок колонок
+        if two:
+            self.put(1, 0, f" {'БЫЛО (' + str(len(before)) + ')':<{cw}} │ {'СТАЛО (' + str(len(after)) + ')':<{cw}}".ljust(w), self.A["colhdr"])
+        elif after is not None:
+            self.put(1, 0, f" СТАЛО ({len(after)})".ljust(w), self.A["colhdr"])
+        else:
+            self.put(1, 0, f" ТЕКУЩИЕ ФАКТЫ ({len(before)})".ljust(w), self.A["colhdr"])
+        # прокрутка: в режиме правки следуем за курсором
+        if vw["edit"]:
+            lines, idx = (R, vw["cur"]) if vw["col"] == "after" else (L, vw["bcur"])
+            pos = [i for i, (fi, _) in enumerate(lines) if fi == idx]
+            if pos:
+                if pos[0] < vw["top"]:
+                    vw["top"] = pos[0]
+                elif pos[-1] >= vw["top"] + area:
+                    vw["top"] = max(0, pos[-1] - area + 1) if len(pos) <= area else pos[0]
+        vw["top"] = max(0, min(vw["top"], max(0, rows - area)))
+        dups = {f for f, n in collections.Counter(after or []).items() if n > 1}
+        for i in range(area):
+            li = vw["top"] + i
+            if li >= rows:
+                break
+
+            def attr(lines, col, cur, facts):
+                if li >= len(lines):
+                    return 0
+                fi = lines[li][0]
+                if vw["edit"] and fi == cur:
+                    return self.A["sel"] if vw["col"] == col else curses.A_BOLD
+                return self.A["warn"] if (col == "after" and facts[fi] in dups) else 0
+            y = 2 + i
+            if two:
+                lt = L[li][1] if li < len(L) else ""
+                rt = R[li][1] if li < len(R) else ""
+                self.put(y, 1, clip(lt, cw).ljust(cw), attr(L, "before", vw["bcur"], before))
+                self.put(y, 1 + cw, " │ ")
+                self.put(y, 4 + cw, clip(rt, cw).ljust(cw), attr(R, "after", vw["cur"], after))
+            elif after is not None:
+                rt = R[li][1] if li < len(R) else ""
+                self.put(y, 1, clip(rt, cw).ljust(cw), attr(R, "after", vw["cur"], after))
+            else:
+                lt = L[li][1] if li < len(L) else ""
+                self.put(y, 1, clip(lt, cw), 0)
+        # строка состояния / строчный редактор
+        self.cursor_pos = None
+        if self.lined:
+            le = self.lined
+            prompt = " правка: "
+            avail = max(5, w - len(prompt) - 2)
+            if le["pos"] < le["scroll"]:
+                le["scroll"] = le["pos"]
+            elif le["pos"] >= le["scroll"] + avail:
+                le["scroll"] = le["pos"] - avail + 1
+            self.put(h - 2, 0, (prompt + le["buf"][le["scroll"]:le["scroll"] + avail]).ljust(w), self.A["warn"])
+            self.cursor_pos = (h - 2, len(prompt) + le["pos"] - le["scroll"])
+        else:
+            bits = []
+            if after is not None and vw["edit"]:
+                bits.append(f"строка {min(vw['cur'] + 1, len(after)) if after else 0}/{len(after)}")
+                if not after:
+                    bits.append("«стало» пусто — группа не будет применена (a — добавить)")
+                elif vw["col"] == "after" and after[vw["cur"]] in dups:
+                    bits.append("дубль в «стало»")
+            if after is not None and not two:
+                bits.append("b — показать было")
+            if vw["msg"]:
+                bits.append(vw["msg"])
+            self.put(h - 2, 1, clip("  ·  ".join(bits), w - 2), self.A["warn"] if vw["msg"] else 0)
+        if self.lined:
+            self.fbar(h, w, [("Enter", "Сохранить"), ("Esc", "Отмена строки"), ("←→ Home End", "Курсор")])
+        elif vw["edit"]:
+            self.fbar(h, w, [("Enter", "Правка"), ("a", "Добавить"), ("d", "Удалить")] +
+                      ([("→", "Из было")] if two else []) + [("u", "Отмена"), ("R", "Сброс"), ("b", "Было"), ("Esc", "Выход")])
+        else:
+            self.fbar(h, w, [("↑↓ PgUp PgDn", "Прокрутка")] + ([("e", "Править")]) + [("b", "Было"), ("Esc", "Назад")])
+
+    # ---- правка
+    def res_label(self, r):
+        if r.status == "ok":
+            return "ok" if r.facts_after else "пусто"
+        return {"truncated": "обрезано", "error": "ошибка", "empty": "пусто", "manual": "ручная"}[r.status]
+
+    def begin_edit(self):
+        vw = self.vw
+        r = vw["r"]
+        if r is None:
+            self.start_manual(vw["g"])
+        elif r.status in ("ok", "manual"):
+            vw["edit"], vw["col"] = True, "after"
+            vw["cur"] = max(0, min(vw["cur"], len(r.facts_after) - 1))
+        else:
+            self.info(f"Править можно результаты ok и ручные; здесь статус «{self.res_label(r)}».")
+
+    def start_manual(self, g):
+        """Правка без модели: «было» = текущие факты снимка, «стало» = их копия. Денег не стоит."""
+        ex = self.results.get(g.key)
+        if ex is not None and ex.status == "manual":
+            self.open_view(g, ex, edit=True)
+        elif ex is not None:
+            self.confirm([f"Для этой группы уже есть результат прогона ({self.res_label(ex)}"
+                          f"{', с правками' if ex.edited else ''}).",
+                          "Заменить его ручной правкой? Ответ модели останется в журнале прогона."],
+                         lambda: self._begin_manual(g))
+        else:
+            self._begin_manual(g)
+
+    def _begin_manual(self, g):
+        r = dm.make_manual_result(g)
+        self.results[g.key] = r
+        self.included.discard(g.key)
+        self.applied_keys.discard(g.key)
+        self.undo.pop(g.key, None)
+        if self.screen != "view":
+            self.open_view(g, r, edit=True)
+        else:
+            self.vw.update(r=r, edit=True, col="after", cur=0, top=0)
+
+    def sync_included(self, r, was):
+        if r.applicable and not was:
+            self.included.add(r.key)
+        elif not r.applicable:
+            self.included.discard(r.key)
+
+    def mutate(self, fn):
+        """Изменить «стало» с записью в стек отмены и пересчётом включённости."""
+        r = self.vw["r"]
+        was = r.applicable
+        self.undo.setdefault(r.key, []).append(list(r.facts_after))
+        fn(r.facts_after)
+        self.sync_included(r, was)
+
+    def open_line(self, text, on_done):
+        self.lined = {"buf": text, "pos": len(text), "scroll": 0, "on_done": on_done}
+
+    def keys_lined(self, k):
+        le = self.lined
+        if k == K_ENTER:
+            self.lined = None
+            le["on_done"](le["buf"].strip())
+        elif k == K_ESC:
+            self.lined = None
+            le["on_done"](None)
+        elif k == curses.KEY_LEFT:
+            le["pos"] = max(0, le["pos"] - 1)
+        elif k == curses.KEY_RIGHT:
+            le["pos"] = min(len(le["buf"]), le["pos"] + 1)
+        elif k == curses.KEY_HOME:
+            le["pos"] = 0
+        elif k == curses.KEY_END:
+            le["pos"] = len(le["buf"])
+        elif k == K_BS:
+            if le["pos"]:
+                le["buf"] = le["buf"][:le["pos"] - 1] + le["buf"][le["pos"]:]
+                le["pos"] -= 1
+        elif k == curses.KEY_DC:
+            le["buf"] = le["buf"][:le["pos"]] + le["buf"][le["pos"] + 1:]
+        elif isinstance(k, str) and k.isprintable():
+            le["buf"] = le["buf"][:le["pos"]] + k + le["buf"][le["pos"]:]
+            le["pos"] += 1
+        self.dirty = True
+
+    def leave_edit(self):
+        vw = self.vw
+        r = vw["r"]
+        vw["edit"] = False
+        if r is not None and r.status == "manual" and not r.edited:
+            # ничего не поменяли — ручной результат не засоряет список
+            self.results.pop(r.key, None)
+            self.included.discard(r.key)
+            self.undo.pop(r.key, None)
+            vw["r"] = None
+
+    def keys_view(self, k):
+        vw = self.vw
+        r = vw["r"]
+        h, w = self.scr.getmaxyx()
+        area = h - 4
+        before, after = self.vw_lists()
+        two = after is not None and self.show_before(w)
+        vw["msg"] = ""
+        if k == "b" and after is not None:
+            self.prefs["show_before"] = not self.show_before(w)
+            self.save_prefs()
+            if not self.show_before(w) and vw["col"] == "before":
+                vw["col"] = "after"
+            return False
+        if not vw["edit"]:
+            if k in self.NAV:
+                vw["top"] = self.move(k, vw["top"], 10 ** 6, area)
+            elif k == "e":
+                self.begin_edit()
+            elif k in (K_ESC, "q", K_ENTER):
+                self.screen = self.prev_screen
+            return False
+        # ---- режим правки
+        col = vw["col"]
+        if k in self.NAV:
+            if col == "after":
+                vw["cur"] = self.move(k, vw["cur"], len(after), area)
+            else:
+                vw["bcur"] = self.move(k, vw["bcur"], len(before), area)
+        elif k == "\t" and two:
+            vw["col"] = "before" if col == "after" else "after"
+        elif k in ("d", curses.KEY_DC) and col == "after" and after:
+            i = vw["cur"]
+            self.mutate(lambda a: a.pop(i))
+            vw["cur"] = max(0, min(i, len(after) - 1))
+        elif k in (K_ENTER, "e") and col == "after" and after:
+            i = vw["cur"]
+            old = after[i]
+
+            def done(text, i=i, old=old):
+                if text is None or text == old:
+                    return
+                if text == "":
+                    self.mutate(lambda a: a.pop(i))
+                    vw["cur"] = max(0, min(i, len(after) - 1))
+                else:
+                    self.mutate(lambda a: a.__setitem__(i, text))
+            self.open_line(old, done)
+        elif k in ("a", curses.KEY_IC) and col == "after":
+            at = vw["cur"] + 1 if after else 0
+
+            def done_new(text, at=at):
+                if text:
+                    self.mutate(lambda a: a.insert(at, text))
+                    vw["cur"] = at
+            self.open_line("", done_new)
+        elif k == curses.KEY_RIGHT and col == "before" and before:
+            fact = before[vw["bcur"]]
+            at = vw["cur"] + 1 if after else 0
+            self.mutate(lambda a: a.insert(at, fact))
+            vw["cur"] = at
+            vw["msg"] = "скопировано в «стало»"
+        elif k == "u":
+            st = self.undo.get(r.key, [])
+            if st:
+                was = r.applicable
+                r.facts_after[:] = st.pop()
+                self.sync_included(r, was)
+                vw["cur"] = max(0, min(vw["cur"], len(r.facts_after) - 1))
+            else:
+                vw["msg"] = "нечего отменять"
+        elif k == "R":
+            base = r.facts_model if r.status == "ok" else r.facts_before
+            self.confirm(["Сбросить правки группы к " + ("ответу модели" if r.status == "ok" else "исходным фактам") + "?",
+                          "Сброс можно отменить клавишей u."], lambda: self._reset_edits(base))
+        elif k == K_ESC:
+            self.leave_edit()
+        return False
+
+    def _reset_edits(self, base):
+        r = self.vw["r"]
+        self.mutate(lambda a: a.__setitem__(slice(None), list(base)))
+        self.vw["cur"] = max(0, min(self.vw["cur"], len(r.facts_after) - 1))
 
     # ---- модель / сравнение / помощь
     def model_rows(self):
@@ -587,20 +890,35 @@ class App:
         ("F7 / c", "сравнение стоимости по моделям (x — сбросить калибровку модели)"),
         ("F5 / d", "пробный прогон выбранного (СТОИТ ДЕНЕГ, в БД не пишет)"),
         ("l", "лимит групп для прогона (0 — без лимита)"),
+        ("e", "правка группы БЕЗ модели (на строке группы): удалить/поправить/добавить факты, бесплатно"),
         ("r", "перечитать снимок БД"),
         ("v", "экран результатов прогона"),
+        ("Просмотр группы", "e — режим правки «стало»; b — показать/скрыть «было» (запоминается)"),
+        ("В режиме правки", "↑↓ курсор · Tab колонка · Enter/e правка · a/Ins добавить · d/Del удалить"),
+        ("", "→ (курсор в «было») копировать в «стало» · u отмена · R сброс к ответу модели · Esc выход"),
+        ("В строчном редакторе", "← → Home End Backspace Del · Enter сохранить · Esc отмена строки; пусто = удалить"),
         ("F8 / A", "применить отрецензированные результаты (бэкап + ввод APPLY)"),
         ("Esc", "закрыть попап / назад / сбросить поиск; на главном экране — ничего"),
         ("F10 / q", "выход (спросит, если есть непримененные результаты)"),
         ("", "Русская раскладка для командных клавиш работает (й=q, ф=a, …)."),
     ]
 
+    def help_lines(self, w):
+        out = []
+        for k, d in self.HELP:
+            parts = textwrap.wrap(d, max(20, w - 30)) or [""]
+            out += [(k if j == 0 else "", p) for j, p in enumerate(parts)]
+        return out
+
     def draw_help(self, h, w):
-        self.put(0, 1, "Помощь — клавиши", self.A["title"])
-        for i, (k, d) in enumerate(self.HELP):
+        self.put(0, 1, "Помощь — клавиши (↑↓ прокрутка)", self.A["title"])
+        lines = self.help_lines(w)
+        area = h - 4
+        self.help_off = max(0, min(self.help_off, max(0, len(lines) - area)))
+        for i, (k, d) in enumerate(lines[self.help_off:self.help_off + area]):
             self.put(2 + i, 1, f"{k:<26}", self.A["warn"])
-            self.put(2 + i, 28, clip(d, w - 29))
-        self.fbar(h, w, [("Esc", "Назад")])
+            self.put(2 + i, 28, d)
+        self.fbar(h, w, [("↑↓", "Прокрутка"), ("Esc", "Назад")])
 
     # ---- модальные окна
     def draw_modal(self, h, w):
@@ -689,6 +1007,9 @@ class App:
         if self.modal:
             self.handle_modal(k)
             return False
+        if self.lined:
+            self.keys_lined(k)  # сырой ввод (не cmd): кириллица в тексте не должна мапиться в команды
+            return False
         h, w = self.scr.getmaxyx()
         if h < MIN_H or w < MIN_W:
             return self.cmd(k) in ("q", "Q", curses.KEY_F10)
@@ -776,6 +1097,11 @@ class App:
             if self.results:
                 self.screen = "results"
             self.start_apply()
+        elif k == "e":
+            if r and r.kind == "group":
+                self.start_manual(r.group)
+            else:
+                self.info("Правка без модели — на строке группы (раскрой чат: →). На чате она не работает.")
         elif k == "v":
             self.screen = "results"
         elif k == "l":
@@ -850,16 +1176,11 @@ class App:
         self.rebuild()
 
     def keys_help(self, k):
-        if k in (K_ESC, "q", K_ENTER):
-            self.screen = "main"
-        return False
-
-    def keys_view(self, k):
-        area = self.scr.getmaxyx()[0] - 3
         if k in self.NAV:
-            self.view_off = self.move(k, self.view_off, max(1, len(self.view_lines) - area + 1), area)
+            area = self.scr.getmaxyx()[0] - 4
+            self.help_off = self.move(k, self.help_off, 10 ** 6, area)
         elif k in (K_ESC, "q", K_ENTER):
-            self.screen = self.prev_screen
+            self.screen = "main"
         return False
 
     def keys_results(self, k):
@@ -876,6 +1197,11 @@ class App:
             g = next((x for x in self.groups if x.key == r.key), None)
             if g:
                 self.open_view(g, r)
+        elif k == "e" and rs:
+            r = rs[self.res_cur]
+            g = next((x for x in self.groups if x.key == r.key), None)
+            if g:
+                self.open_view(g, r, edit=True)
         elif k in (curses.KEY_F8, "A"):
             self.start_apply()
         elif k in (K_ESC, "q"):
@@ -960,8 +1286,14 @@ class App:
             self.dirty = True  # тикают часы
 
     def finish_run(self):
+        kept = 0
         for r in self.run_results:
+            ex = self.results.get(r.key)
+            if ex is not None and ex.edited:
+                kept += 1  # правки человека важнее нового ответа модели; он остался в журнале прогона
+                continue
             self.results[r.key] = r
+            self.undo.pop(r.key, None)
             self.applied_keys.discard(r.key)
             if r.applicable:
                 self.included.add(r.key)
@@ -972,6 +1304,9 @@ class App:
             self.calibs = dm.load_calibration()
             self.est_cache.clear()
         self.run_log_path = path
+        if kept:
+            self.info(f"{kept} групп с вашими правками не перезаписаны новым прогоном.",
+                      "Новый ответ модели по ним — в журнале прогона (data/dedup_runs/).")
 
     # ------------------------------------------------------------ применение
     def start_apply(self):
@@ -987,6 +1322,10 @@ class App:
         hid = [r for r in inc if r.key not in vis]
         self.ask([f"ПРИМЕНЕНИЕ В БОЕВУЮ БД: {len(inc)} групп, {fnum(b)} → {fnum(a)} фактов.",
                   *([f"Из них скрыто фильтром: {len(hid)} групп."] if hid else []),
+                  *([f"Ручных правок (без модели): {sum(1 for r in inc if r.status == 'manual')} групп."]
+                    if any(r.status == "manual" for r in inc) else []),
+                  *([f"С правками человека поверх ответа модели: {sum(1 for r in inc if r.status == 'ok' and r.edited)} групп."]
+                    if any(r.status == "ok" and r.edited for r in inc) else []),
                   f"Перед записью будет сделан бэкап: {dm.BACKUPS_DIR}/claudushka-dedup-<время>.db",
                   "Модель повторно не вызывается — пишется ровно то, что в результатах.",
                   "Введите APPLY и Enter (пусто / Esc — отмена)."], "> ", lambda t: self._apply(inc, t), danger=True)
@@ -996,6 +1335,8 @@ class App:
         if text.strip() != "APPLY":
             self.info("Отменено — ничего не записано.")
             return
+        # журнал ДО записи: ответ модели + итог после правок (edited / manual)
+        dm.save_run(self.run_model if any(r.status == "ok" for r in inc) else "manual", inc, suffix="-reviewed")
         try:
             rep = dm.apply_reviewed(inc)
         except dm.BackupError as e:
@@ -1020,10 +1361,16 @@ class App:
         if pending or running:
             msg = "Идёт прогон! " if running else ""
             self.confirm([msg + f"Есть непримененные результаты ({len(pending)} гр.). Выйти без применения?",
-                          "Журнал прогона уже сохранён в data/dedup_runs/." if not running else
-                          "Текущий запрос будет потерян."], lambda: setattr(self, "quit_now", True))
+                          "Журнал прогона уже сохранён в data/dedup_runs/; правки сохранятся отдельным файлом."
+                          if not running else "Текущий запрос будет потерян."],
+                         lambda: (self.save_edits_journal(), setattr(self, "quit_now", True)))
             return False
         return True
+
+    def save_edits_journal(self):
+        ed = [r for r in self.result_list() if r.edited]
+        if ed:
+            dm.save_run(self.run_model if any(r.status == "ok" for r in ed) else "manual", ed, suffix="-unapplied")
 
     quit_now = False
 
@@ -1066,6 +1413,7 @@ def _main(scr, model_alias):
         # Ctrl+C: терминал восстановит curses.wrapper; уже полученное из прогона не теряем
         if app.run_results and not app.run_ended:
             dm.finish_run(app.run_model, app.run_results)
+        app.save_edits_journal()
         raise
 
 
