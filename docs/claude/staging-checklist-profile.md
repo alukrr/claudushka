@@ -1,11 +1,14 @@
 # Чек-лист стенда: ТЗ `feat/user-profile` (профиль участника, еженедельный дайджест, экран «Профили», v1.5.0)
 
 Дизайн — `docs/claude/profile.md`. Места **TG-админ / TG-юзер / Сервер** и функции `q` / `logs` / `cache` —
-`docs/claude/staging-aliases.sh`, `staging-checklist-v0.10.md` (0.2). Перед стартом — **копия боевой БД на стенд**
-(миграция проверяется на реальных данных), для динамики — две тестовые группы и один личный диалог.
+`docs/claude/staging-aliases.sh`, `staging-checklist-v0.10.md` (0.2). Стенд остаётся на ПУСТОЙ БД
+(`docs/claude/staging.md`: копия прода потянет `allowed_chats`, и тестовый бот запустит дневной обзор Opus по боевым
+чатам). Для динамики — две тестовые группы и один личный диалог. **Миграцию на реальных данных проверяем отдельно,
+на копии ВНЕ работающего стенда** — шаг 0.
 
 | Шаг | Где | Что делаю | Ожидание |
 |---|---|---|---|
+| 0 | Сервер | Миграция на копии прода (стенд и прод не трогаются): `docker exec claudushka python3 -c "import sqlite3; s=sqlite3.connect('/app/data/claudushka.db'); d=sqlite3.connect('/app/data/migtest.db'); s.backup(d); d.close()"` → `mv ~/claudushka/data/migtest.db ~/claudushka-test/data-test/migtest.db` → `docker exec claudushka-test python3 -c "import db; from pathlib import Path; db.DB_PATH=Path('/app/data/migtest.db'); db.init_db(); db.init_db(); print('ok')"` → `sqlite3 ~/claudushka-test/data-test/migtest.db \"SELECT name FROM schema_migrations WHERE name='user_profile_v1'\"` | `ok`, дважды без `Migration FAILED`; маркер `user_profile_v1` есть; существующие таблицы и строки не пострадали (`SELECT COUNT(*) FROM memory` до и после совпадает). Потом `rm ~/claudushka-test/data-test/migtest.db` |
 | 1 | Сервер | `q "SELECT name FROM schema_migrations WHERE name='user_profile_v1'"` до рестарта, затем рестарт стенда ДВАЖДЫ подряд | После первого рестарта строка есть; второй рестарт без ошибок миграции в `logs 80` (нет `Migration FAILED`) |
 | 2 | Сервер | `q "SELECT COUNT(*) AS n FROM user_profile"`, `... FROM profile_proposals` | Обе таблицы существуют, пока 0 строк |
 | 3 | TG-юзер, группа | Написать про отпуск: «я сейчас в Москве в отпуске на неделю», затем дождаться извлечения (≈15 сообщений в чате) | В `memory` — только `medium` («в отпуске в Москве»); `q "SELECT field,new_value,status FROM profile_proposals"` — предложения по `city` НЕТ |
