@@ -68,7 +68,9 @@ import sqlite3
 import sys
 import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterator, Literal
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "claudushka.db"
 
@@ -223,7 +225,98 @@ def dedup_delete(conn, user_id=None, chat_id=None, tier=None, fact=None, like=Fa
     print(f"[delete] удалено {len(rows)} строк")
 
 
-def _groups_for_llm(conn, user_id, chat_id, tier):
+SYSTEM_PROMPT = (
+    "Тебе дан список фактов об одном человеке — часть из них дубли или "
+    "перефразировки одного и того же. Объедини по смыслу, убери повторы, "
+    "оставь МИНИМАЛЬНЫЙ набор уникальных фактов, каждый — короткая фраза "
+    "как в источнике. Не выдумывай ничего нового, не добавляй факты, "
+    "которых не было. Верни ТОЛЬКО JSON: {\"facts\": [\"...\", \"...\"]}"
+)
+
+# max_tokens=8192: на группах в сотни-тысячи фактов (живой случай — 1441 medium-факт в одном
+# чате) даже 4096 не хватило и ответ обрывался — тот же класс проблемы, что инцидент 2026-08-03
+# в extract_all_participants_memory (docs/claude/incidents.md). Обрезанная группа НЕ применяется
+# (status="truncated"); если режет — сузь фильтр и прогони по частям.
+MAX_OUT_TOKENS = 8192
+
+
+class DedupEnvError(Exception):
+    """Не хватает окружения для llm-режима (ключ/пакет). Текст — готовая подсказка пользователю."""
+
+
+@dataclass(frozen=True)
+class GroupKey:
+    user_id: int
+    context: str
+    chat_id: int | None
+    tier: str
+
+
+@dataclass
+class Group:
+    """Снимок группы фактов: что именно (по id) отправили на объединение."""
+    key: GroupKey
+    row_ids: list[int]
+    facts: list[str]
+    expires_at: int | None  # максимум среди строк группы (для medium)
+
+
+@dataclass
+class GroupResult:
+    key: GroupKey
+    row_ids: list[int]
+    facts_before: list[str]
+    facts_after: list[str]
+    expires_at: int | None
+    status: Literal["ok", "truncated", "error", "empty"]
+    error: str | None = None
+    in_tok: int = 0
+    cw_5m: int = 0
+    cw_1h: int = 0
+    cache_read: int = 0
+    out_tok: int = 0
+    cost: float | None = None
+    seconds: float = 0.0
+
+    @property
+    def applicable(self) -> bool:
+        return self.status == "ok" and bool(self.facts_after)
+
+
+@dataclass
+class ApplyReport:
+    applied: list[GroupKey] = field(default_factory=list)
+    skipped: list[tuple[GroupKey, str]] = field(default_factory=list)
+    backup_path: Path | None = None
+    facts_before: int = 0
+    facts_after: int = 0
+
+
+def make_client():
+    """anthropic-клиент или DedupEnvError. sys.exit — только в CLI-обёртке."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise DedupEnvError(
+            "ANTHROPIC_API_KEY не задан в окружении — source .env (и sudo -E, если apply), "
+            "либо запусти через docker exec claudushka — там ключ уже есть, см. --help")
+    try:
+        import anthropic
+        import api_errors
+        del api_errors  # только проверка, что общий модуль на месте
+    except ModuleNotFoundError as e:
+        raise DedupEnvError(
+            f"Не хватает модуля ({e}) — он есть только внутри контейнера.\n"
+            "Либо: pip install anthropic==1.7.0 (api_errors.py — свой файл рядом, копировать не надо)\n"
+            "Либо (проще, не нужен ни pip, ни sudo — контейнер уже root и с ключом в окружении):\n"
+            "  docker exec claudushka python3 /repo/dedup_memory.py --mode llm ...\n"
+            "  docker exec claudushka python3 /repo/dedup_memory.py --mode llm ... --apply")
+    # base_url явно — та же причина, что в bot.py/whatsapp.py: не полагаемся на неявное
+    # чтение ANTHROPIC_BASE_URL внутри SDK.
+    return anthropic.Anthropic(api_key=api_key, base_url=os.environ.get("ANTHROPIC_BASE_URL") or None)
+
+
+def load_groups(conn, user_id=None, chat_id=None, tier=None, min_facts=2) -> list[Group]:
+    """Группы (user_id, context, chat_id, tier) с min_facts+ фактами, в порядке таблицы."""
     where, params = _filters(user_id, chat_id, tier)
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     rows = conn.execute(
@@ -231,172 +324,215 @@ def _groups_for_llm(conn, user_id, chat_id, tier):
         f"FROM memory {where_sql} ORDER BY user_id, context, chat_id, tier",
         params,
     ).fetchall()
-    groups: dict[tuple, list] = {}
+    by_key: dict[GroupKey, list] = {}
     for r in rows:
-        key = (r["user_id"], r["context"], r["chat_id"], r["tier"])
-        groups.setdefault(key, []).append(r)
-    return groups
+        by_key.setdefault(GroupKey(r["user_id"], r["context"], r["chat_id"], r["tier"]), []).append(r)
+    return [
+        Group(k, [r["id"] for r in v], [r["fact"] for r in v],
+              max((r["expires_at"] for r in v if r["expires_at"]), default=None))
+        for k, v in by_key.items() if len(v) >= min_facts
+    ]
+
+
+def _usage_numbers(resp):
+    # Этот ключ/пул автоматически кеширует большие входы (prompt caching) — для уникального,
+    # ни разу не повторяющегося входа (каждая группа фактов своя) это ВСЕГДА запись в кэш,
+    # никогда чтение: input_tokens почти пустой, реальный вес — в cache_creation_input_tokens.
+    # Проверено живьём 2026-08-31: 400 фактов (40690 симв.) -> input_tokens=2,
+    # cache_creation_input_tokens=16186; без учёта оценка занижалась в ~100 раз.
+    usage = getattr(resp, "usage", None)
+    in_tok = getattr(usage, "input_tokens", 0) or 0
+    cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+    # Разбивка записи по TTL (как в bot.py _track_response); нет cache_creation — всё 5m.
+    cc = getattr(usage, "cache_creation", None)
+    if cc is not None:
+        cw_1h = getattr(cc, "ephemeral_1h_input_tokens", 0) or 0
+        cw_5m = getattr(cc, "ephemeral_5m_input_tokens", 0) or 0
+    else:
+        cw_5m, cw_1h = cache_write, 0
+    out_tok = getattr(usage, "output_tokens", 0) or 0
+    return in_tok, cw_5m, cw_1h, cache_read, out_tok
+
+
+def run_llm(groups, model, client, stop_event=None) -> Iterator[GroupResult]:
+    """Прогон: читает снимок (groups), зовёт API, НИЧЕГО не пишет и не печатает.
+
+    stop_event проверяется между группами; идущий HTTP-запрос не прерывается.
+    """
+    import api_errors  # общий с bot.py/whatsapp.py: response_text / parse_json_lenient / was_truncated
+    for g in groups:
+        if stop_event is not None and stop_event.is_set():
+            return
+        k = g.key
+        t0 = time.monotonic()
+        res = GroupResult(k, g.row_ids, g.facts, list(g.facts), g.expires_at, "error")
+        try:
+            resp = client.messages.create(
+                model=model,
+                max_tokens=MAX_OUT_TOKENS,
+                **AUX_PARAMS.get(model, {}),
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": json.dumps(g.facts, ensure_ascii=False)}],
+            )
+            # response_text/parse_json_lenient, не голый content[0].text/find+rfind: у пятого
+            # поколения content[0] может быть thinking-блоком без текста, а обрезанный по
+            # max_tokens JSON рвёт наивный find/rfind (docs/claude/api-errors.md).
+            res.in_tok, res.cw_5m, res.cw_1h, res.cache_read, res.out_tok = _usage_numbers(resp)
+            res.cost = request_cost(model, res.in_tok, res.out_tok, res.cw_5m, res.cw_1h, res.cache_read)
+            text = api_errors.response_text(resp)
+            data = api_errors.parse_json_lenient(text, "{", label=f"dedup user={k.user_id} chat={k.chat_id}")
+            merged = [f.strip() for f in (data or {}).get("facts", []) if isinstance(f, str) and f.strip()]
+            if api_errors.was_truncated(resp):
+                # Обрезанный ответ = частичный список; применить его значило бы удалить ВСЮ
+                # группу и вставить огрызок (тихая потеря данных). Не применяется никогда.
+                res.status = "truncated"
+            elif not merged:
+                res.status = "empty"
+            else:
+                res.status, res.facts_after = "ok", merged
+        except Exception as e:
+            res.status, res.error = "error", f"{type(e).__name__}: {e}"
+        res.seconds = time.monotonic() - t0
+        yield res
+
+
+def apply_results(conn_rw, results: list[GroupResult]) -> ApplyReport:
+    """Применение готовых результатов (без повторного вызова модели).
+
+    Каждая группа — отдельная транзакция. Если хоть одной строки из row_ids уже нет
+    (бот удалил/просрочил после снимка) — группа пропускается целиком. Удаляем строго по id,
+    факты, добавленные ботом после снимка, не трогаются.
+    """
+    rep = ApplyReport()
+    for r in results:
+        if not r.applicable:
+            rep.skipped.append((r.key, f"статус {r.status}"))
+            continue
+        k = r.key
+        try:
+            conn_rw.execute("BEGIN IMMEDIATE")
+            ph = ",".join("?" * len(r.row_ids))
+            have = conn_rw.execute(f"SELECT COUNT(*) FROM memory WHERE id IN ({ph})", r.row_ids).fetchone()[0]
+            if have != len(r.row_ids):
+                conn_rw.rollback()
+                rep.skipped.append((k, f"в БД осталось {have} из {len(r.row_ids)} строк снимка"))
+                continue
+            conn_rw.execute(f"DELETE FROM memory WHERE id IN ({ph})", r.row_ids)
+            now = int(time.time())
+            conn_rw.executemany(
+                "INSERT INTO memory (user_id, context, chat_id, fact, tier, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(k.user_id, k.context, k.chat_id, f, k.tier, now, r.expires_at) for f in r.facts_after],
+            )
+            conn_rw.commit()
+        except Exception as e:
+            conn_rw.rollback()
+            rep.skipped.append((k, f"ошибка записи: {type(e).__name__}: {e}"))
+            continue
+        rep.applied.append(k)
+        rep.facts_before += len(r.facts_before)
+        rep.facts_after += len(r.facts_after)
+    return rep
+
+
+def fmt_dur(sec: float) -> str:
+    sec = int(max(0, sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
               model="claude-haiku-5-5", limit_groups=None, verbose=False):
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        sys.exit("ANTHROPIC_API_KEY не задан в окружении — source .env (и sudo -E, если apply), "
-                 "либо запусти через docker exec claudushka — там ключ уже есть, см. --help")
+    """CLI-обёртка над run_llm: печатает прогресс, при apply пишет каждую группу сразу."""
     try:
-        import anthropic
-        import api_errors  # тот же общий модуль, что у bot.py/whatsapp.py — не изобретаем заново
-    except ModuleNotFoundError as e:
-        sys.exit(
-            f"Не хватает модуля ({e}) — он есть только внутри контейнера.\n"
-            "Либо: pip install anthropic==1.7.0 (api_errors.py — свой файл рядом, копировать не надо)\n"
-            "Либо (проще, не нужен ни pip, ни sudo — контейнер уже root и с ключом в окружении):\n"
-            "  docker exec claudushka python3 /repo/dedup_memory.py --mode llm ...\n"
-            "  docker exec claudushka python3 /repo/dedup_memory.py --mode llm ... --apply"
-        )
-    # base_url явно — та же причина, что в bot.py/whatsapp.py: не полагаемся на неявное
-    # чтение ANTHROPIC_BASE_URL внутри SDK.
-    client = anthropic.Anthropic(api_key=api_key, base_url=os.environ.get("ANTHROPIC_BASE_URL") or None)
+        client = make_client()
+    except DedupEnvError as e:
+        sys.exit(str(e))
 
-    groups = _groups_for_llm(conn, user_id, chat_id, tier)
-    candidates = {k: v for k, v in groups.items() if len(v) >= 2}
+    all_groups = load_groups(conn, user_id, chat_id, tier, min_facts=1)
+    candidates = [g for g in all_groups if len(g.facts) >= 2]
     total_candidate_groups = len(candidates)  # до обрезки --limit-groups — нужно для экстраполяции ниже
-    print(f"[llm] групп (user,context,chat,tier) в фильтре: {len(groups)}, с 2+ фактами: {total_candidate_groups}")
+    print(f"[llm] групп (user,context,chat,tier) в фильтре: {len(all_groups)}, "
+          f"с 2+ фактами: {total_candidate_groups}", flush=True)
     if limit_groups:
-        candidates = dict(list(candidates.items())[:limit_groups])
-        print(f"[llm] ограничено --limit-groups до {len(candidates)} групп")
+        candidates = candidates[:limit_groups]
+        print(f"[llm] ограничено --limit-groups до {len(candidates)} групп", flush=True)
 
+    n = len(candidates)
+    results: list[GroupResult] = []
     total_before = total_after = 0
-    total_in_tok = total_cache_write_tok = total_cache_read_tok = total_out_tok = 0
+    totals = dict(in_tok=0, cw=0, cr=0, out=0)
     total_cost = 0.0
-    truncated_groups = 0
-    total_cache_write_5m_tok = total_cache_write_1h_tok = 0
+    truncated_groups = errors = 0
     started = time.monotonic()
-    for (uid, ctx, cid, grp_tier), rows in candidates.items():
-        facts = [r["fact"] for r in rows]
-        total_before += len(facts)
-        try:
-            # max_tokens=8192: на группах в сотни-тысячи фактов (живой случай — 1441
-            # medium-фактов в одном чате) даже 4096 не хватило и ответ обрывался — тот же
-            # класс проблемы, что инцидент 2026-08-03 в extract_all_participants_memory
-            # (см. docs/claude/incidents.md). parse_json_lenient ниже переживёт обрыв на этом лимите —
-            # это подстраховка, а не гарантия, что 8192 хватит на ЛЮБую группу; если
-            # снова обрежет — сузьте --user-id/--chat-id/--tier и прогоните по частям.
-            resp = client.messages.create(
-                model=model,
-                max_tokens=8192,
-                **AUX_PARAMS.get(model, {}),
-                system=(
-                    "Тебе дан список фактов об одном человеке — часть из них дубли или "
-                    "перефразировки одного и того же. Объедини по смыслу, убери повторы, "
-                    "оставь МИНИМАЛЬНЫЙ набор уникальных фактов, каждый — короткая фраза "
-                    "как в источнике. Не выдумывай ничего нового, не добавляй факты, "
-                    "которых не было. Верни ТОЛЬКО JSON: {\"facts\": [\"...\", \"...\"]}"
-                ),
-                messages=[{"role": "user", "content": json.dumps(facts, ensure_ascii=False)}],
-            )
-            # response_text/parse_json_lenient — те же хелперы, что у bot.py/whatsapp.py,
-            # не голый content[0].text/find+rfind: у пятого поколения content[0] может
-            # быть thinking-блоком без текста, а обрезанный по max_tokens JSON рвёт
-            # наивный find/rfind (оба класса багов задокументированы в docs/claude/api-errors.md).
-            truncated = api_errors.was_truncated(resp)
-            text = api_errors.response_text(resp)
-            data = api_errors.parse_json_lenient(text, "{", label=f"dedup user={uid} chat={cid}")
-            merged = [f.strip() for f in (data or {}).get("facts", []) if isinstance(f, str) and f.strip()]
-            # Этот ключ/пул автоматически кеширует большие входы (prompt caching) —
-            # для уникального, ни разу не повторяющегося входа (каждая группа фактов
-            # своя) это ВСЕГДА запись в кэш, никогда чтение: input_tokens сам по себе
-            # почти пустой (несколько токенов), а реальный вес — в
-            # cache_creation_input_tokens. Проверено живьём 2026-08-31: на 400 фактах
-            # (40690 симв.) input_tokens=2, cache_creation_input_tokens=16186 — без
-            # этой строки оценка стоимости занижалась в ~100 раз. Цена записи в кэш —
-            # премия ~1.25x к обычному input (5-минутный ephemeral, как здесь), чтение
-            # из кэша было бы ~0.1x, но тут читать нечего — каждый вход уникален.
-            usage = getattr(resp, "usage", None)
-            in_tok = getattr(usage, "input_tokens", 0) or 0
-            cache_write_tok = getattr(usage, "cache_creation_input_tokens", 0) or 0
-            cache_read_tok = getattr(usage, "cache_read_input_tokens", 0) or 0
-            # Разбивка записи по TTL (как в bot.py _track_response); нет cache_creation — всё 5m.
-            cc = getattr(usage, "cache_creation", None)
-            if cc is not None:
-                cw_1h = getattr(cc, "ephemeral_1h_input_tokens", 0) or 0
-                cw_5m = getattr(cc, "ephemeral_5m_input_tokens", 0) or 0
-            else:
-                cw_5m, cw_1h = cache_write_tok, 0
-            total_cache_write_5m_tok += cw_5m
-            total_cache_write_1h_tok += cw_1h
-            out_tok = getattr(usage, "output_tokens", 0) or 0
-            req_cost = request_cost(model, in_tok, out_tok, cw_5m, cw_1h, cache_read_tok)
-            if req_cost is not None:
-                total_cost += req_cost
-            total_in_tok += in_tok
-            total_cache_write_tok += cache_write_tok
-            total_cache_read_tok += cache_read_tok
-            total_out_tok += out_tok
-            if verbose:
-                print(f"[llm][токены] user={uid} chat={cid} tier={grp_tier}: "
-                      f"in={in_tok} cache_write={cache_write_tok} cache_read={cache_read_tok} out={out_tok}")
-        except Exception as e:
-            print(f"[llm] user={uid} chat={cid} tier={grp_tier}: ошибка ({e}), пропуск")
-            total_after += len(facts)
-            continue
-
-        if truncated:
-            # Обрезанный ответ = частичный список; применить его значило бы удалить ВСЮ группу
-            # и вставить огрызок (тихая потеря данных). Такая группа не применяется никогда.
+    for i, res in enumerate(run_llm(candidates, model, client), 1):
+        results.append(res)
+        k = res.key
+        tag = f"[{i}/{n}] user={k.user_id} chat={k.chat_id} tier={k.tier}"
+        total_before += len(res.facts_before)
+        total_after += len(res.facts_after) if res.applicable else len(res.facts_before)
+        totals["in_tok"] += res.in_tok
+        totals["cw"] += res.cw_5m + res.cw_1h
+        totals["cr"] += res.cache_read
+        totals["out"] += res.out_tok
+        total_cost += res.cost or 0.0
+        cost_s = f"${res.cost:.4f}" if res.cost is not None else "$?"
+        if res.status == "ok":
+            print(f"{tag}: {len(res.facts_before)} -> {len(res.facts_after)} ok {cost_s} {res.seconds:.1f}с", flush=True)
+        elif res.status == "truncated":
             truncated_groups += 1
-            total_after += len(facts)
-            print(f"[llm] user={uid} chat={cid} tier={grp_tier}: {len(facts)} -> ОБРЕЗАНО по max_tokens, "
-                  f"НЕ применяется")
-            continue
-
-        print(f"[llm] user={uid} chat={cid} tier={grp_tier}: {len(facts)} -> {len(merged)}")
+            print(f"{tag}: {len(res.facts_before)} -> ОБРЕЗАНО по max_tokens, НЕ применяется {cost_s} "
+                  f"{res.seconds:.1f}с", flush=True)
+        elif res.status == "empty":
+            print(f"{tag}: {len(res.facts_before)} -> пустой/неразобранный ответ, пропуск {cost_s}", flush=True)
+        else:
+            errors += 1
+            print(f"{tag}: ошибка ({res.error}), пропуск", flush=True)
         if verbose:
-            print(f"[llm][было] user={uid} chat={cid} tier={grp_tier}:")
-            for f in facts:
-                print(f"    - {f}")
-            print(f"[llm][стало] user={uid} chat={cid} tier={grp_tier}:")
-            for f in merged:
-                print(f"    + {f}")
-        total_after += len(merged) or len(facts)
-        if not merged:
-            continue
+            print(f"[llm][токены] in={res.in_tok} cache_write={res.cw_5m + res.cw_1h} "
+                  f"cache_read={res.cache_read} out={res.out_tok}", flush=True)
+            if res.status == "ok":
+                print("[llm][было]", flush=True)
+                for f in res.facts_before:
+                    print(f"    - {f}", flush=True)
+                print("[llm][стало]", flush=True)
+                for f in res.facts_after:
+                    print(f"    + {f}", flush=True)
         if apply:
-            ids = [r["id"] for r in rows]
-            conn.executemany("DELETE FROM memory WHERE id = ?", [(i,) for i in ids])
-            expires_at = max((r["expires_at"] for r in rows if r["expires_at"]), default=None)
-            now = int(time.time())
-            conn.executemany(
-                "INSERT INTO memory (user_id, context, chat_id, fact, tier, created_at, expires_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                [(uid, ctx, cid, f, grp_tier, now, expires_at) for f in merged],
-            )
-            conn.commit()
+            rep = apply_results(conn, [res])
+            for sk, why in rep.skipped:
+                if res.status == "ok":  # прочие статусы уже объяснены выше
+                    print(f"[llm]   не применено: {why}", flush=True)
+        elapsed = time.monotonic() - started
+        eta = elapsed / i * (n - i)
+        print(f"[llm]   прошло {fmt_dur(elapsed)} · ETA {fmt_dur(eta)} · потрачено ${total_cost:.4f}", flush=True)
 
     if truncated_groups:
         print(f"[llm] обрезано, не применено: {truncated_groups} групп — сузь фильтр "
-              f"(--user-id/--chat-id/--tier) и прогони по частям")
+              f"(--user-id/--chat-id/--tier) и прогони по частям", flush=True)
+    if errors:
+        print(f"[llm] ошибок: {errors} групп (не применены)", flush=True)
     elapsed = time.monotonic() - started
     cost = total_cost if model in PRICING else None
     cost_str = f"${cost:.4f}" if cost is not None else "? (модель не в PRICING — сверься с /cost в боте)"
-    n_groups = len(candidates)
-    per_group = elapsed / n_groups if n_groups else 0
+    per_group = elapsed / n if n else 0
 
     suffix = "" if apply else " (dry-run — ничего не записано, добавь --apply)"
-    print(f"[llm] итого по обработанным группам: {total_before} -> {total_after}{suffix}")
-    print(f"[llm] время: {elapsed:.1f}с на {n_groups} групп (~{per_group:.1f}с/группу)")
-    print(f"[llm] токены: in={total_in_tok} cache_write={total_cache_write_tok} "
-          f"cache_read={total_cache_read_tok} out={total_out_tok}, оценка стоимости: {cost_str}")
+    print(f"[llm] итого по обработанным группам: {total_before} -> {total_after}{suffix}", flush=True)
+    print(f"[llm] время: {elapsed:.1f}с на {n} групп (~{per_group:.1f}с/группу)", flush=True)
+    print(f"[llm] токены: in={totals['in_tok']} cache_write={totals['cw']} "
+          f"cache_read={totals['cr']} out={totals['out']}, оценка стоимости: {cost_str}", flush=True)
 
-    # Экстраполяция на ВЕСЬ фильтр (полезно после пробного --limit-groups N, прежде чем
-    # снимать лимит и гонять все группы разом): грубая, по СРЕДНЕМУ на группу — реальные
-    # группы сильно различаются по размеру (от 2 фактов до 1441), не точная оценка.
-    if limit_groups and n_groups < total_candidate_groups and cost is not None:
-        factor = total_candidate_groups / n_groups
+    # Экстраполяция на ВЕСЬ фильтр (после пробного --limit-groups N, прежде чем снимать лимит):
+    # грубая, по СРЕДНЕМУ на группу — реальные группы сильно различаются по размеру (от 2 до 1441).
+    if limit_groups and n and n < total_candidate_groups and cost is not None:
+        factor = total_candidate_groups / n
         print(f"[llm] грубая экстраполяция на все {total_candidate_groups} групп в фильтре "
               f"(± сильно, группы разного размера): ~{elapsed * factor / 60:.1f} мин, "
-              f"~${cost * factor:.2f}")
+              f"~${cost * factor:.2f}", flush=True)
+    return results
 
 
 def main():
