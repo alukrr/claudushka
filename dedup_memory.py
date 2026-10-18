@@ -68,7 +68,7 @@ import sqlite3
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterator, Literal
 
@@ -436,6 +436,185 @@ def apply_results(conn_rw, results: list[GroupResult]) -> ApplyReport:
     return rep
 
 
+# ---------------------------------------------------------------- оценка стоимости (без API)
+
+# Единственный живой замер (docs/claude/open-tasks.md): 40690 симв. -> 16186 токенов (~2.51).
+# Одна точка — в UI помечается как «грубо». out/in по фактам реального замера нет: 1.0 = верхняя
+# граница («ничего не слилось»).
+CHARS_PER_TOKEN = 2.5
+OUT_RATIO = 1.0
+DATA_DIR = DB_PATH.parent
+CALIBRATION_PATH = DATA_DIR / "dedup_calibration.json"
+RUNS_DIR = DATA_DIR / "dedup_runs"
+BACKUPS_DIR = DATA_DIR / "backups"
+
+
+@dataclass
+class Estimate:
+    in_tok: float
+    out_tok: float
+    cost: float | None      # None — модели нет в PRICING
+    seconds: float | None   # None — нет калибровки модели
+    risk: bool              # ответ, вероятно, обрежется по MAX_OUT_TOKENS
+
+
+def load_calibration(path: Path | None = None) -> dict:
+    try:
+        return json.loads((path or CALIBRATION_PATH).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def facts_chars(facts) -> int:
+    return len(json.dumps(facts, ensure_ascii=False))
+
+
+def estimate_group(facts, model, calib: dict | None = None) -> Estimate:
+    """Оценка одной группы. calib — запись load_calibration()[model] или None (дефолты)."""
+    calib = calib or {}
+    cpt = calib.get("chars_per_token") or CHARS_PER_TOKEN
+    ratio = calib.get("out_ratio") or OUT_RATIO
+    fch = facts_chars(facts)
+    facts_tok = fch / cpt
+    in_tok = (len(SYSTEM_PROMPT) + fch) / cpt
+    want_out = facts_tok * ratio
+    out_tok = min(MAX_OUT_TOKENS, want_out)
+    # Вход всегда уникален -> пул кеширует автоматически -> тарифицируется как запись 5m.
+    cost = request_cost(model, 0, out_tok, in_tok, 0, 0)
+    sec_per_1k = calib.get("sec_per_1k_out")
+    seconds = out_tok / 1000 * sec_per_1k if sec_per_1k else None
+    return Estimate(in_tok, out_tok, cost, seconds, want_out > MAX_OUT_TOKENS)
+
+
+def estimate_total(groups_facts, model, calib: dict | None = None) -> Estimate:
+    ests = [estimate_group(f, model, calib) for f in groups_facts]
+    costs = [e.cost for e in ests]
+    secs = [e.seconds for e in ests]
+    return Estimate(
+        sum(e.in_tok for e in ests), sum(e.out_tok for e in ests),
+        None if any(c is None for c in costs) else sum(costs),
+        None if (not secs or any(s is None for s in secs)) else sum(secs),
+        any(e.risk for e in ests),
+    )
+
+
+def calibration_source(model, calibs: dict) -> str:
+    c = calibs.get(model)
+    if not c:
+        return "без калибровки — грубо"
+    short = next((a for a, m in MODEL_ALIASES.items() if m == model), model)
+    return f"калибровка {short} от {c.get('date', '?')} ({c.get('groups', '?')} гр.)"
+
+
+def update_calibration(model, results: list[GroupResult], path: Path | None = None) -> dict | None:
+    """Пересчёт калибровки модели по реальному прогону; None — нечего считать."""
+    done = [r for r in results if r.status in ("ok", "truncated") and (r.in_tok + r.cw_5m + r.cw_1h + r.cache_read)]
+    if not done:
+        return None
+    in_all = sum(r.in_tok + r.cw_5m + r.cw_1h + r.cache_read for r in done)
+    chars_all = sum(len(SYSTEM_PROMPT) + facts_chars(r.facts_before) for r in done)
+    cpt = chars_all / in_all
+    oks = [r for r in done if r.status == "ok" and r.out_tok]
+    entry = {"chars_per_token": round(cpt, 3), "date": time.strftime("%Y-%m-%d"), "groups": len(done)}
+    if oks:
+        facts_tok = sum(facts_chars(r.facts_before) for r in oks) / cpt
+        entry["out_ratio"] = round(sum(r.out_tok for r in oks) / facts_tok, 3)
+        entry["sec_per_1k_out"] = round(sum(r.seconds for r in oks) / (sum(r.out_tok for r in oks) / 1000), 2)
+    p = path or CALIBRATION_PATH
+    data = load_calibration(p)
+    data[model] = entry
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        return None
+    return entry
+
+
+# ---------------------------------------------------------------- бэкап, журнал прогонов, применение
+
+class BackupError(Exception):
+    pass
+
+
+def backup_db(dest_dir: Path | None = None) -> Path:
+    """Консистентная копия боевой БД (sqlite3 backup API — корректно с WAL). Ошибка = не применять."""
+    dest_dir = dest_dir or BACKUPS_DIR
+    path = dest_dir / f"claudushka-dedup-{time.strftime('%Y%m%d-%H%M%S')}.db"
+    src = dst = None
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        src = sqlite3.connect(str(DB_PATH))
+        dst = sqlite3.connect(str(path))
+        src.backup(dst)
+    except Exception as e:
+        raise BackupError(f"бэкап не создался ({type(e).__name__}: {e})") from e
+    finally:
+        for c in (dst, src):
+            if c is not None:
+                c.close()
+    return path
+
+
+def save_run(model, results: list[GroupResult], runs_dir: Path | None = None) -> Path | None:
+    """Аудит-журнал прогона (в т.ч. непримененного) -> data/dedup_runs/<ts>-<model>.json."""
+    runs_dir = runs_dir or RUNS_DIR
+    path = runs_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{model}.json"
+    payload = {
+        "model": model, "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "groups": [{
+            "key": asdict(r.key), "row_ids": r.row_ids, "status": r.status, "error": r.error,
+            "facts_before": r.facts_before, "facts_after": r.facts_after,
+            "tokens": {"in": r.in_tok, "cw_5m": r.cw_5m, "cw_1h": r.cw_1h,
+                       "cache_read": r.cache_read, "out": r.out_tok},
+            "cost": r.cost, "seconds": round(r.seconds, 2),
+        } for r in results],
+    }
+    try:
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    except OSError:
+        return None
+    return path
+
+
+def finish_run(model, results: list[GroupResult]):
+    """После любого реального прогона: журнал + калибровка. -> (путь журнала, запись калибровки)."""
+    if not results:
+        return None, None
+    return save_run(model, results), update_calibration(model, results)
+
+
+def apply_reviewed(results: list[GroupResult]) -> ApplyReport:
+    """Бэкап -> боевая БД на запись -> apply_results. Бэкап не создался -> BackupError, ничего не пишем."""
+    backup = backup_db()
+    conn, _ = get_conn(writable=True)
+    try:
+        rep = apply_results(conn, results)
+    finally:
+        conn.close()
+    rep.backup_path = backup
+    return rep
+
+
+def load_directory(conn) -> tuple[dict, dict]:
+    """({chat_id: name}, {user_id: 'Имя (@username)'}) — только для показа в TUI."""
+    chats, users = {}, {}
+    try:
+        for r in conn.execute("SELECT chat_id, name FROM allowed_chats"):
+            if r["name"]:
+                chats[r["chat_id"]] = r["name"]
+        for r in conn.execute("SELECT telegram_id, username, full_name FROM users"):
+            name = r["full_name"] or ""
+            if r["username"]:
+                name = f"{name} (@{r['username']})".strip()
+            if name:
+                users[r["telegram_id"]] = name
+    except sqlite3.Error:
+        pass
+    return chats, users
+
+
 def fmt_dur(sec: float) -> str:
     sec = int(max(0, sec))
     h, rem = divmod(sec, 3600)
@@ -461,6 +640,12 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
         print(f"[llm] ограничено --limit-groups до {len(candidates)} групп", flush=True)
 
     n = len(candidates)
+    if apply and n:
+        # Бэкап ДО первого платного вызова: не создался — не тратим деньги и ничего не пишем.
+        try:
+            print(f"[llm] бэкап БД: {backup_db()}", flush=True)
+        except BackupError as e:
+            sys.exit(f"[llm] {e} — прогон отменён")
     results: list[GroupResult] = []
     total_before = total_after = 0
     totals = dict(in_tok=0, cw=0, cr=0, out=0)
@@ -524,6 +709,12 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
     print(f"[llm] время: {elapsed:.1f}с на {n} групп (~{per_group:.1f}с/группу)", flush=True)
     print(f"[llm] токены: in={totals['in_tok']} cache_write={totals['cw']} "
           f"cache_read={totals['cr']} out={totals['out']}, оценка стоимости: {cost_str}", flush=True)
+
+    run_path, calib = finish_run(model, results)
+    if run_path:
+        print(f"[llm] журнал прогона: {run_path}", flush=True)
+    if calib:
+        print(f"[llm] калибровка {model} обновлена: {calib}", flush=True)
 
     # Экстраполяция на ВЕСЬ фильтр (после пробного --limit-groups N, прежде чем снимать лимит):
     # грубая, по СРЕДНЕМУ на группу — реальные группы сильно различаются по размеру (от 2 до 1441).
