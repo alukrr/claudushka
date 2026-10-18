@@ -34,6 +34,10 @@ data/dedup_runs/, калибровка оценок — data/dedup_calibration.j
                  (см. ниже про docker exec). Печатает прогресс [i/N], ETA и потрачено $.
                  Группа с ОБРЕЗАННЫМ ответом (max_tokens) никогда не применяется.
 
+  --mode purge-expired  Удаляет просроченные строки (expires_at <= now: medium старше 7 дней) — бот
+                 их не читает, но раньше их никто не удалял. Без модели, дёшево. dry-run считает,
+                 --apply делает бэкап и удаляет. (Бот чистит их и сам: раз в сутки 04:30 Berlin.)
+
   --mode delete  Точечно удаляет конкретный факт — --fact "точный текст" (--like — как
                  подстрока, LIKE %...%), ОБЯЗАТЕЛЕН --user-id (иначе слишком легко
                  задеть чужие факты, если формулировка не уникальна). Для случаев,
@@ -46,6 +50,8 @@ data/dedup_runs/, калибровка оценок — data/dedup_calibration.j
   --user-id ID        только этот пользователь (обязателен для --mode delete)
   --chat-id ID        только этот чат (для context=group)
   --tier long|medium  только этот tier
+  --include-expired   не прятать просроченные строки (дефолт для exact/delete/llm — только живые,
+                       как видит память бот)
   --limit-groups N    (только --mode llm) не более N групп за один запуск —
                        подстраховка от случайного дорогого прогона на всей таблице
   --fact "текст"       (только --mode delete) что искать
@@ -161,8 +167,17 @@ def get_conn(writable: bool) -> tuple[sqlite3.Connection, str | None]:
     return conn, tmp_path
 
 
+# Дефолт: просроченные строки не видны (тот же фильтр `expires_at IS NULL OR expires_at > now`, что у
+# бота при чтении) — модель не должна платно перерабатывать мусор, который бот и так не читает.
+# --include-expired (только CLI) снимает фильтр для exact/delete/llm; purge-expired удаляет их отдельно.
+INCLUDE_EXPIRED = False
+
+
 def _filters(user_id, chat_id, tier):
     where, params = [], []
+    if not INCLUDE_EXPIRED:
+        where.append("(expires_at IS NULL OR expires_at > ?)")
+        params.append(int(time.time()))
     if user_id is not None:
         where.append("user_id = ?")
         params.append(user_id)
@@ -356,7 +371,7 @@ def load_groups(conn, user_id=None, chat_id=None, tier=None, min_facts=2) -> lis
         by_key.setdefault(GroupKey(r["user_id"], r["context"], r["chat_id"], r["tier"]), []).append(r)
     return [
         Group(k, [r["id"] for r in v], [r["fact"] for r in v],
-              max((r["expires_at"] for r in v if r["expires_at"]), default=None))
+              min((r["expires_at"] for r in v if r["expires_at"]), default=None))
         for k, v in by_key.items() if len(v) >= min_facts
     ]
 
@@ -447,12 +462,24 @@ def apply_results(conn_rw, results: list[GroupResult]) -> ApplyReport:
                 conn_rw.rollback()
                 rep.skipped.append((k, f"в БД осталось {have} из {len(r.row_ids)} строк снимка"))
                 continue
-            conn_rw.execute(f"DELETE FROM memory WHERE id IN ({ph})", r.row_ids)
             now = int(time.time())
+            # Срок слитых фактов = МИНИМУМ живых expires_at строк группы: слитый факт не живёт дольше
+            # самого «старого» из живых источников и не воскрешает просроченное (раньше был максимум —
+            # один свежий факт возвращал боту слитые остатки просроченных). Не знаем, из каких строк
+            # получился каждый слитый факт, поэтому консервативно. Без срока (long) — NULL, как было.
+            exps = [e for (e,) in conn_rw.execute(f"SELECT expires_at FROM memory WHERE id IN ({ph})", r.row_ids)]
+            timed = [e for e in exps if e is not None]
+            if timed and None not in exps and all(e <= now for e in timed):
+                conn_rw.rollback()
+                rep.skipped.append((k, "всё просрочено"))
+                continue
+            live = [e for e in timed if e > now]
+            expires_at = min(live) if live else None
+            conn_rw.execute(f"DELETE FROM memory WHERE id IN ({ph})", r.row_ids)
             conn_rw.executemany(
                 "INSERT INTO memory (user_id, context, chat_id, fact, tier, created_at, expires_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                [(k.user_id, k.context, k.chat_id, f, k.tier, now, r.expires_at) for f in r.facts_after],
+                [(k.user_id, k.context, k.chat_id, f, k.tier, now, expires_at) for f in r.facts_after],
             )
             conn_rw.commit()
         except Exception as e:
@@ -682,6 +709,35 @@ def load_directory(conn) -> tuple[dict, dict]:
     return chats, users
 
 
+def count_expired(conn) -> int:
+    """Сколько просроченных строк (бот их не читает, dedup их не видит)."""
+    return conn.execute("SELECT COUNT(*) FROM memory WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                        (int(time.time()),)).fetchone()[0]
+
+
+def purge_expired(conn_rw) -> int:
+    """Удалить просроченные строки одной транзакцией; -> число удалённых."""
+    conn_rw.execute("BEGIN IMMEDIATE")
+    try:
+        n = conn_rw.execute("DELETE FROM memory WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                            (int(time.time()),)).rowcount
+        conn_rw.commit()
+    except Exception:
+        conn_rw.rollback()
+        raise
+    return n
+
+
+def purge_expired_reviewed() -> tuple[int, Path]:
+    """Бэкап -> боевая БД -> purge_expired. Бэкап не создался -> BackupError, ничего не удалено."""
+    backup = backup_db()
+    conn, _ = get_conn(writable=True)
+    try:
+        return purge_expired(conn), backup
+    finally:
+        conn.close()
+
+
 def make_manual_result(g: Group) -> GroupResult:
     """Ручная правка без модели: «было» = текущие факты снимка, «стало» = их копия. Токены/деньги нулевые."""
     return GroupResult(g.key, list(g.row_ids), list(g.facts), list(g.facts), g.expires_at, "manual",
@@ -801,7 +857,7 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mode", choices=["exact", "llm", "delete"], default=None,
+    p.add_argument("--mode", choices=["exact", "llm", "delete", "purge-expired"], default=None,
                    help="без --mode (или с --tui) открывается интерактивный TUI")
     p.add_argument("--tui", action="store_true", help="интерактивный curses-интерфейс (нужен docker exec -it)")
     p.add_argument("--user-id", type=int, default=None)
@@ -817,12 +873,16 @@ def main():
     p.add_argument("--like", action="store_true",
                     help="только для --mode delete — --fact ищется как подстрока (LIKE %%...%%), "
                          "не точным совпадением")
+    p.add_argument("--include-expired", action="store_true",
+                   help="не прятать просроченные строки (по умолчанию exact/delete/llm видят только живые)")
     p.add_argument("--apply", action="store_true", help="реально писать в БД (иначе dry-run)")
     p.add_argument("-v", "--verbose", action="store_true",
                     help="показать сами факты (exact: какой дубль какому id соответствует; "
                          "llm: полный список 'было'/'стало' по каждой группе), не только счётчики")
     args = p.parse_args()
     args.model = MODEL_ALIASES.get(args.model, args.model)
+    global INCLUDE_EXPIRED
+    INCLUDE_EXPIRED = args.include_expired
 
     if not DB_PATH.exists():
         sys.exit(f"Не нашла БД: {DB_PATH}")
@@ -835,7 +895,18 @@ def main():
     if tmp_path:
         print(f"[dry-run] читаю снимок {tmp_path} (боевой файл не трогаю, sudo не нужен)")
     try:
-        if args.mode == "exact":
+        if args.mode == "purge-expired":
+            n = count_expired(conn)
+            print(f"[purge-expired] просроченных строк (expires_at <= now): {n} — бот их не читает")
+            if not args.apply:
+                print("[purge-expired] dry-run — ничего не удалено, добавь --apply (сделает бэкап)")
+            elif n:
+                try:
+                    print(f"[purge-expired] бэкап БД: {backup_db()}")
+                except BackupError as e:
+                    sys.exit(f"[purge-expired] {e} — ничего не удалено")
+                print(f"[purge-expired] удалено {purge_expired(conn)} строк")
+        elif args.mode == "exact":
             dedup_exact(conn, args.user_id, args.chat_id, args.tier, args.apply, args.verbose)
         elif args.mode == "delete":
             dedup_delete(conn, args.user_id, args.chat_id, args.tier, args.fact, args.like, args.apply)
