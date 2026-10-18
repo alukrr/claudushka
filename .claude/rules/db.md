@@ -11,6 +11,7 @@ paths: ["db.py"]
 db.py используется отовсюду, поэтому полная семантика каждой таблицы описана в
 тематическом файле её фичи, а не здесь:
 - `memory` — `docs/claude/memory.md`
+- `user_profile`, `profile_proposals` (профиль участника, `chat_id=0` для лички) — `docs/claude/profile.md`
 - `group_messages` (в т.ч. `is_bot`), `chat_rate_limits` — `docs/claude/group-chat.md`
 - `chat_models` — `docs/claude/models-and-costs.md`
 - `chat_image_provider` — `docs/claude/images.md`
