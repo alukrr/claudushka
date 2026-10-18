@@ -308,32 +308,42 @@ class App:
     def short_model(self):
         return next((a for a, m in dm.MODEL_ALIASES.items() if m == self.model), self.model)
 
+    def hidden_selected(self, groups=None):
+        """Выбранные группы, которых не видно из-за tier/context-фильтра."""
+        vis = {g.key for g in self.visible_groups()}
+        return [g for g in (self.groups if groups is None else groups) if g.key in self.selected and g.key not in vis]
+
     def draw_header(self, h, w):
         tot_facts = sum(len(g.facts) for g in self.groups)
         sg = [g for g in self.groups if g.key in self.selected]
         sel_facts = sum(len(g.facts) for g in sg)
         self.put(0, 1, "Факты ", self.A["title"])
         self.put(0, 7, meter(sel_facts, tot_facts))
-        self.put(0, 7 + 1, "|" * round(20 * sel_facts / tot_facts) if tot_facts else "", self.A["ok"])
-        self.put(0, 30, f"{fnum(sel_facts)} / {fnum(tot_facts)}   Группы 2+: {len(self.groups)}   "
-                        f"Выбрано: {len(sg)} гр. · {fnum(sel_facts)} ф.")
-        rg = self.sel_groups()
-        t = self.est_total(rg)
+        self.put(0, 8, "|" * round(20 * sel_facts / tot_facts) if tot_facts else "", self.A["ok"])
+        self.put(0, 30, f"{fnum(sel_facts)} / {fnum(tot_facts)}   Группы 2+: {len(self.groups)}")
+        sel_txt = f"Выбрано: {len(sg)} гр. · {fnum(sel_facts)} фактов"
+        self.put(1, 1, sel_txt)
+        hid = self.hidden_selected(sg)
+        if hid:
+            self.put(1, 2 + len(sel_txt), f"(скрыто фильтром: {len(hid)} гр.)", self.A["warn"])
+        # Оценка — по ВСЕМУ выбранному (как и прогон), не по видимому.
+        t = self.est_total(self.sel_groups())
         mid = dm.MODEL_ALIASES.get(self.short_model(), self.model)
-        self.put(1, 1, f"Модель: {self.short_model()} ({mid})   ", 0)
-        self.put(1, 1 + len(f"Модель: {self.short_model()} ({mid})   "),
-                 f"Оценка: {fcost(t.cost)} · {fdur(t.seconds)}" + (f"  [лимит {self.limit} гр.]" if self.limit else ""),
-                 self.A["title"])
+        m_txt = f"Модель: {self.short_model()} ({mid})   "
+        self.put(2, 1, m_txt)
+        self.put(2, 1 + len(m_txt), f"Оценка: {fcost(t.cost)} · {fdur(t.seconds)}" +
+                 (f"  [лимит {self.limit} гр.]" if self.limit else ""), self.A["title"])
+        rg = self.sel_groups()
         risky = sum(1 for g in rg if self.est(g).risk)
-        self.put(2, 1, dm.calibration_source(self.model, self.calibs) +
+        self.put(3, 1, dm.calibration_source(self.model, self.calibs) +
                  (f"   ! риск обрезки: {risky} гр." if risky else ""), self.A["warn"] if risky else 0)
         mode, attr = ("[ APPLY ]", self.A["apply"]) if self.applying else ("[ DRY-RUN ]", self.A["dry"])
-        self.put(3, 1, "Режим: ")
-        self.put(3, 8, mode, attr)
+        self.put(4, 1, "Режим: ")
+        self.put(4, 8, mode, attr)
         flt = f"tier={self.tier_f or 'все'} ctx={self.ctx_f or 'все'} сорт={self.sort}"
         s = f"поиск «{self.search}» {self.match_i + 1 if self.matches else 0}/{len(self.matches)}  " if self.search else ""
-        self.put(3, 20, f"Снимок БД {self.snapshot_at}  {s}{flt}")
-        self.put(4, 1, "Пробный прогон тоже вызывает API и стоит денег — в БД не пишет", self.A["warn"])
+        self.put(4, 20, f"Снимок БД {self.snapshot_at}  {s}{flt}")
+        self.put(5, 1, "Пробный прогон тоже вызывает API и стоит денег — в БД не пишет", self.A["warn"])
 
     def col_layout(self, w):
         # sel(4) arrow(2) name(*) id(14) kind(7) facts(8) cost(8) flag(2) status(13)
@@ -344,21 +354,21 @@ class App:
         self.draw_header(h, w)
         nw = self.col_layout(w)
         hdr = f"{'':8}{'Название':<{nw}} {'ID':<14} {'Тип':<7} {'Фактов':>8} {'$':>8} {'':2} {'Статус':<13}"
-        self.put(5, 0, hdr.ljust(w), self.A["colhdr"])
-        area = h - 7
+        self.put(6, 0, hdr.ljust(w), self.A["colhdr"])
+        area = h - 8
         if self.cur < self.top:
             self.top = self.cur
         if self.cur >= self.top + area:
             self.top = self.cur - area + 1
         mset = set(self.matches)
         if not self.rows:
-            self.put(6, 2, "Нет групп с 2+ фактами под текущий фильтр.")
+            self.put(7, 2, "Нет групп с 2+ фактами под текущий фильтр.")
         for i in range(area):
             idx = self.top + i
             if idx >= len(self.rows):
                 break
             r = self.rows[idx]
-            y = 6 + i
+            y = 7 + i
             gs = self.row_groups(r)
             nf = sum(len(g.facts) for g in gs)
             ec = [self.est(g).cost for g in gs]
@@ -561,7 +571,7 @@ class App:
                  "где ответ, вероятно, обрежется. Время — только из калибровки."]
         for i, ln in enumerate(textwrap.wrap(notes[0], w - 2)):
             self.put(9 + i, 1, ln)
-        self.fbar(h, w, [("Enter", "Сделать текущей"), ("Esc", "Назад")])
+        self.fbar(h, w, [("Enter", "Сделать текущей"), ("x", "Сбросить калибровку"), ("Esc", "Назад")])
 
     HELP = [
         ("↑ ↓ PgUp PgDn Home End", "навигация"),
@@ -574,7 +584,7 @@ class App:
         ("F4 / t", "фильтр tier: все → long → medium;   p — context: все → group → private"),
         ("F6 / s", "сортировка: по фактам → по $ → по имени"),
         ("F2 / m", "выбор модели"),
-        ("F7 / c", "сравнение стоимости по моделям"),
+        ("F7 / c", "сравнение стоимости по моделям (x — сбросить калибровку модели)"),
         ("F5 / d", "пробный прогон выбранного (СТОИТ ДЕНЕГ, в БД не пишет)"),
         ("l", "лимит групп для прогона (0 — без лимита)"),
         ("r", "перечитать снимок БД"),
@@ -617,8 +627,8 @@ class App:
         self.modal = {"type": "info", "lines": list(lines)}
         self.dirty = True
 
-    def confirm(self, lines, on_yes, hint=None):
-        self.modal = {"type": "confirm", "lines": lines, "on_yes": on_yes, "hint": hint}
+    def confirm(self, lines, on_yes, hint=None, enter_ok=False):
+        self.modal = {"type": "confirm", "lines": lines, "on_yes": on_yes, "hint": hint, "enter_ok": enter_ok}
         self.dirty = True
 
     def ask(self, lines, prompt, on_ok, danger=False):
@@ -656,7 +666,7 @@ class App:
             self.modal = None
         elif t == "confirm":
             kk = self.cmd(k)
-            if kk in ("y", "Y"):
+            if kk in ("y", "Y") or (k == K_ENTER and m.get("enter_ok")):
                 self.modal = None
                 m["on_yes"]()
             elif kk in ("n", "N", K_ESC):
@@ -702,7 +712,7 @@ class App:
     NAV = (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END)
 
     def keys_main(self, k):
-        area = self.scr.getmaxyx()[0] - 7
+        area = self.scr.getmaxyx()[0] - 8
         if k in self.NAV:
             self.cur = self.move(k, self.cur, len(self.rows), area)
             return False
@@ -820,9 +830,24 @@ class App:
             self.model = rows[self.pop_cur]
             self.est_cache.clear()
             self.rebuild()
+        elif k == "x":
+            mid = rows[self.pop_cur]
+            if mid not in self.calibs:
+                self.info(f"У {mid} нет калибровки — сбрасывать нечего.")
+            else:
+                self.confirm([f"Сбросить калибровку {mid}?",
+                              "Оценки вернутся к дефолтам (2.5 симв./токен, без времени).",
+                              "Вручную: удалить ключ модели из data/dedup_calibration.json."],
+                             lambda: self._reset_calib(mid))
         elif k in (K_ESC, "q"):
             self.screen = "main"
         return False
+
+    def _reset_calib(self, mid):
+        dm.reset_calibration(mid)
+        self.calibs = dm.load_calibration()
+        self.est_cache.clear()
+        self.rebuild()
 
     def keys_help(self, k):
         if k in (K_ESC, "q", K_ENTER):
@@ -886,10 +911,12 @@ class App:
             self.info(*str(e).split("\n"))
             return
         t = self.est_total(gs)
+        hid = self.hidden_selected(gs)
         self.confirm([f"Пробный прогон: {len(gs)} групп, {fnum(sum(len(g.facts) for g in gs))} фактов, модель {self.short_model()}.",
                       f"Оценка: {fcost(t.cost)} · {fdur(t.seconds)}" + ("  (есть группы с риском обрезки)" if t.risk else ""),
+                      *([f"Из них скрыто фильтром: {len(hid)} групп."] if hid else []),
                       "Это вызывает API и СТОИТ ДЕНЕГ; в БД ничего не пишется."],
-                     lambda: self._launch(gs, client), hint="y — запустить, n / Esc — отмена")
+                     lambda: self._launch(gs, client), hint="Enter — запустить, Esc — отмена", enter_ok=True)
 
     def _launch(self, gs, client):
         self.run_groups, self.run_results = gs, []
@@ -956,7 +983,10 @@ class App:
         b = sum(len(r.facts_before) for r in inc)
         a = sum(len(r.facts_after) for r in inc)
         self.applying = True
+        vis = {g.key for g in self.visible_groups()}
+        hid = [r for r in inc if r.key not in vis]
         self.ask([f"ПРИМЕНЕНИЕ В БОЕВУЮ БД: {len(inc)} групп, {fnum(b)} → {fnum(a)} фактов.",
+                  *([f"Из них скрыто фильтром: {len(hid)} групп."] if hid else []),
                   f"Перед записью будет сделан бэкап: {dm.BACKUPS_DIR}/claudushka-dedup-<время>.db",
                   "Модель повторно не вызывается — пишется ровно то, что в результатах.",
                   "Введите APPLY и Enter (пусто / Esc — отмена)."], "> ", lambda t: self._apply(inc, t), danger=True)
