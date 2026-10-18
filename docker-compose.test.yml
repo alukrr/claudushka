@@ -7,6 +7,8 @@ services:
       - ./bot.py:/app/bot.py
       - ./api_errors.py:/app/api_errors.py
       - ./db.py:/app/db.py
+      - ./dedup_memory.py:/app/dedup_memory.py
+      - ./dedup_tui.py:/app/dedup_tui.py
       - ./requirements.txt:/app/requirements.txt
       - ./data-test:/app/data
     env_file:
