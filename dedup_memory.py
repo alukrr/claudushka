@@ -728,7 +728,9 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mode", choices=["exact", "llm", "delete"], required=True)
+    p.add_argument("--mode", choices=["exact", "llm", "delete"], default=None,
+                   help="без --mode (или с --tui) открывается интерактивный TUI")
+    p.add_argument("--tui", action="store_true", help="интерактивный curses-интерфейс (нужен docker exec -it)")
     p.add_argument("--user-id", type=int, default=None)
     p.add_argument("--chat-id", type=int, default=None)
     p.add_argument("--tier", choices=["long", "medium"], default=None)
@@ -751,6 +753,10 @@ def main():
 
     if not DB_PATH.exists():
         sys.exit(f"Не нашла БД: {DB_PATH}")
+
+    if args.tui or args.mode is None:
+        import dedup_tui  # только в TUI-режиме: curses не нужен CLI
+        sys.exit(dedup_tui.run(args.model))
 
     conn, tmp_path = get_conn(writable=args.apply)
     if tmp_path:
