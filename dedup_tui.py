@@ -80,6 +80,7 @@ class App:
         # данные
         self.groups, self.nodes, self.chats, self.users = [], {}, {}, {}
         self.snapshot_at = ""
+        self.expired_n = 0
         self.calibs = dm.load_calibration()
         self.est_cache = {}
         # состояние списка
@@ -160,6 +161,7 @@ class App:
         try:
             self.groups = dm.load_groups(conn)
             self.chats, self.users = dm.load_directory(conn)
+            self.expired_n = dm.count_expired(conn)
         finally:
             conn.close()
             if tmp:
@@ -374,6 +376,9 @@ class App:
         s = f"поиск «{self.search}» {self.match_i + 1 if self.matches else 0}/{len(self.matches)}  " if self.search else ""
         self.put(4, 20, f"Снимок БД {self.snapshot_at}  {s}{flt}")
         self.put(5, 1, "Пробный прогон тоже вызывает API и стоит денег — в БД не пишет", self.A["warn"])
+        if self.expired_n:
+            self.put(6, 1, f"Просрочено medium: {fnum(self.expired_n)} (бот их не читает, dedup не видит) — x: удалить",
+                     self.A["warn"])
 
     def col_layout(self, w):
         # sel(4) arrow(2) name(*) id(14) kind(7) facts(8) cost(8) flag(2) status(13)
@@ -384,21 +389,21 @@ class App:
         self.draw_header(h, w)
         nw = self.col_layout(w)
         hdr = f"{'':8}{'Название':<{nw}} {'ID':<14} {'Тип':<7} {'Фактов':>8} {'$':>8} {'':2} {'Статус':<13}"
-        self.put(6, 0, hdr.ljust(w), self.A["colhdr"])
-        area = h - 8
+        self.put(7, 0, hdr.ljust(w), self.A["colhdr"])
+        area = h - 9
         if self.cur < self.top:
             self.top = self.cur
         if self.cur >= self.top + area:
             self.top = self.cur - area + 1
         mset = set(self.matches)
         if not self.rows:
-            self.put(7, 2, "Нет групп с 2+ фактами под текущий фильтр.")
+            self.put(8, 2, "Нет групп с 2+ живыми фактами под текущий фильтр.")
         for i in range(area):
             idx = self.top + i
             if idx >= len(self.rows):
                 break
             r = self.rows[idx]
-            y = 7 + i
+            y = 8 + i
             gs = self.row_groups(r)
             nf = sum(len(g.facts) for g in gs)
             ec = [self.est(g).cost for g in gs]
@@ -891,6 +896,7 @@ class App:
         ("F5 / d", "пробный прогон выбранного (СТОИТ ДЕНЕГ, в БД не пишет)"),
         ("l", "лимит групп для прогона (0 — без лимита)"),
         ("e", "правка группы БЕЗ модели (на строке группы): удалить/поправить/добавить факты, бесплатно"),
+        ("x", "удалить просроченные medium-факты (бэкап + ввод APPLY; бот чистит их и сам раз в сутки)"),
         ("r", "перечитать снимок БД"),
         ("v", "экран результатов прогона"),
         ("Просмотр группы", "e — режим правки «стало»; b — показать/скрыть «было» (запоминается)"),
@@ -1033,7 +1039,7 @@ class App:
     NAV = (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END)
 
     def keys_main(self, k):
-        area = self.scr.getmaxyx()[0] - 8
+        area = self.scr.getmaxyx()[0] - 9
         if k in self.NAV:
             self.cur = self.move(k, self.cur, len(self.rows), area)
             return False
@@ -1097,6 +1103,8 @@ class App:
             if self.results:
                 self.screen = "results"
             self.start_apply()
+        elif k == "x":
+            self.start_purge()
         elif k == "e":
             if r and r.kind == "group":
                 self.start_manual(r.group)
@@ -1111,6 +1119,29 @@ class App:
         elif k in ("?", curses.KEY_F1):
             self.screen = "help"
         return False
+
+    def start_purge(self):
+        if not self.expired_n:
+            self.info("Просроченных строк нет.")
+            return
+        self.applying = True
+        self.ask([f"УДАЛЕНИЕ ПРОСРОЧЕННЫХ ФАКТОВ ИЗ БОЕВОЙ БД: {fnum(self.expired_n)} строк (expires_at <= now).",
+                  "Бот их не читает и dedup не видит; long не затрагивается. Модель не вызывается.",
+                  f"Перед удалением будет сделан бэкап: {dm.BACKUPS_DIR}/claudushka-dedup-<время>.db",
+                  "Введите APPLY и Enter (пусто / Esc — отмена)."], "> ", self._purge, danger=True)
+
+    def _purge(self, text):
+        self.applying = False
+        if text.strip() != "APPLY":
+            self.info("Отменено — ничего не удалено.")
+            return
+        try:
+            n, backup = dm.purge_expired_reviewed()
+        except dm.BackupError as e:
+            self.info(f"Не удалено: {e}", "В БД ничего не изменено.")
+            return
+        self.load_data()
+        self.info(f"Удалено просроченных строк: {fnum(n)}.", f"Бэкап: {backup}")
 
     def do_search(self, text):
         self.search = text.strip()
