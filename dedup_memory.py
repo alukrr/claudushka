@@ -279,7 +279,7 @@ class GroupResult:
     facts_before: list[str]
     facts_after: list[str]
     expires_at: int | None
-    status: Literal["ok", "truncated", "error", "empty"]
+    status: Literal["ok", "truncated", "error", "empty", "manual"]
     error: str | None = None
     in_tok: int = 0
     cw_5m: int = 0
@@ -288,10 +288,23 @@ class GroupResult:
     out_tok: int = 0
     cost: float | None = None
     seconds: float = 0.0
+    # Ответ модели как он пришёл (до правок человека); у manual пусто. facts_after — итог после правок.
+    facts_model: list[str] = field(default_factory=list)
+
+    @property
+    def edited(self) -> bool:
+        """Человек менял итог: у ok — отличается от ответа модели, у manual — от текущих фактов."""
+        if self.status == "ok":
+            return self.facts_after != self.facts_model
+        return self.status == "manual" and self.facts_after != self.facts_before
 
     @property
     def applicable(self) -> bool:
-        return self.status == "ok" and bool(self.facts_after)
+        # Пустое «стало» неприменимо (удалить все факты группы можно только --mode delete);
+        # manual без изменений тоже нечего применять.
+        if self.status == "ok":
+            return bool(self.facts_after)
+        return self.status == "manual" and bool(self.facts_after) and self.facts_after != self.facts_before
 
 
 @dataclass
@@ -401,7 +414,7 @@ def run_llm(groups, model, client, stop_event=None) -> Iterator[GroupResult]:
             elif not merged:
                 res.status = "empty"
             else:
-                res.status, res.facts_after = "ok", merged
+                res.status, res.facts_after, res.facts_model = "ok", merged, list(merged)
         except Exception as e:
             res.status, res.error = "error", f"{type(e).__name__}: {e}"
         res.seconds = time.monotonic() - t0
@@ -418,7 +431,9 @@ def apply_results(conn_rw, results: list[GroupResult]) -> ApplyReport:
     rep = ApplyReport()
     for r in results:
         if not r.applicable:
-            rep.skipped.append((r.key, f"статус {r.status}"))
+            why = ("пусто после правки (удалить все факты группы — только --mode delete)" if r.status == "ok" and r.facts_model
+                   else "без изменений" if r.status == "manual" and r.facts_after else f"статус {r.status}")
+            rep.skipped.append((r.key, why))
             continue
         k = r.key
         try:
@@ -600,15 +615,20 @@ def backup_db(dest_dir: Path | None = None) -> Path:
     return path
 
 
-def save_run(model, results: list[GroupResult], runs_dir: Path | None = None) -> Path | None:
-    """Аудит-журнал прогона (в т.ч. непримененного) -> data/dedup_runs/<ts>-<model>.json."""
+def save_run(model, results: list[GroupResult], runs_dir: Path | None = None, suffix: str = "") -> Path | None:
+    """Аудит-журнал прогона (в т.ч. непримененного) -> data/dedup_runs/<ts>-<model>[-suffix].json.
+
+    На группу: facts_before, facts_model (ответ модели), facts_after (итог после правок человека),
+    edited и status (manual — ручная правка без модели): видно, что правил человек, а что модель.
+    """
     runs_dir = runs_dir or RUNS_DIR
-    path = runs_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{model}.json"
+    path = runs_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{model}{suffix}.json"
     payload = {
         "model": model, "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "groups": [{
             "key": asdict(r.key), "row_ids": r.row_ids, "status": r.status, "error": r.error,
-            "facts_before": r.facts_before, "facts_after": r.facts_after,
+            "facts_before": r.facts_before, "facts_model": r.facts_model, "facts_after": r.facts_after,
+            "edited": r.edited,
             "tokens": {"in": r.in_tok, "cw_5m": r.cw_5m, "cw_1h": r.cw_1h,
                        "cache_read": r.cache_read, "out": r.out_tok},
             "cost": r.cost, "seconds": round(r.seconds, 2),
@@ -657,6 +677,12 @@ def load_directory(conn) -> tuple[dict, dict]:
     except sqlite3.Error:
         pass
     return chats, users
+
+
+def make_manual_result(g: Group) -> GroupResult:
+    """Ручная правка без модели: «было» = текущие факты снимка, «стало» = их копия. Токены/деньги нулевые."""
+    return GroupResult(g.key, list(g.row_ids), list(g.facts), list(g.facts), g.expires_at, "manual",
+                       cost=0.0)
 
 
 def fmt_dur(sec: float) -> str:
