@@ -2,6 +2,7 @@ import os
 import re
 import json
 import html
+import io
 from urllib.parse import urlparse
 import logging
 import time
@@ -1878,29 +1879,59 @@ def _persona_text(is_group: bool) -> str:
     return base
 
 
+PROFILE_BLOCK_MAX_CHARS = 8000  # блок профилей в system — под лимитом размера (docs/claude/memory.md)
+
+
+def _profile_text(user_id: int, is_group: bool, chat_id: int | None) -> str:
+    """Проверенный профиль: ПЕРЕД фактами, при противоречии важнее фактов. "" — профилей нет.
+
+    Группа — профили участников ЭТОГО чата; личка — профиль context='private'. Порядок стабилен
+    (prompt cache: блок памяти — точка №2). Профиль не под потолком MEMORY_LONG_PER_USER, у него свой лимит.
+    """
+    def fmt(prof: dict) -> str:
+        return "; ".join(f"{db.PROFILE_LABELS[f]}: {v}" for f, v in prof.items())
+    if is_group:
+        lines = [f"{p['name']}: {fmt(p['profile'])}" for p in db.get_chat_profiles(chat_id) if p["profile"]]
+        head = "Проверенный профиль участников этого чата (подтверждён людьми; при противоречии с фактами ниже ВАЖНЕЕ фактов):"
+    else:
+        prof = db.get_profile(user_id, "private", 0)
+        lines = [fmt(prof)] if prof else []
+        head = "Проверенный профиль этого пользователя (подтверждён людьми; при противоречии с фактами ниже ВАЖНЕЕ фактов):"
+    if not lines:
+        return ""
+    body = "\n".join(lines)
+    if len(body) > PROFILE_BLOCK_MAX_CHARS:
+        body = body[:PROFILE_BLOCK_MAX_CHARS].rsplit("\n", 1)[0]
+    return head + "\n" + body
+
+
 def _memory_text(user_id: int, is_group: bool, chat_id: int | None) -> str:
-    """Блок памяти для system ("" если фактов нет). Меняется при извлечении фактов (раз в
-    5/15 реплик) — поэтому отдельный блок со своей точкой prompt cache №2."""
+    """Блок памяти для system ("" если ничего нет): профиль, затем факты. Меняется при извлечении фактов
+    (раз в 5/15 реплик) и подтверждении профилей — поэтому отдельный блок со своей точкой prompt cache №2."""
+    parts = []
+    profile = _profile_text(user_id, is_group, chat_id)
+    if profile:
+        parts.append(profile)
     if is_group:
         # Группа: факты про ВСЕХ участников этого чата (долго- и среднесрочные).
         all_memory = db.get_all_chat_memory(chat_id)
         if all_memory:
-            parts = []
+            lines = []
             for p in all_memory:
                 line = p["name"] + ": " + "; ".join(p["long"]) if p["long"] else p["name"] + ":"
                 if p["medium"]:
                     line += " | Недавно: " + "; ".join(p["medium"])
                 if p["long"] or p["medium"]:
-                    parts.append(line)
-            if parts:
-                return "Что ты знаешь об участниках этого чата:\n" + "\n".join(parts) + "\nИспользуй эти знания естественно, не перечисляй их."
+                    lines.append(line)
+            if lines:
+                parts.append("Что ты знаешь об участниках этого чата:\n" + "\n".join(lines) + "\nИспользуй эти знания естественно, не перечисляй их.")
     else:
         # Личка: личные факты + все групповые факты про человека (группа течёт вверх).
         facts = db.get_memory_for_private(user_id)
         if facts:
             facts_str = "\n".join(f"- {f}" for f in facts)
-            return f"Вот что ты помнишь об этом пользователе:\n{facts_str}\nИспользуй эти знания естественно, не перечисляй их."
-    return ""
+            parts.append(f"Вот что ты помнишь об этом пользователе:\n{facts_str}\nИспользуй эти знания естественно, не перечисляй их.")
+    return "\n\n".join(parts)
 
 
 def get_system_prompt(user_id: int, is_group: bool = False, chat_id: int = None,
@@ -2073,6 +2104,42 @@ def private_history(user_id: int) -> list[dict]:
     return [{"role": r["role"], "content": r["content"]} for r in window]
 
 
+PROFILE_UPDATES_RULES = (
+    "Профиль человека — отдельно от фактов. Тебе дан ТЕКУЩИЙ профиль (подтверждённые значения; «ожидает» — уже "
+    "предложено и ждёт подтверждения). Если человек ЯВНО и устойчиво заявил о СЕБЕ что-то из полей профиля, "
+    "добавь в profile_updates: [{\"field\": \"city\", \"value\": \"Казань\", \"evidence\": \"короткая цитата\"}]. "
+    "Поля: name (как зовут / как обращаться), gender, nicknames, birth_year (ГОД рождения, не возраст: «мне 40» в "
+    "{year} → {year_40}; если неточно — «≈{year_40}»), city (где человек постоянно живёт), profession, hobbies, "
+    "family, communication (как человек просит с ним общаться). Только явное устойчивое заявление о себе; отпуск, "
+    "поездка, командировка, «сейчас в…», гости — НИКОГДА; при сомнении не предлагай. Не повторяй то, что уже есть в "
+    "профиле или ожидает подтверждения. value — коротко (до 200 символов), evidence — цитата из чата. "
+    "Нечего предложить — profile_updates пустой."
+)
+PROFILE_PROMPT_MAX_CHARS = 6000  # текущие профили в запросе извлечения — под лимитом размера
+
+
+def _profile_prompt_text(context: str, chat_id, people: dict) -> str:
+    """Текущие профили + ожидающие предложения для запроса извлечения. people: {имя: user_id}."""
+    pending = db.get_pending_map(context, chat_id)
+    lines = []
+    for name, uid in people.items():
+        if not uid:
+            continue
+        cur = db.get_profile(uid, context, chat_id)
+        parts = [f"{f}={v}" for f, v in cur.items()]
+        pend = [f"{f}={v}" for f, v in pending.get(uid, {}).items()]
+        line = f"{name}: " + ("; ".join(parts) if parts else "(пусто)")
+        if pend:
+            line += " | ожидает: " + "; ".join(pend)
+        lines.append(line)
+    return "\n".join(lines)[:PROFILE_PROMPT_MAX_CHARS]
+
+
+def _profile_rules() -> str:
+    y = datetime.now(BERLIN_TZ).year
+    return PROFILE_UPDATES_RULES.replace("{year_40}", str(y - 40)).replace("{year}", str(y))
+
+
 def extract_memory(user_id: int, messages: list, is_group: bool = False, chat_id: int = None):
     try:
         recent = messages[-6:]
@@ -2085,27 +2152,41 @@ def extract_memory(user_id: int, messages: list, is_group: bool = False, chat_id
             # docs/claude/models-and-costs.md.
             model=DEFAULT_MODEL_ID,
             **aux_params(),
-            max_tokens=512,
+            # 1024, а не 512: вместе с фактами теперь отдаётся profile_updates (инцидент 2026-08-03 — обрезка JSON).
+            max_tokens=1024,
             system=(
                 "Извлеки важные УСТОЙЧИВЫЕ факты о пользователе из диалога. "
-                "Верни JSON-массив строк. Если новых фактов нет, верни пустой массив [].\n"
+                "Верни JSON-объект: {\"facts\": [строки], \"profile_updates\": [...]}. Если нового нет — пустые массивы.\n"
                 "Место жительства, работа, семейное положение, возраст записывай только когда человек "
                 "прямо говорит о себе как о постоянном («я живу в…», «переехал в…», «устроился в…»). "
                 "Поездки, отпуск, командировки, «сейчас в Москве», гости, «приехал на неделю» — временное, "
                 "НЕ записывай. Не записывай то, что противоречит устойчивому факту о человеке, если он явно "
                 "не сказал «переехал/сменил»; при сомнении пропусти.\n"
-                "Пример: [\"Зовут Алексей\", \"Живёт в Германии\", \"Работает DevOps-инженером\"]"
+                "Пример facts: [\"Зовут Алексей\", \"Живёт в Германии\", \"Работает DevOps-инженером\"]\n"
+                + _profile_rules()
             ),
-            messages=[{"role": "user", "content": f"Диалог:\n{json.dumps(recent, ensure_ascii=False)}"}],
+            messages=[{"role": "user", "content": (
+                f"Текущий профиль: {_profile_prompt_text('private', 0, {'пользователь': user_id}) or '(пусто)'}\n\n"
+                f"Диалог:\n{json.dumps(recent, ensure_ascii=False)}")}],
         )
         if api_errors.was_truncated(response):
             logger.warning(f"Memory extraction: ответ обрезан по max_tokens для {user_id}")
         text = response_text(response)
-        new_facts = api_errors.parse_json_lenient(text, "[", label=f"memory uid={user_id}")
+        data = api_errors.parse_json_lenient(text, "{", label=f"memory uid={user_id}")
+        new_facts, updates = [], []
+        if isinstance(data, dict):
+            new_facts = [f for f in (data.get("facts") or []) if isinstance(f, str)]
+            updates = data.get("profile_updates") or []
+        else:  # модель могла вернуть старый формат — голый массив строк
+            legacy = api_errors.parse_json_lenient(text, "[", label=f"memory uid={user_id} (legacy)")
+            new_facts = [f for f in (legacy or []) if isinstance(f, str)]
         if new_facts:
             context = "group" if is_group else "private"
             db.add_memory_facts(user_id, new_facts, context, chat_id if is_group else None)
             logger.info(f"Memory updated for {user_id} ({context})")
+        if updates and isinstance(updates, list):
+            res = db.add_profile_proposals(user_id, "group" if is_group else "private", chat_id if is_group else None, updates)
+            logger.info(f"Profile proposals for {user_id}: {res}")
     except Exception as e:
         logger.error(f"Memory extraction error (uid={user_id}): {e}", exc_info=True)
 
@@ -2132,6 +2213,7 @@ def extract_all_participants_memory(chat_id: int):
         # фактами об участниках (инцидент 2026-09-28, docs/claude/incidents.md).
         lines = [f"{e['sender']}: {e['text']}" for e in transcript if not e["is_bot"]]
         dialog = "\n".join(lines)
+        uid_by_name = {n: db.get_user_id_by_name_in_chat(chat_id, n) for n in participants}
         response = sync_create(
             label="extract_chat_memory",
             model=DEFAULT_MODEL_ID,
@@ -2139,7 +2221,9 @@ def extract_all_participants_memory(chat_id: int):
             # 4096, а не 1024: на 12 участников с двумя массивами фактов на каждого
             # 1024 не хватало, ответ обрывался на полуслове и разбор терял ВСЁ окно
             # памяти по всем участникам сразу (11% извлечений, инцидент 2026-08-03).
-            max_tokens=4096,
+            # Профиль добавил profile_updates на участника — запас до 6144 (тот же класс проблемы: обрезка JSON
+            # теряет ВСЁ окно памяти по всем участникам сразу).
+            max_tokens=6144,
             system=(
                 "Ты анализируешь групповой чат. Для каждого из указанных участников извлеки два типа фактов.\n"
                 "long_term — устойчивые факты: кто человек, где живёт/работает, чем занимается, "
@@ -2154,14 +2238,19 @@ def extract_all_participants_memory(chat_id: int):
                 "с кем поссорился, что болит, что планирует на этой неделе, где сейчас в поездке. "
                 "Конкретные события.\n"
                 "Не больше 3 фактов каждого типа на человека — только самые важные.\n"
-                "Верни JSON: {\"participants\": [{\"name\": \"Имя\", \"long_term\": [...], \"medium_term\": [...]}]}\n"
+                "Верни JSON: {\"participants\": [{\"name\": \"Имя\", \"long_term\": [...], \"medium_term\": [...], "
+                "\"profile_updates\": [...]}]}\n"
                 "Если фактов нет — пустые массивы []. Клодушку не включай. Только факты прямо из чата.\n"
                 "В чате есть бот Клодушка, её реплик тут нет — обращения к ней в тексте нормальны. "
                 "Не записывай ролевые игры и розыгрыши с ботом (кто «позвонил Алексею», кто «заблокирован», "
                 "кто кем прикидывается ради шутки) и не записывай ярлыки вроде «держит такие-то взгляды» "
-                "по одной перепалке — в long_term только то, что человек устойчиво говорит о себе сам."
+                "по одной перепалке — в long_term только то, что человек устойчиво говорит о себе сам.\n"
+                + _profile_rules()
             ),
-            messages=[{"role": "user", "content": f"Участники: {', '.join(participants)}\n\nЧат:\n{dialog}"}],
+            messages=[{"role": "user", "content": (
+                f"Участники: {', '.join(participants)}\n\n"
+                f"Текущие профили участников:\n{_profile_prompt_text('group', chat_id, uid_by_name) or '(пусто)'}\n\n"
+                f"Чат:\n{dialog}")}],
         )
         if api_errors.was_truncated(response):
             logger.warning(
@@ -2182,9 +2271,13 @@ def extract_all_participants_memory(chat_id: int):
             name = p.get("name", "")
             if not name:
                 continue
-            uid = db.get_user_id_by_name_in_chat(chat_id, name)
+            uid = uid_by_name.get(name) or db.get_user_id_by_name_in_chat(chat_id, name)
             if not uid:
                 continue
+            updates = p.get("profile_updates")
+            if isinstance(updates, list) and updates:
+                res = db.add_profile_proposals(uid, "group", chat_id, updates)
+                logger.info(f"Profile proposals chat={chat_id} uid={uid}: {res}")
             long_facts = [f for f in p.get("long_term", []) if isinstance(f, str)]
             medium_facts = [f for f in p.get("medium_term", []) if isinstance(f, str)]
             if long_facts:
@@ -3446,7 +3539,8 @@ USER_HELP = """\
   /help          — этот список
   /clear         — очистить историю диалога
   /memory        — что бот помнит о тебе
-  /forget        — забыть всё о тебе
+  /profile       — твой профиль в этом чате (имя, город, профессия…; наполняется после подтверждения админами)
+  /forget        — забыть всё о тебе (память и профиль)
   /id            — показать Telegram ID и статус
   /version       — версия бота
   /cost          — баланс, режим и расход (в группе — для админов группы)
@@ -3501,6 +3595,12 @@ ADMIN_HELP = """\
   /flare [chat_id] (/gpt25f)      — GPT Image 2.5 Flare (~$0.02, платный режим)
   /sunburst [chat_id] (/gpt25s)   — GPT Image 2.5 Sunburst (~$0.02, платный режим)
   Без пробного запроса (генерация стоит денег): ошибка провайдера всплывёт при рисовании.
+
+Профили (только в личке; бот предлагает изменения, раз в неделю — вс 19:00 Berlin — шлёт .md):
+  /profile_ok <N>          — подтвердить ВСЕ ещё не решённые предложения дайджеста N
+  /profile_no <N>          — отклонить их все
+  /profile_digest          — собрать и прислать дайджест прямо сейчас (для теста)
+  Править по одному / вручную — dedup, экран «Профили» (клавиша P)
 
 Прочее:
   /captcha_on/off          — включить/выключить капчу
@@ -3984,6 +4084,133 @@ async def notify_admins(text: str) -> None:
             await _admin_bot.send_message(chat_id=admin_id, text=text)
         except Exception as e:
             logger.error(f"Failed to notify admin {admin_id}: {e}")
+
+
+# Цитаты `evidence` из ЛИЧНЫХ чатов в .md-дайджест не включаем (он уходит обоим админам; решение Алексея
+# 2026-10-18). Цитата остаётся в БД и видна в dedup TUI. Группы — с цитатами.
+PROFILE_DIGEST_PRIVATE_EVIDENCE = False
+
+
+def _md_cell(text) -> str:
+    return str(text if text not in (None, "") else "—").replace("|", "\\|").replace("\n", " ")
+
+
+def format_profile_digest(digest_id: int, rows: list, day: str) -> str:
+    """.md дайджеста: чаты (личные — отдельным разделом) -> люди -> таблица поле | было | стало | основание | id."""
+    out = [f"# Профили: предложения за неделю ({day})", "",
+           f"Дайджест **#{digest_id}** · предложений: {len(rows)}", "",
+           f"Подтвердить всё: `/profile_ok {digest_id}` · отклонить всё: `/profile_no {digest_id}` · "
+           f"править по одному — dedup, экран «Профили» (`P`).", ""]
+    chats: dict = {}
+    for r in rows:
+        key = ("Личные чаты", True) if r["context"] == "private" else (r["chat_name"] or f"чат {r['chat_id']}", False)
+        chats.setdefault(key, {}).setdefault(r["user_name"], []).append(r)
+    for (title, is_private), people in chats.items():
+        out += [f"## {title}", ""]
+        with_ev = (not is_private) or PROFILE_DIGEST_PRIVATE_EVIDENCE
+        for person, items in people.items():
+            out += [f"### {person}", ""]
+            out.append("| поле | было | стало | основание | id |" if with_ev else "| поле | было | стало | id |")
+            out.append("|---|---|---|---|---|" if with_ev else "|---|---|---|---|")
+            for r in items:
+                label = db.PROFILE_LABELS.get(r["field"], r["field"])
+                cells = [label, _md_cell(r["old_value"]), _md_cell(r["new_value"])]
+                if with_ev:
+                    cells.append(_md_cell(r["evidence"]))
+                cells.append(str(r["id"]))
+                out.append("| " + " | ".join(cells) + " |")
+            out.append("")
+    return "\n".join(out)
+
+
+async def send_profile_digest(bot) -> str:
+    """Сформировать дайджест и разослать .md каждому из ADMIN_IDS. -> короткий итог (для /profile_digest)."""
+    digest_id, rows = await asyncio.to_thread(db.create_profile_digest)
+    if not digest_id:
+        await notify_admins("Профили: изменений за неделю нет.")
+        return "Предложений нет — дайджест не создан."
+    day = _berlin_now().strftime("%Y-%m-%d")
+    data = format_profile_digest(digest_id, rows, day).encode("utf-8")
+    people = len({(r["user_id"], r["context"], r["chat_id"]) for r in rows})
+    chats = len({(r["context"], r["chat_id"]) for r in rows})
+    caption = (f"Профили: {len(rows)} предложений, {people} чел. в {chats} чатах. "
+               f"Всё верно — /profile_ok {digest_id}, отклонить — /profile_no {digest_id}.")
+    sent = 0
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_document(chat_id=admin_id, document=io.BytesIO(data),
+                                    filename=f"profile-digest-{day}.md", caption=caption)
+            sent += 1
+        except Exception as e:
+            logger.error(f"profile digest: не удалось отправить админу {admin_id}: {e}")
+    logger.info(f"profile digest #{digest_id}: {len(rows)} предложений, отправлено админам: {sent}")
+    return f"Дайджест #{digest_id}: {len(rows)} предложений, отправлено админам: {sent}."
+
+
+async def profile_digest_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await send_profile_digest(context.bot)
+    except Exception:
+        logger.exception("profile_digest: сбой")
+
+
+async def _admin_private_only(update: Update) -> bool:
+    if not is_admin(update.effective_user.id):
+        return False
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Команда профилей — только в личке с ботом.")
+        return False
+    return True
+
+
+async def cmd_profile_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручной запуск дайджеста (для теста и staging) — админ, в личке."""
+    if not await _admin_private_only(update):
+        return
+    await update.message.reply_text(await send_profile_digest(context.bot))
+
+
+async def _profile_decide(update: Update, context: ContextTypes.DEFAULT_TYPE, approve: bool):
+    if not await _admin_private_only(update):
+        return
+    cmd = "/profile_ok" if approve else "/profile_no"
+    try:
+        digest_id = int(context.args[0])
+    except (IndexError, ValueError):
+        await update.message.reply_text(f"Формат: {cmd} <номер дайджеста>")
+        return
+    rep = await asyncio.to_thread(db.decide_digest, digest_id, approve, update.effective_user.id)
+    if not rep["total"]:
+        await update.message.reply_text(f"Дайджест #{digest_id} не найден.")
+        return
+    done = rep["approved"] if approve else rep["rejected"]
+    text = f"{'Подтверждено' if approve else 'Отклонено'} {done}, уже решено {rep['already']}."
+    if rep["failed"]:
+        text += f" Не применено {len(rep['failed'])}: " + "; ".join(sorted({w for _, w in rep["failed"]}))
+    await update.message.reply_text(text)
+
+
+async def cmd_profile_ok(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _profile_decide(update, context, True)
+
+
+async def cmd_profile_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _profile_decide(update, context, False)
+
+
+async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Свой профиль в ТЕКУЩЕМ чате (только чтение; в группе — только свой)."""
+    uid = update.effective_user.id
+    chat = update.effective_chat
+    is_group = chat.type in ("group", "supergroup")
+    prof = await asyncio.to_thread(db.get_profile, uid, "group" if is_group else "private", chat.id if is_group else 0)
+    if not prof:
+        await update.message.reply_text(
+            "Профиль пока пуст. Я замечаю о тебе устойчивые вещи (имя, город, профессию…) и предлагаю их админам — "
+            "раз в неделю они подтверждают.")
+        return
+    lines = [f"{db.PROFILE_LABELS[f]}: {v}" for f, v in prof.items()]
+    await update.message.reply_text("Твой профиль" + (" в этом чате" if is_group else "") + ":\n" + "\n".join(lines))
 
 
 async def memory_purge_job(context: ContextTypes.DEFAULT_TYPE = None):
@@ -4661,6 +4888,10 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("memory", cmd_memory))
+    app.add_handler(CommandHandler("profile", cmd_profile))
+    app.add_handler(CommandHandler("profile_ok", cmd_profile_ok))
+    app.add_handler(CommandHandler("profile_no", cmd_profile_no))
+    app.add_handler(CommandHandler("profile_digest", cmd_profile_digest))
     app.add_handler(CommandHandler("memory_full", cmd_memory_full))  # намеренно не в USER_HELP/ADMIN_HELP
     app.add_handler(CommandHandler("forget", cmd_forget))
     app.add_handler(CommandHandler("imagine", cmd_imagine))
@@ -4694,7 +4925,7 @@ def main():
         "id", "version", "users", "captcha_on", "captcha_off", "captcha_unban", "chats",
         "review", "review_on", "review_off", "verify", "unverify", "ban", "unban", "topup",
         "activity", "ratelimit", "cost", "haiku", "sonnet", "opus", "fable", "models",
-        "imagemodels", "update",
+        "imagemodels", "update", "profile", "profile_ok", "profile_no", "profile_digest",
     }
     _image_provider_cmds = [c for meta in IMAGE_PROVIDERS.values() for c in meta["cmds"]]
     assert len(_image_provider_cmds) == len(set(_image_provider_cmds)), \
@@ -4727,6 +4958,13 @@ def main():
         name="memory_purge"
     )
     logger.info("Memory purge scheduled at 04:30 Berlin time")
+    app.job_queue.run_daily(
+        profile_digest_job,
+        time=dt_time(hour=19, minute=0, tzinfo=BERLIN_TZ),
+        days=(0,),  # PTB >= 20: 0-6 = воскресенье..суббота (проверено по JobQueue.run_daily 22.8), 0 = воскресенье
+        name="profile_digest"
+    )
+    logger.info("Profile digest scheduled on Sundays at 19:00 Berlin time")
     logger.info("Клодушка started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
