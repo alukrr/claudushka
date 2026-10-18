@@ -787,6 +787,25 @@ def list_proposals(status: str = "pending", digest_id: int | None = None, conn=N
     return out
 
 
+def list_profiles(conn=None) -> list[dict]:
+    """Все подтверждённые поля профилей с именами чата/человека (для dedup TUI)."""
+    with _Conn(conn) as c:
+        rows = c.execute(
+            """SELECT p.user_id, p.context, p.chat_id, p.field, p.value, p.source, p.updated_at,
+                      COALESCE(u.full_name, '') AS full_name, COALESCE(u.username, '') AS username,
+                      COALESCE(ac.name, '') AS chat_name
+               FROM user_profile p
+               LEFT JOIN users u ON u.telegram_id = p.user_id
+               LEFT JOIN allowed_chats ac ON ac.chat_id = p.chat_id AND p.context = 'group'""").fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        nm = d["full_name"] or (f"@{d['username']}" if d["username"] else str(d["user_id"]))
+        d["user_name"] = nm + (f" (@{d['username']})" if d["username"] and d["full_name"] else "")
+        out.append(d)
+    return out
+
+
 def decide_digest(digest_id: int, approve: bool, by: int | None = None) -> dict:
     """Решить ВСЕ ещё pending из дайджеста. -> отчёт apply_profile_ops + "total" (строк в дайджесте)."""
     with _Conn() as c:

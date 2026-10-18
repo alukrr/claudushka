@@ -3600,7 +3600,7 @@ ADMIN_HELP = """\
   /profile_ok <N>          — подтвердить ВСЕ ещё не решённые предложения дайджеста N
   /profile_no <N>          — отклонить их все
   /profile_digest          — собрать и прислать дайджест прямо сейчас (для теста)
-  Править по одному / вручную — dedup, экран «Профили» (клавиша P)
+  Править по одному / вручную — dedup, экран «Профили» (клавиша F9 или f)
 
 Прочее:
   /captcha_on/off          — включить/выключить капчу
@@ -4100,7 +4100,7 @@ def format_profile_digest(digest_id: int, rows: list, day: str) -> str:
     out = [f"# Профили: предложения за неделю ({day})", "",
            f"Дайджест **#{digest_id}** · предложений: {len(rows)}", "",
            f"Подтвердить всё: `/profile_ok {digest_id}` · отклонить всё: `/profile_no {digest_id}` · "
-           f"править по одному — dedup, экран «Профили» (`P`).", ""]
+           f"править по одному — dedup, экран «Профили» (F9).", ""]
     chats: dict = {}
     for r in rows:
         key = ("Личные чаты", True) if r["context"] == "private" else (r["chat_name"] or f"чат {r['chat_id']}", False)
