@@ -478,6 +478,25 @@ def add_memory_facts(user_id: int, facts: list[str], context: str = "private", c
     conn.close()
 
 
+def purge_expired_memory() -> int:
+    """Удалить просроченные факты (expires_at <= now). Возвращает число удалённых строк.
+
+    Бот и так не читает просроченное (фильтр `expires_at > now` во всех чтениях), но удалять
+    его никто не удалял — таблица копила medium-мусор бесконечно (docs/claude/memory.md, TTL).
+    long (expires_at IS NULL) не трогается никогда.
+    """
+    conn = get_conn()
+    try:
+        cur = conn.execute("DELETE FROM memory WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                           (int(time.time()),))
+        conn.commit()
+        n = cur.rowcount
+    finally:
+        conn.close()
+    logger.info(f"purge_expired_memory: удалено просроченных фактов: {n}")
+    return n
+
+
 def clear_memory(user_id: int, context: str = None):
     conn = get_conn()
     if context:
