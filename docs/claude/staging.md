@@ -23,7 +23,7 @@
     тестовый бот попытается слать дневные обзоры (`daily_chat_review`) в чужие боевые
     чаты — `allowed_chats` в тестовой БД должна быть пустой, чат тестовому боту нужно
     добавлять заново, отдельно от прода.
-  - `claudushka-test` **без** `/var/run/docker.sock` и **без** `.:/repo` — self-update
+  - `claudushka-test` **без** `/var/run/docker.sock` и **без** `.:/repo` (dedup запускается как `python3 /app/dedup_memory.py`: `dedup_memory.py`/`dedup_tui.py` смонтированы в `/app` отдельно) — self-update
     (`/update`) на стенде не нужен и опасен (стенд обновляется вручную через
     `git pull` + пересборку, см. ниже). Поэтому и без `git`/`docker.io` в `command:`
     — они там были только ради `/update`.

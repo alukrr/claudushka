@@ -895,6 +895,30 @@ def purge_expired_reviewed() -> tuple[int, Path]:
         conn.close()
 
 
+def _bot_db():
+    """Слой данных бота (db.py): ту же логику профилей (apply_profile_ops и т.д.) не дублируем.
+    db.DB_PATH по умолчанию /app/data/... — выравниваем с DB_PATH этого скрипта."""
+    import db
+    db.DB_PATH = DB_PATH
+    return db
+
+
+def load_profile_data(conn) -> tuple[list, list]:
+    """(предложения pending, подтверждённые поля) со снимка. sqlite3.OperationalError — таблиц ещё нет
+    (бот с профилями не запускался)."""
+    d = _bot_db()
+    return d.list_proposals(conn=conn), d.list_profiles(conn=conn)
+
+
+def profile_commit(ops: list, by: int | None = None) -> dict:
+    """Запись профилей в боевую БД: бэкап -> apply_profile_ops (одна транзакция).
+    Бэкап не создался -> BackupError, ничего не записано. -> (отчёт apply_profile_ops + 'backup')."""
+    backup = backup_db()
+    rep = _bot_db().apply_profile_ops(ops, by)
+    rep["backup"] = backup
+    return rep
+
+
 def make_manual_result(g: Group) -> GroupResult:
     """Ручная правка без модели: «было» = текущие факты снимка, «стало» = их копия. Токены/деньги нулевые."""
     return GroupResult(g.key, list(g.row_ids), list(g.facts), list(g.facts), g.expires_at, "manual",

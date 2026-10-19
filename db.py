@@ -289,6 +289,9 @@ def init_db():
     _run_once(conn, "billing_access", _mig_access)
     _run_once(conn, "billing_defaults", _mig_defaults)
     _run_once(conn, "billing_starter_bonus", _mig_starter_bonus)
+    _run_once(conn, "user_profile_v1", _mig_profile)
+    # куда переехали нерешённые предложения старого дайджеста (для ответа /profile_ok со старым номером)
+    conn.execute("CREATE TABLE IF NOT EXISTS profile_digest_moves (old_id INTEGER PRIMARY KEY, new_id INTEGER NOT NULL)")
     # daily_usage нужна только за сегодня; строки старше недели — мусор.
     try:
         conn.execute("DELETE FROM daily_usage WHERE day < date('now', '-7 days')")
@@ -497,6 +500,369 @@ def purge_expired_memory() -> int:
     return n
 
 
+# --- Профиль участника (docs/claude/profile.md) ---
+# Подтверждённые человеком/админом значения полей + очередь предложений от модели. Профиль свой в каждом чате:
+# (user_id, context, chat_id); личка — context='private', chat_id=0 (не NULL: PRIMARY KEY с NULL не держит
+# уникальность). Модель только ПРЕДЛАГАЕТ (profile_proposals), в user_profile пишет админ (/profile_ok или dedup TUI).
+
+# Порядок = порядок показа. username в профиль не дублируем — он есть в users.
+PROFILE_FIELDS = ("name", "gender", "nicknames", "birth_year", "city", "profession", "hobbies", "family",
+                  "communication")
+PROFILE_LABELS = {
+    "name": "Имя", "gender": "Пол", "nicknames": "Прозвища", "birth_year": "Год рождения",
+    "city": "Город", "profession": "Профессия", "hobbies": "Увлечения", "family": "Семья",
+    "communication": "Как общаться",
+}
+# Любой источник в system-prompt — с лимитом по РАЗМЕРУ (docs/claude/memory.md, общий инвариант).
+PROFILE_VALUE_MAX = 200     # символов в одном значении
+PROFILE_TOTAL_MAX = 1200    # символов значений на один профиль
+PROFILE_EVIDENCE_MAX = 200
+
+
+def _mig_profile(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS user_profile (
+            user_id INTEGER NOT NULL, context TEXT NOT NULL, chat_id INTEGER NOT NULL,
+            field TEXT NOT NULL, value TEXT NOT NULL,
+            source TEXT NOT NULL,
+            updated_at INTEGER NOT NULL, updated_by INTEGER,
+            PRIMARY KEY (user_id, context, chat_id, field)
+        );
+        CREATE TABLE IF NOT EXISTS profile_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL, context TEXT NOT NULL, chat_id INTEGER NOT NULL,
+            field TEXT NOT NULL, old_value TEXT, new_value TEXT NOT NULL,
+            evidence TEXT,
+            created_at INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+            digest_id INTEGER, decided_at INTEGER, decided_by INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_profile_prop_status ON profile_proposals(status, digest_id);
+        CREATE INDEX IF NOT EXISTS idx_profile_prop_user ON profile_proposals(user_id, context, chat_id, field);
+    """)
+
+
+def profile_chat_id(context: str, chat_id) -> int:
+    return 0 if context == "private" else int(chat_id or 0)
+
+
+def normalize_profile_value(field: str, value) -> str | None:
+    """Чистое значение поля или None (мусор). birth_year — ГОД (опц. «≈»), не возраст."""
+    if field not in PROFILE_FIELDS or not isinstance(value, (str, int)):
+        return None
+    v = " ".join(str(value).split()).strip()
+    if not v:
+        return None
+    if field == "birth_year":
+        approx = v.startswith(("≈", "~"))
+        digits = v.lstrip("≈~ ").strip()
+        if not digits.isdigit() or not (1900 <= int(digits) <= time.localtime().tm_year):
+            return None
+        return ("≈" if approx else "") + digits
+    return v[:PROFILE_VALUE_MAX]
+
+
+class _Conn:
+    """with-обёртка: своё соединение закрывается, переданное снаружи — нет."""
+    def __init__(self, conn=None):
+        self.own = conn is None
+        self.conn = get_conn() if conn is None else conn
+
+    def __enter__(self):
+        return self.conn
+
+    def __exit__(self, *exc):
+        if self.own:
+            self.conn.close()
+
+
+def get_profile(user_id: int, context: str, chat_id, conn=None) -> dict:
+    """{field: value} в порядке PROFILE_FIELDS (только заполненные)."""
+    with _Conn(conn) as c:
+        rows = {r["field"]: r["value"] for r in c.execute(
+            "SELECT field, value FROM user_profile WHERE user_id = ? AND context = ? AND chat_id = ?",
+            (user_id, context, profile_chat_id(context, chat_id)))}
+    return {f: rows[f] for f in PROFILE_FIELDS if f in rows}
+
+
+def get_chat_profiles(chat_id: int, limit: int = 40, conn=None) -> list[dict]:
+    """Профили участников ЭТОГО чата: [{"user_id","name","profile":{...}}]. Изоляция по chat_id."""
+    with _Conn(conn) as c:
+        rows = c.execute(
+            """SELECT p.user_id, p.field, p.value,
+                      COALESCE((SELECT gm.sender_name FROM group_messages gm
+                                WHERE gm.chat_id = p.chat_id AND gm.user_id = p.user_id
+                                  AND gm.sender_name IS NOT NULL ORDER BY gm.timestamp DESC LIMIT 1),
+                               u.full_name, CAST(p.user_id AS TEXT)) AS name
+               FROM user_profile p LEFT JOIN users u ON u.telegram_id = p.user_id
+               WHERE p.context = 'group' AND p.chat_id = ? ORDER BY p.user_id""", (chat_id,)).fetchall()
+    people: dict[int, dict] = {}
+    for r in rows:
+        people.setdefault(r["user_id"], {"user_id": r["user_id"], "name": r["name"], "raw": {}})["raw"][r["field"]] = r["value"]
+    out = []
+    for p in list(people.values())[:limit]:
+        out.append({"user_id": p["user_id"], "name": p["name"],
+                    "profile": {f: p["raw"][f] for f in PROFILE_FIELDS if f in p["raw"]}})
+    return out
+
+
+def get_pending_map(context: str, chat_id, conn=None) -> dict:
+    """{user_id: {field: new_value}} — ожидающие предложения в этом чате (чтобы извлечение не предлагало то же)."""
+    with _Conn(conn) as c:
+        rows = c.execute(
+            "SELECT user_id, field, new_value FROM profile_proposals WHERE status = 'pending' AND context = ? AND chat_id = ?",
+            (context, profile_chat_id(context, chat_id))).fetchall()
+    out: dict = {}
+    for r in rows:
+        out.setdefault(r["user_id"], {})[r["field"]] = r["new_value"]
+    return out
+
+
+def add_profile_proposals(user_id: int, context: str, chat_id, updates: list, conn=None) -> dict:
+    """Сохранить предложения модели. -> счётчики {new, same, superseded, bad}.
+
+    То же значение, что в профиле или уже ожидающее по этому полю -> ничего; иначе новое pending,
+    старое pending по этому полю -> superseded. Неизвестное поле/мусор отбрасываются с warning.
+    """
+    cid = profile_chat_id(context, chat_id)
+    res = {"new": 0, "same": 0, "superseded": 0, "bad": 0}
+    now = int(time.time())
+    with _Conn(conn) as c:
+        for u in updates or []:
+            if not isinstance(u, dict):
+                res["bad"] += 1
+                continue
+            field = u.get("field")
+            if field not in PROFILE_FIELDS:
+                logger.warning(f"profile_updates: неизвестное поле {field!r} (uid={user_id}) — отброшено")
+                res["bad"] += 1
+                continue
+            value = normalize_profile_value(field, u.get("value"))
+            if value is None:
+                res["bad"] += 1
+                continue
+            ev = u.get("evidence")
+            ev = " ".join(str(ev).split())[:PROFILE_EVIDENCE_MAX] if ev else None
+            cur = c.execute("SELECT value FROM user_profile WHERE user_id=? AND context=? AND chat_id=? AND field=?",
+                            (user_id, context, cid, field)).fetchone()
+            pend = c.execute("SELECT id, new_value FROM profile_proposals WHERE user_id=? AND context=? AND chat_id=? "
+                             "AND field=? AND status='pending'", (user_id, context, cid, field)).fetchall()
+            if cur and cur["value"] == value:
+                # модель подтвердила ТЕКУЩЕЕ значение — висящие предложения с другим значением устарели
+                for p in pend:
+                    c.execute("UPDATE profile_proposals SET status='superseded', decided_at=? WHERE id=?", (now, p["id"]))
+                    res["superseded"] += 1
+                res["same"] += 1
+                continue
+            if any(p["new_value"] == value for p in pend):
+                res["same"] += 1
+                continue
+            for p in pend:
+                c.execute("UPDATE profile_proposals SET status='superseded', decided_at=? WHERE id=?", (now, p["id"]))
+                res["superseded"] += 1
+            c.execute("INSERT INTO profile_proposals (user_id, context, chat_id, field, old_value, new_value, evidence, "
+                      "created_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+                      (user_id, context, cid, field, cur["value"] if cur else None, value, ev, now))
+            res["new"] += 1
+        c.commit()
+    return res
+
+
+def _set_field(c, user_id, context, chat_id, field, value, source, by, now) -> str | None:
+    """Записать поле профиля; None — успех, иначе причина отказа."""
+    value = normalize_profile_value(field, value)
+    if value is None:
+        return "некорректное значение"
+    cid = profile_chat_id(context, chat_id)
+    others = sum(len(r["value"]) for r in c.execute(
+        "SELECT value FROM user_profile WHERE user_id=? AND context=? AND chat_id=? AND field != ?",
+        (user_id, context, cid, field)))
+    if others + len(value) > PROFILE_TOTAL_MAX:
+        return f"профиль длиннее {PROFILE_TOTAL_MAX} символов"
+    c.execute("INSERT INTO user_profile (user_id, context, chat_id, field, value, source, updated_at, updated_by) "
+              "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, context, chat_id, field) DO UPDATE SET "
+              "value=excluded.value, source=excluded.source, updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+              (user_id, context, cid, field, value, source, now, by))
+    return None
+
+
+def apply_profile_ops(ops: list, by: int | None = None, conn=None) -> dict:
+    """Одна транзакция на все операции (общий путь для /profile_ok, /profile_no и dedup TUI).
+
+    ops: ("approve", proposal_id, override_value|None) | ("reject", proposal_id) |
+         ("set", user_id, context, chat_id, field, value) | ("delete", user_id, context, chat_id, field).
+    approve: берёт ещё pending-предложение; source='model', а с override_value (админ поправил) — 'admin'.
+    Уже решённые предложения не трогаются (-> already). -> {approved, rejected, set, deleted, already, failed:[(op, why)]}
+    """
+    rep = {"approved": 0, "rejected": 0, "set": 0, "deleted": 0, "already": 0, "failed": []}
+    now = int(time.time())
+    with _Conn(conn) as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            for op in ops:
+                kind = op[0]
+                if kind in ("approve", "reject"):
+                    p = c.execute("SELECT * FROM profile_proposals WHERE id = ?", (op[1],)).fetchone()
+                    if p is None:
+                        rep["failed"].append((op, "предложение не найдено"))
+                        continue
+                    if p["status"] != "pending":
+                        rep["already"] += 1
+                        continue
+                    if kind == "reject":
+                        c.execute("UPDATE profile_proposals SET status='rejected', decided_at=?, decided_by=? WHERE id=?",
+                                  (now, by, p["id"]))
+                        rep["rejected"] += 1
+                        continue
+                    override = op[2] if len(op) > 2 else None
+                    if not override:
+                        # профиль изменился после создания предложения (напр. админ поправил в TUI) — не затираем
+                        cur = c.execute("SELECT value FROM user_profile WHERE user_id=? AND context=? AND chat_id=? "
+                                        "AND field=?", (p["user_id"], p["context"], p["chat_id"], p["field"])).fetchone()
+                        cur_v = cur["value"] if cur else None
+                        if cur_v != p["old_value"] and cur_v != p["new_value"]:
+                            rep["failed"].append((op, f"профиль изменился после предложения: было {p['old_value'] or '—'}, "
+                                                      f"сейчас {cur_v or '—'}"))
+                            continue
+                    why = _set_field(c, p["user_id"], p["context"], p["chat_id"], p["field"],
+                                     override if override else p["new_value"],
+                                     "admin" if override else "model", by, now)
+                    if why:
+                        rep["failed"].append((op, why))
+                        continue
+                    c.execute("UPDATE profile_proposals SET status='approved', decided_at=?, decided_by=? WHERE id=?",
+                              (now, by, p["id"]))
+                    rep["approved"] += 1
+                elif kind == "set":
+                    _, uid, ctx, cid, field, value = op
+                    why = _set_field(c, uid, ctx, cid, field, value, "admin", by, now)
+                    if why:
+                        rep["failed"].append((op, why))
+                    else:
+                        rep["set"] += 1
+                elif kind == "delete":
+                    _, uid, ctx, cid, field = op
+                    n = c.execute("DELETE FROM user_profile WHERE user_id=? AND context=? AND chat_id=? AND field=?",
+                                  (uid, ctx, profile_chat_id(ctx, cid), field)).rowcount
+                    rep["deleted"] += n
+                else:
+                    rep["failed"].append((op, "неизвестная операция"))
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+    return rep
+
+
+def create_profile_digest(conn=None) -> tuple:
+    """Недельный дайджест: ВСЕ pending на момент запуска получают новый digest_id.
+
+    Невыбранное из прошлых дайджестов переезжает в новый (напоминание раз в неделю); старые номера
+    для таких строк больше не действуют. Предложения, пришедшие ПОСЛЕ, в дайджест не входят.
+    -> (digest_id|None, rows) rows: [{id, user_id, user_name, context, chat_id, chat_name, field, old_value,
+    new_value, evidence}] в порядке показа.
+    """
+    with _Conn(conn) as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            did = (c.execute("SELECT COALESCE(MAX(digest_id), 0) FROM profile_proposals").fetchone()[0]) + 1
+            for r in c.execute("SELECT DISTINCT digest_id FROM profile_proposals "
+                               "WHERE status = 'pending' AND digest_id IS NOT NULL").fetchall():
+                c.execute("INSERT OR REPLACE INTO profile_digest_moves (old_id, new_id) VALUES (?, ?)",
+                          (r["digest_id"], did))
+            n = c.execute("UPDATE profile_proposals SET digest_id = ? WHERE status = 'pending'", (did,)).rowcount
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+        if not n:
+            return None, []
+        return did, list_proposals(digest_id=did, conn=c)
+
+
+def list_proposals(status: str = "pending", digest_id: int | None = None, conn=None) -> list[dict]:
+    """Предложения с именами чата/человека; порядок: чаты (личка в конце) -> человек -> поле профиля."""
+    where, params = ["p.status = ?"], [status]
+    if digest_id is not None:
+        where.append("p.digest_id = ?")
+        params.append(digest_id)
+    with _Conn(conn) as c:
+        rows = c.execute(
+            f"""SELECT p.id, p.user_id, p.context, p.chat_id, p.field, p.old_value, p.new_value, p.evidence,
+                       p.created_at, p.digest_id,
+                       COALESCE(u.full_name, '') AS full_name, COALESCE(u.username, '') AS username,
+                       COALESCE(ac.name, '') AS chat_name
+                FROM profile_proposals p
+                LEFT JOIN users u ON u.telegram_id = p.user_id
+                LEFT JOIN allowed_chats ac ON ac.chat_id = p.chat_id AND p.context = 'group'
+                WHERE {' AND '.join(where)}""", params).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        nm = d["full_name"] or (f"@{d['username']}" if d["username"] else str(d["user_id"]))
+        d["user_name"] = nm + (f" (@{d['username']})" if d["username"] and d["full_name"] else "")
+        out.append(d)
+    out.sort(key=lambda d: (d["context"] == "private", d["chat_name"] or str(d["chat_id"]), d["user_name"].lower(),
+                            PROFILE_FIELDS.index(d["field"]) if d["field"] in PROFILE_FIELDS else 99, d["id"]))
+    return out
+
+
+def list_profiles(conn=None) -> list[dict]:
+    """Все подтверждённые поля профилей с именами чата/человека (для dedup TUI)."""
+    with _Conn(conn) as c:
+        rows = c.execute(
+            """SELECT p.user_id, p.context, p.chat_id, p.field, p.value, p.source, p.updated_at,
+                      COALESCE(u.full_name, '') AS full_name, COALESCE(u.username, '') AS username,
+                      COALESCE(ac.name, '') AS chat_name
+               FROM user_profile p
+               LEFT JOIN users u ON u.telegram_id = p.user_id
+               LEFT JOIN allowed_chats ac ON ac.chat_id = p.chat_id AND p.context = 'group'""").fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        nm = d["full_name"] or (f"@{d['username']}" if d["username"] else str(d["user_id"]))
+        d["user_name"] = nm + (f" (@{d['username']})" if d["username"] and d["full_name"] else "")
+        out.append(d)
+    return out
+
+
+def decide_digest(digest_id: int, approve: bool, by: int | None = None) -> dict:
+    """Решить ВСЕ ещё pending из дайджеста. -> отчёт apply_profile_ops + "total" (строк в дайджесте);
+    "moved_to": M — номер устарел (нерешённые переехали в #M), ничего не сделано."""
+    with _Conn() as c:
+        # старый номер, чьи нерешённые предложения переехали в новый дайджест, ничего не решает
+        moved, seen = digest_id, set()
+        while moved not in seen:
+            seen.add(moved)
+            r = c.execute("SELECT new_id FROM profile_digest_moves WHERE old_id = ?", (moved,)).fetchone()
+            if not r:
+                break
+            moved = r["new_id"]
+        if moved != digest_id and c.execute(
+                "SELECT 1 FROM profile_proposals WHERE digest_id = ? AND status = 'pending'", (moved,)).fetchone():
+            return {"approved": 0, "rejected": 0, "set": 0, "deleted": 0, "already": 0, "failed": [],
+                    "total": 1, "moved_to": moved}
+        ids = [r["id"] for r in c.execute("SELECT id FROM profile_proposals WHERE digest_id = ?", (digest_id,))]
+        pend = [r["id"] for r in c.execute("SELECT id FROM profile_proposals WHERE digest_id = ? AND status = 'pending'",
+                                           (digest_id,))]
+        rep = apply_profile_ops([("approve" if approve else "reject", i) for i in pend], by, conn=c) if pend else \
+            {"approved": 0, "rejected": 0, "set": 0, "deleted": 0, "already": 0, "failed": []}
+        rep["already"] += len(ids) - len(pend)
+        rep["total"] = len(ids)
+    return rep
+
+
+def clear_profile_data(user_id: int, context: str | None = None) -> None:
+    """/forget: профиль и предложения человека (context=None — везде)."""
+    conn = get_conn()
+    for tbl in ("user_profile", "profile_proposals"):
+        if context:
+            conn.execute(f"DELETE FROM {tbl} WHERE user_id = ? AND context = ?", (user_id, context))
+        else:
+            conn.execute(f"DELETE FROM {tbl} WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
 def clear_memory(user_id: int, context: str = None):
     conn = get_conn()
     if context:
@@ -505,6 +871,7 @@ def clear_memory(user_id: int, context: str = None):
         conn.execute("DELETE FROM memory WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
+    clear_profile_data(user_id, context)  # профиль и предложения — часть «памяти» человека (/forget)
 
 
 def get_memory_for_private(user_id: int, long_limit: int = None, medium_limit: int = None) -> list[str]:

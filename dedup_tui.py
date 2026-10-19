@@ -11,6 +11,7 @@ import locale
 import logging
 import os
 import queue
+import sqlite3
 import textwrap
 import threading
 import time
@@ -320,10 +321,10 @@ class App:
             if self.modal:
                 self.draw_modal(h, w)
         try:
-            curses.curs_set(1 if (self.lined and self.cursor_pos and self.screen == "view") else 0)
+            curses.curs_set(1 if (self.lined and self.cursor_pos and self.screen in ("view", "profiles")) else 0)
         except curses.error:
             pass
-        if self.lined and self.cursor_pos and self.screen == "view" and not self.modal:
+        if self.lined and self.cursor_pos and self.screen in ("view", "profiles") and not self.modal:
             try:
                 self.scr.move(*self.cursor_pos)
             except curses.error:
@@ -436,7 +437,8 @@ class App:
             if status:
                 self.put(y, len(line), clip(status, 13), base if idx == self.cur else sattr)
         self.fbar(h, w, [("F1", "Помощь"), ("F2", "Модель"), ("F3", "Поиск"), ("F4", "Фильтр"),
-                         ("F5", "Пробный"), ("F6", "Сорт"), ("F7", "Цены"), ("F8", "Применить"), ("F10", "Выход")])
+                         ("F5", "Прогон"), ("F6", "Сорт"), ("F7", "Цены"), ("F8", "Примен"), ("F9", "Проф"),
+                         ("F10", "Выход")])
 
     # ---- экран прогона
     def draw_run(self, h, w):
@@ -634,16 +636,8 @@ class App:
                 self.put(y, 1, clip(lt, cw), 0)
         # строка состояния / строчный редактор
         self.cursor_pos = None
-        if self.lined:
-            le = self.lined
-            prompt = " правка: "
-            avail = max(5, w - len(prompt) - 2)
-            if le["pos"] < le["scroll"]:
-                le["scroll"] = le["pos"]
-            elif le["pos"] >= le["scroll"] + avail:
-                le["scroll"] = le["pos"] - avail + 1
-            self.put(h - 2, 0, (prompt + le["buf"][le["scroll"]:le["scroll"] + avail]).ljust(w), self.A["warn"])
-            self.cursor_pos = (h - 2, len(prompt) + le["pos"] - le["scroll"])
+        if self.draw_lined_bar(h, w):
+            pass
         else:
             bits = []
             if after is not None and vw["edit"]:
@@ -664,6 +658,21 @@ class App:
                       ([("→", "Из было")] if two else []) + [("u", "Отмена"), ("R", "Сброс"), ("b", "Было"), ("Esc", "Выход")])
         else:
             self.fbar(h, w, [("↑↓ PgUp PgDn", "Прокрутка")] + ([("e", "Править")]) + [("b", "Было"), ("Esc", "Назад")])
+
+    def draw_lined_bar(self, h, w) -> bool:
+        """Строчный редактор на строке h-2 (общий для просмотра группы и экрана «Профили»)."""
+        le = self.lined
+        if not le:
+            return False
+        prompt = " правка: "
+        avail = max(5, w - len(prompt) - 2)
+        if le["pos"] < le["scroll"]:
+            le["scroll"] = le["pos"]
+        elif le["pos"] >= le["scroll"] + avail:
+            le["scroll"] = le["pos"] - avail + 1
+        self.put(h - 2, 0, (prompt + le["buf"][le["scroll"]:le["scroll"] + avail]).ljust(w), self.A["warn"])
+        self.cursor_pos = (h - 2, len(prompt) + le["pos"] - le["scroll"])
+        return True
 
     # ---- правка
     def res_label(self, r):
@@ -845,6 +854,240 @@ class App:
         self.mutate(lambda a: a.__setitem__(slice(None), list(base)))
         self.vw["cur"] = max(0, min(self.vw["cur"], len(r.facts_after) - 1))
 
+    # ---- экран «Профили» (docs/claude/profile.md)
+    def open_profiles(self):
+        self.pf = {"tab": 0, "cur": 0, "top": 0, "marked": set(), "props": [], "profs": [], "rows": [], "missing": False}
+        self.pf_reload()
+        self.screen = "profiles"
+
+    def pf_reload(self):
+        pf = self.pf
+        conn, tmp = dm.get_conn(writable=False)
+        try:
+            pf["props"], pf["profs"] = dm.load_profile_data(conn)
+            pf["missing"] = False
+        except sqlite3.OperationalError:
+            pf["props"], pf["profs"], pf["missing"] = [], [], True  # бот с профилями ещё не запускался
+        finally:
+            conn.close()
+            if tmp:
+                os.remove(tmp)
+        pf["marked"] &= {p["id"] for p in pf["props"]}
+        self.pf_rebuild()
+
+    def pf_rebuild(self):
+        """Плоский список: чат -> человек -> (предложения | 9 полей профиля). Личка — отдельным пунктом."""
+        pf = self.pf
+        people: dict = {}   # (ctx, cid) -> {uid: {"name", "props", "fields"}}
+        titles: dict = {}
+
+        def person(ctx, cid, uid, name, chat_name):
+            key = (ctx, cid if ctx == "group" else 0)
+            titles[key] = "Личка" if ctx == "private" else (chat_name or f"чат {cid}")
+            return people.setdefault(key, {}).setdefault(uid, {"name": name, "props": [], "fields": {}})
+        for p in pf["props"]:
+            person(p["context"], p["chat_id"], p["user_id"], p["user_name"], p["chat_name"])["props"].append(p)
+        for r in pf["profs"]:
+            person(r["context"], r["chat_id"], r["user_id"], r["user_name"], r["chat_name"])["fields"][r["field"]] = r
+        rows = []
+        for key in sorted(people, key=lambda k: (k[0] == "private", titles[k].lower())):
+            n_props = sum(len(p["props"]) for p in people[key].values())
+            if pf["tab"] == 0 and not n_props:
+                continue
+            rows.append({"kind": "chat", "title": titles[key], "key": key,
+                         "count": n_props if pf["tab"] == 0 else len(people[key])})
+            for uid, pr in sorted(people[key].items(), key=lambda kv: kv[1]["name"].lower()):
+                if pf["tab"] == 0 and not pr["props"]:
+                    continue
+                rows.append({"kind": "person", "name": pr["name"], "uid": uid, "key": key, "props": pr["props"]})
+                if pf["tab"] == 0:
+                    rows += [{"kind": "prop", "p": p, "key": key, "uid": uid} for p in pr["props"]]
+                else:
+                    rows += [{"kind": "field", "key": key, "uid": uid, "field": f, "rec": pr["fields"].get(f)}
+                             for f in dm._bot_db().PROFILE_FIELDS]
+        pf["rows"] = rows
+        pf["cur"] = max(0, min(pf["cur"], len(rows) - 1))
+        self.dirty = True
+
+    def pf_targets(self, row):
+        """id предложений, на которые действуют y/n: отмеченные, иначе область под курсором."""
+        pf = self.pf
+        if pf["marked"]:
+            return sorted(pf["marked"])
+        if row is None:
+            return []
+        if row["kind"] == "prop":
+            return [row["p"]["id"]]
+        if row["kind"] == "person":
+            return [p["id"] for p in row["props"]]
+        if row["kind"] == "chat":
+            return [r["p"]["id"] for r in pf["rows"] if r["kind"] == "prop" and r["key"] == row["key"]]
+        return []
+
+    def draw_profiles(self, h, w):
+        pf = self.pf
+        d = dm._bot_db()
+        n_pend = len(pf["props"])
+        for i, (name, x) in enumerate((("Предложения (%d)" % n_pend, 1), ("Профили (%d)" % len(pf["profs"]), 22))):
+            self.put(0, x, f" {name} ", self.A["sel"] if pf["tab"] == i else 0)
+        self.put(0, 44, "Tab — вкладка", 0)
+        self.put(1, 1, "Запись в БОЕВУЮ базу: перед ней бэкап, подтверждение y/n. Личные чаты — полноправно, цитата видна здесь.",
+                 self.A["warn"])
+        if pf["missing"]:
+            self.put(3, 2, "Таблиц профилей ещё нет: бот с профилями не запускался (перезапусти claudushka).")
+            self.fbar(h, w, [("Esc", "Назад")])
+            return
+        self.put(2, 0, f" {'Предложения: чат → человек → поле' if pf['tab'] == 0 else 'Профили: чат → человек → поле'}".ljust(w),
+                 self.A["colhdr"])
+        area = h - 8
+        rows = pf["rows"]
+        if pf["cur"] < pf["top"]:
+            pf["top"] = pf["cur"]
+        if pf["cur"] >= pf["top"] + area:
+            pf["top"] = pf["cur"] - area + 1
+        if not rows:
+            self.put(3, 2, "Нет ожидающих предложений." if pf["tab"] == 0 else "Профилей пока нет.")
+        for i in range(area):
+            idx = pf["top"] + i
+            if idx >= len(rows):
+                break
+            r = rows[idx]
+            if r["kind"] == "chat":
+                text, attr = f"{r['title']}  ({r['count']})", self.A["title"]
+            elif r["kind"] == "person":
+                text, attr = f"  {r['name']}", curses.A_BOLD
+            elif r["kind"] == "prop":
+                p = r["p"]
+                mark = "x" if p["id"] in pf["marked"] else " "
+                text = (f"    [{mark}] {d.PROFILE_LABELS.get(p['field'], p['field'])}: {p['old_value'] or '—'} → {p['new_value']}"
+                        f"   (дайджест {p['digest_id'] if p['digest_id'] else 'не было'})")
+                attr = 0
+            else:
+                rec = r["rec"]
+                text = f"    {d.PROFILE_LABELS[r['field']]:<14} {rec['value'] if rec else '—'}" + \
+                       (f"   [{rec['source']}]" if rec else "")
+                attr = 0 if rec else curses.A_DIM
+            if idx == pf["cur"]:
+                self.put(3 + i, 0, clip(text, w).ljust(w), self.A["sel"])
+            else:
+                self.put(3 + i, 0, clip(text, w), attr)
+        # панель деталей: цитата-основание
+        cur = rows[pf["cur"]] if rows else None
+        if cur and cur["kind"] == "prop":
+            p = cur["p"]
+            ev = f"«{p['evidence']}»" if p["evidence"] else "—"
+            for j, ln in enumerate(textwrap.wrap(f"Основание: {ev}", w - 3)[:2]):
+                self.put(h - 5 + j, 1, ln, self.A["ok"])
+            self.put(h - 3, 1, f"{'личка' if p['context'] == 'private' else 'группа'} · создано "
+                               f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(p['created_at']))}"
+                               f"{' · цитата есть только здесь, в .md-дайджесте её нет' if p['context'] == 'private' else ''}")
+        if not self.draw_lined_bar(h, w):
+            self.cursor_pos = None
+        if self.lined:
+            self.fbar(h, w, [("Enter", "Сохранить"), ("Esc", "Отмена"), ("←→ Home End", "Курсор")])
+        elif pf["tab"] == 0:
+            self.fbar(h, w, [("Space", "Отметить"), ("a", "Все"), ("y", "Подтвердить"), ("n", "Отклонить"),
+                             ("Enter", "Исправить"), ("Tab", "Вкладка"), ("Esc", "Назад")])
+        else:
+            self.fbar(h, w, [("Enter", "Править"), ("d", "Удалить поле"), ("Tab", "Вкладка"), ("r", "Обновить"),
+                             ("Esc", "Назад")])
+
+    def keys_profiles(self, k):
+        pf = self.pf
+        rows = pf["rows"]
+        area = self.scr.getmaxyx()[0] - 8
+        row = rows[pf["cur"]] if rows else None
+        if pf["missing"]:
+            if k in (K_ESC, "q"):
+                self.screen = "main"
+            return False
+        if k in self.NAV:
+            pf["cur"] = self.move(k, pf["cur"], len(rows), area)
+        elif k == "\t":
+            pf["tab"] ^= 1
+            pf["cur"] = pf["top"] = 0
+            self.pf_rebuild()
+        elif k in (K_ESC, "q"):
+            self.screen = "main"
+        elif k == "r":
+            self.pf_reload()
+        elif pf["tab"] == 0:
+            ids = self.pf_targets(row)
+            if k == " " and row:
+                if row["kind"] == "prop":
+                    pf["marked"] ^= {row["p"]["id"]}
+                else:
+                    target = set(self.pf_targets_scope(row))
+                    pf["marked"] = (pf["marked"] - target) if target <= pf["marked"] else (pf["marked"] | target)
+            elif k == "a":
+                pf["marked"] = {p["id"] for p in pf["props"]}
+            elif k in ("y", "n") and ids:
+                self.pf_confirm_decide(ids, approve=(k == "y"))
+            elif k == K_ENTER and row and row["kind"] == "prop":
+                p = row["p"]
+                self.open_line(p["new_value"], lambda text, p=p: self.pf_edit_done(p, text))
+        else:
+            if k == K_ENTER and row and row["kind"] == "field":
+                cur = row["rec"]["value"] if row["rec"] else ""
+                self.open_line(cur, lambda text, row=row: self.pf_field_done(row, text))
+            elif k in ("d", curses.KEY_DC) and row and row["kind"] == "field" and row["rec"]:
+                label = dm._bot_db().PROFILE_LABELS[row["field"]]
+                op = ("delete", row["uid"], row["key"][0], row["key"][1], row["field"])
+                self.confirm([f"Удалить поле «{label}» ({row['rec']['value']}) из профиля?",
+                              "Перед записью — бэкап БД. Запись в боевую базу."], lambda: self.pf_commit([op]))
+        return False
+
+    def pf_targets_scope(self, row):
+        """id предложений под строкой-заголовком (для отметки пробелом на чате/человеке)."""
+        pf = self.pf
+        if row["kind"] == "person":
+            return [p["id"] for p in row["props"]]
+        return [r["p"]["id"] for r in pf["rows"] if r["kind"] == "prop" and r["key"] == row["key"]]
+
+    def pf_confirm_decide(self, ids, approve):
+        by_id = {p["id"]: p for p in self.pf["props"]}
+        lines = [f"{'Подтвердить' if approve else 'Отклонить'} предложений: {len(ids)}.", ""]
+        d = dm._bot_db()
+        for i in ids[:6]:
+            p = by_id[i]
+            lines.append(f"· {p['user_name']}: {d.PROFILE_LABELS.get(p['field'], p['field'])} → {p['new_value']}")
+        if len(ids) > 6:
+            lines.append(f"· … и ещё {len(ids) - 6}")
+        lines.append("Перед записью — бэкап БД. Запись в боевую базу.")
+        op = "approve" if approve else "reject"
+        self.confirm(lines, lambda: self.pf_commit([(op, i) for i in ids]))
+
+    def pf_edit_done(self, p, text):
+        if text is None or not text:
+            return
+        d = dm._bot_db()
+        override = None if text == p["new_value"] else text
+        self.confirm([f"Подтвердить {p['user_name']}: {d.PROFILE_LABELS.get(p['field'], p['field'])} → {text}"
+                      + (" (исправлено вами, source=admin)" if override else "") + "?",
+                      "Перед записью — бэкап БД. Запись в боевую базу."],
+                     lambda: self.pf_commit([("approve", p["id"], override)]))
+
+    def pf_field_done(self, row, text):
+        if text is None or not text:
+            return
+        d = dm._bot_db()
+        op = ("set", row["uid"], row["key"][0], row["key"][1], row["field"], text)
+        self.confirm([f"Записать в профиль: {d.PROFILE_LABELS[row['field']]} = {text}  (source=admin)?",
+                      "Перед записью — бэкап БД. Запись в боевую базу."], lambda: self.pf_commit([op]))
+
+    def pf_commit(self, ops):
+        try:
+            rep = dm.profile_commit(ops)
+        except dm.BackupError as e:
+            self.info(f"Не записано: {e}", "В БД ничего не изменено.")
+            return
+        self.pf_reload()
+        lines = [f"Готово: подтверждено {rep['approved']}, отклонено {rep['rejected']}, записано {rep['set']}, "
+                 f"удалено {rep['deleted']}; уже решено {rep['already']}.", f"Бэкап: {rep['backup']}"]
+        for op, why in rep["failed"][:4]:
+            lines.append(f" · не применено: {why}")
+        self.info(*lines)
+
     # ---- модель / сравнение / помощь
     def model_rows(self):
         out = []
@@ -907,6 +1150,7 @@ class App:
         ("F5 / d", "пробный прогон выбранного (СТОИТ ДЕНЕГ, в БД не пишет)"),
         ("l", "лимит групп для прогона (0 — без лимита)"),
         ("e", "правка группы БЕЗ модели (на строке группы): удалить/поправить/добавить факты, бесплатно"),
+        ("F9 / f", "экран «Профили»: предложения модели (подтвердить/отклонить/исправить) и ручная правка профилей"),
         ("x", "удалить просроченные medium-факты (бэкап + ввод APPLY; бот чистит их и сам раз в сутки)"),
         ("r", "перечитать снимок БД"),
         ("v", "экран результатов прогона"),
@@ -1125,6 +1369,8 @@ class App:
             if self.results:
                 self.screen = "results"
             self.start_apply()
+        elif k in (curses.KEY_F9, "f"):
+            self.open_profiles()
         elif k == "x":
             self.start_purge()
         elif k == "e":

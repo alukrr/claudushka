@@ -1,0 +1,37 @@
+# Чек-лист стенда: ТЗ `feat/user-profile` (профиль участника, еженедельный дайджест, экран «Профили», v1.5.0)
+
+Дизайн — `docs/claude/profile.md`. Места **TG-админ / TG-юзер / Сервер** и функции `q` / `logs` / `cache` —
+`docs/claude/staging-aliases.sh`, `staging-checklist-v0.10.md` (0.2). Стенд остаётся на ПУСТОЙ БД
+(`docs/claude/staging.md`: копия прода потянет `allowed_chats`, и тестовый бот запустит дневной обзор Opus по боевым
+чатам). Для динамики — две тестовые группы и один личный диалог. **Миграцию на реальных данных проверяем отдельно,
+на копии ВНЕ работающего стенда** — шаг 0.
+
+| Шаг | Где | Что делаю | Ожидание |
+|---|---|---|---|
+| 0 | Сервер | Миграция на копии прода (стенд и прод не трогаются): `docker exec claudushka python3 -c "import sqlite3; s=sqlite3.connect('/app/data/claudushka.db'); d=sqlite3.connect('/app/data/migtest.db'); s.backup(d); d.close()"` → `mv ~/claudushka/data/migtest.db ~/claudushka-test/data-test/migtest.db` → `docker exec claudushka-test python3 -c "import db; from pathlib import Path; db.DB_PATH=Path('/app/data/migtest.db'); db.init_db(); db.init_db(); print('ok')"` → `sqlite3 ~/claudushka-test/data-test/migtest.db \"SELECT name FROM schema_migrations WHERE name='user_profile_v1'\"` | `ok`, дважды без `Migration FAILED`; маркер `user_profile_v1` есть; существующие таблицы и строки не пострадали (`SELECT COUNT(*) FROM memory` до и после совпадает). Потом `rm ~/claudushka-test/data-test/migtest.db` |
+| 1 | Сервер | `q "SELECT name FROM schema_migrations WHERE name='user_profile_v1'"` до рестарта, затем рестарт стенда ДВАЖДЫ подряд | После первого рестарта строка есть; второй рестарт без ошибок миграции в `logs 80` (нет `Migration FAILED`) |
+| 2 | Сервер | `q "SELECT COUNT(*) AS n FROM user_profile"`, `... FROM profile_proposals` | Обе таблицы существуют, пока 0 строк |
+| 3 | TG-юзер, группа | Написать про отпуск: «я сейчас в Москве в отпуске на неделю», затем дождаться извлечения (≈15 сообщений в чате) | В `memory` — только `medium` («в отпуске в Москве»); `q "SELECT field,new_value,status FROM profile_proposals"` — предложения по `city` НЕТ |
+| 4 | TG-юзер, группа | «Я переехал в Москву насовсем», ≈15 сообщений | В `profile_proposals` одна `pending` строка `city` → «Москва» с цитатой в `evidence` |
+| 5 | TG-юзер, группа | Ещё раз то же самое («напомню, я живу в Москве») ≈15 сообщений | Новая строка НЕ появилась (то же значение, что в pending) |
+| 6 | TG-юзер, группа | «Всё, я переехал в Казань» ≈15 сообщений | Новая `pending` `city` → «Казань», прежняя `pending` стала `superseded` |
+| 7 | TG-юзер, личка с ботом | «Меня зовут …, мне 40, я переехал в Берлин и работаю врачом», 5 сообщений | `profile_proposals` с `context='private'`, `chat_id=0`; `birth_year` — год (не 40) |
+| 8 | TG-админ, личка | `/profile_digest` | Приходит `profile-digest-<дата>.md` обоим админам, подпись «Профили: N предложений…»; файл открывается, группы с цитатами |
+| 9 | TG-админ | Открыть .md | Раздел «Личные чаты» **без** колонки «основание» и без цитат; в БД `evidence` для private на месте (`q "SELECT evidence FROM profile_proposals WHERE context='private'"`) |
+| 10 | TG-юзер, группа | После дайджеста (шаг 8) вызвать ещё одно предложение (≈15 сообщений: новое увлечение) | Новая `pending`, `digest_id` NULL — в уже отправленный дайджест не входит |
+| 11 | TG-админ, личка | `/profile_ok <digest_id из шага 8>` | «Подтверждено N, уже решено 0.»; `user_profile` заполнен (`source='model'`); предложение из шага 10 осталось `pending` |
+| 12 | TG-админ #2 | Тот же `/profile_ok <id>` | «Подтверждено 0, уже решено N.» без ошибок; `/profile_no 99999` → «Дайджест #99999 не найден.» |
+| 13 | TG-админ, группа | `/profile_ok 1` в группе | «Команда профилей — только в личке с ботом.» (никаких побочных эффектов) |
+| 14 | TG-юзер, группа / личка | `/profile` | Показывает свой профиль именно этого чата (в группе — только своё); пустой — подсказка |
+| 15 | Сервер | Диалог в группе после подтверждения: «где я живу?»; `cache` | В system профиль идёт ПЕРЕД фактами, с пометкой «важнее фактов»; ответ использует город из профиля. `cache`: чтение кэша (`cache_read`) растёт как до ветки — prompt cache не сломан |
+| 16 | Сервер | `docker exec -it claudushka-test python3 /app/dedup_memory.py`, F9 (или `f`) | Экран «Профили»: вкладка «Предложения» (цитата в панели внизу, **для лички тоже**), «Профили» |
+| 17 | Сервер | В TUI: отметить `Space`, `y`, подтвердить `y` | Бэкап в `data/backups/`, предложение стало `approved`, поле записано; отклонить `n` — `rejected` |
+| 18 | Сервер | В TUI: `Enter` на предложении, исправить значение (кириллица), подтвердить | Поле записано с `source='admin'`, `status='approved'` |
+| 19 | Сервер | В TUI вкладка «Профили»: `Enter` на пустом поле — ввести, потом `d` на заполненном | Запись/удаление после `y`, бэкап есть; пункт «Личка» работает так же |
+| 20 | TG-юзер | `/forget` | `q "SELECT COUNT(*) FROM user_profile WHERE user_id=…"` и `profile_proposals` — 0 у этого человека, у других нет изменений |
+| 21 | Сервер | `q "SELECT value FROM user_profile"` — длина полей; вставить в извлечение очень длинную фразу | Значение ≤ 200 символов, профиль ≤ 1200; блок профиля в system ограничен |
+| 22 | Сервер | Воскресенье 19:00 Berlin (или ждать): `logs 200 \| grep -i "profile digest"` | Джоб `profile_digest` отработал сам, `Profile digest scheduled on Sundays at 19:00` в логе старта |
+| 23 | Сервер | Откат: `git revert` ветки + рестарт | Бот работает как до ветки; таблицы профилей остаются (безвредны) |
+
+**Лимиты и стоимость:** извлечение стало чуть дороже (профили в запросе ≤ 6000 симв., `max_tokens` 6144/1024) —
+сравни расход `label='extract_chat_memory'` / `extract_memory` в `usage_log` до и после (`/cost <chat_id>`).
