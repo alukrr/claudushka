@@ -290,6 +290,8 @@ def init_db():
     _run_once(conn, "billing_defaults", _mig_defaults)
     _run_once(conn, "billing_starter_bonus", _mig_starter_bonus)
     _run_once(conn, "user_profile_v1", _mig_profile)
+    # куда переехали нерешённые предложения старого дайджеста (для ответа /profile_ok со старым номером)
+    conn.execute("CREATE TABLE IF NOT EXISTS profile_digest_moves (old_id INTEGER PRIMARY KEY, new_id INTEGER NOT NULL)")
     # daily_usage нужна только за сегодня; строки старше недели — мусор.
     try:
         conn.execute("DELETE FROM daily_usage WHERE day < date('now', '-7 days')")
@@ -642,11 +644,15 @@ def add_profile_proposals(user_id: int, context: str, chat_id, updates: list, co
             ev = " ".join(str(ev).split())[:PROFILE_EVIDENCE_MAX] if ev else None
             cur = c.execute("SELECT value FROM user_profile WHERE user_id=? AND context=? AND chat_id=? AND field=?",
                             (user_id, context, cid, field)).fetchone()
-            if cur and cur["value"] == value:
-                res["same"] += 1
-                continue
             pend = c.execute("SELECT id, new_value FROM profile_proposals WHERE user_id=? AND context=? AND chat_id=? "
                              "AND field=? AND status='pending'", (user_id, context, cid, field)).fetchall()
+            if cur and cur["value"] == value:
+                # модель подтвердила ТЕКУЩЕЕ значение — висящие предложения с другим значением устарели
+                for p in pend:
+                    c.execute("UPDATE profile_proposals SET status='superseded', decided_at=? WHERE id=?", (now, p["id"]))
+                    res["superseded"] += 1
+                res["same"] += 1
+                continue
             if any(p["new_value"] == value for p in pend):
                 res["same"] += 1
                 continue
@@ -708,6 +714,15 @@ def apply_profile_ops(ops: list, by: int | None = None, conn=None) -> dict:
                         rep["rejected"] += 1
                         continue
                     override = op[2] if len(op) > 2 else None
+                    if not override:
+                        # профиль изменился после создания предложения (напр. админ поправил в TUI) — не затираем
+                        cur = c.execute("SELECT value FROM user_profile WHERE user_id=? AND context=? AND chat_id=? "
+                                        "AND field=?", (p["user_id"], p["context"], p["chat_id"], p["field"])).fetchone()
+                        cur_v = cur["value"] if cur else None
+                        if cur_v != p["old_value"] and cur_v != p["new_value"]:
+                            rep["failed"].append((op, f"профиль изменился после предложения: было {p['old_value'] or '—'}, "
+                                                      f"сейчас {cur_v or '—'}"))
+                            continue
                     why = _set_field(c, p["user_id"], p["context"], p["chat_id"], p["field"],
                                      override if override else p["new_value"],
                                      "admin" if override else "model", by, now)
@@ -750,6 +765,10 @@ def create_profile_digest(conn=None) -> tuple:
         c.execute("BEGIN IMMEDIATE")
         try:
             did = (c.execute("SELECT COALESCE(MAX(digest_id), 0) FROM profile_proposals").fetchone()[0]) + 1
+            for r in c.execute("SELECT DISTINCT digest_id FROM profile_proposals "
+                               "WHERE status = 'pending' AND digest_id IS NOT NULL").fetchall():
+                c.execute("INSERT OR REPLACE INTO profile_digest_moves (old_id, new_id) VALUES (?, ?)",
+                          (r["digest_id"], did))
             n = c.execute("UPDATE profile_proposals SET digest_id = ? WHERE status = 'pending'", (did,)).rowcount
             c.commit()
         except Exception:
@@ -807,8 +826,21 @@ def list_profiles(conn=None) -> list[dict]:
 
 
 def decide_digest(digest_id: int, approve: bool, by: int | None = None) -> dict:
-    """Решить ВСЕ ещё pending из дайджеста. -> отчёт apply_profile_ops + "total" (строк в дайджесте)."""
+    """Решить ВСЕ ещё pending из дайджеста. -> отчёт apply_profile_ops + "total" (строк в дайджесте);
+    "moved_to": M — номер устарел (нерешённые переехали в #M), ничего не сделано."""
     with _Conn() as c:
+        # старый номер, чьи нерешённые предложения переехали в новый дайджест, ничего не решает
+        moved, seen = digest_id, set()
+        while moved not in seen:
+            seen.add(moved)
+            r = c.execute("SELECT new_id FROM profile_digest_moves WHERE old_id = ?", (moved,)).fetchone()
+            if not r:
+                break
+            moved = r["new_id"]
+        if moved != digest_id and c.execute(
+                "SELECT 1 FROM profile_proposals WHERE digest_id = ? AND status = 'pending'", (moved,)).fetchone():
+            return {"approved": 0, "rejected": 0, "set": 0, "deleted": 0, "already": 0, "failed": [],
+                    "total": 1, "moved_to": moved}
         ids = [r["id"] for r in c.execute("SELECT id FROM profile_proposals WHERE digest_id = ?", (digest_id,))]
         pend = [r["id"] for r in c.execute("SELECT id FROM profile_proposals WHERE digest_id = ? AND status = 'pending'",
                                            (digest_id,))]

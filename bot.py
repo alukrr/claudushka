@@ -4180,6 +4180,10 @@ async def _profile_decide(update: Update, context: ContextTypes.DEFAULT_TYPE, ap
         await update.message.reply_text(f"Формат: {cmd} <номер дайджеста>")
         return
     rep = await asyncio.to_thread(db.decide_digest, digest_id, approve, update.effective_user.id)
+    if rep.get("moved_to"):
+        await update.message.reply_text(f"Дайджест #{digest_id} устарел, его нерешённые предложения перенесены в "
+                                        f"#{rep['moved_to']}. Решай по {cmd} {rep['moved_to']}.")
+        return
     if not rep["total"]:
         await update.message.reply_text(f"Дайджест #{digest_id} не найден.")
         return
