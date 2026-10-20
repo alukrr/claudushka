@@ -456,22 +456,49 @@ def run_llm(groups, model, client, stop_event=None, calib: dict | None = None) -
                 return "truncated", []
             return ("ok", merged) if merged else ("empty", [])
 
+        def call_split(facts, depth=0):
+            """Вызов; если ответ обрезан — кусок делится пополам и оба конца идут отдельно (до 4 раз подряд).
+            Оценка выхода занижена у уникальных фактов (почти нет слияний), поэтому реальная обрезка бывает и у куска."""
+            st, m = call(facts)
+            if st != "truncated" or len(facts) < 2 or depth >= 4:
+                return st, m
+            if not res.chunks:
+                res.chunks = 2
+            mid = len(facts) // 2
+            out = []
+            for half in (facts[:mid], facts[mid:]):
+                st, m = call_split(half, depth + 1)
+                if st != "ok":
+                    return st, []
+                out += m
+            return "ok", out
+
         def process(facts, level):
+            """level 0 — исходные факты; level>0 — уже результаты кусков, их слияние — опциональное улучшение:
+            обрезка/пусто/«не сжимается» на слиянии НЕ роняет группу, результат кусков (каждый честно дедуплицирован)
+            остаётся итогом, просто без межкусочной дедупликации."""
             if not estimate_group(facts, model, calib).risk:
-                return call(facts)
+                st, m = call_split(facts)
+                return (st, m) if level == 0 or st == "ok" else ("ok", facts)
             if level >= MAX_CHUNK_LEVELS:
-                return "truncated", []  # и после трёх проходов не влезает — как раньше, не применяем
+                return "ok", facts
             parts = plan_chunks(facts, calib)
             if len(parts) < 2:
-                return call(facts)
+                st, m = call_split(facts)
+                return (st, m) if level == 0 or st == "ok" else ("ok", facts)
             if level == 0:
                 res.chunks = len(parts)
             outs = []
             for part in parts:
-                st, m = call(part)
+                st, m = call_split(part)
                 if st != "ok":
-                    return st, []
-                outs += m
+                    if level == 0:
+                        return st, []
+                    outs += part  # кусок слияния не удался — оставляем его как есть
+                else:
+                    outs += m
+            if len(outs) >= 0.9 * len(facts):
+                return "ok", outs  # почти не сжимается — дальнейшие проходы только жгут деньги
             return process(outs, level + 1)  # слияние результатов кусков
 
         try:
