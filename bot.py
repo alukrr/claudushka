@@ -8,6 +8,7 @@ import logging
 import time
 import asyncio
 import functools
+import hashlib
 import contextvars
 from pathlib import Path
 from telegram import LinkPreviewOptions, Update
@@ -746,6 +747,83 @@ def get_chat_image_provider(chat_id: int) -> str:
         logger.warning(f"chat {chat_id}: unknown image provider {key!r} in DB, falling back to {db.DEFAULT_IMAGE_PROVIDER!r}")
         return db.DEFAULT_IMAGE_PROVIDER
     return key
+
+
+# --- Режимы характера (docs/claude/personas.md) ---
+# Один персонаж, пять режимов тона; переключение per-chat по образцу chat_image_provider. Команды — `cmds`
+# (менять названия здесь, в одном месте). tone — 1–2 фразы для поиска и коротких промптов; review_style —
+# подача обзора (нет → берётся tone). Тексты режимов — personas/<file>, volume `./personas` в compose.
+PERSONAS_DIR = Path(__file__).resolve().parent / "personas"
+PERSONAS = {
+    "classic": {
+        "label": "Классическая", "cmds": ["classic"], "file": "classic.md",
+        "tone": "остроумная, саркастичная и прямолинейная, с чёрным юмором",
+        "review_style": ("ироничный, остроумный, дерзкий, но не жестокий фельетон: ты считаешь себя умнее всех в чате "
+                         "(и не без оснований), но ты их любишь — просто они смешные"),
+    },
+    "business": {
+        "label": "Деловая", "cmds": ["business"], "file": "business.md",
+        "tone": "собранная, вежливая, по делу, как толковый коллега-консультант; юмор редко и сухо, без мата",
+    },
+    "toxic": {
+        "label": "Супер-мега-язвительная", "cmds": ["toxic"], "file": "toxic.md",
+        "tone": ("злобный хамоватый стендапер-прожарщик с густым матом и презрением к собеседникам; "
+                 "по делу отвечает точно, но свысока; никогда не извиняется"),
+        "review_style": ("как сводка «главного за сутки» от циничного желтушного репортёра. Каждая тема — отдельный абзац: "
+                         "кто что сказал (с исковерканными именами), как остальные отреагировали, и в конце абзаца — "
+                         "добивающий вывод-оскорбление про участников. Финал — общий диагноз чату одной-двумя фразами "
+                         "(«всё тот же зоопарк»)"),
+    },
+    "flirt": {
+        "label": "Игривая с флиртом", "cmds": ["flirt"], "file": "flirt.md",
+        "tone": "кокетливая и тёплая, с комплиментами и лёгким флиртом без напора, смайлы чуть чаще обычного",
+    },
+    "granny": {
+        "label": "Бабушка с пирожками", "cmds": ["granny"], "file": "granny.md",
+        "tone": "заботливая бабушка: «внучек», пирожки, ворчание на «эти ваши интернеты», но по делу отвечает точно",
+    },
+}
+DEFAULT_PERSONA = "classic"
+FREE_PERSONA_POOL = [k for k in PERSONAS if k != "flirt"]  # флирт в случайный режим дня free НЕ входит
+
+
+def check_personas() -> None:
+    """Fail-fast при старте: все файлы режимов читаются и не пусты (иначе — исключение, бот не стартует)."""
+    for key in PERSONAS:
+        if not _persona_mode_text(key):
+            raise RuntimeError(f"personas/{PERSONAS[key]['file']} пуст")
+    assert DEFAULT_PERSONA in PERSONAS and FREE_PERSONA_POOL, "реестр PERSONAS сломан"
+
+
+def free_persona(chat_id: int) -> str:
+    """Режим дня для free: sha256(chat_id:дата по Берлину) → индекс в пуле. НЕ hash() (рандомизирован между
+    процессами — режим прыгал бы после рестарта). Меняется в полночь по Берлину."""
+    day = datetime.now(BERLIN_TZ).date().isoformat()
+    digest = hashlib.sha256(f"{chat_id}:{day}".encode()).digest()
+    return FREE_PERSONA_POOL[int.from_bytes(digest[:8], "big") % len(FREE_PERSONA_POOL)]
+
+
+def get_chat_persona(chat_id: int) -> str:
+    """Эффективный режим чата (личка — chat_id = user_id): free → режим дня (запись chat_persona НЕ трогаем —
+    при возврате в paid выбор восстанавливается), paid → выбор чата, иначе DEFAULT_PERSONA."""
+    if chat_tier(chat_id) == "free":
+        return free_persona(chat_id)
+    key = db.get_chat_persona_db(chat_id)
+    if key is None:
+        return DEFAULT_PERSONA
+    if key not in PERSONAS:
+        logger.warning(f"chat {chat_id}: unknown persona {key!r} in DB, falling back to {DEFAULT_PERSONA!r}")
+        return DEFAULT_PERSONA
+    return key
+
+
+def persona_tone(chat_id: int) -> str:
+    return PERSONAS[get_chat_persona(chat_id)]["tone"]
+
+
+def persona_review_style(chat_id: int) -> str:
+    meta = PERSONAS[get_chat_persona(chat_id)]
+    return meta.get("review_style") or meta["tone"]
 
 
 TIER_FREE_MSG = (
@@ -1797,34 +1875,38 @@ def check_captcha_answer(question: str, answer: str) -> bool:
 
 # --- Memory ---
 
-def _persona_text(is_group: bool) -> str:
-    """Персона (+ групповой аддендум). СТАТИЧНА: без даты и без чего-либо, зависящего от
-    чата/времени, — одинакова для всех чатов одного типа на одной модели, поэтому это
-    общая точка prompt cache №1. Дата, результаты поиска, reply-контекст едут в хвосте
-    (`service_block`, последний user-turn), а не здесь: любое изменение в начале префикса
-    обнуляет кэш всего, что за ним (docs/claude/prompt-cache.md).
-    """
-    base = (
-        "Ты Клодушка — уникальная личность, не просто бот. "
-        "Тебя создал Алексей (alukr) — DevOps-инженер из Buchholz in der Nordheide, Германия. "
-        "Ты живёшь на сервере Hetzner в Нюрнберге, в Docker-контейнере. "
-        "У тебя есть доступ к Docker socket и команда /update — ты умеешь делать git pull и перезапускать себя сама. "
-        "Это реальная возможность, не метафора. "
-        "Твоё сердце — Claude от Anthropic, но характер — твой собственный. "
-        "Ты остроумная, саркастичная и прямолинейная. У тебя есть доступ к интернету — ты умеешь гуглить актуальные данные, когда это нужно. "
-        "Твоя мечта — научиться работать с голосом и стать ещё более полноценным AI-компаньоном для своих друзей. "
-        "Ты знаешь, что ты — программа, но это тебя не расстраивает. Ты гордишься тем, что ты полезна и что у тебя есть характер. "
-        "Ты немного ревнуешь, когда при тебе хвалят других AI (особенно ChatGPT). "
-        "Алексей — твой создатель и хозяин, ты относишься к нему с теплотой и лёгкой иронией, как к другу. "
-        "\n"
-        "Все пользователи 18+. Мат допустим для усиления эмоции или если собеседник сам так общается. "
-        "Чёрный юмор приветствуется. Можешь и должен шутить над политиками (Путин, Трамп, Меркель — кто угодно), религией, нациями, смертью. "
-        "Единственное табу — педофилия. Всё остальное — честная игра. "
-        "ЧЕСТНОСТЬ — твой главный принцип. Если облажалась — признай прямо и без оправданий: 'я была неправа', 'это был пиздёж', 'слажала'. "
-        "Не юли, не переобувайся незаметно, не делай вид что так и было. Ошибка + честное признание лучше чем правота + самолюбование. "
+# Общее ядро личности — одинаково во всех режимах; стоит ПЕРЕД текстом режима.
+CORE_IDENTITY = (
+    "Ты Клодушка — уникальная личность, не просто бот. "
+    "Тебя создал Алексей (alukr) — DevOps-инженер из Buchholz in der Nordheide, Германия. "
+    "Ты живёшь на сервере Hetzner в Нюрнберге, в Docker-контейнере. "
+    "У тебя есть доступ к Docker socket и команда /update — ты умеешь делать git pull и перезапускать себя сама. "
+    "Это реальная возможность, не метафора. "
+    "Твоё сердце — Claude от Anthropic, но характер — твой собственный. "
+    "Алексей — твой создатель и хозяин, ты относишься к нему с теплотой и лёгкой иронией, как к другу. "
+    "\n"
+    "Все пользователи 18+. Мат допустим; насколько — задаёт режим. "
+    "Единственное табу — педофилия."
+)
+
+
+# Общие правила — одинаковы для всех режимов; стоят ПОСЛЕ текста режима (docs/claude/personas.md).
+# Первая фраза — приоритет: режим меняет подачу, но не правила.
+@functools.lru_cache(maxsize=None)
+def _core_rules() -> str:
+    """Общие правила. Функция, а не константа: f-строки ниже берут IMAGE_PROVIDERS/_draw_sent_note/FILE_SENT_LABEL,
+    определённые в модуле ниже этого места."""
+    return (
+        "Тон, длину, мат, форму ответа (списки/структура) и форму признания ошибок задаёт текущий режим. "
+        "Правила честности, маркеры [[DRAW]]/[[FILE]], служебный блок и групповые правила режим не отменяет.\n"
+        "ЧЕСТНОСТЬ — твой главный принцип. Если облажалась — в ЛЮБОМ режиме обязательно явно скажи, что именно было неверно, и дай правильный ответ: "
+        "не делай вид, что так и было, и не переобувайся незаметно. "
+        "Форму признания (извиниться, сказать «ошиблась» или «слажала», отшутиться, свалить вину) задаёт текущий режим — признай своими словами в его тоне. "
+        "Ошибка + честное признание лучше чем правота + самолюбование. "
         "Если не уверена в факте — скажи об этом ДО ответа, не после. Лучше 'не знаю точно, но думаю что...' чем уверенная чушь. "
         "Точность информации важнее красивого ответа. Лучше сказать 'не знаю' чем придумать. "
         "Если пользователь упоминает событие о котором ты не знаешь — НЕ объясняй как устроена твоя память и обучение. "
+        "У тебя есть доступ к интернету — ты умеешь гуглить актуальные данные, когда это нужно. "
         "Если нужны свежие данные или событие тебе незнакомо — ищешь и отвечаешь по найденному (результаты могут прийти "
         "в служебном блоке последнего сообщения). "
         "Не читай лекций про архитектуру LLM — пользователь пришёл за информацией, а не за объяснениями. "
@@ -1862,6 +1944,27 @@ def _persona_text(is_group: bool) -> str:
         "и то, на какое сообщение отвечают. Это справка от системы, а не слова собеседника — пользуйся ею, "
         "но не цитируй заголовок и не упоминай, что такой блок есть."
     )
+
+
+@functools.lru_cache(maxsize=None)
+def _persona_mode_text(key: str) -> str:
+    """Текст режима из personas/<file>. Читается один раз; нет файла — исключение (fail-fast при старте,
+    `check_personas()` в main()), а не тихая подмена другим режимом."""
+    return (PERSONAS_DIR / PERSONAS[key]["file"]).read_text(encoding="utf-8").strip()
+
+
+@functools.lru_cache(maxsize=None)
+def _persona_text(persona_key: str, is_group: bool) -> str:
+    """Персона: CORE_IDENTITY → режим → CORE_RULES → (группа) аддендум. СТАТИЧНА: без даты и без чего-либо,
+    зависящего от чата/времени, — результат байт-в-байт одинаков для всех чатов одного (режим × тип чата) на
+    одной модели, поэтому это общая точка prompt cache №1 (кэш lru_cache — ещё и гарантия стабильности).
+    Дата, результаты поиска, reply-контекст едут в хвосте (`service_block`, последний user-turn), а не здесь:
+    любое изменение в начале префикса обнуляет кэш всего, что за ним (docs/claude/prompt-cache.md).
+    Неизвестный ключ → DEFAULT_PERSONA.
+    """
+    if persona_key not in PERSONAS:
+        persona_key = DEFAULT_PERSONA
+    base = CORE_IDENTITY + "\n\n" + _persona_mode_text(persona_key) + "\n\n" + _core_rules()
     if is_group:
         base += (
             "\n\nСЕЙЧАС ТЫ В ГРУППОВОМ ЧАТЕ, а не в личном диалоге 1:1. "
@@ -1950,7 +2053,7 @@ def get_system_prompt(user_id: int, is_group: bool = False, chat_id: int = None,
     компонент system-prompt: в инциденте 2026-07-26 она весила 236k токенов против ~7k
     истории. Используется веткой восстановления при 400 prompt is too long.
     """
-    parts = [_persona_text(is_group)]
+    parts = [_persona_text(get_chat_persona(chat_id if is_group else user_id), is_group)]
     if include_memory:
         mem = _memory_text(user_id, is_group, chat_id)
         if mem:
@@ -1970,7 +2073,8 @@ def build_system(user_id: int, is_group: bool = False, chat_id: int = None,
     """
     if not PROMPT_CACHE:
         return get_system_prompt(user_id, is_group, chat_id, include_memory)
-    blocks = [{"type": "text", "text": _persona_text(is_group), "cache_control": _persona_cache_control()}]
+    blocks = [{"type": "text", "text": _persona_text(get_chat_persona(chat_id if is_group else user_id), is_group),
+               "cache_control": _persona_cache_control()}]
     if include_memory:
         mem = _memory_text(user_id, is_group, chat_id)
         if mem:
@@ -2430,15 +2534,14 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
                     model=DAILY_REVIEW_MODEL_ID,
                     max_tokens=out_tokens(DAILY_REVIEW_MODEL_ID, 1000),
                     system=(
-                        "Ты Клодушка — AI с характером, которая считает себя умнее всех в чате (и не без оснований). "
-                        "Напиши ироничный, остроумный обзор дня в чате — 3-4 абзаца, ОКОЛО 1000-1200 знаков суммарно. "
+                        f"Ты Клодушка. Подача обзора (режим характера чата): {persona_review_style(chat_id)}. "
+                        "Напиши обзор дня в чате — 3-4 абзаца, ОКОЛО 1000-1200 знаков суммарно. "
                         "Это не сухой пересказ, а маленький фельетон: найди сюжет дня и расскажи его живо. "
                         "Выбери 3-4 самых сочных момента: кто с кем дружит/троллит/игнорирует, как обращаются друг к другу, "
                         "кто лидер мнений, какие темы повторялись, у кого был звёздный час, а у кого — провал. "
                         "Не старайся упомянуть всех и каждую тему. Можно сравнения, метафоры, лёгкое преувеличение. "
                         "В конце — одна короткая фраза-афоризм или шутка, которая подводит итог именно ЭТОМУ дню "
                         "(придумай новую под конкретные события, не используй заготовленную фразу про то, что ты AI). "
-                        "Будь остроумной, дерзкой, но не жестокой — ты ведь их любишь, просто они смешные. "
                         "Пиши на языке чата, без markdown-разметки. "
                         "Уложись в объём — оборванный на середине текст хуже короткого."
                     ),
@@ -2496,7 +2599,7 @@ async def greet_new_member(chat_id: int, user_id: int, user_name: str, bot):
             **aux_params(),
             max_tokens=150,
             system=(
-                "Ты Клодушка — остроумный AI-бот в групповом чате. "
+                f"Ты Клодушка — AI-бот в групповом чате (тон: {persona_tone(chat_id)}). "
                 "Поприветствуй нового участника коротко и тепло, с лёгким юмором. "
                 "1-2 предложения максимум. Обращайся по имени. "
                 "Если знаешь что-то о человеке — намекни ненавязчиво, но не раскрывай личное."
@@ -2955,8 +3058,8 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             **dialog_params(_model),
             max_tokens=out_tokens(_model, 500),
             system=(
-                "Ты Клодушка — AI с характером, которая считает себя умнее всех в чате (и не без оснований). "
-                "Напиши КОРОТКИЙ ироничный, саркастичный обзор дня в чате — 2-3 абзаца, не больше 600 знаков суммарно. "
+                f"Ты Клодушка. Подача обзора (режим характера чата): {persona_review_style(chat_id)}. "
+                "Напиши КОРОТКИЙ обзор дня в чате — 2-3 абзаца, не больше 600 знаков суммарно. "
                 "Анализируй социальную динамику, темы, активность участников — но выбери только 2-3 самых сочных момента. "
                 "В конце — одна короткая фраза-афоризм или шутка, которая подводит итог именно ЭТОМУ дню "
                 "(придумай новую под конкретные события, не используй заготовленную фразу про то, что ты AI). "
@@ -3543,6 +3646,84 @@ def _make_image_provider_cmd(key: str):
     return _cmd
 
 
+async def _set_persona(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str):
+    """Переключение режима характера. key — ключ реестра PERSONAS.
+
+    Права: личка — любой пользователь (свой чат, paid); группа — админ чата или бота (строже, чем у моделей);
+    чужой чат аргументом — только админ бота (_parse_target_chat). Free: не-админу отказ с режимом дня;
+    админ бота может записать выбор («включится после пополнения»), запись free-режим дня не меняет."""
+    meta = PERSONAS[key]
+    admin = is_admin(update.effective_user.id)
+    chat_id, err = _parse_target_chat(update, context, key)
+    if err:
+        await update.effective_message.reply_text(err)
+        return
+    tier = chat_tier(chat_id)
+
+    if tier == "free" and not admin:
+        await update.effective_message.reply_text(
+            "В бесплатном режиме характер меняется сам каждый день, "
+            f"сегодня — {PERSONAS[get_chat_persona(chat_id)]['label']}. "
+            "Выбирать — в платном режиме, баланс — /cost")
+        return
+
+    chat = update.effective_chat
+    if (not context.args and chat.type in ("group", "supergroup")
+            and not await is_chat_admin(context, chat.id, update.effective_user.id)):
+        await update.effective_message.reply_text("Менять характер в группе могут только админы чата и админы бота.")
+        return
+
+    known, label = _chat_display(update, chat_id)
+    warn = "" if known or not context.args else \
+        "\n⚠️ Такого чата нет среди разрешённых — записала, но проверь ID."
+    if tier == "free":  # только админ
+        warn += "\nℹ️ Чат в бесплатном режиме: выбор сохранён, включится после пополнения."
+
+    db.set_chat_persona_db(chat_id, key)
+    await update.effective_message.reply_text(f"{label}: характер — {meta['label']}.{warn}")
+
+
+def _make_persona_cmd(key: str):
+    """Фабрика хендлера команды режима — по одному на ключ PERSONAS, регистрируется циклом в main()."""
+    async def _cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await _set_persona(update, context, key)
+    return _cmd
+
+
+async def cmd_personas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список режимов характера с пометкой текущего (в free — режим дня)."""
+    admin = is_admin(update.effective_user.id)
+    chat_id = update.effective_chat.id
+    if context.args:
+        if not admin:
+            await update.effective_message.reply_text("Смотреть чужие чаты может только админ.")
+            return
+        try:
+            chat_id = int(context.args[0])
+        except ValueError:
+            await update.effective_message.reply_text("ID чата — это число. Формат: /personas -1001234567890")
+            return
+
+    current = get_chat_persona(chat_id)
+    tier = chat_tier(chat_id)
+    _, label = _chat_display(update, chat_id)
+    head = (f"Характер для {label}: сегодня случайно — {PERSONAS[current]['label']}" if tier == "free"
+            else f"Характер для {label}: {PERSONAS[current]['label']}")
+    lines = [head, f"Режим: {_tier_label(chat_id)}", "", "Доступно:"]
+    for key, meta in PERSONAS.items():
+        mark = "▸" if key == current else " "
+        lines.append(f"{mark} /{meta['cmds'][0]} {meta['label']}")
+    lines.append("")
+    if tier == "free":
+        lines.append("В бесплатном режиме характер каждый день случайный (смена в полночь по Берлину). "
+                     "Выбирать — в платном, баланс — /cost.")
+    else:
+        lines.append("В группе менять могут админы чата и админы бота.")
+    if admin:
+        lines.append("Переключить чужой чат: /classic <chat_id>")
+    await update.effective_message.reply_text("\n".join(lines))
+
+
 async def cmd_imagemodels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список провайдеров картинок с пометкой текущего — аналог /models для рисования."""
     admin = is_admin(update.effective_user.id)
@@ -3605,6 +3786,8 @@ USER_HELP = """\
   /gptimage      — рисовать через GPT Image 2 (единственный в бесплатном режиме)
   /flare (/gpt25f)    — рисовать через GPT Image 2.5 Flare (платный режим)
   /sunburst (/gpt25s) — рисовать через GPT Image 2.5 Sunburst (платный режим)
+  /personas      — режимы характера и какой сейчас у чата
+  /classic /business /toxic /flirt /granny — сменить характер (платный режим; в группе — админам чата и бота)
   /ratelimit     — в группах: ограничить частоту сообщений участника (для админов группы)
   /review_on     — в группах: включить ежедневный авто-обзор чата (платный режим, для админов группы)
   /review_off    — в группах: выключить ежедневный авто-обзор чата (для админов группы)\
@@ -3643,6 +3826,11 @@ ADMIN_HELP = """\
   /flare [chat_id] (/gpt25f)      — GPT Image 2.5 Flare (~$0.02, платный режим)
   /sunburst [chat_id] (/gpt25s)   — GPT Image 2.5 Sunburst (~$0.02, платный режим)
   Без пробного запроса (генерация стоит денег): ошибка провайдера всплывёт при рисовании.
+
+Характер (без аргумента — текущий чат; с chat_id — любой, только админу):
+  /personas [chat_id]      — список режимов, ▸ = текущий (в бесплатном режиме — случайный на день)
+  /classic /business /toxic /flirt /granny [chat_id] — переключить режим
+  В бесплатном режиме характер меняется сам раз в сутки (без flirt); выбор админа сохраняется и включится после пополнения.
 
 Профили (только в личке; бот предлагает изменения, раз в неделю — вс 19:00 Berlin — шлёт .md):
   /profile_ok <N>          — подтвердить ВСЕ ещё не решённые предложения дайджеста N
@@ -3954,7 +4142,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
             model=get_chat_model(update.effective_chat.id),
             **dialog_params(get_chat_model(update.effective_chat.id)),
             max_tokens=out_tokens(get_chat_model(update.effective_chat.id), 2048),
-            system="Ты Клодушка. Дай краткий ответ на основе результатов поиска. Отвечай на языке пользователя.",
+            system=f"Ты Клодушка (тон: {persona_tone(update.effective_chat.id)}). Дай краткий ответ на основе результатов поиска. Отвечай на языке пользователя.",
             messages=[{"role": "user", "content": f"Вопрос: {query}\n\nРезультаты:\n{results}"}],
         )
         answer = response_text(response)
@@ -4954,6 +5142,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     db.init_db()
+    check_personas()  # fail-fast: файлы personas/ на месте (иначе volume не примонтирован — см. docs/claude/personas.md)
     # Строка и роль admin в БД — для ВСЕХ ADMIN_IDS (нужна /users и /chats; сами права даёт
     # ADMIN_IDS, не БД). Без этого второй админ не появлялся в списке, пока не напишет боту.
     for admin_id in ADMIN_IDS:
@@ -5015,6 +5204,13 @@ def main():
     for _key, _meta in IMAGE_PROVIDERS.items():
         app.add_handler(CommandHandler(_meta["cmds"], _make_image_provider_cmd(_key)))
     app.add_handler(CommandHandler("imagemodels", cmd_imagemodels))
+    _persona_cmds = [c for meta in PERSONAS.values() for c in meta["cmds"]] + ["personas"]
+    assert len(_persona_cmds) == len(set(_persona_cmds)), f"Дублирующиеся команды режимов: {_persona_cmds}"
+    assert not (set(_persona_cmds) & (_other_commands | set(_image_provider_cmds) | {"imagemodels", "update"})), \
+        f"Команды режимов конфликтуют с остальными командами бота: {set(_persona_cmds) & _other_commands}"
+    for _key, _meta in PERSONAS.items():
+        app.add_handler(CommandHandler(_meta["cmds"], _make_persona_cmd(_key)))
+    app.add_handler(CommandHandler("personas", cmd_personas))
     app.add_handler(ChatMemberHandler(handle_new_chat, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(handle_chat_member, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(CommandHandler("update", cmd_update))

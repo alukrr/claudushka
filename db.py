@@ -170,6 +170,11 @@ def init_db():
             provider TEXT NOT NULL DEFAULT 'banana'
         );
 
+        CREATE TABLE IF NOT EXISTS chat_persona (
+            chat_id INTEGER PRIMARY KEY,
+            persona TEXT NOT NULL DEFAULT 'classic'
+        );
+
         CREATE TABLE IF NOT EXISTS usage_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts INTEGER NOT NULL,
@@ -1598,5 +1603,22 @@ def add_memory_facts_by_key(phone: str, facts: list[str], context: str = "whatsa
                 "INSERT INTO wa_memory (phone, fact, created_at) VALUES (?, ?, ?)",
                 (phone, fact, now)
             )
+    conn.commit()
+    conn.close()
+
+
+# --- Режим характера чата (PERSONAS в bot.py, docs/claude/personas.md) ---
+
+def get_chat_persona_db(chat_id: int) -> str | None:
+    """Сохранённый выбор режима или None (нет строки — решает bot.get_chat_persona: дефолт / режим дня free)."""
+    conn = get_conn()
+    row = conn.execute("SELECT persona FROM chat_persona WHERE chat_id = ?", (chat_id,)).fetchone()
+    conn.close()
+    return row["persona"] if row else None
+
+
+def set_chat_persona_db(chat_id: int, persona: str):
+    conn = get_conn()
+    conn.execute("INSERT OR REPLACE INTO chat_persona (chat_id, persona) VALUES (?, ?)", (chat_id, persona))
     conn.commit()
     conn.close()

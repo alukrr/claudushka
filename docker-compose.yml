@@ -7,6 +7,7 @@ services:
       - ./bot.py:/app/bot.py
       - ./api_errors.py:/app/api_errors.py
       - ./db.py:/app/db.py
+      - ./personas:/app/personas
       - ./requirements.txt:/app/requirements.txt
       - ./data:/app/data
       - .:/repo
@@ -34,6 +35,7 @@ services:
       - ./whatsapp.py:/app/whatsapp.py
       - ./api_errors.py:/app/api_errors.py
       - ./db.py:/app/db.py
+      - ./personas:/app/personas
       - ./requirements.txt:/app/requirements.txt
       - ./data:/app/data
     env_file:
