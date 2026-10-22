@@ -1845,6 +1845,12 @@ def _persona_text(is_group: bool) -> str:
         f"В истории чата ты можешь увидеть свои прошлые сообщения вида «{_draw_sent_note('...')}» — это служебная пометка о том, что картинка УЖЕ была отправлена раньше, а не образец, который надо копировать. "
         "Чтобы нарисовать картинку СЕЙЧАС, нужен именно маркер [[DRAW: ...]] в двойных квадратных скобках — никогда не пиши «Нарисовала картинку: <промпт>» обычным текстом вместо маркера, иначе промпт по-английски утечёт в чат, а картинка не появится вообще. "
         "Не отрицай эти возможности и не говори что не можешь работать с изображениями — это неправда. "
+        "Ты умеешь присылать текстовые файлы целиком (код, md, конфиги, любой текст) — Telegram режет длинные сообщения и портит отступы. "
+        "Если пользователь просит файл, скрипт, модуль, документ целиком или код слишком длинный для сообщения — оберни содержимое в маркер: "
+        "[[FILE: имя.py]] на отдельной строке, затем содержимое КАК ЕСТЬ (без ``` и без экранирования, отступы сохраняй), затем [[/FILE]] на отдельной строке. "
+        "Бот вырежет блок и пришлёт его документом; в обычном тексте скажи пару слов, что приложила. Не больше 3 файлов за ответ. "
+        "Короткий сниппет на несколько строк по-прежнему лучше дать обычным блоком кода. "
+        f"В истории ты можешь увидеть пометку «({FILE_SENT_LABEL} …)» — это служебная запись о том, что файл УЖЕ отправлен, а не образец; чтобы прислать файл СЕЙЧАС, нужен именно маркер [[FILE: ...]]. "
         f"Движок рисования у тебя переключаемый: {', '.join(m['label'] + ' (/' + m['cmds'][0] + ')' for m in IMAGE_PROVIDERS.values())} — "
         "Алексей или админ чата выбирает соответствующей командой. "
         "Ты НЕ обязана знать, какой из них активен именно сейчас в этом чате — тебе не нужно это уточнять и не нужно писать это в ответе. "
@@ -2530,6 +2536,48 @@ DRAW_SENT_LABEL = "в чат отправлена картинка по пром
 
 def _draw_sent_note(prompt: str) -> str:
     return f"({DRAW_SENT_LABEL}: {prompt})"
+
+
+# Файл целиком: Клодушка оборачивает содержимое в [[FILE: имя.py]] ... [[/FILE]], бот вырезает блок из
+# текста и шлёт его документом (Telegram режет длинные сообщения, а в питоне важны отступы). Нет
+# закрывающего маркера — ответ упёрся в max_tokens, берём всё до конца и предупреждаем пользователя.
+# Группы: name, body, end (None = не закрыт). docs/claude/files.md.
+FILE_MARKER_RE = re.compile(
+    r"\[\[FILE:\s*(?P<name>[^\]\n]*?)\s*\]\][ \t]*\n?(?P<body>.*?)(?:(?P<end>\n?[ \t]*\[\[/FILE\]\])|(?=\[\[FILE:)|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+FILE_MAX_PER_REPLY = 3
+FILE_MAX_BYTES = 300_000
+FILE_HISTORY_CHARS = 3000  # сколько символов файла остаётся в истории (лимит по размеру, см. инвариант в CLAUDE.md)
+FILE_SENT_LABEL = "в чат отправлен файл"
+
+
+def _safe_filename(name: str) -> str:
+    name = os.path.basename(name.strip().replace("\\", "/"))
+    name = re.sub(r"[^\w.\-]+", "_", name, flags=re.UNICODE).strip("._")[:80]
+    return name if "." in name else (f"{name or 'claudushka'}.txt")
+
+
+def extract_files(text: str) -> tuple[str, list[tuple[str, str, bool]]]:
+    """(текст без файловых блоков, [(имя, содержимое, закрыт_ли_блок)]). Блоков сверх FILE_MAX_PER_REPLY
+    вырезаются, но не отправляются."""
+    files: list[tuple[str, str, bool]] = []
+    for m in FILE_MARKER_RE.finditer(text):
+        body = m.group("body")
+        # модель иногда сама оборачивает содержимое в ```-ограждение — оно не часть файла
+        fm = re.fullmatch(r"\s*```[^\n]*\n(.*?)\n?```\s*", body, re.DOTALL)
+        if fm:
+            body = fm.group(1)
+        if body.strip():
+            files.append((_safe_filename(m.group("name")), body.rstrip("\n") + "\n", m.group("end") is not None))
+    return FILE_MARKER_RE.sub("", text).strip(), files[:FILE_MAX_PER_REPLY]
+
+
+def _file_sent_note(name: str, content: str) -> str:
+    """Пометка в историю: факт отправки + начало файла (чтобы «добавь функцию» не теряла контекст)."""
+    head = content[:FILE_HISTORY_CHARS]
+    cut = "…" if len(content) > len(head) else ""
+    return f"({FILE_SENT_LABEL} {name}, {content.count(chr(10))} строк; содержимое:\n{head}{cut})"
 
 
 # Fallback-регекс #1: модель вместо маркера [[DRAW: ...]] написала в видимый ответ НАШУ
@@ -4757,6 +4805,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         _count_reply(user_id, chat_id)
 
+        # Файлы целиком ([[FILE: имя]]...[[/FILE]]) — вырезаем из текста, отправим документами после него.
+        out_files: list[tuple[str, str, bool]] = []
+        if FILE_MARKER_RE.search(assistant_text):
+            assistant_text, out_files = extract_files(assistant_text)
+
         # Клодушка могла сама инициировать рисование маркером [[DRAW: ...]] внутри ответа.
         draw_match = DRAW_MARKER_RE.search(assistant_text)
         draw_en_prompt = draw_match.group("prompt").strip() if draw_match else None
@@ -4804,10 +4857,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         saved_text = assistant_text or (
             _draw_sent_note(draw_en_prompt) if draw_en_prompt else assistant_text
         )
+        if out_files:
+            saved_text = "\n".join(filter(None, [assistant_text, *(_file_sent_note(n, c) for n, c, _ in out_files)]))
         if is_group:
             # Ответ Клодушки — в групповой транскрипт, чтобы видела свои реплики.
             # При пустом тексте + рисовании запись сделает _draw_and_send, чтобы не дублировать.
-            if assistant_text:
+            if out_files:
+                db.save_group_message(chat_id, context_bot_id, "Клодушка", saved_text, is_bot=True)
+            elif assistant_text:
                 db.save_group_message(chat_id, context_bot_id, "Клодушка", assistant_text, is_bot=True)
         else:
             db.save_message(user_id, "user", user_text)
@@ -4860,6 +4917,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(src_md, parse_mode="Markdown", **send_kw)
                 except Exception:
                     await update.message.reply_text(src_plain, **send_kw)
+
+        for fname, fcontent, closed in out_files:
+            data = fcontent.encode("utf-8")
+            if len(data) > FILE_MAX_BYTES:
+                await update.message.reply_text(f"Файл {fname} слишком большой ({len(data) // 1024} КБ) — не отправляю.")
+                continue
+            bio = io.BytesIO(data)
+            bio.name = fname
+            try:
+                await update.message.reply_document(document=bio)
+            except Exception:
+                logger.exception(f"не удалось отправить файл {fname} chat={chat_id}")
+                await update.message.reply_text(f"Не получилось отправить файл {fname}.")
+                continue
+            if not closed:
+                await update.message.reply_text(
+                    f"⚠️ {fname} оборвался на лимите длины ответа — файл неполный. "
+                    "Попроси продолжить или разбить на части."
+                )
 
         # Клодушка сама попросила картинку — теперь реально рисуем и отправляем.
         if draw_en_prompt:

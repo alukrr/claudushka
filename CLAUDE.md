@@ -31,6 +31,7 @@
 - Рисование (`react`/`REACTIONS`, `_try_gemini_image`, `_try_gpt_image`, `_draw_and_send`, `DRAW_MARKER_RE`,
   `LEAKED_DRAW_RE`, `IMAGE_PROVIDERS`, `GEMINI_IMAGE_PRICING`, `/imagine [2k]` `/banana` `/bananapro` `/gptimage` `/flare`
   `/sunburst` `/imagemodels`) — `docs/claude/images.md`
+- Файлы целиком (`[[FILE: имя]]`, `FILE_MARKER_RE`, `extract_files`, `_file_sent_note`, `FILE_*`) — `docs/claude/files.md`
 - Групповой чат (`build_group_messages`, `group_messages`, гейтинг доступа,
   `/ratelimit`, `is_chat_admin`) — `docs/claude/group-chat.md`
 - Голос/видео/кружочки/GIF (`_transcribe_audio_gemini`, `_extract_video_frames`,
@@ -151,7 +152,7 @@
 `/help` показывает всем пользователям базовые команды, adminам — полный список из двух блоков (`USER_HELP` + `ADMIN_HELP` в bot.py). При добавлении новой команды обновлять оба константы.
 
 ## Версионность
-Текущая версия: v1.5.1 (dedup: обрезанный кусок большой группы делится пополам, провал слияния не роняет группу, `docs/claude/open-tasks.md`; предыдущая: v1.5.0 — профиль участника: предложения модели, еженедельный дайджест .md вс 19:00 Berlin, подтверждение /profile_ok, экран «Профили» в dedup TUI, `docs/claude/profile.md`; предыдущая: v1.4.4 — промпты извлечения памяти: поездки/отпуск/командировки не пишутся в long, `docs/claude/memory.md`; предыдущая: v1.4.3 — бот удаляет просроченные факты памяти — `memory_purge` 04:30 Berlin, `docs/claude/memory.md`; dedup: только
+Текущая версия: v1.6.0 (файлы целиком документом по `[[FILE: имя]]`, `docs/claude/files.md`; предыдущая: v1.5.1 — dedup: обрезанный кусок большой группы делится пополам, провал слияния не роняет группу, `docs/claude/open-tasks.md`; предыдущая: v1.5.0 — профиль участника: предложения модели, еженедельный дайджест .md вс 19:00 Berlin, подтверждение /profile_ok, экран «Профили» в dedup TUI, `docs/claude/profile.md`; предыдущая: v1.4.4 — промпты извлечения памяти: поездки/отпуск/командировки не пишутся в long, `docs/claude/memory.md`; предыдущая: v1.4.3 — бот удаляет просроченные факты памяти — `memory_purge` 04:30 Berlin, `docs/claude/memory.md`; dedup: только
 живые факты, `--mode purge-expired`, большие группы по частям, не платить дважды за обрезанное, срок слияния = минимум;
 `docs/claude/open-tasks.md`, инцидент 2026-10-18; предыдущие: v1.4.2 — построчная правка и ручная правка в dedup TUI, v1.4.1 — видимость скрытого выбора, накопительная калибровка, функция `dedup`, v1.4.0 — dedup TUI, v1.3.0 — Nano Banana 2.1, `/bananapro`, 2K по запросу, `/opus` `/fable` `/bananapro` в группе только
 админам, 2026-10-10, `docs/claude/images.md`; предыдущие: v1.2.0 — нативный web_search, `docs/claude/native-search.md`, v1.1.5 — реакции 👀/✍, `docs/claude/images.md`, v1.1.4 — prompt cache,
