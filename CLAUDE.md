@@ -31,6 +31,8 @@
 - Рисование (`react`/`REACTIONS`, `_try_gemini_image`, `_try_gpt_image`, `_draw_and_send`, `DRAW_MARKER_RE`,
   `LEAKED_DRAW_RE`, `IMAGE_PROVIDERS`, `GEMINI_IMAGE_PRICING`, `/imagine [2k]` `/banana` `/bananapro` `/gptimage` `/flare`
   `/sunburst` `/imagemodels`) — `docs/claude/images.md`
+- Режимы характера (`PERSONAS`, `/classic /business /toxic /flirt /granny /personas`, `_persona_text`, `CORE_IDENTITY`/`_core_rules`,
+  `get_chat_persona`, `free_persona`, `personas/*.md`, volume `./personas`) — `docs/claude/personas.md`; ТЗ — `docs/claude/tz-personas.md`
 - Файлы целиком (`[[FILE: имя]]`, `FILE_MARKER_RE`, `extract_files`, `_file_sent_note`, `FILE_*`) — `docs/claude/files.md`
 - Групповой чат (`build_group_messages`, `group_messages`, гейтинг доступа,
   `/ratelimit`, `is_chat_admin`) — `docs/claude/group-chat.md`
@@ -69,7 +71,7 @@
   истории шагами) — `docs/claude/staging-checklist-prompt-cache.md`; чек-лист ТЗ `feat/reactions`
   (реакции 👀/✍ вместо «Рисую…»/«ищу…») — `docs/claude/staging-checklist-reactions.md`; чек-лист ТЗ `feat/native-search` (нативный
   `web_search` в платном режиме) — `docs/claude/staging-checklist-native-search.md`; чек-лист ТЗ `feat/banana-21` (Nano Banana 2.1,
-  `/bananapro`, 2K) — `docs/claude/staging-checklist-banana-21.md`; чек-лист ТЗ `feat/user-profile` (профиль участника,
+  `/bananapro`, 2K) — `docs/claude/staging-checklist-banana-21.md`; чек-лист ТЗ `feat/personas` (режимы характера, выкатка только `--force-recreate`) — `docs/claude/staging-checklist-personas.md`; чек-лист ТЗ `feat/user-profile` (профиль участника,
   дайджест, экран «Профили») — `docs/claude/staging-checklist-profile.md`
 
 ## Стек
@@ -122,7 +124,11 @@
 - Любой источник данных, попадающий в system-prompt или `messages`, обязан иметь лимит
   по РАЗМЕРУ (не только по числу элементов) — см. инцидент 2026-07-26 в `docs/claude/incidents.md`.
 - Каждый новый `.py`-файл, который импортируют bot.py/whatsapp.py — добавить в volume
-  mounts ОБОИХ сервисов в `docker-compose.yml`. `.claude/rules/docker-compose.md`.
+  mounts ОБОИХ сервисов в `docker-compose.yml`. `.claude/rules/docker-compose.md`. Новый volume (как `./personas`) —
+  релиз только через `docker compose up -d --force-recreate`, не `/update`.
+- Характер: `CORE_IDENTITY` → режим (`personas/*.md`) → `_core_rules()` → групповой аддендум; режим задаёт тон, не правила
+  (честность/маркеры/служебный блок/группа). Новое место с зашитым «характером» — брать `tone`/`review_style` режима
+  чата. Ключ режима в личке — `user_id`. `docs/claude/personas.md`.
 - Уровень логов httpx не поднимать до INFO — токен бота утекает в URL.
 - Пользователь никогда не видит сырой текст исключения — только `api_errors.reply_api_error`.
 - Служебные вызовы (капча, поиск, перевод промпта, извлечение памяти, описание медиа) —
@@ -152,7 +158,7 @@
 `/help` показывает всем пользователям базовые команды, adminам — полный список из двух блоков (`USER_HELP` + `ADMIN_HELP` в bot.py). При добавлении новой команды обновлять оба константы.
 
 ## Версионность
-Текущая версия: v1.6.0 (файлы целиком документом по `[[FILE: имя]]`, `docs/claude/files.md`; предыдущая: v1.5.1 — dedup: обрезанный кусок большой группы делится пополам, провал слияния не роняет группу, `docs/claude/open-tasks.md`; предыдущая: v1.5.0 — профиль участника: предложения модели, еженедельный дайджест .md вс 19:00 Berlin, подтверждение /profile_ok, экран «Профили» в dedup TUI, `docs/claude/profile.md`; предыдущая: v1.4.4 — промпты извлечения памяти: поездки/отпуск/командировки не пишутся в long, `docs/claude/memory.md`; предыдущая: v1.4.3 — бот удаляет просроченные факты памяти — `memory_purge` 04:30 Berlin, `docs/claude/memory.md`; dedup: только
+Текущая версия: v1.7.0 (режимы характера: 5 режимов per-chat, режим дня в free, `docs/claude/personas.md`; предыдущая: v1.6.0 — файлы целиком документом по `[[FILE: имя]]`, `docs/claude/files.md`; предыдущая: v1.5.1 — dedup: обрезанный кусок большой группы делится пополам, провал слияния не роняет группу, `docs/claude/open-tasks.md`; предыдущая: v1.5.0 — профиль участника: предложения модели, еженедельный дайджест .md вс 19:00 Berlin, подтверждение /profile_ok, экран «Профили» в dedup TUI, `docs/claude/profile.md`; предыдущая: v1.4.4 — промпты извлечения памяти: поездки/отпуск/командировки не пишутся в long, `docs/claude/memory.md`; предыдущая: v1.4.3 — бот удаляет просроченные факты памяти — `memory_purge` 04:30 Berlin, `docs/claude/memory.md`; dedup: только
 живые факты, `--mode purge-expired`, большие группы по частям, не платить дважды за обрезанное, срок слияния = минимум;
 `docs/claude/open-tasks.md`, инцидент 2026-10-18; предыдущие: v1.4.2 — построчная правка и ручная правка в dedup TUI, v1.4.1 — видимость скрытого выбора, накопительная калибровка, функция `dedup`, v1.4.0 — dedup TUI, v1.3.0 — Nano Banana 2.1, `/bananapro`, 2K по запросу, `/opus` `/fable` `/bananapro` в группе только
 админам, 2026-10-10, `docs/claude/images.md`; предыдущие: v1.2.0 — нативный web_search, `docs/claude/native-search.md`, v1.1.5 — реакции 👀/✍, `docs/claude/images.md`, v1.1.4 — prompt cache,

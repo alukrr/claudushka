@@ -32,6 +32,11 @@ bot.py и/или whatsapp.py (по образцу `api_errors.py`, `db.py`) — 
 Забытый mount — контейнер стартует со старой (или отсутствующей) версией файла молча,
 без явной ошибки при деплое.
 
+## Новый volume (`./personas:/app/personas`) — только `--force-recreate`, не `/update`
+`restart` и `/update` состав volumes не применяют. Папка `personas/` (тексты режимов характера) читается ботом при старте
+(`check_personas`, fail-fast): релиз, добавивший mount, выкатывать `docker compose up -d --force-recreate`
+(`docs/claude/personas.md`, `staging-checklist-personas.md`). Mount добавлен в оба сервиса и в `docker-compose.test.yml`.
+
 ## `requirements.txt` меняется → хватает обычного `restart`
 Оба сервиса ставят зависимости через `pip install` в самом `command:`, а `command:`
 выполняется заново при КАЖДОМ старте процесса в контейнере — `docker restart` тоже
