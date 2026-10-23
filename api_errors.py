@@ -137,6 +137,32 @@ def is_retryable(exc: BaseException) -> bool:
     return isinstance(exc, (anthropic.RateLimitError, anthropic.APIConnectionError))
 
 
+# Признаки «упал апстрим пула», а не наш ключ/запрос (из dnd-mcp, 2026-10-23). Нужны для 401/403/404:
+# пул иногда отдаёт их, когда канал/подписка модели на его стороне недоступны. Список уточнять по логу.
+UPSTREAM_MARKERS = ("subscription", "upstream", "no available", "overloaded", "channel", "quota")
+
+
+def should_fallback(exc: BaseException) -> bool:
+    """Claude недоступен — пора отвечать Gemini (docs/claude/model-fallback.md).
+
+    Переключаем: 5xx/529, 429, обрыв/таймаут, ошибка посреди стрима, 404 (модель не знает пул),
+    401/403/404 с признаками апстрима. НЕ переключаем: 402 (баланс общий, Gemini тоже не пройдёт),
+    400/422 (баг запроса, в т.ч. prompt is too long — его лечит обрезка), 401/403 без признаков (ключ)."""
+    if is_insufficient_balance(exc):
+        return False
+    status = getattr(exc, "status_code", None) or 0
+    if isinstance(exc, anthropic.BadRequestError) or status in (400, 422):
+        return False
+    if is_retryable(exc):
+        return True
+    if status in (401, 403, 404):
+        if status == 404:
+            return True
+        text = f"{exc} {getattr(exc, 'body', '')}".lower()
+        return any(m in text for m in UPSTREAM_MARKERS)
+    return False
+
+
 def user_message(exc: BaseException, default: str | None = None, clear_hint: str = CLEAR_HINT_DEFAULT) -> str:
     """Что показать пользователю. В характере Клодушки, коротко, без JSON и traceback.
 
@@ -455,7 +481,7 @@ async def _sleep_with_keepalive(delay: float, keepalive, label: str) -> None:
             logger.debug(f"[{label}] keepalive failed: {keepalive_exc}")
 
 
-async def call_with_retry(fn, *, label: str, keepalive=None):
+async def call_with_retry(fn, *, label: str, keepalive=None, delays: tuple = RETRY_DELAYS):
     """Выполнить синхронный вызов API в отдельном потоке, переживая транзиентные ошибки.
 
     fn — функция без аргументов (обычно functools.partial(client.messages.create, ...)).
@@ -468,14 +494,14 @@ async def call_with_retry(fn, *, label: str, keepalive=None):
     keepalive — необязательная корутина, принимающая asyncio.Event; работает всю паузу
     между попытками (см. _sleep_with_keepalive).
     """
-    attempts = len(RETRY_DELAYS) + 1
+    attempts = len(delays) + 1
     for attempt in range(1, attempts + 1):
         try:
             return await asyncio.to_thread(fn)
         except Exception as exc:
             if attempt == attempts or not is_retryable(exc):
                 raise
-            delay = RETRY_DELAYS[attempt - 1]
+            delay = delays[attempt - 1]
             logger.warning(
                 f"[{label}] {type(exc).__name__}: повтор через {delay}с "
                 f"(попытка {attempt}/{attempts})"

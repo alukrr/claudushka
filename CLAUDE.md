@@ -52,6 +52,8 @@
   лимиты непроверенных, стартовый бонус, `/fable`-подтверждение) — `docs/claude/billing.md`
 - Ошибки API, ретраи, блокирующие вызовы, `response_text`, `parse_json_lenient` —
   `docs/claude/api-errors.md`
+- Фолбэк Claude → Gemini при сбоях пула (`FALLBACK_*`, `should_fallback`, `_call_with_fallback`, `_fallback_kwargs`,
+  липкое окно, `NativeSearchUnavailable`, цены Gemini в `LEGACY_PRICES`) — `docs/claude/model-fallback.md`
 - Профиль участника (`user_profile`, `profile_proposals`, `_profile_text`, `profile_updates`, `send_profile_digest`,
   `/profile` `/profile_ok` `/profile_no` `/profile_digest`, экран «Профили» в dedup TUI) — `docs/claude/profile.md`
 - Память (`memory`-таблица, `extract_memory`, `extract_all_participants_memory`,
@@ -72,7 +74,8 @@
   (реакции 👀/✍ вместо «Рисую…»/«ищу…») — `docs/claude/staging-checklist-reactions.md`; чек-лист ТЗ `feat/native-search` (нативный
   `web_search` в платном режиме) — `docs/claude/staging-checklist-native-search.md`; чек-лист ТЗ `feat/banana-21` (Nano Banana 2.1,
   `/bananapro`, 2K) — `docs/claude/staging-checklist-banana-21.md`; чек-лист ТЗ `feat/personas` (режимы характера, выкатка только `--force-recreate`) — `docs/claude/staging-checklist-personas.md`; чек-лист ТЗ `feat/user-profile` (профиль участника,
-  дайджест, экран «Профили») — `docs/claude/staging-checklist-profile.md`
+  дайджест, экран «Профили») — `docs/claude/staging-checklist-profile.md`; чек-лист ТЗ `feat/model-fallback`
+  (фолбэк на Gemini) — `docs/claude/staging-checklist-model-fallback.md`
 
 ## Стек
 - Python 3.12 (python:3.12-slim Docker image)
@@ -129,6 +132,10 @@
 - Характер: `CORE_IDENTITY` → режим (`personas/*.md`) → `_core_rules()` → групповой аддендум; режим задаёт тон, не правила
   (честность/маркеры/служебный блок/группа). Новое место с зашитым «характером» — брать `tone`/`review_style` режима
   чата. Ключ режима в личке — `user_id`. `docs/claude/personas.md`.
+- Фолбэк на Gemini живёт ТОЛЬКО в обёртках (`call_claude`/`call_claude_stream`/`sync_create`): новый вызов
+  модели — через них, не `client.messages.create` напрямую. Пробам, которым нужна именно запрошенная модель,
+  — `fallback=False`. На Gemini не уходят `thinking`/`output_config`/`tools`/`cache_control` (пул отвечает 400);
+  402 и 400 (`prompt is too long`) не переключают. `docs/claude/model-fallback.md`.
 - Уровень логов httpx не поднимать до INFO — токен бота утекает в URL.
 - Пользователь никогда не видит сырой текст исключения — только `api_errors.reply_api_error`.
 - Служебные вызовы (капча, поиск, перевод промпта, извлечение памяти, описание медиа) —
