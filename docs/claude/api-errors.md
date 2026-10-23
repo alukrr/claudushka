@@ -81,6 +81,11 @@ GPT Image), не к Anthropic SDK.** Тот же принцип, тот же с�
 `_transcribe_audio_gemini`. Все три HTTP-вызова к Gemini/GPT-image теперь однотипны —
 подробности в `docs/claude/images.md` и `docs/claude/media.md`.
 
+## Фолбэк на Gemini
+Если Claude недоступен (5xx/529/429/сеть/404), обёртки переключают запрос на Gemini через тот же пул — правила,
+конфиг, липкое окно и результаты проверки пула в `docs/claude/model-fallback.md`. На Claude остаётся одна повторная
+попытка (2 с) вместо лестницы `RETRY_DELAYS`; 402 и 400 не переключают. `call_with_retry(..., delays=...)`.
+
 ## Ретраи: два уровня, не путать
 1. **SDK-ретраи** (`ANTHROPIC_SDK_RETRIES = 3` в конструкторе `anthropic.Anthropic`) —
    для служебных вызовов. SDK ретраит 408/409/429/5xx, бэкофф 0.5→8с, блокирующий —

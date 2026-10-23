@@ -65,6 +65,21 @@ client = anthropic.Anthropic(
 )
 client_noretry = client.with_options(max_retries=0)  # переиспользует тот же httpx-пул
 
+# --- Фолбэк Claude → Gemini при сбоях пула (ТЗ feat/model-fallback, docs/claude/model-fallback.md) ---
+# Тот же Anthropic Messages API и тот же ключ, другая модель. FALLBACK_ENABLED=0 — откат без правки кода.
+# FALLBACK_MODEL — для чатов на Sonnet/Opus/Fable; FALLBACK_MODEL_CHEAP — для Haiku (free-режим и все
+# служебные вызовы), чтобы бесплатный режим не подорожал в разы. Цены обеих должны быть в LEGACY_PRICES.
+FALLBACK_ENABLED = os.environ.get("FALLBACK_ENABLED", "1").strip() != "0"
+FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "").strip() or "gemini-3.8-flash"
+FALLBACK_MODEL_CHEAP = os.environ.get("FALLBACK_MODEL_CHEAP", "").strip() or "gemini-3.1-flash-lite"
+# После сбоя Claude-модели X следующие N секунд запросы на X сразу идут на Gemini (без попытки и ожидания).
+FALLBACK_STICKY_SECONDS = int(os.environ.get("FALLBACK_STICKY_SECONDS", "300") or 300)
+# gemini-3.8-flash думает ~300+ токенов ВСЕГДА (thinking не выключить, output_config не принимает): при малом
+# max_tokens ответ обрывается, а недодуманное протекает в текст (Шаг 0, 2026-10-23). Запас ничего не стоит.
+FALLBACK_THINKING_HEADROOM = 4000
+FALLBACK_CLAUDE_DELAYS = (2,)         # на Claude одна повторная попытка, потом сразу Gemini
+FALLBACK_ALERT_COOLDOWN = 1800        # админу не чаще раза в 30 минут (как BALANCE_ALERT_COOLDOWN)
+
 MAX_HISTORY = 40
 GROUP_TRANSCRIPT_LIMIT = 50   # сколько реплик группового транскрипта тащить в messages
 
@@ -197,6 +212,16 @@ LEGACY_PRICES = {
                         "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0},
     "claude-opus-4-8": {"label": "Opus 4.8", "in": 5.0, "out": 25.0, "cache_read_mult": 0.1,
                         "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0},
+    # Фолбэк-модели Gemini (только цена/подпись, в выбор пользователя не входят). Цены — по докам пула на
+    # 2026-10-23; response.model у них голая строка без «google/» (Шаг 0). cache_read_mult 0.1 — «cached input
+    # bills at 10%» по докам пула; множитель записи в кэш у Gemini в доках не указан — 1.0 по dnd-mcp,
+    # НЕПРОВЕРЕНО (cache_control на этом endpoint всё равно режется, так что запись кэша не возникает).
+    "gemini-3.8-flash":      {"label": "Gemini 3.8 Flash (фолбэк)", "in": 0.75, "out": 3.75, "cache_read_mult": 0.1,
+                              "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0},
+    "gemini-3.1-flash-lite": {"label": "Gemini 3.1 Flash-Lite (фолбэк)", "in": 0.25, "out": 1.50, "cache_read_mult": 0.1,
+                              "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0},
+    "gemini-2.5-flash-lite": {"label": "Gemini 2.5 Flash-Lite (фолбэк)", "in": 0.10, "out": 0.40, "cache_read_mult": 0.1,
+                              "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0},
 }
 DEFAULT_CACHE_MULTS = {"cache_read_mult": 0.1, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0}
 
@@ -543,7 +568,126 @@ async def reply_expandable(reply_fn, body: str, header: str = "") -> None:
             await reply_fn(plain)
 
 
-async def call_claude(context, chat_id: int | None, *, label: str, usage_label: str | None = None, **kwargs):
+# --- Фолбэк Claude → Gemini (docs/claude/model-fallback.md) ---
+
+class NativeSearchUnavailable(Exception):
+    """Claude лёг во время запроса с нативным web_search: Gemini его не умеет — вызывающий код уходит
+    на схему Tavily (should_search → поиск → служебный блок) и повторяет запрос обычным call_claude."""
+
+
+_fallback_until: dict[str, float] = {}   # id Claude-модели → monotonic-время конца «липкого» окна
+_last_fallback_alert = 0.0
+
+
+def fallback_model_for(model_id: str) -> str | None:
+    """Модель фолбэка для Claude-модели или None (фолбэк выключен / запрос и так не на Claude)."""
+    if not FALLBACK_ENABLED or not model_id or model_id.startswith("gemini"):
+        return None
+    return FALLBACK_MODEL_CHEAP if model_id == DEFAULT_MODEL_ID else FALLBACK_MODEL
+
+
+def _sticky_fallback(model_id: str) -> str | None:
+    """Модель фолбэка, если окно после сбоя `model_id` ещё не закончилось."""
+    fb = fallback_model_for(model_id)
+    if fb and _fallback_until.get(model_id, 0.0) > time.monotonic():
+        return fb
+    return None
+
+
+def _strip_cache_control(obj):
+    """Копия system/messages без cache_control: Gemini-полоса пула отвечает 400 на любое его вхождение,
+    исходные структуры нужны ветке обрезки промпта, поэтому копия, а не правка на месте."""
+    if isinstance(obj, dict):
+        return {k: _strip_cache_control(v) for k, v in obj.items() if k != "cache_control"}
+    if isinstance(obj, list):
+        return [_strip_cache_control(v) for v in obj]
+    return obj
+
+
+def _fallback_kwargs(kwargs: dict, fb_model: str) -> dict:
+    """Параметры Claude-вызова → параметры Gemini-вызова: без thinking/output_config/tools/cache_control,
+    max_tokens с запасом на мышление Gemini. Исходный словарь не меняется."""
+    kw = {k: v for k, v in kwargs.items() if k not in ("thinking", "output_config", "tools", "tool_choice")}
+    kw["model"] = fb_model
+    kw["max_tokens"] = (kw.get("max_tokens") or 1024) + FALLBACK_THINKING_HEADROOM
+    for key in ("system", "messages"):
+        if key in kw:
+            kw[key] = _strip_cache_control(kw[key])
+    return kw
+
+
+def _enter_fallback(model: str, fb_model: str, exc: BaseException, label: str) -> None:
+    """Зафиксировать сбой Claude: открыть липкое окно, залогировать, раз в 30 минут сказать админам."""
+    global _last_fallback_alert
+    now = time.monotonic()
+    newly = _fallback_until.get(model, 0.0) <= now
+    _fallback_until[model] = now + FALLBACK_STICKY_SECONDS
+    status = getattr(exc, "status_code", None)
+    ctx = usage_ctx.get()
+    chat = ctx[0] if ctx else None
+    if status == 404:
+        logger.error(f"MODEL NOT FOUND: пул не знает {model!r} (404) — отвечаю через {fb_model}")
+    logger.warning(f"FALLBACK {model} → {fb_model} [{label}] chat={chat} {type(exc).__name__} HTTP {status}: "
+                   f"{str(exc)[:300]}")
+    if newly and now - _last_fallback_alert >= FALLBACK_ALERT_COOLDOWN:
+        _last_fallback_alert = now
+        _fire(notify_admins(f"⚠️ Claude {model} не отвечает ({status or type(exc).__name__}), "
+                            f"отвечаю через {fb_model} ближайшие {FALLBACK_STICKY_SECONDS // 60} мин."))
+
+
+async def check_fallback_models() -> None:
+    """При старте, в фоне: сверить FALLBACK_MODEL* с GET /v1/models пула. Только warning, старт не блокирует.
+    Наличие в каталоге работу НЕ гарантирует (gemini-3.6/3.7 в каталоге, а апстрим отвечает 404)."""
+    if not FALLBACK_ENABLED:
+        return
+    def fetch() -> set[str]:
+        base = (os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/")
+        r = http_requests.get(f"{base}/v1/models", timeout=15, headers={
+            "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"})
+        r.raise_for_status()
+        return {m.get("id", "").removeprefix("google/") for m in r.json().get("data", [])}
+    try:
+        ids = await asyncio.to_thread(fetch)
+    except Exception as e:
+        logger.warning(f"fallback: каталог моделей пула не получен ({type(e).__name__}) — проверка пропущена")
+        return
+    for m in (FALLBACK_MODEL, FALLBACK_MODEL_CHEAP):
+        if m not in ids:
+            logger.warning(f"fallback: {m!r} нет в каталоге пула /v1/models — фолбэк на неё не сработает")
+        if price_meta(m) is None:
+            logger.warning(f"fallback: у {m!r} нет цены в LEGACY_PRICES — usage_log посчитает по цене Haiku")
+
+
+async def _call_with_fallback(kwargs: dict, make_fn, *, label: str, keepalive, fallback: bool = True):
+    """Вызов Claude с переходом на Gemini. make_fn(kw) → функция без аргументов для call_with_retry.
+    Возвращает (response, фактически запрошенная модель). Запрос с tools (нативный поиск) на Gemini не
+    отправляется — NativeSearchUnavailable (липкое окно при этом всё равно открывается)."""
+    model = kwargs.get("model", "")
+    fb = fallback_model_for(model) if fallback else None
+    if fb and _sticky_fallback(model):
+        if kwargs.get("tools"):
+            raise NativeSearchUnavailable(model)
+        response = await api_errors.call_with_retry(
+            make_fn(_fallback_kwargs(kwargs, fb)), label=f"{label} [{fb}]", keepalive=keepalive)
+        return response, fb
+    try:
+        response = await api_errors.call_with_retry(
+            make_fn(kwargs), label=label, keepalive=keepalive,
+            delays=FALLBACK_CLAUDE_DELAYS if fb else api_errors.RETRY_DELAYS)
+        return response, model
+    except Exception as exc:
+        if not fb or not api_errors.should_fallback(exc):
+            raise
+        _enter_fallback(model, fb, exc, label)
+        if kwargs.get("tools"):
+            raise NativeSearchUnavailable(model) from exc
+    response = await api_errors.call_with_retry(
+        make_fn(_fallback_kwargs(kwargs, fb)), label=f"{label} [{fb}]", keepalive=keepalive)
+    return response, fb
+
+
+async def call_claude(context, chat_id: int | None, *, label: str, usage_label: str | None = None,
+                      fallback: bool = True, **kwargs):
     """messages.create из хендлера: не блокирует event loop, переживает 529/429/сеть.
 
     label — для логов ретраев; usage_label — метка в usage_log (по умолчанию первое слово
@@ -552,18 +696,17 @@ async def call_claude(context, chat_id: int | None, *, label: str, usage_label: 
 
     Всю паузу между попытками держит «печатает…», чтобы ожидание (до 15с) не выглядело
     зависанием. Исключение после всех попыток пробрасывается наверх — его ловит
-    reply_api_error.
+    reply_api_error. Сбой Claude (5xx/429/сеть/404) → ответ от Gemini (_call_with_fallback);
+    fallback=False — для проб, которым нужен именно ответ запрошенной модели (_probe_model).
     """
     keepalive = None
     if context is not None and chat_id is not None:
         keepalive = functools.partial(_keep_chat_action, context.bot, chat_id, "typing")
 
-    response = await api_errors.call_with_retry(
-        functools.partial(client_noretry.messages.create, **kwargs),
-        label=label,
-        keepalive=keepalive,
-    )
-    _track_response(kwargs.get("model", ""), response, usage_label or label.split()[0])
+    response, used = await _call_with_fallback(
+        kwargs, lambda kw: functools.partial(client_noretry.messages.create, **kw),
+        label=label, keepalive=keepalive, fallback=fallback)
+    _track_response(used, response, usage_label or label.split()[0])
     return response
 
 
@@ -591,12 +734,10 @@ async def call_claude_stream(context, chat_id: int | None, *, label: str, usage_
     keepalive = None
     if context is not None and chat_id is not None:
         keepalive = functools.partial(_keep_chat_action, context.bot, chat_id, "typing")
-    response = await api_errors.call_with_retry(
-        functools.partial(_stream_final_message, kwargs, on_search),
-        label=label,
-        keepalive=keepalive,
-    )
-    _track_response(kwargs.get("model", ""), response, usage_label or label.split()[0])
+    response, used = await _call_with_fallback(
+        kwargs, lambda kw: functools.partial(_stream_final_message, kw, on_search),
+        label=label, keepalive=keepalive)
+    _track_response(used, response, usage_label or label.split()[0])
     return response
 
 
@@ -618,8 +759,22 @@ def sync_create(**kwargs):
     `label=` (не уходит в API) — метка строки usage_log; чат берётся из usage_ctx.
     """
     label = kwargs.pop("label", "aux")
-    response = client.messages.create(**kwargs)
-    _track_response(kwargs.get("model", ""), response, label)
+    model = kwargs.get("model", "")
+    fb = fallback_model_for(model)
+    used = model
+    if fb and _sticky_fallback(model):
+        used = fb
+        response = client.messages.create(**_fallback_kwargs(kwargs, fb))
+    else:
+        try:
+            response = client.messages.create(**kwargs)   # SDK-ретраи отработали, дальше — Gemini
+        except Exception as exc:
+            if not (fb and api_errors.should_fallback(exc)):
+                raise
+            _enter_fallback(model, fb, exc, label)
+            used = fb
+            response = client.messages.create(**_fallback_kwargs(kwargs, fb))
+    _track_response(used, response, label)
     return response
 
 
@@ -1051,28 +1206,31 @@ async def call_dialog_native(context, chat_id: int, message, *, label: str, **kw
     searches = 0
     text = ""
     response = None
-    for i in range(NATIVE_SEARCH_MAX_PAUSE + 1):
-        response = await call_claude_stream(
-            context, chat_id, label=label if i == 0 else f"{label} (pause {i})",
-            usage_label="dialog" if i == 0 else "dialog_pause",
-            on_search=on_search, tools=tools, messages=messages, **kwargs,
-        )
-        su = getattr(response.usage, "server_tool_use", None)
-        searches += getattr(su, "web_search_requests", 0) or 0
-        for b in response.content:
-            if getattr(b, "type", "") == "web_search_tool_result" and not isinstance(b.content, list):
-                logger.warning(f"web_search: {getattr(b.content, 'error_code', b.content)} ({label})")
-        text, new_urls = native_answer(response)
-        urls += [u for u in new_urls if u not in urls]
-        if response.stop_reason != "pause_turn":
-            break
-        if i == NATIVE_SEARCH_MAX_PAUSE:
-            logger.warning(f"pause_turn: {NATIVE_SEARCH_MAX_PAUSE} продолжения не хватило, беру что есть ({label})")
-            break
-        messages = messages + [{"role": "assistant",
-                                "content": [b.model_dump(mode="json", exclude_none=True) for b in response.content]}]
-    for _ in range(searches):
-        _record_usage("search", "anthropic", "native_search", NATIVE_SEARCH_PRICE)
+    try:
+        for i in range(NATIVE_SEARCH_MAX_PAUSE + 1):
+            response = await call_claude_stream(
+                context, chat_id, label=label if i == 0 else f"{label} (pause {i})",
+                usage_label="dialog" if i == 0 else "dialog_pause",
+                on_search=on_search, tools=tools, messages=messages, **kwargs,
+            )
+            su = getattr(response.usage, "server_tool_use", None)
+            searches += getattr(su, "web_search_requests", 0) or 0
+            for b in response.content:
+                if getattr(b, "type", "") == "web_search_tool_result" and not isinstance(b.content, list):
+                    logger.warning(f"web_search: {getattr(b.content, 'error_code', b.content)} ({label})")
+            text, new_urls = native_answer(response)
+            urls += [u for u in new_urls if u not in urls]
+            if response.stop_reason != "pause_turn":
+                break
+            if i == NATIVE_SEARCH_MAX_PAUSE:
+                logger.warning(f"pause_turn: {NATIVE_SEARCH_MAX_PAUSE} продолжения не хватило, беру что есть ({label})")
+                break
+            messages = messages + [{"role": "assistant",
+                                    "content": [b.model_dump(mode="json", exclude_none=True) for b in response.content]}]
+    finally:
+        # Поиски уже выполнены и оплачены, даже если следующая итерация упала (529, NativeSearchUnavailable).
+        for _ in range(searches):
+            _record_usage("search", "anthropic", "native_search", NATIVE_SEARCH_PRICE)
     return response, text, urls, searches
 
 
@@ -3436,7 +3594,7 @@ async def _probe_model(context, chat_id: int, model_id: str) -> None:
     """
     await call_claude(
         context, chat_id, label=f"проверка модели {model_id}",
-        model=model_id, max_tokens=1, **aux_params(model_id),
+        model=model_id, max_tokens=1, **aux_params(model_id), fallback=False,
         messages=[{"role": "user", "content": "hi"}],
     )
 
@@ -4498,6 +4656,7 @@ async def post_init(application):
     api_errors.set_admin_notifier(notify_admins)
     logger.info(f"Bot: @{bot_username} (ID: {context_bot_id})")
     _spawn_background_task(memory_purge_job())  # разовая чистка на старте, не блокируя запуск
+    _spawn_background_task(check_fallback_models())  # сверка моделей фолбэка с каталогом пула, только warning
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4927,11 +5086,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         model=_model, **dialog_params(_model), max_tokens=out_tokens(_model, 4096),
                         system=system, messages=messages,
                     )
-                except anthropic.BadRequestError as e_native:
-                    if not _native_search_rejected(e_native):
+                except (anthropic.BadRequestError, NativeSearchUnavailable) as e_native:
+                    if isinstance(e_native, anthropic.BadRequestError) and not _native_search_rejected(e_native):
                         raise
-                    # Пул/модель не принимает инструмент — этот же запрос по старой схеме (Tavily).
-                    logger.warning(f"native web_search отклонён ({_model}), перехожу на Tavily: {e_native}")
+                    # Пул/модель не принимает инструмент ИЛИ Claude лёг (фолбэк на Gemini, у которого нет
+                    # нативного поиска) — этот же запрос по старой схеме (Tavily).
+                    logger.warning(f"native web_search недоступен ({_model}), перехожу на Tavily: {e_native!r}")
                     use_native, native_text, native_urls = False, None, []
                     search_query, search_results = await _tavily_search(
                         update, user_id, chat_id, is_group, user_text, reply_context)
