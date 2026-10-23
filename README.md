@@ -174,6 +174,10 @@ GPT Image 2.5 Flare или Sunburst без дневного лимита, еже
 2. Заполнить переменные: `TELEGRAM_BOT_TOKEN`, `ANTHROPIC_API_KEY`, `TAVILY_API_KEY`, `GEMINI_API_KEY`
 3. Запустить: `docker compose up -d`
 
+Прод живёт на Hetzner, доступ по SSH через локальный алиас (`SSH_HOST`, задаётся вне репозитория). Правила для
+AI-агентов (только с явного согласия владельца, сначала чтение) — в `CLAUDE.md`, раздел
+«Доступ к серверу (SSH)».
+
 ## Автор
 
 [@alukr](https://t.me/alukr) — DevOps-инженер, Buchholz in der Nordheide, Германия
