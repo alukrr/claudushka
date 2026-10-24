@@ -23,7 +23,10 @@
   dry-run: читает со снимка во временном файле, sudo НЕ требует. `--apply` пишет в
   боевой файл напрямую — `data/` на сервере root:root, нужен `sudo` (для llm — `sudo -E`,
   прокинуть `ANTHROPIC_API_KEY`). `--model` принимает короткие имена
-  (`haiku`/`sonnet`/`opus`/`fable`, реестр `MODEL_ALIASES` дублирует `MODELS` из bot.py,
+  (`haiku`/`sonnet`/`opus`/`fable`, а также `argon` = gemini-4-argon, `flash` = gemini-3.8-flash и `lite` = gemini-3.1-flash-lite (те же имена, что команды бота) —
+  Gemini через пул, ВЫБОР ВРУЧНУЮ, не автофолбэк: дедуп меняет память, смена модели посреди прогона дала бы смесь;
+  у Gemini `max_tokens` + запас 4000 на рассуждения, без thinking/output_config/cache_control, оценка цены
+  приблизительная — `THINKING_EST`; реестр `MODEL_ALIASES` дублирует `MODELS` из bot.py,
   см. `docs/claude/models-and-costs.md`) или полную API-строку. По завершении llm-режима
   печатает время, токены (in/cache_write/cache_read/out по отдельности) и оценку
   стоимости по локальной табличке `PRICING` (тоже дубль `MODELS`, сверять при смене цен
