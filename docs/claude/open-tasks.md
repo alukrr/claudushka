@@ -23,7 +23,7 @@
   dry-run: читает со снимка во временном файле, sudo НЕ требует. `--apply` пишет в
   боевой файл напрямую — `data/` на сервере root:root, нужен `sudo` (для llm — `sudo -E`,
   прокинуть `ANTHROPIC_API_KEY`). `--model` принимает короткие имена
-  (`haiku`/`sonnet`/`opus`/`fable`, а также `gemini` = gemini-3.8-flash и `gemini-lite` = gemini-3.1-flash-lite —
+  (`haiku`/`sonnet`/`opus`/`fable`, а также `argon` = gemini-4-argon, `flash` = gemini-3.8-flash и `lite` = gemini-3.1-flash-lite (те же имена, что команды бота) —
   Gemini через пул, ВЫБОР ВРУЧНУЮ, не автофолбэк: дедуп меняет память, смена модели посреди прогона дала бы смесь;
   у Gemini `max_tokens` + запас 4000 на рассуждения, без thinking/output_config/cache_control, оценка цены
   приблизительная — `THINKING_EST`; реестр `MODEL_ALIASES` дублирует `MODELS` из bot.py,
