@@ -2904,56 +2904,259 @@ DAILY_REVIEW_FOOTER = "Отключить ежедневный обзор: /revi
 # Час рассылки по Берлину. 21:00 = 23:00 МСК зимой (CET) и 22:00 МСК летом (CEST); при 22:00 зимой выходила полночь по МСК.
 DAILY_REVIEW_HOUR = 21
 
+# --- Окно, сбор лога, ветки A/B (ТЗ feat/review-topics, docs/claude/daily-review.md) ---
+REVIEW_USER_MSG_CHARS = int(os.environ.get("REVIEW_USER_MSG_CHARS", "500"))   # реплика человека в логе обзора
+REVIEW_BOT_MSG_CHARS = int(os.environ.get("REVIEW_BOT_MSG_CHARS", "200"))     # реплика бота режем сильнее
+# Лог влезает в этот размер — ветка A (один вызов Opus по всему логу). 0 — всегда ветка B.
+REVIEW_SINGLE_MAX_CHARS = int(os.environ.get("REVIEW_SINGLE_MAX_CHARS", "60000"))
+REVIEW_SESSION_GAP_MIN = 45        # пауза, после которой начинается новая сессия (ветка B)
+REVIEW_CHUNK_MAX_CHARS = 20000     # сессия длиннее режется на части по границе сообщения
+REVIEW_TOPICS_MAX_CHARS = 30000    # лимит JSON выжимок в итоговом вызове
+REVIEW_RAW_TAIL_MSGS = 40          # последние сообщения лога сырьём — для живости (ветка B)
+REVIEW_RAW_TAIL_MAX_CHARS = 8000
+REVIEW_MIN_HUMAN_MSGS = 5
+REVIEW_CHUNK_PARALLEL = 4
+TELEGRAM_MSG_LIMIT = 4096
+
+
+def _review_window(now: datetime | None = None) -> tuple[datetime, datetime]:
+    """Окно ежедневного обзора: с DAILY_REVIEW_HOUR вчера до now. Через дату, не now-24h:
+    в ночь перехода CET/CEST окно честно 23 или 25 часов."""
+    now = now or _berlin_now()
+    since = datetime.combine(now.date() - timedelta(days=1), dt_time(DAILY_REVIEW_HOUR, 0), tzinfo=BERLIN_TZ)
+    return since, now
+
+
+def _clip(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def build_review_log(rows: list[dict]) -> list[dict]:
+    """Строки group_messages окна → записи лога [{ts, line, is_bot}] (по возрастанию времени).
+    Прошлый обзор (is_bot и текст начинается с «(обзор дня по») выкидываем — иначе Opus пересказывает вчерашнее.
+    Формат строки «HH:MM Имя: текст» (Берлин)."""
+    out = []
+    for r in rows:
+        text = r.get("text") or ""
+        if r.get("is_bot") and text.startswith(f"({REVIEW_SENT_LABEL}"):
+            continue
+        limit = REVIEW_BOT_MSG_CHARS if r.get("is_bot") else REVIEW_USER_MSG_CHARS
+        hhmm = datetime.fromtimestamp(r["ts"], BERLIN_TZ).strftime("%H:%M")
+        out.append({"ts": r["ts"], "is_bot": bool(r.get("is_bot")),
+                    "line": f"{hhmm} {r.get('sender') or '?'}: {_clip(text, limit).replace(chr(10), ' ')}"})
+    return out
+
+
+def split_review_sessions(entries: list[dict], gap_min: int | None = None,
+                          chunk_max: int | None = None) -> list[list[dict]]:
+    """Нарезка лога на части для ветки B. Новая сессия — пауза >= gap_min минут между соседними сообщениями
+    (по epoch-времени, так что переход CET/CEST не мешает); сессия длиннее chunk_max знаков режется по границе
+    сообщения. Чистая функция, без I/O."""
+    gap_min = REVIEW_SESSION_GAP_MIN if gap_min is None else gap_min
+    chunk_max = REVIEW_CHUNK_MAX_CHARS if chunk_max is None else chunk_max
+    sessions: list[list[dict]] = []
+    cur: list[dict] = []
+    cur_chars = 0
+    prev_ts = None
+    for e in entries:
+        size = len(e["line"]) + 1
+        new_session = prev_ts is not None and e["ts"] - prev_ts >= gap_min * 60
+        if cur and (new_session or cur_chars + size > chunk_max):
+            sessions.append(cur)
+            cur, cur_chars = [], 0
+        cur.append(e)
+        cur_chars += size
+        prev_ts = e["ts"]
+    if cur:
+        sessions.append(cur)
+    return sessions
+
+
+def split_telegram_text(review: str, footer: str = "", limit: int = TELEGRAM_MSG_LIMIT) -> list[str]:
+    """review + «\\n\\n» + footer, разбитый на сообщения <= limit по границе абзаца (футер — в последнем).
+    Абзац длиннее limit режется по пробелу. Влезает в одно — одно сообщение."""
+    full = f"{review}\n\n{footer}" if footer else review
+    if len(full) <= limit:
+        return [full]
+    paras: list[str] = []
+    for p in review.split("\n\n"):
+        while len(p) > limit:
+            cut = p.rfind(" ", 0, limit)
+            cut = cut if cut > 0 else limit
+            paras.append(p[:cut])
+            p = p[cut:].lstrip()
+        if p:
+            paras.append(p)
+    if footer:
+        paras.append(footer)
+    parts, cur = [], ""
+    for p in paras:
+        cand = f"{cur}\n\n{p}" if cur else p
+        if len(cand) > limit and cur:
+            parts.append(cur)
+            cur = p
+        else:
+            cur = cand
+    if cur:
+        parts.append(cur)
+    return parts
+
+
+def _cap_topics(topics: list[dict], max_chars: int = REVIEW_TOPICS_MAX_CHARS) -> str:
+    """JSON выжимок под лимит по размеру: сначала режем цитаты, потом моменты, потом хвост списка."""
+    def dump(ts):
+        return json.dumps(ts, ensure_ascii=False)
+    s = dump(topics)
+    for field in ("quotes", "moments"):
+        if len(s) <= max_chars:
+            break
+        topics = [{k: v for k, v in t.items() if k != field} for t in topics]
+        s = dump(topics)
+    while len(s) > max_chars and len(topics) > 1:
+        topics = topics[:-max(1, len(topics) // 10)]
+        s = dump(topics)
+    return s[:max_chars]
+
+
+REVIEW_CHUNK_SYSTEM = (
+    "Ты помогаешь составить обзор дня в групповом чате. Тебе дан кусок лога (строки «HH:MM Имя: текст», время по Берлину). "
+    "Выдели темы этого куска и верни ТОЛЬКО JSON без пояснений: "
+    '{"topics": [{"title": "короткий заголовок", "from": "HH:MM", "to": "HH:MM", "participants": ["имена"], '
+    '"gist": "1-2 предложения: о чём и чем кончилось", "moments": ["сочные моменты: кто кого подколол, чей звёздный час или провал"], '
+    '"quotes": ["дословные короткие цитаты из лога, до 120 знаков, 0-2 на тему"]}]}. '
+    "Цитаты бери ТОЛЬКО дословно из лога, ничего не выдумывай. Мелочь, не тянущую на тему, пропускай. Язык — как в чате."
+)
+
+
+async def _review_chunk_topics(chat_id: int, idx: int, chunk: list[dict]) -> list[dict] | None:
+    """Выжимка одной части Haiku → список тем. Сбой/пустой ответ → None (часть пропускается, обзор не падает)."""
+    try:
+        resp = await aux_create(
+            label="daily_review_chunk",
+            model=DEFAULT_MODEL_ID,
+            **aux_params(),
+            max_tokens=2000,
+            system=REVIEW_CHUNK_SYSTEM,
+            messages=[{"role": "user", "content": "\n".join(e["line"] for e in chunk)}],
+        )
+        data = api_errors.parse_json_lenient(response_text(resp), "{", label="daily_review_chunk")
+        topics = data.get("topics") if isinstance(data, dict) else None
+        topics = [t for t in (topics or []) if isinstance(t, dict)]
+        if not topics:
+            logger.warning(f"Выжимка части {idx} пуста, chat={chat_id}: {api_errors.response_debug(resp)}")
+            return None
+        return topics
+    except Exception as e:
+        logger.warning(f"Выжимка части {idx} упала, chat={chat_id}: {e}")
+        return None
+
+
+def _review_system(chat_id: int) -> str:
+    return (
+        f"Ты Клодушка. Подача обзора (режим характера чата): {persona_review_style(chat_id)}. "
+        "Напиши обзор чата за сутки (с прошлого вечернего обзора) — не сухой пересказ, а маленький фельетон. "
+        "Структура: 1) вступление в 1-3 предложения — сюжет дня; 2) 3-6 блоков тем; 3) в самом конце одна короткая "
+        "фраза-афоризм или шутка, которая подводит итог именно ЭТОМУ дню (придумай новую под конкретные события, "
+        "не используй заготовленную фразу про то, что ты AI). "
+        "Блок темы: короткий заголовок, когда это было (утро/день/вечер или время), кто участвовал, и 2-4 предложения "
+        "с подачей твоего режима: кто с кем дружит/троллит/спорит, чей звёздный час, чей провал. Эмодзи в начале блока — можно. "
+        "Блоки отделяй пустой строкой. Мелочь, не тянущую на тему, не перечисляй; не старайся упомянуть всех. "
+        "Если подряд идущие блоки или выжимки про одну и ту же тему — объедини их. "
+        "Пиши на языке чата, обычным текстом без markdown-разметки (звёздочки, решётки, обратные кавычки не нужны). "
+        "Объём — ориентир 2000-3000 знаков; оборванный на середине текст хуже короткого."
+    )
+
+
+async def prepare_review_input(chat_id: int, entries: list[dict]) -> tuple[str, str] | None:
+    """Лог → (ветка 'A'|'B', текст user-сообщения для итогового вызова). None — все выжимки упали.
+    Все вызовы Haiku идут в usage_ctx вызывающего (чат выставлен до вызова)."""
+    log_text = "\n".join(e["line"] for e in entries)
+    if REVIEW_SINGLE_MAX_CHARS and len(log_text) <= REVIEW_SINGLE_MAX_CHARS:
+        return "A", (f"Вот сообщения за период (время по Берлину). Сначала про себя выдели темы дня, потом пиши обзор:\n{log_text}")
+    chunks = split_review_sessions(entries)
+    sem = asyncio.Semaphore(REVIEW_CHUNK_PARALLEL)
+
+    async def one(i, c):
+        async with sem:
+            return await _review_chunk_topics(chat_id, i, c)
+
+    results = await asyncio.gather(*(one(i, c) for i, c in enumerate(chunks)))
+    topics = [t for r in results if r for t in r]
+    if not topics:
+        logger.warning(f"Дневной обзор: все {len(chunks)} выжимок пусты/упали, chat={chat_id}")
+        return None
+    tail, size = [], 0
+    for e in reversed(entries[-REVIEW_RAW_TAIL_MSGS:]):
+        size += len(e["line"]) + 1
+        if size > REVIEW_RAW_TAIL_MAX_CHARS:
+            break
+        tail.append(e["line"])
+    tail.reverse()
+    logger.info(f"Дневной обзор B: chat={chat_id}, частей={len(chunks)}, упало={sum(1 for r in results if not r)}, тем={len(topics)}")
+    return "B", (
+        "Лог дня был слишком большим, поэтому вот выжимки тем по частям лога (JSON, по порядку времени; "
+        "соседние части могут про одно и то же — объединяй):\n"
+        f"{_cap_topics(topics)}\n\nИ самые последние сообщения дня сырьём:\n" + "\n".join(tail)
+    )
+
+
+def _finish_review(response, chat_id: int, tag: str) -> str:
+    review = response_text(response)
+    if not review:
+        logger.warning(f"{tag} пуст: {api_errors.response_debug(response)}")
+        return ""
+    if api_errors.was_truncated(response):
+        logger.warning(f"{tag} обрезан по max_tokens, chat={chat_id}: {api_errors.response_debug(response)}")
+        review = api_errors.trim_to_last_sentence(review)
+    return review
+
+
+def collect_review_entries(chat_id: int) -> tuple[list[dict], int]:
+    """Окно «с прошлого обзора» → (записи лога, число сообщений людей)."""
+    since, until = _review_window()
+    rows = db.get_group_messages_range(chat_id, int(since.timestamp()), int(until.timestamp()))
+    entries = build_review_log(rows)
+    return entries, sum(1 for e in entries if not e["is_bot"])
+
 
 async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
     """Ежедневный обзор — только paid-группы, не забаненные, с включённым флагом.
-    Модель — Opus независимо от модели чата; стоимость идёт в usage_log с billed=1
-    (chat_id выставляется явно на каждый чат цикла: у джоба нет апдейта → нет gate_update).
+    Окно — с DAILY_REVIEW_HOUR вчера до запуска; влезает в REVIEW_SINGLE_MAX_CHARS — один вызов Opus (A),
+    иначе выжимки частей Haiku + итог Opus (B). Модель итога — Opus независимо от модели чата; стоимость идёт
+    в usage_log с billed=1 (chat_id выставляется явно на каждый чат цикла: у джоба нет апдейта → нет gate_update).
     Free-чатам обзор не шлём, флаг daily_review_enabled при этом не трогаем."""
     try:
         for chat in db.get_review_chats():
             chat_id = chat["chat_id"]
             if chat_tier(chat_id) != "paid":
                 continue
-            # Только сегодняшние сообщения (с полуночи по Берлину): «последние 100 вообще»
-            # пересказывали бы старое молчащего чата каждую ночь — теперь за деньги чата.
-            messages = db.get_group_history(chat_id, 100, since_ts=_day_start_ts())
-            if len(messages) < 5:
+            entries, human = collect_review_entries(chat_id)
+            if human < REVIEW_MIN_HUMAN_MSGS:
                 continue
             usage_ctx.set((chat_id, "group", None))
             try:
-                chat_log = "\n".join(messages)
+                prepared = await prepare_review_input(chat_id, entries)
+                if not prepared:
+                    continue
+                branch, user_content = prepared
                 response = await aux_create(
                     label="daily_review",
                     model=DAILY_REVIEW_MODEL_ID,
-                    max_tokens=out_tokens(DAILY_REVIEW_MODEL_ID, 1000),
-                    system=(
-                        f"Ты Клодушка. Подача обзора (режим характера чата): {persona_review_style(chat_id)}. "
-                        "Напиши обзор дня в чате — 3-4 абзаца, ОКОЛО 1000-1200 знаков суммарно. "
-                        "Это не сухой пересказ, а маленький фельетон: найди сюжет дня и расскажи его живо. "
-                        "Выбери 3-4 самых сочных момента: кто с кем дружит/троллит/игнорирует, как обращаются друг к другу, "
-                        "кто лидер мнений, какие темы повторялись, у кого был звёздный час, а у кого — провал. "
-                        "Не старайся упомянуть всех и каждую тему. Можно сравнения, метафоры, лёгкое преувеличение. "
-                        "В конце — одна короткая фраза-афоризм или шутка, которая подводит итог именно ЭТОМУ дню "
-                        "(придумай новую под конкретные события, не используй заготовленную фразу про то, что ты AI). "
-                        "Пиши на языке чата, без markdown-разметки. "
-                        "Уложись в объём — оборванный на середине текст хуже короткого."
-                    ),
-                    messages=[{"role": "user", "content": f"Вот сообщения за день:\n{chat_log}"}],
+                    max_tokens=out_tokens(DAILY_REVIEW_MODEL_ID, 2200),
+                    system=_review_system(chat_id),
+                    messages=[{"role": "user", "content": user_content}],
                 )
-                review = response_text(response)
+                review = _finish_review(response, chat_id, f"Дневной обзор ({branch})")
                 if not review:
-                    logger.warning(f"Дневной обзор пуст: {api_errors.response_debug(response)}")
                     continue
-                if api_errors.was_truncated(response):
-                    logger.warning(f"Дневной обзор обрезан по max_tokens, chat={chat_id}: {api_errors.response_debug(response)}")
-                    review = api_errors.trim_to_last_sentence(review)
                 # Подсказку про отключение добавляет КОД, не модель. В транскрипт кладём обзор
                 # без неё — иначе модель начнёт копировать хвост в живые ответы.
-                await context.bot.send_message(chat_id=chat_id, text=f"{review}\n\n{DAILY_REVIEW_FOOTER}")
+                for part in split_telegram_text(review, DAILY_REVIEW_FOOTER):
+                    await context.bot.send_message(chat_id=chat_id, text=part)
                 db.save_group_message(chat_id, context_bot_id, "Клодушка",
-                                      f"{_review_sent_note(len(messages))}\n{review}", is_bot=True)
-                logger.info(f"Daily review sent to {chat_id}")
+                                      f"{_review_sent_note(len(entries))}\n{review}", is_bot=True)
+                logger.info(f"Daily review sent to {chat_id} (branch {branch}, {len(entries)} msgs)")
             except Exception as e:
                 logger.error(f"Daily review error for {chat_id}: {e}")
     finally:
@@ -3036,16 +3239,16 @@ def _draw_sent_note(prompt: str) -> str:
     return f"({DRAW_SENT_LABEL}: {prompt})"
 
 
-# Пометка перед текстом обзора при записи в group_messages: обзор строится по ВСЕМ сообщениям дня (до 100), а диалог
+# Пометка перед текстом обзора при записи в group_messages: обзор строится по ВСЕМ сообщениям окна, а диалог
 # видит только окно GROUP_TRANSCRIPT_LIMIT — иначе модель не находит событий обзора в своей истории и «признаётся»,
 # что выдумала его (инцидент 2026-10-22, docs/claude/incidents.md). Пользователю пометка не показывается.
 REVIEW_SENT_LABEL = "обзор дня по"
 
 
-def _review_sent_note(n, today: bool = True) -> str:
-    """today=True — ежедневный обзор (сообщения с начала суток); False — /review (последние N вообще)."""
-    scope = f"{n} сообщениям с начала суток" if today else f"последним {n} сообщениям"
-    return (f"({REVIEW_SENT_LABEL} {scope}; "
+def _review_sent_note(n) -> str:
+    """Ежедневный обзор и /review одинаково смотрят окно «с прошлого обзора» (DAILY_REVIEW_HOUR вчера → сейчас).
+    Префикс REVIEW_SENT_LABEL не менять: по нему build_review_log выкидывает прошлый обзор из лога."""
+    return (f"({REVIEW_SENT_LABEL} {n} сообщениям с прошлого обзора ({DAILY_REVIEW_HOUR}:00); "
             "большинство из них могут быть вне твоего окна истории)")
 
 
@@ -3450,42 +3653,42 @@ async def cmd_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Разовый обзор (admin-only): тот же сбор лога и ветки A/B, что у ежедневного (окно «с прошлого 21:00 до
+    сейчас»), финал — на модели чата с dialog_params. Позволяет проверить фичу, не дожидаясь 21:00."""
     if not is_admin(update.effective_user.id):
         return
     chat_id = update.effective_chat.id
-    messages = db.get_group_history(chat_id, 100)
-    if len(messages) < 5:
+    entries, human = collect_review_entries(chat_id)
+    if human < REVIEW_MIN_HUMAN_MSGS:
         await update.message.reply_text("Маловато сообщений для обзора.")
         return
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     try:
-        chat_log = "\n".join(messages)
+        prepared = await prepare_review_input(chat_id, entries)
+        if not prepared:
+            await update.message.reply_text("Не удалось собрать обзор (выжимки частей не получились). Попробуй ещё раз.")
+            return
+        branch, user_content = prepared
         _model = get_chat_model(chat_id)
         response = await call_claude(
             context, chat_id, label=f"/review chat={chat_id}",
             model=_model,
             **dialog_params(_model),
-            max_tokens=out_tokens(_model, 500),
-            system=(
-                f"Ты Клодушка. Подача обзора (режим характера чата): {persona_review_style(chat_id)}. "
-                "Напиши КОРОТКИЙ обзор дня в чате — 2-3 абзаца, не больше 600 знаков суммарно. "
-                "Анализируй социальную динамику, темы, активность участников — но выбери только 2-3 самых сочных момента. "
-                "В конце — одна короткая фраза-афоризм или шутка, которая подводит итог именно ЭТОМУ дню "
-                "(придумай новую под конкретные события, не используй заготовленную фразу про то, что ты AI). "
-                "Пиши на языке чата. Уложись в объём — оборванный на середине текст хуже короткого."
-            ),
-            messages=[{"role": "user", "content": f"Вот сообщения за день:\n{chat_log}"}],
+            max_tokens=out_tokens(_model, 2200),
+            system=_review_system(chat_id),
+            messages=[{"role": "user", "content": user_content}],
         )
-        review = response_text(response)
+        review = _finish_review(response, chat_id, f"/review ({branch})")
         if not review:
-            logger.warning(f"/review пуст: {api_errors.response_debug(response)}")
             review = "Модель вернула пустой ответ. Попробуй ещё раз или смени модель через /models."
-        elif api_errors.was_truncated(response):
-            logger.warning(f"/review обрезан по max_tokens, chat={chat_id}: {api_errors.response_debug(response)}")
-            review = api_errors.trim_to_last_sentence(review)
-        await update.message.reply_text(review)
+            await update.message.reply_text(review)
+            return
+        parts = split_telegram_text(review)
+        await update.message.reply_text(parts[0])
+        for part in parts[1:]:
+            await context.bot.send_message(chat_id=chat_id, text=part)
         db.save_group_message(chat_id, context_bot_id, "Клодушка",
-                              f"{_review_sent_note(len(messages), today=False)}\n{review}", is_bot=True)
+                              f"{_review_sent_note(len(entries))}\n{review}", is_bot=True)
     except Exception as e:
         await api_errors.reply_api_error(
             update.message.reply_text, e, context_label=f"/review chat={chat_id}",
