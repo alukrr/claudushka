@@ -2901,6 +2901,8 @@ async def handle_captcha(update: Update, user: dict) -> bool:
 
 DAILY_REVIEW_MODEL_ID = MODELS["opus"]["id"]  # осознанное исключение из «служебное — Haiku»: платная фича
 DAILY_REVIEW_FOOTER = "Отключить ежедневный обзор: /review_off (админ чата)"
+# Час рассылки по Берлину. 21:00 = 23:00 МСК зимой (CET) и 22:00 МСК летом (CEST); при 22:00 зимой выходила полночь по МСК.
+DAILY_REVIEW_HOUR = 21
 
 
 async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
@@ -5754,10 +5756,10 @@ def main():
 
     app.job_queue.run_daily(
         daily_chat_review,
-        time=dt_time(hour=22, minute=0, tzinfo=BERLIN_TZ),
+        time=dt_time(hour=DAILY_REVIEW_HOUR, minute=0, tzinfo=BERLIN_TZ),
         name="daily_review"
     )
-    logger.info("Daily review scheduled at 22:00 Berlin time")
+    logger.info(f"Daily review scheduled at {DAILY_REVIEW_HOUR:02d}:00 Berlin time")
     app.job_queue.run_daily(
         memory_purge_job,
         time=dt_time(hour=4, minute=30, tzinfo=BERLIN_TZ),

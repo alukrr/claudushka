@@ -40,7 +40,7 @@
   `_describe_media_haiku`, ветки `voice`/`video_note`/`video`/`animation`) —
   `docs/claude/media.md`
 - Дневной обзор (`daily_chat_review`, `cmd_review`, `/review_on`, `/review_off`,
-  `run_daily`, `BERLIN_TZ`) — `docs/claude/daily-review.md`
+  `run_daily`, `BERLIN_TZ`) — `docs/claude/daily-review.md`; ТЗ «весь день + блоки тем» — `docs/claude/tz-daily-review-topics.md`
 - Модели и цены (`MODELS`, `/haiku /sonnet /opus /fable /argon /flash /lite`, Gemini-модели чата, free-выбор `chat_free_model`, `/models`, `calc_llm_cost`) —
   `docs/claude/models-and-costs.md`
 - Prompt caching (`build_system`, `service_block`, `mark_cache_tail`, `pick_history_window`,

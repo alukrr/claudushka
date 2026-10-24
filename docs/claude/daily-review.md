@@ -64,7 +64,7 @@ Telegram-чата — переиспользован `is_chat_admin()` (`docs/cl
 команды управляют только ЕЖЕДНЕВНОЙ фоновой рассылкой (`run_daily` в `main()`).
 
 ## Часовой пояс (`BERLIN_TZ`)
-Дневной обзор запускается через `app.job_queue.run_daily(daily_chat_review, time=dt_time(hour=22, minute=0, tzinfo=BERLIN_TZ), ...)` в `main()`. `BERLIN_TZ = ZoneInfo("Europe/Berlin")` —
+Дневной обзор запускается через `app.job_queue.run_daily(daily_chat_review, time=dt_time(hour=DAILY_REVIEW_HOUR, minute=0, tzinfo=BERLIN_TZ), ...)` в `main()`. `DAILY_REVIEW_HOUR = 21` (до 2026-10-25 было 22: после перехода на CET это полночь по МСК, а часть участников живёт по МСК; 21:00 Berlin = 23:00 МСК зимой / 22:00 МСК летом). Сообщения после 21:00 в обзор не попадают (окно — с полуночи до момента запуска); см. `docs/claude/open-tasks.md`. `BERLIN_TZ = ZoneInfo("Europe/Berlin")` —
 единственный источник правды для часового пояса во всём проекте (используется и здесь,
 и в `service_block` для текущей даты/времени — служебный блок последнего user-turn, `docs/claude/prompt-cache.md`). До фикса 2026-09-19 (`b72e96e`) было
 жёсткое `timezone(timedelta(hours=2))` — не учитывало переход CET/CEST, обзор съехал бы
