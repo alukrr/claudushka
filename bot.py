@@ -4050,7 +4050,7 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tier = chat_tier(chat_id)
     _, label = _chat_display(update, chat_id)
     lines = [f"Модель для {label}: {model_meta(current)['label']}", f"Режим: {_tier_label(chat_id)}"]
-    for title, provider in (("Claude", "anthropic"), ("Gemini (кэша промпта нет — вход каждый раз по полной цене)",
+    for title, provider in (("Claude", "anthropic"), ("Gemini (явного кэша промпта нет; неявный срабатывает не всегда)",
                                                        "gemini")):
         lines += ["", f"{title}:"]
         for key, meta in MODELS.items():

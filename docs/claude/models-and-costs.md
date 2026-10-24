@@ -150,11 +150,11 @@ effort не задаёт; forced `tool_choice` (`any`/`tool`) → 400 — в к�
 - Вызов идёт через ту же Anthropic-полосу (`/v1/messages`) и те же обёртки; `kwargs_for_model` чистит параметры
   (без `thinking`/`output_config`/`tools`/`cache_control`, запас на рассуждения уже в `out_tokens`). `dialog_params` и
   `aux_params` для них `{}`. Служебные вызовы и дневной обзор от выбора модели чата не зависят.
-- **Кэша промпта нет** (`cache_control` режется — пул отвечает 400): на 7–10k system каждое сообщение платится по полной
-  цене входа; `/models` пишет это у блока Gemini. Приходит ли `cache_read_input_tokens` от неявного кэша Google — проверить
-  на стенде, записать в `prompt-cache.md`. Множитель записи 1.0 непроверен.
-- **Argon не проходил Шаг 0** (`model-fallback.md`) — до стенда считать непроверенным; `check_fallback_models` на старте
-  предупреждает, если Gemini-моделей нет в каталоге пула. Лимит нестримового вывода argon — 32K по докам пула.
+- **Явного кэша промпта нет** (`cache_control` режется — пул отвечает 400), но неявный кэш Google иногда срабатывает
+  (`cache_read_input_tokens` > 0, `prompt-cache.md`): цена входа на 5–10k system — по прайсу, со скидкой на попавшую в кэш
+  часть. Множитель записи 1.0 непроверен.
+- **Argon прошёл Шаг 0 на стенде 2026-10-24** (`model-fallback.md`): текст, system, картинка, транскрипт, стрим, нестримовый
+  `max_tokens=32000`. `check_fallback_models` на старте предупреждает, если Gemini-моделей нет в каталоге пула.
 - Обратный фолбэк Gemini → Claude — `model-fallback.md`.
 - **Free:** доступны Haiku и Lite (`FREE_MODEL_KEYS`). Выбор free хранится в `chat_free_model` (НЕ в `chat_models`:
   его в free не трогаем, прошлый платный выбор возвращается при пополнении); `get_chat_model` в free = запись

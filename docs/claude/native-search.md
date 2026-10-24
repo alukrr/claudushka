@@ -138,6 +138,15 @@ Haiku 5.5 («Search behavior»), а не «ищи всегда» (по гайд�
   `usage.server_tool_use.web_search_requests` (нет поля — по числу `web_search_call`), цена `GPT_SEARCH_PRICE = 0.0` —
   **НЕ ИЗВЕСТНО** («Search actions incur a tool call cost» без цифры), замерить по балансу пула.
 
+**Замер стенда 2026-10-24 (`gpt-6-luna`, `/v1/responses`):** пул принимает `reasoning.effort` = `none|low|minimal` (дефолт —
+`low`), ответ 200. Время сильно гуляет и от effort почти не зависит: 7–39 с, чаще 15–25 с (запрос «курс евро»: 25 / 19.5 /
+39 / 24 с; на повторе 14 и 8 с). Число поисков в одном ответе 1–3 (`server_tool_use.web_search_requests`), от этого и время;
+фраза «не более одного веб-поиска» картину не меняет. `usage`: `total_tokens == input + output`, `reasoning_tokens` внутри
+`output_tokens`, `cached_tokens` ≈ 4096 внутри `input_tokens` — формула учёта верна (строка `gpt_search` на стенде:
+0.000586 $ = формула). Модель сама вставляет в текст markdown-ссылки `([домен](url?...&utm_source=openai))` — `utm_*` чистятся и в
+тексте, и в источниках; прочие трекинговые параметры сайтов (`GL_Campaign_ID`…) остаются. Сквозной прогон на `/flash`
+(`should_search` 4.8 с + GPT 7.3 с + ответ flash 9.8 с) = 22 с — выше порога 20 с из ТЗ.
+
 **Google Search (grounding Gemini) не используем.** Условия Gemini API (https://ai.google.dev/gemini-api/terms, раздел
 Grounding with Google Search, сверено 2026-10-24): результат показывать только автору запроса и вместе с Search
 Suggestions (HTML), нельзя изменять/перемежать другим контентом, «analyze… or otherwise learn from». Схема «нашли → модель
