@@ -15,6 +15,7 @@ db.py используется отовсюду, поэтому полная с�
 - `group_messages` (в т.ч. `is_bot`), `chat_rate_limits` — `docs/claude/group-chat.md`
 - `chat_models` — `docs/claude/models-and-costs.md`
 - `chat_image_provider` — `docs/claude/images.md`
+- `chat_free_model` (выбор Haiku/Lite в free, отдельно от `chat_models`), `chat_search_mode` (`auto|gpt|claude|tavily`) — `docs/claude/models-and-costs.md`, `docs/claude/native-search.md`
 - `chat_persona` (режим характера чата, личка — `user_id`) — `docs/claude/personas.md`
 - `allowed_chats` (в т.ч. `daily_review_enabled`, `status`) — `docs/claude/daily-review.md`;
   колонки `banned` (и `users.banned`), смысл `status` как «проверена/нет» — `docs/claude/billing.md`

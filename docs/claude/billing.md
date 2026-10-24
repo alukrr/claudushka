@@ -100,10 +100,11 @@ GPT Image 2.5 Flare/Sunburst (добавлены 2026-09-22, `docs/claude/images
 
 ## Тарифы
 `chat_tier(chat_id)` — `paid`/`free` по балансу (`is_admin(chat_id)` → всегда paid).
-- **free**: `get_chat_model` → Haiku, `get_chat_image_provider` → `gpt`, БЕЗ изменения строк
-  `chat_models`/`chat_image_provider` — при возврате в paid прошлый выбор восстанавливается.
-  `/sonnet /opus /fable /banana /bananapro /flare /sunburst` → «доступно в платном режиме»; `/haiku`, `/gptimage` — «уже так»,
-  без записи. Админ бота может менять настройки чужих free-чатов (запись без применения).
+- **free**: `get_chat_model` → выбор free (`chat_free_model`: Haiku или Gemini Lite, дефолт Haiku),
+  `get_chat_image_provider` → `gpt`, БЕЗ изменения строк `chat_models`/`chat_image_provider` — при возврате в paid прошлый
+  выбор восстанавливается. `/sonnet /opus /fable /argon /flash /banana /bananapro /flare /sunburst` → «доступно в платном
+  режиме»; `/haiku` и `/lite` пишут `chat_free_model`, `/gptimage` — «уже так», без записи. Поиск в free — `SEARCH_PROVIDER_FREE`,
+  `/searchmode` не-админу отказ. Админ бота может менять настройки чужих free-чатов (запись без применения).
   Дневной лимит картинок (для ВСЕХ, включая проверенных): личка 10, группа 5 на `user_id`;
   считается по `usage_log kind='image' AND billed=0` с полуночи Берлина (`image_quota`).
   Исчерпан: на «нарисуй»/`/imagine` — ответ с лимитом и временем сброса, спонтанный `[[DRAW]]`

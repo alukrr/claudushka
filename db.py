@@ -165,6 +165,16 @@ def init_db():
             model TEXT NOT NULL DEFAULT 'claude-haiku-5-5'
         );
 
+        CREATE TABLE IF NOT EXISTS chat_free_model (
+            chat_id INTEGER PRIMARY KEY,
+            model TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS chat_search_mode (
+            chat_id INTEGER PRIMARY KEY,
+            mode TEXT NOT NULL DEFAULT 'auto'
+        );
+
         CREATE TABLE IF NOT EXISTS chat_image_provider (
             chat_id INTEGER PRIMARY KEY,
             provider TEXT NOT NULL DEFAULT 'banana'
@@ -1184,6 +1194,40 @@ def set_chat_model_db(chat_id: int, model: str):
         "INSERT OR REPLACE INTO chat_models (chat_id, model) VALUES (?, ?)",
         (chat_id, model)
     )
+    conn.commit()
+    conn.close()
+
+
+# --- Выбор модели бесплатного режима (Haiku / Lite) — ОТДЕЛЬНО от chat_models ---
+# chat_models в free не трогаем (прошлый платный выбор восстанавливается при пополнении), поэтому выбор free —
+# своя таблица. Строки нет = Haiku. Допустимые значения решает bot.FREE_MODEL_KEYS, здесь только хранилище.
+
+def get_chat_free_model_db(chat_id: int) -> str | None:
+    conn = get_conn()
+    row = conn.execute("SELECT model FROM chat_free_model WHERE chat_id = ?", (chat_id,)).fetchone()
+    conn.close()
+    return row["model"] if row else None
+
+
+def set_chat_free_model_db(chat_id: int, model: str):
+    conn = get_conn()
+    conn.execute("INSERT OR REPLACE INTO chat_free_model (chat_id, model) VALUES (?, ?)", (chat_id, model))
+    conn.commit()
+    conn.close()
+
+
+# --- Режим поиска чата (auto | gpt | claude | tavily), по образцу chat_image_provider ---
+
+def get_chat_search_mode_db(chat_id: int) -> str:
+    conn = get_conn()
+    row = conn.execute("SELECT mode FROM chat_search_mode WHERE chat_id = ?", (chat_id,)).fetchone()
+    conn.close()
+    return row["mode"] if row else "auto"
+
+
+def set_chat_search_mode_db(chat_id: int, mode: str):
+    conn = get_conn()
+    conn.execute("INSERT OR REPLACE INTO chat_search_mode (chat_id, mode) VALUES (?, ?)", (chat_id, mode))
     conn.commit()
     conn.close()
 

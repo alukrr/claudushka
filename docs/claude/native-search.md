@@ -101,5 +101,57 @@ Haiku 5.5 («Search behavior»), а не «ищи всегда» (по гайд�
 у пула ≈ **$0.004**. Мы учитываем по официальному прайсу ($0.01), как и токены — `PRICE_MARKUP = 1.0`, скидка
 пула в `usage_log` не заводится, так что в `/cost` поиск виден по официальной цене.
 
+## Провайдеры поиска и режим чата (ТЗ `feat/gemini-models`, v1.9.0)
+Схема `should_search` (Haiku) → провайдер → `service_block` с выбором провайдера (`search_with_provider`). Провайдеры:
+- `claude` — нативный `web_search` Anthropic (всё, что выше). Только на Claude-моделях чата.
+- `gpt` — `_gpt_web_search`: веб-поиск GPT (`gpt-6-luna`) через пул, работает при ЛЮБОЙ модели чата; выжимка идёт в
+  `service_block` так же, как результаты Tavily.
+- `tavily` — как раньше.
+
+**Режим чата** — `chat_search_mode` (`auto|gpt|claude|tavily`, дефолт `auto`, таблица по образцу `chat_image_provider`),
+команда `/searchmode [режим] [chat_id]` (чужой чат — только админ бота; в группе переключает любой, как модели).
+`search_provider_for(chat_id, model_id)`:
+- free → `SEARCH_PROVIDER_FREE` (env `tavily|gpt`, дефолт `tavily`, пока не замерена цена поиска GPT). Ручного выбора
+  в free нет: не-админу отказ; админ может записать режим — включится после пополнения.
+- paid, `auto`: Claude-модель → `claude` (при `NATIVE_SEARCH=0` → `tavily`), Gemini-модель → `gpt`;
+- `gpt`/`tavily` — принудительно; `claude` при Gemini-модели невозможен → как `auto` (`/models` пишет «Claude →
+  недоступен на Gemini, сейчас GPT»).
+- **Фолбэк** (`NativeSearchUnavailable` или пул отклонил инструмент) → `gpt`, а если тот вернул `None` — `tavily`
+  (с пометкой в логе); без Tavily — ответ без поиска. Тот же провайдер второй раз не зовём: платили бы дважды.
+- Решение «искать или нет» для `gpt`/`tavily` — `should_search`; дневной лимит поиска непроверенных
+  (`_search_allowed`) — на все провайдеры (строки `kind=search` считаются независимо от `model`).
+- `/search` в платном чате с режимом `gpt` идёт через GPT, иначе (в т.ч. `claude`, нативный поиск живёт только в
+  диалоге) — Tavily, как раньше; в free — `SEARCH_PROVIDER_FREE`.
+
+**`_gpt_web_search(query)`** (env `SEARCH_GPT_MODEL`=`gpt-6-luna`, `SEARCH_GPT_EFFORT`=`low`):
+`POST {POOL_BASE_URL}/v1/responses`, `Authorization: Bearer <ключ бота>`, `tools=[{"type":"web_search"}]`, без
+`max_output_tokens` и `store`, `requests` в потоке (без зависимости `openai`). Таймаут `(10, 40)`; одна повторная попытка
+на 429/5xx/сеть; 400 при заданном `reasoning` → один повтор без него (принимает ли пул `reasoning.effort` у luna —
+проверить на стенде); `None` при любой ошибке. Выжимка ≤ 3000 символов (инвариант про размер).
+- **Источники:** `url_citation` из `output[].content[].annotations[]` (`title`, `url`), без дублей, ≤ 5, `utm_source=openai`
+  срезан; ссылки настоящие (не редиректы). Строка `🔗 домен · домен` под ответом — всегда кликабельная (Markdown-ссылки,
+  фолбэк plain только при отказе Telegram), до 3 доменов (`sources_line`), как у нативного поиска. Условие OpenAI —
+  «inline citations must be made clearly visible and clickable»; предложение про ссылки рядом с фактом — в отчёте ТЗ.
+- **Деньги:** LLM-строка `gpt_search`, модель `gpt-6-luna` (`LEGACY_PRICES`: $0.10/$0.50, кэш-чтение 10%): вход без
+  `cached_tokens`, кэш-чтение отдельно, выход = `output_tokens` (reasoning внутри; при `total_tokens != input+output`
+  warning в логе). Поиск — `kind=search`, `model=gpt` (в `/cost` — «GPT web_search»), по строке на
+  `usage.server_tool_use.web_search_requests` (нет поля — по числу `web_search_call`), цена `GPT_SEARCH_PRICE = 0.0` —
+  **НЕ ИЗВЕСТНО** («Search actions incur a tool call cost» без цифры), замерить по балансу пула.
+
+**Замер стенда 2026-10-24 (`gpt-6-luna`, `/v1/responses`):** пул принимает `reasoning.effort` = `none|low|minimal` (дефолт —
+`low`), ответ 200. Время сильно гуляет и от effort почти не зависит: 7–39 с, чаще 15–25 с (запрос «курс евро»: 25 / 19.5 /
+39 / 24 с; на повторе 14 и 8 с). Число поисков в одном ответе 1–3 (`server_tool_use.web_search_requests`), от этого и время;
+фраза «не более одного веб-поиска» картину не меняет. `usage`: `total_tokens == input + output`, `reasoning_tokens` внутри
+`output_tokens`, `cached_tokens` ≈ 4096 внутри `input_tokens` — формула учёта верна (строка `gpt_search` на стенде:
+0.000586 $ = формула). Модель сама вставляет в текст markdown-ссылки `([домен](url?...&utm_source=openai))` — `utm_*` чистятся и в
+тексте, и в источниках; прочие трекинговые параметры сайтов (`GL_Campaign_ID`…) остаются. Сквозной прогон на `/flash`
+(`should_search` 4.8 с + GPT 7.3 с + ответ flash 9.8 с) = 22 с — выше порога 20 с из ТЗ.
+
+**Google Search (grounding Gemini) не используем.** Условия Gemini API (https://ai.google.dev/gemini-api/terms, раздел
+Grounding with Google Search, сверено 2026-10-24): результат показывать только автору запроса и вместе с Search
+Suggestions (HTML), нельзя изменять/перемежать другим контентом, «analyze… or otherwise learn from». Схема «нашли → модель
+чата пересказала в группу» им противоречит. Рабочий вызов нативной полосы с `google_search` остаётся в истории git
+(ветка `feat/gemini-search`, коммит `bf4c8d5`), в коде его нет.
+
 ## Открыто
 - Стоимость токенов выдачи: сравнить среднюю цену реплики с поиском — Tavily против нативного (шаг 9 чек-листа).

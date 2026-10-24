@@ -45,12 +45,44 @@ Gemini, без попытки и ожидания (`_fallback_until`, в пам�
 
 ## Нативный поиск
 Gemini `web_search` не получает. Запрос с `tools` при сбое/липком окне → `NativeSearchUnavailable`; хендлер
-(рядом с `_native_search_rejected`) уходит на схему Tavily и повторяет запрос обычным `call_claude` (который
-в окне идёт на Gemini). 👀 ставится только если реально искали.
+(рядом с `_native_search_rejected`) уходит на поиск через GPT (`_gpt_web_search`, запасной — Tavily; см.
+`native-search.md`, «Провайдеры поиска») и повторяет запрос обычным `call_claude` (который в окне идёт на Gemini).
+👀 ставится только если реально искали.
+
+## Обратный фолбэк: Gemini-модель чата → Claude (v1.9.0)
+Gemini стала выбираемой моделью чата (`/argon /flash /lite`, `docs/claude/models-and-costs.md`). Упала она —
+ответ даёт Claude по тем же правилам `should_fallback` и с тем же липким окном (ключ — ID Gemini-модели):
+`argon`/`flash` → Sonnet 5.5, `lite` → Haiku 5.5 (`fallback_model_for`). Один переход: Claude-фолбэк дальше не
+фолбэчится. Параметры приводит та же функция `kwargs_for_model(kwargs, model)`, что чистит вызов Gemini-модели
+(и первый, и фолбэк): → Gemini без `thinking`/`output_config`/`tools`/`cache_control`; из Gemini → Claude запас
+Gemini (4000) меняется на запас целевой модели, thinking/effort не добавляются (запас покрывает adaptive-thinking Haiku).
+Метка `usage_log` фолбэк-ответа — с суффиксом `_fallback` (`dialog_fallback`; `_usage_label`), модель в строке —
+фактическая. Это и есть видимость фолбэка в `/cost`: подпись «(фолбэк)» у моделей убрана — у Gemini-моделей теперь
+обычные подписи из `MODELS`.
+
+## Открыто (проверить на стенде): токены рассуждения на Anthropic-полосе
+Не проверено, входят ли в `usage.output_tokens` Anthropic-полосы (`/v1/messages`) для Gemini-моделей токены
+рассуждения. На нативной полосе они отдельные (`thoughtsTokenCount`, ~480 на короткий ответ в 215 токенов).
+Сравнить один запрос на обеих полосах; если на Anthropic-полосе рассуждения не попадают в `output_tokens`, `/cost`
+на фолбэке занижен — чинить отдельно. Результат записать сюда.
+
+## Стенд 2026-10-24: `gemini-4-argon` и токены рассуждения (ТЗ feat/gemini-models)
+Замер с сервера (`/v1/messages`, ключ бота), все модели через Anthropic-полосу пула:
+- **`gemini-4-argon` проходит Шаг 0:** текст, system-блоки, картинка (16×16 PNG → «Красный»), групповой транскрипт, стрим
+  (события `message_start … message_stop`, `usage`), `response.model == "gemini-4-argon"`, первым блоком пустой
+  `thinking`. `cache_control` и `output_config` → 400 (как у остальных). Нестримовый `max_tokens=32000` принят (200).
+  Argon почти не тратит токены на рассуждения: на `17*23` нативная полоса вернула `candidatesTokenCount 37` без
+  `thoughtsTokenCount`.
+- **Рассуждения Gemini входят в `usage.output_tokens` Anthropic-полосы** (п. 1.6 ТЗ закрыт). `gemini-3.8-flash`, тот же
+  вопрос ×3: Anthropic-полоса `output_tokens` 664 / 697 / 667, нативная `candidates 78/76/79 + thoughts 493/631/474`;
+  видимый ответ ~320 символов ≈ 80 токенов. Значит `/cost` на фолбэке НЕ занижен. У `gemini-3.1-flash-lite` на коротких
+  вопросах рассуждений почти нет (`output_tokens` 2–63).
+- Пул Claude 24.10 днём отвечал 529 (Overloaded) на Haiku/Sonnet часами — живой прогон фолбэка в обе стороны на стенде.
 
 ## Деньги и видимость
-- Цена — по фактической `response.model` (`_billed_model`): `gemini-*` в `LEGACY_PRICES` с подписью
-  «… (фолбэк)» — в `/cost` видны отдельной строкой. Кошелёк списывается по цене Gemini (дешевле) — так задумано.
+- Цена — по фактической `response.model` (`_billed_model`): Gemini-модели в `MODELS` (одна цена на строку, не
+  дублируется в `LEGACY_PRICES`). Фолбэк-ответы в `/cost` — по метке `*_fallback`. Кошелёк списывается по цене
+  фактической модели — так задумано.
 - Множитель записи в кэш Gemini в доках пула не указан → 1.0 (**непроверено**, но `cache_control` на этом
   endpoint режется, записи в кэш не возникает). Чтение — 0.1× («cached input bills at 10%»).
 - `logger.warning("FALLBACK <claude> → <gemini> …")` на каждое переключение; админам `notify_admins` —

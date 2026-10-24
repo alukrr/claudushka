@@ -160,7 +160,7 @@ GPT Image 2.5 Flare или Sunburst без дневного лимита, еже
 - Python 3.12
 - python-telegram-bot 22.8
 - Anthropic Claude API — Haiku 5.5 в бесплатном режиме; Sonnet 5.5 / Opus 5.5 / Fable 5.1 в платном (`/models`)
-- Tavily API (веб-поиск в бесплатном режиме и `/search`); нативный `web_search` Anthropic — в платном
+- Tavily API (веб-поиск в бесплатном режиме и `/search`); веб-поиск GPT (`gpt-6-luna`) — при сбое Claude и на Gemini-моделях; нативный `web_search` Anthropic — в платном
 - Генерация изображений, переключаемый провайдер per-chat: Gemini «Nano Banana 2» (`gemini-3.1-flash-image-preview`, прямой Google API) или через пул api.apitoken.sale — GPT Image 2 (`gpt-image-2`), GPT Image 2.5 Flare (`openai/gpt-image-2.5-flare`) или Sunburst (`openai/gpt-image-2.5-sunburst`)
 - SQLite (пользователи, история, память, модели чатов, провайдер картинок, учёт расхода и балансы) через `db.py`
 - Общая обработка ошибок API в `api_errors.py` (ретраи + сообщения пользователю)

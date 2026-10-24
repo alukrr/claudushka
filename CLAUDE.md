@@ -41,12 +41,12 @@
   `docs/claude/media.md`
 - Дневной обзор (`daily_chat_review`, `cmd_review`, `/review_on`, `/review_off`,
   `run_daily`, `BERLIN_TZ`) — `docs/claude/daily-review.md`
-- Модели и цены (`MODELS`, `/haiku /sonnet /opus /fable`, `/models`, `calc_llm_cost`) —
+- Модели и цены (`MODELS`, `/haiku /sonnet /opus /fable /argon /flash /lite`, Gemini-модели чата, free-выбор `chat_free_model`, `/models`, `calc_llm_cost`) —
   `docs/claude/models-and-costs.md`
 - Prompt caching (`build_system`, `service_block`, `mark_cache_tail`, `pick_history_window`,
   `PROMPT_CACHE`, `HISTORY_STEP`, `CACHE_TTL_PERSONA`) — `docs/claude/prompt-cache.md`
 - Нативный веб-поиск Anthropic в платном режиме (`call_dialog_native`, `call_claude_stream`, `native_answer`,
-  `sources_line`, `NATIVE_SEARCH*`, `pause_turn`, реакция по событию стрима) — `docs/claude/native-search.md`
+  `sources_line`, `NATIVE_SEARCH*`, `pause_turn`, реакция по событию стрима; провайдеры поиска claude/gpt/tavily, `/searchmode`, `chat_search_mode`, `search_provider_for`, `_gpt_web_search`, `SEARCH_PROVIDER_FREE`, `SEARCH_GPT_*`) — `docs/claude/native-search.md`
 - Деньги и доступ (`usage_log`, `chat_credits`, баланс, тарифы paid/free, `usage_ctx`,
   `_record_usage`, `gate_update`, `/cost`, `/topup`, `/verify /unverify /ban /unban`,
   лимиты непроверенных, стартовый бонус, `/fable`-подтверждение) — `docs/claude/billing.md`
@@ -132,7 +132,11 @@
 - Характер: `CORE_IDENTITY` → режим (`personas/*.md`) → `_core_rules()` → групповой аддендум; режим задаёт тон, не правила
   (честность/маркеры/служебный блок/группа). Новое место с зашитым «характером» — брать `tone`/`review_style` режима
   чата. Ключ режима в личке — `user_id`. `docs/claude/personas.md`.
-- Фолбэк на Gemini живёт ТОЛЬКО в обёртках (`call_claude`/`call_claude_stream`/`sync_create`): новый вызов
+- Выбор модели в free (Haiku/Lite) хранится в `chat_free_model`, НЕ в `chat_models`: `chat_models` в free не трогаем;
+  `get_chat_model` — единственная точка. Режим поиска чата — `chat_search_mode` через `search_provider_for`, не читать напрямую.
+  Параметры вызова под провайдера модели — только `kwargs_for_model` (и для Gemini-модели чата, и для фолбэка в обе стороны).
+  `docs/claude/models-and-costs.md`, `docs/claude/native-search.md`.
+- Фолбэк на Gemini (и обратно, с Gemini-модели чата на Claude) живёт ТОЛЬКО в обёртках (`call_claude`/`call_claude_stream`/`sync_create`): новый вызов
   модели — через них, не `client.messages.create` напрямую. Пробам, которым нужна именно запрошенная модель,
   — `fallback=False`. На Gemini не уходят `thinking`/`output_config`/`tools`/`cache_control` (пул отвечает 400);
   402 и 400 (`prompt is too long`) не переключают. `docs/claude/model-fallback.md`.
