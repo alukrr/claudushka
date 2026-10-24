@@ -3,7 +3,7 @@ import re
 import json
 import html
 import io
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 import logging
 import time
 import asyncio
@@ -103,25 +103,26 @@ NATIVE_SEARCH_MAX_PAUSE = 3   # сколько раз продолжаем от�
 # Сверено с балансом пула 2026-10-10: пул берёт 40% от официальной цены (скидка 60% и на поиск, и на токены).
 NATIVE_SEARCH_PRICE = 0.01
 
-# --- Поисковый провайдер Gemini + Google Search (ТЗ feat/gemini-search, docs/claude/native-search.md) ---
-# Gemini — не модель диалога, а источник данных в цепочке should_search → поиск → service_block.
-# SEARCH_PROVIDER_FALLBACK — когда нативный поиск недоступен (фолбэк Claude → Gemini / пул отклонил инструмент);
-# SEARCH_PROVIDER_FREE — бесплатный режим и /search. Значения: tavily | gemini.
-def _search_provider_env(name: str, default: str) -> str:
-    value = os.environ.get(name, default).strip().lower()
-    return value if value in ("tavily", "gemini") else default
-
-
-SEARCH_PROVIDER_FALLBACK = _search_provider_env("SEARCH_PROVIDER_FALLBACK", "gemini")
-SEARCH_PROVIDER_FREE = _search_provider_env("SEARCH_PROVIDER_FREE", "tavily")
-SEARCH_GEMINI_MODEL = os.environ.get("SEARCH_GEMINI_MODEL", "").strip() or "gemini-3.8-flash"
-SEARCH_GEMINI_TIMEOUT = (10, 40)          # (connect, read): ответ с поиском идёт ~10 с — это норма
-SEARCH_GEMINI_MAX_CHARS = 3000            # выжимка уходит в service_block — лимит по РАЗМЕРУ (инвариант CLAUDE.md)
-SEARCH_GEMINI_MAX_SOURCES = 5             # сколько redirect-ссылок разворачивать
-SEARCH_GEMINI_REDIRECT_TIMEOUT = 4
-# $ за один поиск Gemini через пул. НЕ ИЗВЕСТНО — замерить по балансу пула (как цену нативного поиска
-# 2026-10-10). Пока 0.0: токены поискового вызова считаются отдельно (label=gemini_search).
-GEMINI_SEARCH_PRICE = 0.0
+# --- Провайдеры поиска: claude / gpt / tavily (ТЗ feat/gemini-models, docs/claude/native-search.md) ---
+# claude — нативный web_search Anthropic (только Claude-модели чата); gpt — веб-поиск GPT (`gpt-6-luna`, /v1/responses),
+# работает при любой модели чата, выжимка идёт в service_block как результаты Tavily; tavily — как раньше.
+# Google Search (grounding Gemini) НЕ используем: условия Google запрещают пересказ результата (ТЗ, 1.4).
+# SEARCH_PROVIDER_FREE — провайдер бесплатного режима (там ручного выбора нет): tavily | gpt, дефолт tavily, пока не
+# замерена цена вызова поиска GPT. В платном чате провайдер решает режим /searchmode (chat_search_mode).
+SEARCH_MODES = ("auto", "gpt", "claude", "tavily")
+SEARCH_PROVIDER_FREE = os.environ.get("SEARCH_PROVIDER_FREE", "tavily").strip().lower()
+if SEARCH_PROVIDER_FREE not in ("tavily", "gpt"):
+    SEARCH_PROVIDER_FREE = "tavily"
+SEARCH_GPT_MODEL = os.environ.get("SEARCH_GPT_MODEL", "").strip() or "gpt-6-luna"
+# reasoning.effort поискового вызова. Пусто — не передавать. Принимает ли пул значение, проверить на стенде
+# (400 из-за reasoning → один повтор без него, см. _gpt_web_search).
+SEARCH_GPT_EFFORT = os.environ.get("SEARCH_GPT_EFFORT", "low").strip().lower()
+SEARCH_GPT_TIMEOUT = (10, 40)        # (connect, read): ответ с поиском идёт 6–7 с
+SEARCH_GPT_MAX_CHARS = 3000          # выжимка уходит в service_block — лимит по РАЗМЕРУ (инвариант CLAUDE.md)
+SEARCH_GPT_MAX_SOURCES = 5
+# $ за один поиск GPT через пул. НЕ ИЗВЕСТНО (OpenAI: «Search actions incur a tool call cost», без цифры) —
+# замерить по балансу пула, как цену нативного поиска 2026-10-10. Пока 0.0: токены считаются отдельно (gpt_search).
+GPT_SEARCH_PRICE = 0.0
 
 # --- Prompt caching (ТЗ feat/prompt-cache, docs/claude/prompt-cache.md) ---
 # PROMPT_CACHE=0 — откат без правки кода: system снова одной строкой без cache_control,
@@ -213,6 +214,22 @@ MODELS = {
                "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0, "context": 1_000_000,
                "thinking_headroom": 8000,
                "restricted": True},
+    # Gemini через пул (ТЗ feat/gemini-models, v1.9.0): та же Anthropic-полоса /v1/messages и тот же ключ, "provider":
+    # "gemini". Цены — доки пула 2026-10-24. Кэш промпта НЕ работает (cache_control пул режет 400): cache_read_mult 0.1 —
+    # «cached input bills at 10%» по докам, запись 1.0 НЕПРОВЕРЕНА. thinking не выключается (думают всегда) и идёт в
+    # вывод — запас 4000 в thinking_headroom, "effort" не ставим (dialog_params/aux_params дают {}).
+    "argon":  {"id": "gemini-4-argon",            "label": "Gemini 4 Argon", "provider": "gemini",
+               "in": 2.0,  "out": 10.0, "cache_read_mult": 0.1,
+               "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0, "context": 1_000_000,
+               "thinking_headroom": 4000},
+    "flash":  {"id": "gemini-3.8-flash",          "label": "Gemini 3.8 Flash", "provider": "gemini",
+               "in": 0.75, "out": 3.75, "cache_read_mult": 0.1,
+               "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0, "context": 1_000_000,
+               "thinking_headroom": 4000},
+    "lite":   {"id": "gemini-3.1-flash-lite",     "label": "Gemini 3.1 Flash-Lite", "provider": "gemini",
+               "in": 0.25, "out": 1.50, "cache_read_mult": 0.1,
+               "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0, "context": 1_000_000,
+               "thinking_headroom": 4000},
 }
 DEFAULT_MODEL_KEY = "haiku"
 DEFAULT_MODEL_ID = MODELS[DEFAULT_MODEL_KEY]["id"]
@@ -232,22 +249,25 @@ LEGACY_PRICES = {
                         "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0},
     "claude-opus-4-8": {"label": "Opus 4.8", "in": 5.0, "out": 25.0, "cache_read_mult": 0.1,
                         "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0},
-    # Фолбэк-модели Gemini (только цена/подпись, в выбор пользователя не входят). Цены — по докам пула на
-    # 2026-10-23; response.model у них голая строка без «google/» (Шаг 0). cache_read_mult 0.1 — «cached input
-    # bills at 10%» по докам пула; множитель записи в кэш у Gemini в доках не указан — 1.0 по dnd-mcp,
-    # НЕПРОВЕРЕНО (cache_control на этом endpoint всё равно режется, так что запись кэша не возникает).
-    "gemini-3.8-flash":      {"label": "Gemini 3.8 Flash (фолбэк)", "in": 0.75, "out": 3.75, "cache_read_mult": 0.1,
-                              "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0},
-    "gemini-3.1-flash-lite": {"label": "Gemini 3.1 Flash-Lite (фолбэк)", "in": 0.25, "out": 1.50, "cache_read_mult": 0.1,
-                              "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0},
-    "gemini-2.5-flash-lite": {"label": "Gemini 2.5 Flash-Lite (фолбэк)", "in": 0.10, "out": 0.40, "cache_read_mult": 0.1,
-                              "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0},
+    # Gemini-модели чата (argon/flash/lite) живут в MODELS. Здесь — только то, чего в выборе пользователя нет.
+    "gemini-2.5-flash-lite": {"label": "Gemini 2.5 Flash-Lite", "provider": "gemini", "in": 0.10, "out": 0.40,
+                              "cache_read_mult": 0.1, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0},
+    # Модель веб-поиска GPT (/v1/responses, label=gpt_search), цены по докам пула 2026-10-24: вход 0.10, выход 0.50,
+    # кэш-чтение — 10% входа; запись в кэш — 1.0 (у OpenAI отдельной платы нет). Выход включает reasoning.
+    "gpt-6-luna": {"label": "GPT-6 Luna (поиск)", "provider": "openai", "in": 0.10, "out": 0.50,
+                   "cache_read_mult": 0.1, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0},
 }
 DEFAULT_CACHE_MULTS = {"cache_read_mult": 0.1, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0}
 
 _MODELS_BY_ID = {m["id"]: m for m in MODELS.values()}
 # Всё, у чего есть цена: выбираемые модели + легаси. Выбираемые перекрывают легаси.
 _PRICES_BY_ID = {**LEGACY_PRICES, **_MODELS_BY_ID}
+
+
+def model_provider(model_id: str | None) -> str:
+    """'anthropic' | 'gemini' | 'openai' по API-строке: флаг provider в записи цены, иначе по префиксу gemini*."""
+    meta = _PRICES_BY_ID.get(model_id or "") or {}
+    return meta.get("provider") or ("gemini" if (model_id or "").startswith("gemini") else "anthropic")
 
 
 def model_meta(model_id: str) -> dict:
@@ -600,9 +620,12 @@ _last_fallback_alert = 0.0
 
 
 def fallback_model_for(model_id: str) -> str | None:
-    """Модель фолбэка для Claude-модели или None (фолбэк выключен / запрос и так не на Claude)."""
-    if not FALLBACK_ENABLED or not model_id or model_id.startswith("gemini"):
+    """Модель фолбэка или None (фолбэк выключен). Claude → Gemini (FALLBACK_MODEL[_CHEAP]); Gemini-модель чата →
+    Claude (обратный фолбэк, ТЗ feat/gemini-models): argon/flash → Sonnet, lite → Haiku. Только один переход."""
+    if not FALLBACK_ENABLED or not model_id:
         return None
+    if model_provider(model_id) == "gemini":
+        return DEFAULT_MODEL_ID if model_id == MODELS["lite"]["id"] else MODELS[PAID_DEFAULT_MODEL_KEY]["id"]
     return FALLBACK_MODEL_CHEAP if model_id == DEFAULT_MODEL_ID else FALLBACK_MODEL
 
 
@@ -624,15 +647,28 @@ def _strip_cache_control(obj):
     return obj
 
 
-def _fallback_kwargs(kwargs: dict, fb_model: str) -> dict:
-    """Параметры Claude-вызова → параметры Gemini-вызова: без thinking/output_config/tools/cache_control,
-    max_tokens с запасом на мышление Gemini. Исходный словарь не меняется."""
-    kw = {k: v for k, v in kwargs.items() if k not in ("thinking", "output_config", "tools", "tool_choice")}
-    kw["model"] = fb_model
-    kw["max_tokens"] = (kw.get("max_tokens") or 1024) + FALLBACK_THINKING_HEADROOM
-    for key in ("system", "messages"):
-        if key in kw:
-            kw[key] = _strip_cache_control(kw[key])
+def kwargs_for_model(kwargs: dict, model: str) -> dict:
+    """Параметры вызова → параметры, которые принимает провайдер модели `model` (одна функция и для обычного вызова
+    Gemini-модели чата, и для фолбэка в обе стороны). Исходный словарь не меняется; kwargs["model"] — модель, ДЛЯ
+    которой собран max_tokens (запас на thinking уже включён в него по out_tokens).
+    → Gemini: без thinking/output_config/tools/cache_control (пул отвечает 400); запас на рассуждения добавляется,
+      только если вызов собирали не под Gemini (иначе он уже в max_tokens).
+    → Claude из Gemini: запас Gemini заменяется запасом целевой модели; thinking/effort не добавляем (служебный это
+      вызов или диалог — отсюда не видно), запас покрывает adaptive-thinking Haiku."""
+    src = kwargs.get("model", "")
+    kw = dict(kwargs)
+    kw["model"] = model
+    if model_provider(model) == "gemini":
+        kw = {k: v for k, v in kw.items() if k not in ("thinking", "output_config", "tools", "tool_choice")}
+        if model_provider(src) != "gemini":
+            kw["max_tokens"] = (kw.get("max_tokens") or 1024) + FALLBACK_THINKING_HEADROOM
+        for key in ("system", "messages"):
+            if key in kw:
+                kw[key] = _strip_cache_control(kw[key])
+    elif model_provider(src) == "gemini":
+        kw = {k: v for k, v in kw.items() if k not in ("thinking", "output_config")}
+        kw["max_tokens"] = (max(1, (kw.get("max_tokens") or 1024) - model_meta(src).get("thinking_headroom", 0))
+                            + model_meta(model).get("thinking_headroom", 0))
     return kw
 
 
@@ -651,7 +687,7 @@ def _enter_fallback(model: str, fb_model: str, exc: BaseException, label: str) -
                    f"{str(exc)[:300]}")
     if newly and now - _last_fallback_alert >= FALLBACK_ALERT_COOLDOWN:
         _last_fallback_alert = now
-        _fire(notify_admins(f"⚠️ Claude {model} не отвечает ({status or type(exc).__name__}), "
+        _fire(notify_admins(f"⚠️ Модель {model} не отвечает ({status or type(exc).__name__}), "
                             f"отвечаю через {fb_model} ближайшие {FALLBACK_STICKY_SECONDS // 60} мин."))
 
 
@@ -671,11 +707,12 @@ async def check_fallback_models() -> None:
     except Exception as e:
         logger.warning(f"fallback: каталог моделей пула не получен ({type(e).__name__}) — проверка пропущена")
         return
-    for m in (FALLBACK_MODEL, FALLBACK_MODEL_CHEAP):
+    gemini_chat = [meta["id"] for meta in MODELS.values() if meta.get("provider") == "gemini"]
+    for m in dict.fromkeys([FALLBACK_MODEL, FALLBACK_MODEL_CHEAP, *gemini_chat]):   # argon не проверялся (ТЗ v3)
         if m not in ids:
             logger.warning(f"fallback: {m!r} нет в каталоге пула /v1/models — фолбэк на неё не сработает")
         if price_meta(m) is None:
-            logger.warning(f"fallback: у {m!r} нет цены в LEGACY_PRICES — usage_log посчитает по цене Haiku")
+            logger.warning(f"fallback: у {m!r} нет цены (MODELS/LEGACY_PRICES) — usage_log посчитает по цене Haiku")
 
 
 async def _call_with_fallback(kwargs: dict, make_fn, *, label: str, keepalive, fallback: bool = True):
@@ -684,11 +721,13 @@ async def _call_with_fallback(kwargs: dict, make_fn, *, label: str, keepalive, f
     отправляется — NativeSearchUnavailable (липкое окно при этом всё равно открывается)."""
     model = kwargs.get("model", "")
     fb = fallback_model_for(model) if fallback else None
+    if model_provider(model) == "gemini":
+        kwargs = kwargs_for_model(kwargs, model)   # Gemini-модель чата: параметры чистим уже для первого вызова
     if fb and _sticky_fallback(model):
         if kwargs.get("tools"):
             raise NativeSearchUnavailable(model)
         response = await api_errors.call_with_retry(
-            make_fn(_fallback_kwargs(kwargs, fb)), label=f"{label} [{fb}]", keepalive=keepalive)
+            make_fn(kwargs_for_model(kwargs, fb)), label=f"{label} [{fb}]", keepalive=keepalive)
         return response, fb
     try:
         response = await api_errors.call_with_retry(
@@ -702,8 +741,14 @@ async def _call_with_fallback(kwargs: dict, make_fn, *, label: str, keepalive, f
         if kwargs.get("tools"):
             raise NativeSearchUnavailable(model) from exc
     response = await api_errors.call_with_retry(
-        make_fn(_fallback_kwargs(kwargs, fb)), label=f"{label} [{fb}]", keepalive=keepalive)
+        make_fn(kwargs_for_model(kwargs, fb)), label=f"{label} [{fb}]", keepalive=keepalive)
     return response, fb
+
+
+def _usage_label(label: str, used: str, requested: str) -> str:
+    """Ответ дала фолбэк-модель, а не запрошенная — метка usage_log получает суффикс `_fallback` (в /cost видно,
+    что это не выбор чата; модель в строке — фактическая). Основная метка (dialog…) остаётся префиксом."""
+    return f"{label}_fallback" if used != requested else label
 
 
 async def call_claude(context, chat_id: int | None, *, label: str, usage_label: str | None = None,
@@ -726,7 +771,7 @@ async def call_claude(context, chat_id: int | None, *, label: str, usage_label: 
     response, used = await _call_with_fallback(
         kwargs, lambda kw: functools.partial(client_noretry.messages.create, **kw),
         label=label, keepalive=keepalive, fallback=fallback)
-    _track_response(used, response, usage_label or label.split()[0])
+    _track_response(used, response, _usage_label(usage_label or label.split()[0], used, kwargs.get("model", "")))
     return response
 
 
@@ -757,7 +802,7 @@ async def call_claude_stream(context, chat_id: int | None, *, label: str, usage_
     response, used = await _call_with_fallback(
         kwargs, lambda kw: functools.partial(_stream_final_message, kw, on_search),
         label=label, keepalive=keepalive)
-    _track_response(used, response, usage_label or label.split()[0])
+    _track_response(used, response, _usage_label(usage_label or label.split()[0], used, kwargs.get("model", "")))
     return response
 
 
@@ -782,9 +827,11 @@ def sync_create(**kwargs):
     model = kwargs.get("model", "")
     fb = fallback_model_for(model)
     used = model
+    if model_provider(model) == "gemini":
+        kwargs = kwargs_for_model(kwargs, model)
     if fb and _sticky_fallback(model):
         used = fb
-        response = client.messages.create(**_fallback_kwargs(kwargs, fb))
+        response = client.messages.create(**kwargs_for_model(kwargs, fb))
     else:
         try:
             response = client.messages.create(**kwargs)   # SDK-ретраи отработали, дальше — Gemini
@@ -793,8 +840,8 @@ def sync_create(**kwargs):
                 raise
             _enter_fallback(model, fb, exc, label)
             used = fb
-            response = client.messages.create(**_fallback_kwargs(kwargs, fb))
-    _track_response(used, response, label)
+            response = client.messages.create(**kwargs_for_model(kwargs, fb))
+    _track_response(used, response, label + "_fallback" if used != model else label)
     return response
 
 
@@ -903,11 +950,15 @@ PAID_DEFAULT_MODEL_KEY = "sonnet"   # модель платного чата, к
 FREE_IMAGE_PROVIDER = "gpt"         # единственный провайдер картинок в free
 
 
+FREE_MODEL_KEYS = ("haiku", "lite")   # модели, доступные в free: Haiku (дефолт) и Gemini Flash-Lite
+
+
 def get_chat_model(chat_id: int) -> str:
-    """Эффективная модель чата: free → всегда Haiku (запись chat_models НЕ трогаем — при
-    возврате в paid прошлый выбор восстанавливается), paid → выбор чата, иначе Sonnet."""
+    """Эффективная модель чата: free → выбор free (chat_free_model: Haiku или Lite), иначе Haiku; запись chat_models
+    НЕ трогаем — при возврате в paid прошлый выбор восстанавливается. paid → выбор чата, иначе Sonnet."""
     if chat_tier(chat_id) == "free":
-        return DEFAULT_MODEL_ID
+        saved = db.get_chat_free_model_db(chat_id)
+        return saved if saved in {MODELS[k]["id"] for k in FREE_MODEL_KEYS} else DEFAULT_MODEL_ID
     return db.get_chat_model_db(chat_id, MODELS[PAID_DEFAULT_MODEL_KEY]["id"])
 
 
@@ -1133,8 +1184,10 @@ def image_quota(chat_id: int, is_group: bool, user_id: int) -> tuple[int, int] |
 # --- Нативный поиск Anthropic ---
 
 def _native_search_on(user_id: int, chat_id: int, is_group: bool) -> bool:
-    """Нативный поиск — только в платном режиме (и в пределах дневного лимита поиска непроверенных)."""
-    return NATIVE_SEARCH and chat_tier(chat_id) == "paid" and _search_allowed(user_id, chat_id, is_group)
+    """Нативный поиск — только когда провайдер чата claude (платный чат на Claude, режим auto/claude) и в пределах
+    дневного лимита поиска непроверенных."""
+    return (search_provider_for(chat_id, get_chat_model(chat_id)) == "claude"
+            and _search_allowed(user_id, chat_id, is_group))
 
 
 async def _tavily_search(update, user_id: int, chat_id: int, is_group: bool, user_text: str,
@@ -1151,98 +1204,131 @@ async def _tavily_search(update, user_id: int, chat_id: int, is_group: bool, use
     return search_query, await call_claude_aux(web_search, search_query, label="web_search") or ""
 
 
-def _resolve_redirect(url: str) -> str | None:
-    """Настоящий URL из redirect-ссылки grounding (vertexaisearch.cloud.google.com/grounding-api-redirect/...):
-    Location первого ответа. Блокирующая — звать через to_thread. None — не развернулось."""
-    try:
-        r = http_requests.head(url, allow_redirects=False, timeout=SEARCH_GEMINI_REDIRECT_TIMEOUT)
-        if r.status_code in (301, 302, 303, 307, 308):
-            loc = r.headers.get("Location", "")
-            return loc if loc.startswith(("http://", "https://")) else None
-    except Exception as e:
-        logger.info(f"gemini_search: redirect не развернулся ({type(e).__name__})")
-    return None
+def _clean_citation_url(url: str) -> str:
+    """Срезает utm_source=openai (OpenAI дописывает его ко всем ссылкам выдачи); остальные параметры не трогает."""
+    parts = urlsplit(url)
+    query = "&".join(p for p in parts.query.split("&") if p and p.lower() != "utm_source=openai")
+    return urlunsplit(parts._replace(query=query))
 
 
-async def _gemini_grounded_search(query: str) -> tuple[str, list[tuple[str, str]]] | None:
-    """Поиск через Gemini с инструментом google_search (нативная Gemini-полоса пула, тот же ключ).
+async def _gpt_web_search(query: str) -> tuple[str, list[tuple[str, str]]] | None:
+    """Веб-поиск GPT через пул: POST {POOL_BASE_URL}/v1/responses, Bearer-ключ бота, tools=[{"type":"web_search"}].
 
-    Возвращает (выжимка, [(подпись, url)]) или None при любой ошибке/пустом ответе — вызывающий код сам решает,
-    идти ли на запасной провайдер. Токены (выход = candidates + thoughts) пишутся в usage_log как LLM с
-    label=gemini_search, сам поиск — строкой kind=search/gemini. Источники: redirect-ссылки разворачиваются в
-    настоящие URL параллельно (не больше SEARCH_GEMINI_MAX_SOURCES), не развернулась — остаётся redirect с
-    подписью из title (домен)."""
-    url = f"{POOL_BASE_URL}/v1beta/models/{SEARCH_GEMINI_MODEL}:generateContent"
+    Возвращает (выжимка, [(домен, url)]) или None при любой ошибке/пустом ответе — вызывающий код сам решает, идти ли
+    на Tavily. max_output_tokens НЕ передаём (на этой полосе не honoured, клиент режет сам), store не передаём.
+    Одна повторная попытка на 429/5xx/сеть; 400 при заданном reasoning — один повтор без него. Источники — из
+    url_citation, без дублей, ≤ SEARCH_GPT_MAX_SOURCES, utm_source=openai срезан; ссылки настоящие, не редиректы.
+    Учёт: LLM-строка gpt_search (вход без кэша, кэш-чтение отдельно, выход = output_tokens, reasoning уже внутри) и
+    по строке kind=search/gpt на каждый web_search_requests."""
+    url = f"{POOL_BASE_URL}/v1/responses"
     payload = {
-        "contents": [{"role": "user", "parts": [{"text": (
-            f"Поисковый запрос: {query}\n\n"
-            "Найди актуальные факты через поиск и дай сжатую выжимку: цифры, даты, названия, без вступлений "
-            "и без рассуждений о самом поиске. Отвечай по-русски, если запрос на русском."
-        )}]}],
-        "tools": [{"google_search": {}}],
+        "model": SEARCH_GPT_MODEL,
+        "tools": [{"type": "web_search"}],
+        "input": (f"Поисковый запрос: {query}\n\n"
+                  "Найди актуальные факты и дай сжатую выжимку: цифры, даты, названия, без вступлений. "
+                  "Отвечай на языке запроса."),
     }
-    headers = {"x-goog-api-key": ANTHROPIC_API_KEY}
+    if SEARCH_GPT_EFFORT:
+        payload["reasoning"] = {"effort": SEARCH_GPT_EFFORT}
+    headers = {"Authorization": f"Bearer {ANTHROPIC_API_KEY}"}
     data = None
-    for attempt in (1, 2):
+    attempt = 1
+    while attempt <= 2:
         try:
             resp = await asyncio.to_thread(http_requests.post, url, json=payload, headers=headers,
-                                           timeout=SEARCH_GEMINI_TIMEOUT)
+                                           timeout=SEARCH_GPT_TIMEOUT)
         except Exception as e:
-            logger.warning(f"gemini_search: запрос не прошёл (попытка {attempt}/2): {type(e).__name__}: {e}")
+            logger.warning(f"gpt_search: запрос не прошёл (попытка {attempt}/2): {type(e).__name__}: {e}")
         else:
             if resp.status_code == 200:
                 try:
                     data = resp.json()
                 except Exception as e:
-                    logger.warning(f"gemini_search: ответ не разобран: {e}")
+                    logger.warning(f"gpt_search: ответ не разобран: {e}")
                     return None
                 break
+            if resp.status_code == 400 and "reasoning" in payload:
+                logger.warning(f"gpt_search: HTTP 400 при reasoning.effort={SEARCH_GPT_EFFORT!r} — повтор без него: "
+                               f"{resp.text[:200]}")
+                payload.pop("reasoning")
+                continue
             if resp.status_code not in (429, 500, 502, 503, 504):
-                logger.warning(f"gemini_search: HTTP {resp.status_code} (не повторяем)")
+                logger.warning(f"gpt_search: HTTP {resp.status_code} (не повторяем): {resp.text[:200]}")
                 return None
-            logger.warning(f"gemini_search: HTTP {resp.status_code} (попытка {attempt}/2)")
+            logger.warning(f"gpt_search: HTTP {resp.status_code} (попытка {attempt}/2)")
         if attempt == 1:
             await asyncio.sleep(GEMINI_RETRY_DELAY)
+        attempt += 1
     if data is None:
         return None
 
     try:
-        cand = (data.get("candidates") or [{}])[0]
-        parts = (cand.get("content") or {}).get("parts") or []
-        text = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
-        grounding = cand.get("groundingMetadata") or {}
-        um = data.get("usageMetadata") or {}
-        thoughts = um.get("thoughtsTokenCount") or 0
-        # Рассуждения оплачиваются как вывод (так же считает dnd-mcp) — отдельного счётчика поисков нет.
-        _record_usage("llm", SEARCH_GEMINI_MODEL, "gemini_search",
-                      calc_llm_cost(SEARCH_GEMINI_MODEL, um.get("promptTokenCount") or 0,
-                                    (um.get("candidatesTokenCount") or 0) + thoughts),
-                      um.get("promptTokenCount") or 0, (um.get("candidatesTokenCount") or 0) + thoughts,
-                      thinking=thoughts)
-        if grounding.get("webSearchQueries"):
-            _record_usage("search", "gemini", "gemini_search", GEMINI_SEARCH_PRICE)
-        raw = [((c.get("web") or {}).get("title") or "", (c.get("web") or {}).get("uri") or "")
-               for c in grounding.get("groundingChunks") or []]
+        texts, cites, calls = [], [], 0
+        for item in data.get("output") or []:
+            kind = item.get("type")
+            if kind == "web_search_call":
+                calls += 1
+            elif kind == "message":
+                for c in item.get("content") or []:
+                    if c.get("type") == "output_text":
+                        texts.append(c.get("text") or "")
+                        cites += [(a.get("title") or "", a.get("url") or "")
+                                  for a in c.get("annotations") or [] if a.get("type") == "url_citation"]
+        usage = data.get("usage") or {}
+        inp, out = usage.get("input_tokens") or 0, usage.get("output_tokens") or 0
+        cached = (usage.get("input_tokens_details") or {}).get("cached_tokens") or 0
+        reasoning = (usage.get("output_tokens_details") or {}).get("reasoning_tokens") or 0
+        total = usage.get("total_tokens")
+        if total is not None and total != inp + out:
+            logger.warning(f"gpt_search: total_tokens={total} != input+output={inp + out} — reasoning вне output_tokens?")
+        searches = (usage.get("server_tool_use") or {}).get("web_search_requests")
+        searches = calls if searches is None else searches
+        fresh = max(0, inp - cached)   # cached_tokens входят во вход по формату OpenAI — считаем по цене кэша отдельно
+        _record_usage("llm", SEARCH_GPT_MODEL, "gpt_search",
+                      calc_llm_cost(SEARCH_GPT_MODEL, fresh, out, cache_read=cached), fresh, out, 0, cached,
+                      thinking=reasoning)
+        for _ in range(searches):
+            _record_usage("search", "gpt", "gpt_search", GPT_SEARCH_PRICE)
     except Exception as e:
-        logger.warning(f"gemini_search: неожиданная форма ответа: {type(e).__name__}: {e}")
+        logger.warning(f"gpt_search: неожиданная форма ответа: {type(e).__name__}: {e}")
         return None
+    text = "".join(texts).strip()
     if not text:
-        logger.warning(f"gemini_search: пустой текст (finishReason={cand.get('finishReason')})")
+        logger.warning(f"gpt_search: пустой текст (status={data.get('status')})")
         return None
 
-    raw = [(t, u) for t, u in raw if u][:SEARCH_GEMINI_MAX_SOURCES]
-    real = await asyncio.gather(*(asyncio.to_thread(_resolve_redirect, u) for _, u in raw))
-    sources = [(urlparse(r).netloc.lower().removeprefix("www.") if r else t or urlparse(u).netloc, r or u)
-               for (t, u), r in zip(raw, real)]
-    return text[:SEARCH_GEMINI_MAX_CHARS], sources
+    sources, seen = [], set()
+    for _, u in cites:
+        u = _clean_citation_url(u) if u else ""
+        host = urlparse(u).netloc.lower().removeprefix("www.")
+        if u and u not in seen:
+            seen.add(u)
+            sources.append((host, u))
+            if len(sources) == SEARCH_GPT_MAX_SOURCES:
+                break
+    return text[:SEARCH_GPT_MAX_CHARS], sources
+
+
+def search_provider_for(chat_id: int, model_id: str) -> str:
+    """'claude' | 'gpt' | 'tavily' — откуда берёт данные поиска ЭТОТ чат на ЭТОЙ модели.
+    free: SEARCH_PROVIDER_FREE (ручного выбора нет). paid: режим /searchmode; auto = за моделью (Claude → нативный,
+    Gemini → gpt); claude при Gemini-модели невозможен → как auto. NATIVE_SEARCH=0 → вместо claude Tavily."""
+    if chat_tier(chat_id) == "free":
+        return SEARCH_PROVIDER_FREE
+    mode = db.get_chat_search_mode_db(chat_id)
+    if mode in ("gpt", "tavily"):
+        return mode
+    if model_provider(model_id) == "anthropic":
+        return "claude" if NATIVE_SEARCH else "tavily"
+    return "gpt"
 
 
 async def search_with_provider(update, user_id: int, chat_id: int, is_group: bool, user_text: str,
                                reply_context: str, provider: str) -> tuple[str, str, list]:
-    """should_search → провайдер поиска (tavily | gemini). Возвращает (запрос, результаты, источники);
-    источники — [(подпись, url)] только у Gemini. Gemini вернул None → Tavily как запасной (с пометкой в логе),
+    """should_search → провайдер поиска (gpt | tavily; всё прочее — tavily). Возвращает (запрос, результаты,
+    источники); источники — [(подпись, url)] только у gpt. gpt вернул None → Tavily как запасной (с пометкой в логе),
     если он настроен; второй раз тот же провайдер не зовём — иначе платим дважды."""
-    if provider != "gemini":
+    if provider != "gpt":
         sq, sr = await _tavily_search(update, user_id, chat_id, is_group, user_text, reply_context)
         return sq, sr, []
     if not _search_allowed(user_id, chat_id, is_group):
@@ -1252,13 +1338,13 @@ async def search_with_provider(update, user_id: int, chat_id: int, is_group: boo
     if not search_query:
         return "", "", []
     react(update.message, REACTION_SEARCH)
-    found = await _gemini_grounded_search(search_query)
+    found = await _gpt_web_search(search_query)
     if found:
         return search_query, found[0], found[1]
     if tavily:
-        logger.warning(f"gemini_search не дал результата, запасной провайдер — Tavily (запрос {search_query!r})")
+        logger.warning(f"gpt_search не дал результата, запасной провайдер — Tavily (запрос {search_query!r})")
         return search_query, await call_claude_aux(web_search, search_query, label="web_search") or "", []
-    logger.warning(f"gemini_search не дал результата, Tavily не настроен — отвечаю без поиска ({search_query!r})")
+    logger.warning(f"gpt_search не дал результата, Tavily не настроен — отвечаю без поиска ({search_query!r})")
     return "", "", []
 
 
@@ -3166,7 +3252,8 @@ async def cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         def eff_model(chat_id: int, saved: str | None, balance: float) -> str:
             paid = is_admin(chat_id) or balance > db.PAID_MIN_BALANCE
-            model_id = (saved or MODELS[PAID_DEFAULT_MODEL_KEY]["id"]) if paid else DEFAULT_MODEL_ID
+            model_id = (saved or MODELS[PAID_DEFAULT_MODEL_KEY]["id"]) if paid else \
+                (db.get_chat_free_model_db(chat_id) or DEFAULT_MODEL_ID)
             return model_meta(model_id)["label"]
 
         lines = ["Группы (✅ проверена, ⏳ нет, 🚫 бан):"]
@@ -3529,7 +3616,7 @@ async def cmd_ratelimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _usage_model_label(kind: str, model: str | None) -> str:
     """Подпись «модели» строки usage_log: LLM — из реестра; картинки хранят ключ провайдера,
-    поиск — 'tavily' (бесплатный режим) / 'anthropic' (нативный, платный) / 'gemini' (Google Search через пул). Модель вне реестра показываем как есть (цена по дефолту, см. model_meta)."""
+    поиск — 'tavily' (бесплатный режим) / 'anthropic' (нативный, платный) / 'gpt' (веб-поиск GPT через пул). Модель вне реестра показываем как есть (цена по дефолту, см. model_meta)."""
     if kind == "llm":
         meta = price_meta(model)
         return meta["label"] if meta else f"{model} (нет в реестре)"
@@ -3537,8 +3624,8 @@ def _usage_model_label(kind: str, model: str | None) -> str:
         return IMAGE_PROVIDERS.get(model, {}).get("label", model or "?")
     if model == "anthropic":
         return "Anthropic web_search"
-    if model == "gemini":
-        return "Gemini Google Search"
+    if model == "gpt":
+        return "GPT web_search"
     return "Tavily" if model == "tavily" else (model or "?")
 
 
@@ -3730,7 +3817,9 @@ async def _probe_model(context, chat_id: int, model_id: str) -> None:
     """
     await call_claude(
         context, chat_id, label=f"проверка модели {model_id}",
-        model=model_id, max_tokens=1, **aux_params(model_id), fallback=False,
+        # Gemini думает всегда: max_tokens=1 может дать пустой текст, но не ошибку — проба проверяет только HTTP.
+        model=model_id, max_tokens=out_tokens(model_id, 1) if model_provider(model_id) == "gemini" else 1,
+        **aux_params(model_id), fallback=False,
         messages=[{"role": "user", "content": "hi"}],
     )
 
@@ -3782,17 +3871,15 @@ async def _set_chat_model(update: Update, context: ContextTypes.DEFAULT_TYPE, ke
         await update.effective_message.reply_text(err)
         return
     tier = chat_tier(chat_id)
+    free_choice = tier == "free" and key in FREE_MODEL_KEYS   # выбор free: пишем chat_free_model, не chat_models
 
-    if tier == "free" and not admin:
-        if key == DEFAULT_MODEL_KEY:
-            await update.effective_message.reply_text(
-                f"Сейчас бесплатный режим — {meta['label']} и так включён. Баланс — /cost")
-        else:
-            await update.effective_message.reply_text(
-                f"{meta['label']} — доступно в платном режиме "
-                f"(${meta['in']:g}/${meta['out']:g} за миллион токенов). "
-                f"Баланс — /cost, пополнить — {ADMIN_CONTACT}."
-            )
+    if tier == "free" and not admin and not free_choice:
+        await update.effective_message.reply_text(
+            f"{meta['label']} — доступно в платном режиме "
+            f"(${meta['in']:g}/${meta['out']:g} за миллион токенов). "
+            f"В бесплатном режиме можно выбрать {' или '.join(MODELS[k]['label'] for k in FREE_MODEL_KEYS)}. "
+            f"Баланс — /cost, пополнить — {ADMIN_CONTACT}."
+        )
         return
 
     if meta.get("restricted") and await _deny_restricted(
@@ -3803,7 +3890,7 @@ async def _set_chat_model(update: Update, context: ContextTypes.DEFAULT_TYPE, ke
     # Чат мог ещё не попасть в allowed_chats — предупреждаем, но запись разрешаем.
     warn = "" if known or not context.args else \
         "\n⚠️ Такого чата нет среди разрешённых — записала, но проверь ID."
-    if tier == "free":  # сюда попадает только админ
+    if tier == "free" and not free_choice:  # сюда попадает только админ
         warn += "\nℹ️ Чат в бесплатном режиме: выбор сохранён, включится после пополнения."
 
     if key == "fable" and tier == "paid":
@@ -3824,21 +3911,27 @@ async def _set_chat_model(update: Update, context: ContextTypes.DEFAULT_TYPE, ke
             )
             return
 
-    if tier == "free":
-        # Админ пишет выбор в чужой free-чат без пробы: get_chat_model в free всё равно Haiku.
+    if tier == "free" and not free_choice:
+        # Админ пишет выбор в чужой free-чат без пробы: в free он не действует до пополнения.
         db.set_chat_model_db(chat_id, meta["id"])
         await update.effective_message.reply_text(f"{label} → {meta['label']}.{warn}")
         return
 
-    try:
-        await _probe_model(context, update.effective_chat.id, meta["id"])
-    except Exception as e:
-        api_errors.log_api_error(e, context_label=f"проверка модели {meta['id']}")
-        await update.effective_message.reply_text(
-            f"{meta['label']} сейчас недоступна — модель не меняю. {api_errors.user_message(e)}"
-        )
-        return
+    if meta["id"] != DEFAULT_MODEL_ID:   # Haiku — дефолт, проба ему не нужна (возврат на него не должен падать)
+        try:
+            await _probe_model(context, update.effective_chat.id, meta["id"])
+        except Exception as e:
+            api_errors.log_api_error(e, context_label=f"проверка модели {meta['id']}")
+            await update.effective_message.reply_text(
+                f"{meta['label']} сейчас недоступна — модель не меняю. {api_errors.user_message(e)}"
+            )
+            return
 
+    if free_choice:
+        db.set_chat_free_model_db(chat_id, meta["id"])
+        await update.effective_message.reply_text(
+            f"{label} → {meta['label']} (бесплатный режим; платный выбор не тронут).{warn}")
+        return
     db.set_chat_model_db(chat_id, meta["id"])
     _fable_pending.pop(chat_id, None)
     await update.effective_message.reply_text(f"{label} → {meta['label']}.{warn}")
@@ -3860,6 +3953,78 @@ async def cmd_fable(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _set_chat_model(update, context, "fable")
 
 
+async def cmd_argon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _set_chat_model(update, context, "argon")
+
+
+async def cmd_flash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _set_chat_model(update, context, "flash")
+
+
+async def cmd_lite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _set_chat_model(update, context, "lite")
+
+
+SEARCH_PROVIDER_LABELS = {"claude": "Claude (нативный)", "gpt": "GPT", "tavily": "Tavily"}
+
+
+def _search_status_line(chat_id: int) -> str:
+    """Строка /models и /searchmode: режим поиска чата и провайдер, который реально сработает."""
+    model = get_chat_model(chat_id)
+    actual = SEARCH_PROVIDER_LABELS[search_provider_for(chat_id, model)]
+    if chat_tier(chat_id) == "free":
+        return f"Поиск: {actual} (бесплатный режим, выбор — после пополнения). /searchmode"
+    mode = db.get_chat_search_mode_db(chat_id)
+    if mode == "claude" and model_provider(model) != "anthropic":
+        return f"Поиск: Claude → недоступен на Gemini, сейчас {actual}. /searchmode"
+    return f"Поиск: {mode} (сейчас: {actual}). /searchmode auto|gpt|claude|tavily"
+
+
+SEARCHMODE_USAGE = (
+    "/searchmode auto|gpt|claude|tavily\n"
+    "  auto — за моделью чата: Claude ищет нативно, Gemini — через GPT\n"
+    "  gpt — поиск GPT при любой модели · claude — нативный поиск Anthropic (только на Claude-моделях)\n"
+    "  tavily — Tavily. Решение «искать ли» везде за моделью/службой (should_search), режим выбирает только источник."
+)
+
+
+async def cmd_searchmode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/searchmode [auto|gpt|claude|tavily] [chat_id] — режим поиска чата (chat_search_mode). Без аргумента —
+    текущий режим и варианты. Кто переключает — как с моделями: любой в личке и в группе; чужой чат (chat_id) —
+    только админ бота. В free ручного выбора нет (цена поиска GPT неизвестна) — действует SEARCH_PROVIDER_FREE;
+    админ может записать выбор, он включится после пополнения."""
+    admin = is_admin(update.effective_user.id)
+    chat_id = update.effective_chat.id
+    if len(context.args) >= 2:
+        if not admin:
+            await update.effective_message.reply_text("Менять настройки другого чата может только админ.")
+            return
+        try:
+            chat_id = int(context.args[1])
+        except ValueError:
+            await update.effective_message.reply_text("ID чата — это число. Формат: /searchmode gpt -1001234567890")
+            return
+    if not context.args:
+        await update.effective_message.reply_text(f"{_search_status_line(chat_id)}\n\n{SEARCHMODE_USAGE}")
+        return
+    mode = context.args[0].lower()
+    if mode not in SEARCH_MODES:
+        await update.effective_message.reply_text(SEARCHMODE_USAGE)
+        return
+    tier = chat_tier(chat_id)
+    if tier == "free" and not admin:
+        await update.effective_message.reply_text(
+            f"В бесплатном режиме поиск — {SEARCH_PROVIDER_LABELS[SEARCH_PROVIDER_FREE]}, выбрать нельзя. "
+            f"Баланс — /cost, пополнить — {ADMIN_CONTACT}.")
+        return
+    known, label = _chat_display(update, chat_id)
+    db.set_chat_search_mode_db(chat_id, mode)
+    warn = "" if known or len(context.args) < 2 else "\n⚠️ Такого чата нет среди разрешённых — записала, но проверь ID."
+    if tier == "free":
+        warn += "\nℹ️ Чат в бесплатном режиме: выбор сохранён, включится после пополнения."
+    await update.effective_message.reply_text(f"{label}: поиск — {mode}.\n{_search_status_line(chat_id)}{warn}")
+
+
 async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список моделей с ценами и окном; текущая модель чата помечена."""
     admin = is_admin(update.effective_user.id)
@@ -3878,19 +4043,22 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current = get_chat_model(chat_id)
     tier = chat_tier(chat_id)
     _, label = _chat_display(update, chat_id)
-    lines = [f"Модель для {label}: {model_meta(current)['label']}",
-             f"Режим: {_tier_label(chat_id)}", "", "Модели:"]
-    for key, meta in MODELS.items():
-        mark = "▸" if meta["id"] == current else " "
-        window = f"{meta['context'] // 1000}k" if meta["context"] < 1_000_000 else "1M"
-        tail = "  (платный режим)" if key != DEFAULT_MODEL_KEY and tier == "free" else ""
-        if meta.get("restricted"):
-            tail += "  (админы)"
-        lines.append(
-            f"{mark} /{key:6} {meta['label']:10} ${meta['in']:g}/${meta['out']:g} за MTok, окно {window}{tail}"
-        )
-    lines.append("")
-    lines.append("Цены — прайс Anthropic за миллион токенов (вход/выход).")
+    lines = [f"Модель для {label}: {model_meta(current)['label']}", f"Режим: {_tier_label(chat_id)}"]
+    for title, provider in (("Claude", "anthropic"), ("Gemini (кэша промпта нет — вход каждый раз по полной цене)",
+                                                       "gemini")):
+        lines += ["", f"{title}:"]
+        for key, meta in MODELS.items():
+            if model_provider(meta["id"]) != provider:
+                continue
+            mark = "▸" if meta["id"] == current else " "
+            window = f"{meta['context'] // 1000}k" if meta["context"] < 1_000_000 else "1M"
+            tail = "  (платный режим)" if tier == "free" and key not in FREE_MODEL_KEYS else ""
+            if meta.get("restricted"):
+                tail += "  (админы)"
+            lines.append(
+                f"{mark} /{key:6} {meta['label']:22} ${meta['in']:g}/${meta['out']:g} за MTok, окно {window}{tail}"
+            )
+    lines += ["", "Цены — прайс провайдера за миллион токенов (вход/выход).", _search_status_line(chat_id)]
     # Генерация картинок — те же провайдеры, что в /imagemodels, но компактно и с ценами за картинку.
     current_img = get_chat_image_provider(chat_id)
     lines += ["", "Генерация картинок:"]
@@ -3903,7 +4071,7 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("Nano Banana — 2K по запросу («нарисуй 2к …», /imagine 2k …), приходит документом. Подробнее — /imagemodels.")
     lines.append("(админы) — в группе переключают только админы чата и бота.")
     if tier == "free":
-        lines.append("В бесплатном режиме работает только Haiku; остальные — после пополнения баланса (/cost).")
+        lines.append("В бесплатном режиме доступны Haiku и Lite (/haiku, /lite); остальные — после пополнения баланса (/cost).")
         saved = db.get_chat_model_db(chat_id)
         if saved and saved != DEFAULT_MODEL_ID:
             lines.append(f"Прошлый выбор ({model_meta(saved)['label']}) вернётся в платном режиме.")
@@ -4093,10 +4261,14 @@ USER_HELP = """\
   /search <q>    — веб-поиск
   /imagine <q>   — генерация изображения (/imagine 2k <q> — в 2K, документом)
   /models        — модели, режим (платный/бесплатный) и что сейчас у чата
-  /haiku         — Haiku 5.5 (дёшево и быстро; единственная в бесплатном режиме)
+  /haiku         — Haiku 5.5 (дёшево и быстро; доступна в бесплатном режиме)
+  /lite          — Gemini 3.1 Flash-Lite (доступна в бесплатном режиме; кэша промпта нет)
   /sonnet        — Sonnet 5.5 (платный режим)
   /opus          — Opus 5.5 (платный режим; в группе — админам чата и бота)
   /fable         — Fable 5.1 (платный режим, в группе — админам чата и бота; просит подтверждения — очень дорогая)
+  /argon         — Gemini 4 Argon (платный режим)
+  /flash         — Gemini 3.8 Flash (платный режим)
+  /searchmode    — откуда брать данные для поиска: auto|gpt|claude|tavily (платный режим; без аргумента — текущий)
   /imagemodels   — какой провайдер картинок сейчас у чата
   /banana        — рисовать через Nano Banana 2.1 (платный режим)
   /bananapro     — рисовать через Nano Banana Pro (платный режим, 2K; в группе — админам чата и бота)
@@ -4128,12 +4300,22 @@ ADMIN_HELP = """\
 Модели (без аргумента — текущий чат; с chat_id — любой, только админу):
   /models [chat_id]        — список моделей, цены, окно; ▸ = текущая
   /haiku [chat_id]         — Haiku 5.5 — $0.10/$0.50 (×5 при промпте >100k), окно 1M (бесплатный режим)
+  /lite [chat_id]          — Gemini 3.1 Flash-Lite — $0.25/$1.50, окно 1M (бесплатный режим; в free выбор хранится отдельно)
   /sonnet [chat_id]        — Sonnet 5.5 — $2/$10, окно 1M (дефолт платного режима)
   /opus [chat_id]          — Opus 5.5 — $4/$20, окно 1M (в группе — админам чата и бота)
   /fable [chat_id]         — Fable 5.1 — $10/$50, окно 1M (в группе — админам чата и бота; повтор в течение 2 минут = подтверждение)
+  /argon [chat_id]         — Gemini 4 Argon — $2/$10, окно 1M (платный режим)
+  /flash [chat_id]         — Gemini 3.8 Flash — $0.75/$3.75, окно 1M (платный режим)
   chat_id — число с минусом, например: /opus -1001109809707
-  Не-Haiku модели — админу или чату в платном режиме. Выбор постоянный (chat_models),
-  в бесплатном режиме не применяется, но и не стирается. Перед записью — пробный запрос.
+  Gemini-модели без кэша промпта: вход каждый раз по полной цене. Если модель чата упала, ответ даёт Claude
+  (argon/flash → Sonnet, lite → Haiku), в /cost такие строки с меткой *_fallback.
+  Кроме Haiku и Lite — админу или чату в платном режиме. Выбор постоянный (chat_models), в бесплатном режиме
+  не применяется, но и не стирается; выбор free (Haiku/Lite) хранится отдельно (chat_free_model).
+  Перед записью — пробный запрос (кроме Haiku).
+
+Поиск (без аргумента — текущий режим чата; chat_id вторым аргументом — любой чат, только админу):
+  /searchmode [auto|gpt|claude|tavily] [chat_id] — auto = за моделью (Claude — нативный, Gemini — GPT);
+                           claude на Gemini-модели невозможен → GPT. В бесплатном режиме выбора нет (SEARCH_PROVIDER_FREE)
 
 Провайдер картинок (без аргумента — текущий чат; с chat_id — любой, только админу):
   /imagemodels [chat_id]   — текущий провайдер картинок чата
@@ -4443,12 +4625,13 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     try:
         results, search_sources = "", []
-        if SEARCH_PROVIDER_FREE == "gemini":
-            found = await _gemini_grounded_search(query)
+        # /search: провайдер чата; claude (нативный поиск живёт только в диалоге) → Tavily, как раньше.
+        if search_provider_for(update.effective_chat.id, get_chat_model(update.effective_chat.id)) == "gpt":
+            found = await _gpt_web_search(query)
             if found:
                 results, search_sources = found
             elif tavily:
-                logger.warning(f"gemini_search не дал результата, запасной провайдер — Tavily (/search {query!r})")
+                logger.warning(f"gpt_search не дал результата, запасной провайдер — Tavily (/search {query!r})")
         if not results:
             results = await call_claude_aux(web_search, query, label="web_search")
     except BaseException:
@@ -5196,7 +5379,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         search_sources: list = []
         if not use_native:
             search_query, search_results, search_sources = await search_with_provider(
-                update, user_id, chat_id, is_group, user_text, reply_context, SEARCH_PROVIDER_FREE)
+                update, user_id, chat_id, is_group, user_text, reply_context,
+                search_provider_for(chat_id, get_chat_model(chat_id)))
 
         system = build_system(user_id, is_group, chat_id if is_group else None)
 
@@ -5242,12 +5426,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if isinstance(e_native, anthropic.BadRequestError) and not _native_search_rejected(e_native):
                         raise
                     # Пул/модель не принимает инструмент ИЛИ Claude лёг (фолбэк на Gemini, у которого нет
-                    # нативного поиска) — этот же запрос по схеме SEARCH_PROVIDER_FALLBACK (should_search → поиск → service_block).
-                    logger.warning(f"native web_search недоступен ({_model}), перехожу на "
-                                   f"{SEARCH_PROVIDER_FALLBACK}: {e_native!r}")
+                    # нативного поиска) — этот же запрос по схеме gpt → Tavily (should_search → поиск → service_block).
+                    logger.warning(f"native web_search недоступен ({_model}), перехожу на gpt (запасной — Tavily): "
+                                   f"{e_native!r}")
                     use_native, native_text = False, None
                     search_query, search_results, native_urls = await search_with_provider(
-                        update, user_id, chat_id, is_group, user_text, reply_context, SEARCH_PROVIDER_FALLBACK)
+                        update, user_id, chat_id, is_group, user_text, reply_context, "gpt")
                     messages = compose(search_query, search_results)
             if not use_native:
                 response = await call_claude(
@@ -5523,7 +5707,11 @@ def main():
     app.add_handler(CommandHandler("sonnet", cmd_sonnet))
     app.add_handler(CommandHandler("opus", cmd_opus))
     app.add_handler(CommandHandler("fable", cmd_fable))
+    app.add_handler(CommandHandler("argon", cmd_argon))
+    app.add_handler(CommandHandler("flash", cmd_flash))
+    app.add_handler(CommandHandler("lite", cmd_lite))
     app.add_handler(CommandHandler("models", cmd_models))
+    app.add_handler(CommandHandler("searchmode", cmd_searchmode))
 
     _other_commands = {
         "start", "help", "clear", "memory", "memory_full", "forget", "imagine", "search",

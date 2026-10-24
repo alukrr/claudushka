@@ -45,9 +45,20 @@ Gemini, без попытки и ожидания (`_fallback_until`, в пам�
 
 ## Нативный поиск
 Gemini `web_search` не получает. Запрос с `tools` при сбое/липком окне → `NativeSearchUnavailable`; хендлер
-(рядом с `_native_search_rejected`) уходит на схему поиска с провайдером `SEARCH_PROVIDER_FALLBACK` (по умолчанию
-`gemini` — Google Search через Gemini, см. `native-search.md`, раздел «Провайдеры поиска»; `tavily` — как раньше) и
-повторяет запрос обычным `call_claude` (который в окне идёт на Gemini). 👀 ставится только если реально искали.
+(рядом с `_native_search_rejected`) уходит на поиск через GPT (`_gpt_web_search`, запасной — Tavily; см.
+`native-search.md`, «Провайдеры поиска») и повторяет запрос обычным `call_claude` (который в окне идёт на Gemini).
+👀 ставится только если реально искали.
+
+## Обратный фолбэк: Gemini-модель чата → Claude (v1.9.0)
+Gemini стала выбираемой моделью чата (`/argon /flash /lite`, `docs/claude/models-and-costs.md`). Упала она —
+ответ даёт Claude по тем же правилам `should_fallback` и с тем же липким окном (ключ — ID Gemini-модели):
+`argon`/`flash` → Sonnet 5.5, `lite` → Haiku 5.5 (`fallback_model_for`). Один переход: Claude-фолбэк дальше не
+фолбэчится. Параметры приводит та же функция `kwargs_for_model(kwargs, model)`, что чистит вызов Gemini-модели
+(и первый, и фолбэк): → Gemini без `thinking`/`output_config`/`tools`/`cache_control`; из Gemini → Claude запас
+Gemini (4000) меняется на запас целевой модели, thinking/effort не добавляются (запас покрывает adaptive-thinking Haiku).
+Метка `usage_log` фолбэк-ответа — с суффиксом `_fallback` (`dialog_fallback`; `_usage_label`), модель в строке —
+фактическая. Это и есть видимость фолбэка в `/cost`: подпись «(фолбэк)» у моделей убрана — у Gemini-моделей теперь
+обычные подписи из `MODELS`.
 
 ## Открыто (проверить на стенде): токены рассуждения на Anthropic-полосе
 Не проверено, входят ли в `usage.output_tokens` Anthropic-полосы (`/v1/messages`) для Gemini-моделей токены
@@ -56,8 +67,9 @@ Gemini `web_search` не получает. Запрос с `tools` при сбо
 на фолбэке занижен — чинить отдельно. Результат записать сюда.
 
 ## Деньги и видимость
-- Цена — по фактической `response.model` (`_billed_model`): `gemini-*` в `LEGACY_PRICES` с подписью
-  «… (фолбэк)» — в `/cost` видны отдельной строкой. Кошелёк списывается по цене Gemini (дешевле) — так задумано.
+- Цена — по фактической `response.model` (`_billed_model`): Gemini-модели в `MODELS` (одна цена на строку, не
+  дублируется в `LEGACY_PRICES`). Фолбэк-ответы в `/cost` — по метке `*_fallback`. Кошелёк списывается по цене
+  фактической модели — так задумано.
 - Множитель записи в кэш Gemini в доках пула не указан → 1.0 (**непроверено**, но `cache_control` на этом
   endpoint режется, записи в кэш не возникает). Чтение — 0.1× («cached input bills at 10%»).
 - `logger.warning("FALLBACK <claude> → <gemini> …")` на каждое переключение; админам `notify_admins` —

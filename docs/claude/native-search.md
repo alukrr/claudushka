@@ -101,36 +101,48 @@ Haiku 5.5 («Search behavior»), а не «ищи всегда» (по гайд�
 у пула ≈ **$0.004**. Мы учитываем по официальному прайсу ($0.01), как и токены — `PRICE_MARKUP = 1.0`, скидка
 пула в `usage_log` не заводится, так что в `/cost` поиск виден по официальной цене.
 
-## Провайдеры поиска (ТЗ `feat/gemini-search`)
-Схема `should_search` (Haiku) → провайдер → `service_block` теперь с выбором провайдера (`search_with_provider`):
-- `SEARCH_PROVIDER_FALLBACK` (дефолт `gemini`) — когда нативный поиск недоступен: Claude лёг и чат на фолбэке
-  (`NativeSearchUnavailable`) или пул отклонил инструмент (`_native_search_rejected`).
-- `SEARCH_PROVIDER_FREE` (дефолт `tavily`) — бесплатный режим и `/search`. `gemini` работает, но дефолт не меняем,
-  пока не замерена цена поиска Gemini у пула.
-- `SEARCH_GEMINI_MODEL` (дефолт `gemini-3.8-flash`). Константы: таймаут `(10, 40)`, выжимка ≤ 3000 символов,
-  ≤ 5 источников.
-- Gemini вернул `None` → Tavily как запасной (если настроен; в логе «gemini_search не дал результата»), иначе ответ
-  без поиска. Tavily-провайдер сам к Gemini не откатывается: второй раз тот же провайдер не зовём.
+## Провайдеры поиска и режим чата (ТЗ `feat/gemini-models`, v1.9.0)
+Схема `should_search` (Haiku) → провайдер → `service_block` с выбором провайдера (`search_with_provider`). Провайдеры:
+- `claude` — нативный `web_search` Anthropic (всё, что выше). Только на Claude-моделях чата.
+- `gpt` — `_gpt_web_search`: веб-поиск GPT (`gpt-6-luna`) через пул, работает при ЛЮБОЙ модели чата; выжимка идёт в
+  `service_block` так же, как результаты Tavily.
+- `tavily` — как раньше.
 
-`_gemini_grounded_search(query)`: `POST {POOL_BASE_URL}/v1beta/models/<модель>:generateContent`, `x-goog-api-key`,
-`tools=[{"google_search":{}}]`, по образцу `_transcribe_audio_gemini`. Gemini — НЕ модель диалога, только источник
-данных: диалог в её формат не конвертируется. Одна повторная попытка на 429/5xx/сетевую ошибку. Текст — только
-`parts` без `thought`. `thinkingConfig` НЕ передаётся (не проверено, принимает ли пул — проверить на стенде;
-`maxOutputTokens` тоже не задаём).
-- **Источники:** `groundingChunks[].web.uri` — redirect `vertexaisearch.cloud.google.com/grounding-api-redirect/...`;
-  разворачиваем `HEAD` без следования редиректу (Location), параллельно, таймаут 4 с. Не развернулось — остаётся
-  redirect с подписью из `title` (это домен). `sources_line` принимает и `url`, и пары `(подпись, url)`.
-- **Деньги:** токены → `usage_log` LLM, модель = `SEARCH_GEMINI_MODEL`, `label=gemini_search`, выход =
-  `candidatesTokenCount + thoughtsTokenCount` (рассуждения оплачиваются как вывод), колонка `thinking` = рассуждения.
-  Сам поиск — строка `kind=search`, `model=gemini` (в `/cost` — «Gemini Google Search»), цена
-  `GEMINI_SEARCH_PRICE = 0.0` — **НЕ ИЗВЕСТНО, замерить по балансу пула**. Строка пишется только если в ответе есть
-  `webSearchQueries`. Строки `search` считает и дневной лимит непроверенных.
-- **Условия Google (Gemini API Additional Terms, раздел Grounding with Google Search, сверено 2026-10-24,
-  https://ai.google.dev/gemini-api/terms):** результаты показывать только пользователю, задавшему запрос, вместе с
-  Search Suggestions (`searchEntryPoint`, до 5); нельзя «изменять или перемежать другим контентом» Grounded Results
-  и Search Suggestions, ставить промежуточные страницы перед ссылками, извлекать их для других целей. Мы пересказываем
-  выжимку моделью чата и показываем только домены — формально это расходится с условиями. Пул — посредник, применимость
-  условий к нему неясна; решение за Алексеем до мержа. Срок жизни redirect-ссылок в доках не найден.
+**Режим чата** — `chat_search_mode` (`auto|gpt|claude|tavily`, дефолт `auto`, таблица по образцу `chat_image_provider`),
+команда `/searchmode [режим] [chat_id]` (чужой чат — только админ бота; в группе переключает любой, как модели).
+`search_provider_for(chat_id, model_id)`:
+- free → `SEARCH_PROVIDER_FREE` (env `tavily|gpt`, дефолт `tavily`, пока не замерена цена поиска GPT). Ручного выбора
+  в free нет: не-админу отказ; админ может записать режим — включится после пополнения.
+- paid, `auto`: Claude-модель → `claude` (при `NATIVE_SEARCH=0` → `tavily`), Gemini-модель → `gpt`;
+- `gpt`/`tavily` — принудительно; `claude` при Gemini-модели невозможен → как `auto` (`/models` пишет «Claude →
+  недоступен на Gemini, сейчас GPT»).
+- **Фолбэк** (`NativeSearchUnavailable` или пул отклонил инструмент) → `gpt`, а если тот вернул `None` — `tavily`
+  (с пометкой в логе); без Tavily — ответ без поиска. Тот же провайдер второй раз не зовём: платили бы дважды.
+- Решение «искать или нет» для `gpt`/`tavily` — `should_search`; дневной лимит поиска непроверенных
+  (`_search_allowed`) — на все провайдеры (строки `kind=search` считаются независимо от `model`).
+- `/search` в платном чате с режимом `gpt` идёт через GPT, иначе (в т.ч. `claude`, нативный поиск живёт только в
+  диалоге) — Tavily, как раньше; в free — `SEARCH_PROVIDER_FREE`.
+
+**`_gpt_web_search(query)`** (env `SEARCH_GPT_MODEL`=`gpt-6-luna`, `SEARCH_GPT_EFFORT`=`low`):
+`POST {POOL_BASE_URL}/v1/responses`, `Authorization: Bearer <ключ бота>`, `tools=[{"type":"web_search"}]`, без
+`max_output_tokens` и `store`, `requests` в потоке (без зависимости `openai`). Таймаут `(10, 40)`; одна повторная попытка
+на 429/5xx/сеть; 400 при заданном `reasoning` → один повтор без него (принимает ли пул `reasoning.effort` у luna —
+проверить на стенде); `None` при любой ошибке. Выжимка ≤ 3000 символов (инвариант про размер).
+- **Источники:** `url_citation` из `output[].content[].annotations[]` (`title`, `url`), без дублей, ≤ 5, `utm_source=openai`
+  срезан; ссылки настоящие (не редиректы). Строка `🔗 домен · домен` под ответом — всегда кликабельная (Markdown-ссылки,
+  фолбэк plain только при отказе Telegram), до 3 доменов (`sources_line`), как у нативного поиска. Условие OpenAI —
+  «inline citations must be made clearly visible and clickable»; предложение про ссылки рядом с фактом — в отчёте ТЗ.
+- **Деньги:** LLM-строка `gpt_search`, модель `gpt-6-luna` (`LEGACY_PRICES`: $0.10/$0.50, кэш-чтение 10%): вход без
+  `cached_tokens`, кэш-чтение отдельно, выход = `output_tokens` (reasoning внутри; при `total_tokens != input+output`
+  warning в логе). Поиск — `kind=search`, `model=gpt` (в `/cost` — «GPT web_search»), по строке на
+  `usage.server_tool_use.web_search_requests` (нет поля — по числу `web_search_call`), цена `GPT_SEARCH_PRICE = 0.0` —
+  **НЕ ИЗВЕСТНО** («Search actions incur a tool call cost» без цифры), замерить по балансу пула.
+
+**Google Search (grounding Gemini) не используем.** Условия Gemini API (https://ai.google.dev/gemini-api/terms, раздел
+Grounding with Google Search, сверено 2026-10-24): результат показывать только автору запроса и вместе с Search
+Suggestions (HTML), нельзя изменять/перемежать другим контентом, «analyze… or otherwise learn from». Схема «нашли → модель
+чата пересказала в группу» им противоречит. Рабочий вызов нативной полосы с `google_search` остаётся в истории git
+(ветка `feat/gemini-search`, коммит `bf4c8d5`), в коде его нет.
 
 ## Открыто
 - Стоимость токенов выдачи: сравнить среднюю цену реплики с поиском — Tavily против нативного (шаг 9 чек-листа).

@@ -70,7 +70,7 @@ def test_fallback_kwargs_strips_and_copies():
     messages = [{"role": "user", "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]}]
     kw = dict(model=bot.DEFAULT_MODEL_ID, system=system, messages=messages, max_tokens=100,
               thinking={"type": "adaptive"}, output_config={"effort": "low"}, tools=[{"type": "web_search"}])
-    out = bot._fallback_kwargs(kw, "gemini-x")
+    out = bot.kwargs_for_model(kw, "gemini-x")
     assert out["model"] == "gemini-x"
     assert out["max_tokens"] == 100 + bot.FALLBACK_THINKING_HEADROOM
     assert not {"thinking", "output_config", "tools"} & out.keys()
