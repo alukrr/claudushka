@@ -46,7 +46,7 @@
 - Prompt caching (`build_system`, `service_block`, `mark_cache_tail`, `pick_history_window`,
   `PROMPT_CACHE`, `HISTORY_STEP`, `CACHE_TTL_PERSONA`) — `docs/claude/prompt-cache.md`
 - Нативный веб-поиск Anthropic в платном режиме (`call_dialog_native`, `call_claude_stream`, `native_answer`,
-  `sources_line`, `NATIVE_SEARCH*`, `pause_turn`, реакция по событию стрима) — `docs/claude/native-search.md`
+  `sources_line`, `NATIVE_SEARCH*`, `pause_turn`, реакция по событию стрима; провайдеры поиска `SEARCH_PROVIDER_*`, `_gemini_grounded_search`, `search_with_provider`) — `docs/claude/native-search.md`
 - Деньги и доступ (`usage_log`, `chat_credits`, баланс, тарифы paid/free, `usage_ctx`,
   `_record_usage`, `gate_update`, `/cost`, `/topup`, `/verify /unverify /ban /unban`,
   лимиты непроверенных, стартовый бонус, `/fable`-подтверждение) — `docs/claude/billing.md`

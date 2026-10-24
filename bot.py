@@ -103,6 +103,26 @@ NATIVE_SEARCH_MAX_PAUSE = 3   # сколько раз продолжаем от�
 # Сверено с балансом пула 2026-10-10: пул берёт 40% от официальной цены (скидка 60% и на поиск, и на токены).
 NATIVE_SEARCH_PRICE = 0.01
 
+# --- Поисковый провайдер Gemini + Google Search (ТЗ feat/gemini-search, docs/claude/native-search.md) ---
+# Gemini — не модель диалога, а источник данных в цепочке should_search → поиск → service_block.
+# SEARCH_PROVIDER_FALLBACK — когда нативный поиск недоступен (фолбэк Claude → Gemini / пул отклонил инструмент);
+# SEARCH_PROVIDER_FREE — бесплатный режим и /search. Значения: tavily | gemini.
+def _search_provider_env(name: str, default: str) -> str:
+    value = os.environ.get(name, default).strip().lower()
+    return value if value in ("tavily", "gemini") else default
+
+
+SEARCH_PROVIDER_FALLBACK = _search_provider_env("SEARCH_PROVIDER_FALLBACK", "gemini")
+SEARCH_PROVIDER_FREE = _search_provider_env("SEARCH_PROVIDER_FREE", "tavily")
+SEARCH_GEMINI_MODEL = os.environ.get("SEARCH_GEMINI_MODEL", "").strip() or "gemini-3.8-flash"
+SEARCH_GEMINI_TIMEOUT = (10, 40)          # (connect, read): ответ с поиском идёт ~10 с — это норма
+SEARCH_GEMINI_MAX_CHARS = 3000            # выжимка уходит в service_block — лимит по РАЗМЕРУ (инвариант CLAUDE.md)
+SEARCH_GEMINI_MAX_SOURCES = 5             # сколько redirect-ссылок разворачивать
+SEARCH_GEMINI_REDIRECT_TIMEOUT = 4
+# $ за один поиск Gemini через пул. НЕ ИЗВЕСТНО — замерить по балансу пула (как цену нативного поиска
+# 2026-10-10). Пока 0.0: токены поискового вызова считаются отдельно (label=gemini_search).
+GEMINI_SEARCH_PRICE = 0.0
+
 # --- Prompt caching (ТЗ feat/prompt-cache, docs/claude/prompt-cache.md) ---
 # PROMPT_CACHE=0 — откат без правки кода: system снова одной строкой без cache_control,
 # окно истории скользит как раньше (HISTORY_STEP=0). Служебный блок в хвосте остаётся.
@@ -1131,6 +1151,117 @@ async def _tavily_search(update, user_id: int, chat_id: int, is_group: bool, use
     return search_query, await call_claude_aux(web_search, search_query, label="web_search") or ""
 
 
+def _resolve_redirect(url: str) -> str | None:
+    """Настоящий URL из redirect-ссылки grounding (vertexaisearch.cloud.google.com/grounding-api-redirect/...):
+    Location первого ответа. Блокирующая — звать через to_thread. None — не развернулось."""
+    try:
+        r = http_requests.head(url, allow_redirects=False, timeout=SEARCH_GEMINI_REDIRECT_TIMEOUT)
+        if r.status_code in (301, 302, 303, 307, 308):
+            loc = r.headers.get("Location", "")
+            return loc if loc.startswith(("http://", "https://")) else None
+    except Exception as e:
+        logger.info(f"gemini_search: redirect не развернулся ({type(e).__name__})")
+    return None
+
+
+async def _gemini_grounded_search(query: str) -> tuple[str, list[tuple[str, str]]] | None:
+    """Поиск через Gemini с инструментом google_search (нативная Gemini-полоса пула, тот же ключ).
+
+    Возвращает (выжимка, [(подпись, url)]) или None при любой ошибке/пустом ответе — вызывающий код сам решает,
+    идти ли на запасной провайдер. Токены (выход = candidates + thoughts) пишутся в usage_log как LLM с
+    label=gemini_search, сам поиск — строкой kind=search/gemini. Источники: redirect-ссылки разворачиваются в
+    настоящие URL параллельно (не больше SEARCH_GEMINI_MAX_SOURCES), не развернулась — остаётся redirect с
+    подписью из title (домен)."""
+    url = f"{POOL_BASE_URL}/v1beta/models/{SEARCH_GEMINI_MODEL}:generateContent"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": (
+            f"Поисковый запрос: {query}\n\n"
+            "Найди актуальные факты через поиск и дай сжатую выжимку: цифры, даты, названия, без вступлений "
+            "и без рассуждений о самом поиске. Отвечай по-русски, если запрос на русском."
+        )}]}],
+        "tools": [{"google_search": {}}],
+    }
+    headers = {"x-goog-api-key": ANTHROPIC_API_KEY}
+    data = None
+    for attempt in (1, 2):
+        try:
+            resp = await asyncio.to_thread(http_requests.post, url, json=payload, headers=headers,
+                                           timeout=SEARCH_GEMINI_TIMEOUT)
+        except Exception as e:
+            logger.warning(f"gemini_search: запрос не прошёл (попытка {attempt}/2): {type(e).__name__}: {e}")
+        else:
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except Exception as e:
+                    logger.warning(f"gemini_search: ответ не разобран: {e}")
+                    return None
+                break
+            if resp.status_code not in (429, 500, 502, 503, 504):
+                logger.warning(f"gemini_search: HTTP {resp.status_code} (не повторяем)")
+                return None
+            logger.warning(f"gemini_search: HTTP {resp.status_code} (попытка {attempt}/2)")
+        if attempt == 1:
+            await asyncio.sleep(GEMINI_RETRY_DELAY)
+    if data is None:
+        return None
+
+    try:
+        cand = (data.get("candidates") or [{}])[0]
+        parts = (cand.get("content") or {}).get("parts") or []
+        text = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
+        grounding = cand.get("groundingMetadata") or {}
+        um = data.get("usageMetadata") or {}
+        thoughts = um.get("thoughtsTokenCount") or 0
+        # Рассуждения оплачиваются как вывод (так же считает dnd-mcp) — отдельного счётчика поисков нет.
+        _record_usage("llm", SEARCH_GEMINI_MODEL, "gemini_search",
+                      calc_llm_cost(SEARCH_GEMINI_MODEL, um.get("promptTokenCount") or 0,
+                                    (um.get("candidatesTokenCount") or 0) + thoughts),
+                      um.get("promptTokenCount") or 0, (um.get("candidatesTokenCount") or 0) + thoughts,
+                      thinking=thoughts)
+        if grounding.get("webSearchQueries"):
+            _record_usage("search", "gemini", "gemini_search", GEMINI_SEARCH_PRICE)
+        raw = [((c.get("web") or {}).get("title") or "", (c.get("web") or {}).get("uri") or "")
+               for c in grounding.get("groundingChunks") or []]
+    except Exception as e:
+        logger.warning(f"gemini_search: неожиданная форма ответа: {type(e).__name__}: {e}")
+        return None
+    if not text:
+        logger.warning(f"gemini_search: пустой текст (finishReason={cand.get('finishReason')})")
+        return None
+
+    raw = [(t, u) for t, u in raw if u][:SEARCH_GEMINI_MAX_SOURCES]
+    real = await asyncio.gather(*(asyncio.to_thread(_resolve_redirect, u) for _, u in raw))
+    sources = [(urlparse(r).netloc.lower().removeprefix("www.") if r else t or urlparse(u).netloc, r or u)
+               for (t, u), r in zip(raw, real)]
+    return text[:SEARCH_GEMINI_MAX_CHARS], sources
+
+
+async def search_with_provider(update, user_id: int, chat_id: int, is_group: bool, user_text: str,
+                               reply_context: str, provider: str) -> tuple[str, str, list]:
+    """should_search → провайдер поиска (tavily | gemini). Возвращает (запрос, результаты, источники);
+    источники — [(подпись, url)] только у Gemini. Gemini вернул None → Tavily как запасной (с пометкой в логе),
+    если он настроен; второй раз тот же провайдер не зовём — иначе платим дважды."""
+    if provider != "gemini":
+        sq, sr = await _tavily_search(update, user_id, chat_id, is_group, user_text, reply_context)
+        return sq, sr, []
+    if not _search_allowed(user_id, chat_id, is_group):
+        return "", "", []
+    search_input = f"{user_text}\nКонтекст реплая: {reply_context}".strip() if reply_context else user_text
+    search_query = await call_claude_aux(should_search, search_input, label="should_search")
+    if not search_query:
+        return "", "", []
+    react(update.message, REACTION_SEARCH)
+    found = await _gemini_grounded_search(search_query)
+    if found:
+        return search_query, found[0], found[1]
+    if tavily:
+        logger.warning(f"gemini_search не дал результата, запасной провайдер — Tavily (запрос {search_query!r})")
+        return search_query, await call_claude_aux(web_search, search_query, label="web_search") or "", []
+    logger.warning(f"gemini_search не дал результата, Tavily не настроен — отвечаю без поиска ({search_query!r})")
+    return "", "", []
+
+
 def native_answer(response) -> tuple[str, list[str]]:
     """(текст, url источников) из ответа с серверным поиском.
 
@@ -1164,13 +1295,16 @@ def _md_url(url: str) -> str:
     return head + enc(url[len(head):]) if url.startswith(head) else enc(url)
 
 
-def sources_line(urls: list[str], limit: int = 3) -> tuple[str, str]:
+def sources_line(urls: list, limit: int = 3) -> tuple[str, str]:
     """Строка источников под ответом: (Markdown, plain). Домен как текст ссылки, не больше `limit`
-    разных доменов. Plain — фолбэк, если Telegram не принял Markdown (без ссылок, только домены)."""
+    разных доменов. Элемент — url или (подпись, url): подпись нужна поиску Gemini, где url может остаться
+    redirect-ссылкой Google (по ней домен не видно). Plain — фолбэк, если Telegram не принял Markdown
+    (без ссылок, только домены)."""
     items: list[tuple[str, str]] = []
     seen: set[str] = set()
-    for u in urls:
-        host = (urlparse(u).netloc or "").lower().removeprefix("www.")
+    for entry in urls:
+        label, u = entry if isinstance(entry, tuple) else ("", entry)
+        host = label.lower().removeprefix("www.") or (urlparse(u).netloc or "").lower().removeprefix("www.")
         if host and host not in seen:
             seen.add(host)
             items.append((host, u))
@@ -3395,7 +3529,7 @@ async def cmd_ratelimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _usage_model_label(kind: str, model: str | None) -> str:
     """Подпись «модели» строки usage_log: LLM — из реестра; картинки хранят ключ провайдера,
-    поиск — 'tavily' (бесплатный режим) / 'anthropic' (нативный, платный). Модель вне реестра показываем как есть (цена по дефолту, см. model_meta)."""
+    поиск — 'tavily' (бесплатный режим) / 'anthropic' (нативный, платный) / 'gemini' (Google Search через пул). Модель вне реестра показываем как есть (цена по дефолту, см. model_meta)."""
     if kind == "llm":
         meta = price_meta(model)
         return meta["label"] if meta else f"{model} (нет в реестре)"
@@ -3403,6 +3537,8 @@ def _usage_model_label(kind: str, model: str | None) -> str:
         return IMAGE_PROVIDERS.get(model, {}).get("label", model or "?")
     if model == "anthropic":
         return "Anthropic web_search"
+    if model == "gemini":
+        return "Gemini Google Search"
     return "Tavily" if model == "tavily" else (model or "?")
 
 
@@ -4306,7 +4442,15 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     react(update.message, REACTION_SEARCH)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     try:
-        results = await call_claude_aux(web_search, query, label="web_search")
+        results, search_sources = "", []
+        if SEARCH_PROVIDER_FREE == "gemini":
+            found = await _gemini_grounded_search(query)
+            if found:
+                results, search_sources = found
+            elif tavily:
+                logger.warning(f"gemini_search не дал результата, запасной провайдер — Tavily (/search {query!r})")
+        if not results:
+            results = await call_claude_aux(web_search, query, label="web_search")
     except BaseException:
         unreact(update.message)
         raise
@@ -4332,6 +4476,13 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
             answer = "Модель вернула пустой ответ. Попробуй ещё раз или смени модель через /models."
         for i in range(0, len(answer), 4096):
             await update.message.reply_text(answer[i:i + 4096])
+        src_md, src_plain = sources_line(search_sources)
+        if src_md:
+            kw = {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
+            try:
+                await update.message.reply_text(src_md, parse_mode="Markdown", **kw)
+            except Exception:
+                await update.message.reply_text(src_plain, **kw)
     except Exception as e:
         await api_errors.reply_api_error(
             update.message.reply_text, e, context_label=f"/search uid={user_id}",
@@ -5042,9 +5193,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Бесплатный: should_search → Tavily → результаты в служебный блок.
         use_native = _native_search_on(user_id, chat_id, is_group)
         search_query = search_results = ""
+        search_sources: list = []
         if not use_native:
-            search_query, search_results = await _tavily_search(
-                update, user_id, chat_id, is_group, user_text, reply_context)
+            search_query, search_results, search_sources = await search_with_provider(
+                update, user_id, chat_id, is_group, user_text, reply_context, SEARCH_PROVIDER_FREE)
 
         system = build_system(user_id, is_group, chat_id if is_group else None)
 
@@ -5077,7 +5229,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"PROMPT uid={user_id} chat={chat_id} model={_model} "
             f"system={system_chars(system)} history_chars={hist_chars} msgs={len(messages)} imgs={hist_imgs}"
         )
-        native_text, native_urls = None, []
+        native_text, native_urls = None, list(search_sources)
         try:
             if use_native:
                 try:
@@ -5090,11 +5242,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if isinstance(e_native, anthropic.BadRequestError) and not _native_search_rejected(e_native):
                         raise
                     # Пул/модель не принимает инструмент ИЛИ Claude лёг (фолбэк на Gemini, у которого нет
-                    # нативного поиска) — этот же запрос по старой схеме (Tavily).
-                    logger.warning(f"native web_search недоступен ({_model}), перехожу на Tavily: {e_native!r}")
-                    use_native, native_text, native_urls = False, None, []
-                    search_query, search_results = await _tavily_search(
-                        update, user_id, chat_id, is_group, user_text, reply_context)
+                    # нативного поиска) — этот же запрос по схеме SEARCH_PROVIDER_FALLBACK (should_search → поиск → service_block).
+                    logger.warning(f"native web_search недоступен ({_model}), перехожу на "
+                                   f"{SEARCH_PROVIDER_FALLBACK}: {e_native!r}")
+                    use_native, native_text = False, None
+                    search_query, search_results, native_urls = await search_with_provider(
+                        update, user_id, chat_id, is_group, user_text, reply_context, SEARCH_PROVIDER_FALLBACK)
                     messages = compose(search_query, search_results)
             if not use_native:
                 response = await call_claude(

@@ -101,5 +101,36 @@ Haiku 5.5 («Search behavior»), а не «ищи всегда» (по гайд�
 у пула ≈ **$0.004**. Мы учитываем по официальному прайсу ($0.01), как и токены — `PRICE_MARKUP = 1.0`, скидка
 пула в `usage_log` не заводится, так что в `/cost` поиск виден по официальной цене.
 
+## Провайдеры поиска (ТЗ `feat/gemini-search`)
+Схема `should_search` (Haiku) → провайдер → `service_block` теперь с выбором провайдера (`search_with_provider`):
+- `SEARCH_PROVIDER_FALLBACK` (дефолт `gemini`) — когда нативный поиск недоступен: Claude лёг и чат на фолбэке
+  (`NativeSearchUnavailable`) или пул отклонил инструмент (`_native_search_rejected`).
+- `SEARCH_PROVIDER_FREE` (дефолт `tavily`) — бесплатный режим и `/search`. `gemini` работает, но дефолт не меняем,
+  пока не замерена цена поиска Gemini у пула.
+- `SEARCH_GEMINI_MODEL` (дефолт `gemini-3.8-flash`). Константы: таймаут `(10, 40)`, выжимка ≤ 3000 символов,
+  ≤ 5 источников.
+- Gemini вернул `None` → Tavily как запасной (если настроен; в логе «gemini_search не дал результата»), иначе ответ
+  без поиска. Tavily-провайдер сам к Gemini не откатывается: второй раз тот же провайдер не зовём.
+
+`_gemini_grounded_search(query)`: `POST {POOL_BASE_URL}/v1beta/models/<модель>:generateContent`, `x-goog-api-key`,
+`tools=[{"google_search":{}}]`, по образцу `_transcribe_audio_gemini`. Gemini — НЕ модель диалога, только источник
+данных: диалог в её формат не конвертируется. Одна повторная попытка на 429/5xx/сетевую ошибку. Текст — только
+`parts` без `thought`. `thinkingConfig` НЕ передаётся (не проверено, принимает ли пул — проверить на стенде;
+`maxOutputTokens` тоже не задаём).
+- **Источники:** `groundingChunks[].web.uri` — redirect `vertexaisearch.cloud.google.com/grounding-api-redirect/...`;
+  разворачиваем `HEAD` без следования редиректу (Location), параллельно, таймаут 4 с. Не развернулось — остаётся
+  redirect с подписью из `title` (это домен). `sources_line` принимает и `url`, и пары `(подпись, url)`.
+- **Деньги:** токены → `usage_log` LLM, модель = `SEARCH_GEMINI_MODEL`, `label=gemini_search`, выход =
+  `candidatesTokenCount + thoughtsTokenCount` (рассуждения оплачиваются как вывод), колонка `thinking` = рассуждения.
+  Сам поиск — строка `kind=search`, `model=gemini` (в `/cost` — «Gemini Google Search»), цена
+  `GEMINI_SEARCH_PRICE = 0.0` — **НЕ ИЗВЕСТНО, замерить по балансу пула**. Строка пишется только если в ответе есть
+  `webSearchQueries`. Строки `search` считает и дневной лимит непроверенных.
+- **Условия Google (Gemini API Additional Terms, раздел Grounding with Google Search, сверено 2026-10-24,
+  https://ai.google.dev/gemini-api/terms):** результаты показывать только пользователю, задавшему запрос, вместе с
+  Search Suggestions (`searchEntryPoint`, до 5); нельзя «изменять или перемежать другим контентом» Grounded Results
+  и Search Suggestions, ставить промежуточные страницы перед ссылками, извлекать их для других целей. Мы пересказываем
+  выжимку моделью чата и показываем только домены — формально это расходится с условиями. Пул — посредник, применимость
+  условий к нему неясна; решение за Алексеем до мержа. Срок жизни redirect-ссылок в доках не найден.
+
 ## Открыто
 - Стоимость токенов выдачи: сравнить среднюю цену реплики с поиском — Tavily против нативного (шаг 9 чек-листа).
