@@ -31,7 +31,8 @@ data/dedup_runs/, калибровка оценок — data/dedup_calibration.j
                  "Отправил фото в чат" -> один факт). Один вызов модели на группу
                  (user_id, context, chat_id, tier) — СТОИТ ДЕНЕГ, задаётся --model
                  (короткое имя haiku/sonnet/opus/fable, как в bot.py, дефолт haiku,
-                 либо полная API-строка). Старые записи группы удаляются, вместо
+                 либо полная API-строка; есть и gemini / gemini-lite — Gemini через пул, выбор
+                 вручную, не автофолбэк; оценка цены для них приблизительна: рассуждения идут в вывод). Старые записи группы удаляются, вместо
                  них вставляется объединённый список с tier и (для medium)
                  максимальным expires_at среди объединяемых записей. Нужен пакет
                  anthropic и ANTHROPIC_API_KEY — на голом хосте их обычно нет
@@ -106,6 +107,10 @@ MODEL_ALIASES = {
     "sonnet": "claude-sonnet-5-5",
     "opus": "claude-opus-5-5",
     "fable": "claude-fable-5-1",
+    # Gemini через пул (тот же Anthropic Messages API и ключ). Не автофолбэк, а выбор вручную: дедуп меняет память,
+    # молчаливая смена модели посреди прогона дала бы смесь результатов двух моделей.
+    "gemini": "gemini-3.8-flash",
+    "gemini-lite": "gemini-3.1-flash-lite",
 }
 
 # $/MTok in,out + множители кэша — дубль MODELS/LEGACY_PRICES из bot.py, менять
@@ -121,7 +126,17 @@ PRICING = {
     "claude-opus-5": (5.0, 25.0, 0.1, 1.25, 2.0),
     "claude-opus-4-8": (5.0, 25.0, 0.1, 1.25, 2.0),
     "claude-fable-5-1": (10.0, 50.0, 0.025, 1.25, 2.0),
+    # Gemini — синхронно с LEGACY_PRICES в bot.py (запись кэша 1.0, у фолбэка cache_control режется).
+    "gemini-3.8-flash": (0.75, 3.75, 0.1, 1.0, 1.0),
+    "gemini-3.1-flash-lite": (0.25, 1.50, 0.1, 1.0, 1.0),
 }
+
+# Gemini думает ВСЕГДА (thinking не выключить, output_config пул отклоняет 400) и токены рассуждения идут в вывод.
+# Запас к max_tokens — как FALLBACK_THINKING_HEADROOM в bot.py (бесплатный: платятся только реальные токены).
+# Оценка стоимости для Gemini ПРИБЛИЗИТЕЛЬНАЯ: THINKING_EST — ~480 токенов на короткий ответ (замер 2026-10-24),
+# а входят ли они в usage.output_tokens Anthropic-полосы — не проверено (docs/claude/model-fallback.md).
+THINKING_HEADROOM = {"gemini-3.8-flash": 4000, "gemini-3.1-flash-lite": 4000}
+THINKING_EST = {"gemini-3.8-flash": 500, "gemini-3.1-flash-lite": 500}
 
 # Ступенчатая цена (Haiku 5.5): промпт > порога токенов тарифицируется по (in, out) верхней ступени, множители
 # кэша те же. ДОПУЩЕНИЕ (в доке не уточнено, консервативное — завышает): длина промпта =
@@ -430,7 +445,7 @@ def run_llm(groups, model, client, stop_event=None, calib: dict | None = None) -
             nonlocal cost_unknown
             resp = client.messages.create(
                 model=model,
-                max_tokens=MAX_OUT_TOKENS,
+                max_tokens=MAX_OUT_TOKENS + THINKING_HEADROOM.get(model, 0),
                 **AUX_PARAMS.get(model, {}),
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": json.dumps(facts, ensure_ascii=False)}],
@@ -649,7 +664,7 @@ def _estimate_single(facts_chars_n: int, model, calib: dict, n_sys: int | None =
     facts_tok = facts_chars_n / cpt
     in_tok = (len(SYSTEM_PROMPT) + facts_chars_n) / cpt
     want_out = facts_tok * ratio
-    out_tok = min(MAX_OUT_TOKENS, want_out)
+    out_tok = min(MAX_OUT_TOKENS, want_out) + THINKING_EST.get(model, 0)
     # Вход всегда уникален -> пул кеширует автоматически -> тарифицируется как запись 5m.
     return in_tok, out_tok, request_cost(model, 0, out_tok, in_tok, 0, 0), want_out
 
