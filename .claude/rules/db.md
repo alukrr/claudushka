@@ -26,7 +26,7 @@ db.py используется отовсюду, поэтому полная с�
 Здесь — только готчи уровня самих db.py-функций, не привязанные к одной фиче.
 
 ## `count_chat_messages()` немонотонна — не использовать для каденса
-`save_group_message` подрезает `group_messages` до 1000 строк на чат, поэтому
+`save_group_message` подрезает `group_messages` до `GROUP_MESSAGES_KEEP` (3000, было 1000) строк на чат, поэтому
 `COUNT(*)` перестаёт расти и любая проверка `% N == 0` от него залипает навсегда.
 Именно так однажды перестала обновляться групповая память (инцидент 2026-07-26,
 `docs/claude/incidents.md`). Для каденса использовать `should_extract_chat_memory()`,
@@ -44,6 +44,10 @@ db.py используется отовсюду, поэтому полная с�
 `daily_chat_review` и `cmd_review` (`docs/claude/daily-review.md`). `get_group_transcript()`
 кормит `build_group_messages()` для основного диалога (`docs/claude/group-chat.md`).
 Разные форматы для разных потребителей — не сливать в одну функцию и не удалять первую.
+Исключение: дневной обзор и `/review` с v1.10.0 берут `get_group_messages_range(chat_id, since_ts, until_ts)` — dict'ы
+`{id, ts, sender, text, is_bot}` по возрастанию времени, БЕЗ LIMIT по числу (размер ограничивает вызывающий:
+`build_review_log` режет реплики, ветки A/B держат общий лимит; `docs/claude/daily-review.md`). `get_group_history`
+остаётся для остальных потребителей.
 `get_group_transcript()` отдаёт и `id` строки, а `get_conversation_rows()` (личка, порядок по `id`) — строки с `id`:
 по ним якорь окна истории шагами (`pick_history_window`, `docs/claude/prompt-cache.md`). `get_conversation()` (без id)
 остался для счётчика сообщений.

@@ -17,7 +17,8 @@
   - Веб-поиск доступен всем; у непроверенных — 20 поисков/сутки (группа — на чат, личка — на юзера), сверх — ответ без поиска молча (`_search_allowed`).
   - `handle_captcha()` (интерактивная капча) — мёртвый код, нигде не вызывается (как и раньше).
 - Схема: `group_messages.is_bot INTEGER NOT NULL DEFAULT 0`, миграция идемпотентная в `init_db()`. Сигнатура `save_group_message(chat_id, user_id, sender_name, content, is_bot=False)`.
-- `db.get_group_history()` (строки «Имя: текст») оставлена специально — её используют `daily_chat_review` и `cmd_review`. Не удалять и не путать с `get_group_transcript()`.
+- `db.get_group_history()` (строки «Имя: текст») оставлена специально, не удалять и не путать с `get_group_transcript()`. Дневной обзор и `/review` с v1.10.0 читают `db.get_group_messages_range` (окно «с прошлого обзора», без LIMIT по числу).
+- `group_messages` подрезается до `db.GROUP_MESSAGES_KEEP` = 3000 строк на чат (было 1000: в активном чате утро удалялось до вечернего обзора). Недельному обзору этого мало — `docs/claude/open-tasks.md`.
 
 ## Лимит частоты сообщений per-user в группе (`/ratelimit`, v0.10.0)
 Просили ограничить отдельных «спамящих» участников группы, не трогая остальных.

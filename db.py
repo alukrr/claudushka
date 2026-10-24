@@ -942,6 +942,11 @@ def get_memory_for_private(user_id: int, long_limit: int = None, medium_limit: i
 
 # --- Group messages ---
 
+# Сколько строк group_messages держим на чат. Дневной обзор берёт окно «с прошлого обзора» (~24 ч, без LIMIT по
+# числу), так что в активном чате 1000 строк съедали утро ещё до обзора. docs/claude/daily-review.md.
+GROUP_MESSAGES_KEEP = 3000
+
+
 def save_group_message(chat_id: int, user_id: int, sender_name: str, content: str, is_bot: bool = False):
     conn = get_conn()
     conn.execute(
@@ -949,12 +954,12 @@ def save_group_message(chat_id: int, user_id: int, sender_name: str, content: st
         "VALUES (?, ?, ?, ?, ?, ?)",
         (chat_id, user_id, sender_name, content, 1 if is_bot else 0, int(time.time()))
     )
-    # Keep only last 1000 per chat
+    # Keep only last GROUP_MESSAGES_KEEP per chat
     conn.execute("""
         DELETE FROM group_messages WHERE chat_id = ? AND id NOT IN (
-            SELECT id FROM group_messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 1000
+            SELECT id FROM group_messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT ?
         )
-    """, (chat_id, chat_id))
+    """, (chat_id, chat_id, GROUP_MESSAGES_KEEP))
     conn.commit()
     conn.close()
 
@@ -969,6 +974,24 @@ def get_group_history(chat_id: int, limit: int = 30, since_ts: int = 0) -> list[
     ).fetchall()
     conn.close()
     return [f"{r['sender_name']}: {r['content']}" for r in reversed(rows)]
+
+
+def get_group_messages_range(chat_id: int, since_ts: int, until_ts: int) -> list[dict]:
+    """Все сообщения чата в окне [since_ts, until_ts] по ВОЗРАСТАНИЮ времени, без LIMIT по числу
+    (ограничение — по размеру, на стороне вызывающего: обзор режет текст и нарезает сессии).
+    Для дневного обзора; get_group_history не заменяет (её зовут и другие)."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, sender_name, content, is_bot, timestamp FROM group_messages "
+        "WHERE chat_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp, id",
+        (chat_id, since_ts, until_ts)
+    ).fetchall()
+    conn.close()
+    return [
+        {"id": r["id"], "ts": r["timestamp"], "sender": r["sender_name"], "text": r["content"],
+         "is_bot": bool(r["is_bot"])}
+        for r in rows
+    ]
 
 
 def get_group_transcript(chat_id: int, limit: int = 40) -> list[dict]:
@@ -1003,7 +1026,7 @@ def should_extract_chat_memory(chat_id: int, every: int) -> bool:
     """True, если в ЭТОМ чате с прошлого извлечения накопилось >= every сообщений.
 
     Считает строки чата новее last_extract_id, а не COUNT(*) по всему чату: подрезка
-    до 1000 в save_group_message делает общий счётчик немонотонным, и проверка по
+    до GROUP_MESSAGES_KEEP в save_group_message делает общий счётчик немонотонным, и проверка по
     модулю от него залипает.
     Дельту MAX(id) брать нельзя — id это глобальный AUTOINCREMENT на все чаты сразу,
     поэтому болтовня в соседней группе продвигала бы счётчик тихому чату и извлечение

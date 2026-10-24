@@ -3,6 +3,51 @@
 Перед правкой `daily_chat_review`, `cmd_review`, `/review_on`, `/review_off`,
 `run_daily` — читай этот файл.
 
+## Обзор за сутки с блоками тем (v1.10.0, ТЗ `docs/claude/tz-daily-review-topics.md`)
+Разделы ниже («Три проблемы…», «Пометка… (v1.7.1)») — история прежней версии (последние 100 сообщений дня, 1000–1200
+знаков); актуальное поведение — здесь. Чек-лист стенда — `docs/claude/staging-checklist-review-topics.md`.
+
+**Окно.** `_review_window()` — с `DAILY_REVIEW_HOUR` (21:00) ВЧЕРА до запуска, по `BERLIN_TZ`, через дату (в ночь
+перехода CET/CEST окно честно 23 или 25 часов). `db.get_group_messages_range(chat_id, since, until)` — все сообщения окна по
+возрастанию, без LIMIT по числу. `collect_review_entries` → `build_review_log`:
+- прошлый обзор (`is_bot` и текст начинается с `(` + `REVIEW_SENT_LABEL`) выкидывается — иначе Opus пересказывает
+  вчерашнее (префикс `REVIEW_SENT_LABEL` менять нельзя — на нём фильтр; так же отфильтруются и старые `/review`);
+- реплика человека режется до `REVIEW_USER_MSG_CHARS` (500), бота — до `REVIEW_BOT_MSG_CHARS` (200), с «…»;
+- строка лога — `HH:MM Имя: текст` (Берлин), переводы строк в тексте заменяются пробелом;
+- порог «мало сообщений» — `REVIEW_MIN_HUMAN_MSGS` (5) по НЕ-бот сообщениям.
+
+**Хранение.** `db.GROUP_MESSAGES_KEEP` = 3000 строк на чат (было 1000): иначе в активном чате утро удалялось до обзора.
+
+**Ветка A** — лог ≤ `REVIEW_SINGLE_MAX_CHARS` (60 000, env): весь лог одним сообщением в Opus («сначала про себя выдели темы»).
+`REVIEW_SINGLE_MAX_CHARS=0` — всегда ветка B (переключатель без правки кода).
+
+**Ветка B** — `split_review_sessions` (чистая функция): новая сессия при паузе ≥ `REVIEW_SESSION_GAP_MIN` (45 мин, по epoch —
+переход CET/CEST не мешает), сессия длиннее `REVIEW_CHUNK_MAX_CHARS` (20 000) режется по границе сообщения. Каждая часть →
+`aux_create(label="daily_review_chunk", model=DEFAULT_MODEL_ID, **aux_params())` (Haiku, до `REVIEW_CHUNK_PARALLEL`=4
+параллельно), ответ — JSON `{"topics": [{title, from, to, participants, gist, moments, quotes}]}` через `parse_json_lenient`.
+Упавшая/пустая часть пропускается (warning), обзор живёт; упали ВСЕ → обзор не шлётся. Итоговый вызов Opus получает JSON тем
+(`_cap_topics`, лимит `REVIEW_TOPICS_MAX_CHARS` = 30 000: сначала режутся цитаты, потом моменты, потом хвост) + последние
+`REVIEW_RAW_TAIL_MSGS` (40) сообщений сырьём под лимитом `REVIEW_RAW_TAIL_MAX_CHARS` (8000); соседние похожие темы
+разных частей модель объединяет сама (сказано в промпте).
+
+**Формат итога** (`_review_system`, общий для A, B и `/review`): вступление 1–3 предложения → 3–6 блоков тем (заголовок, когда,
+кто, 2–4 предложения с подачей режима `persona_review_style`) → афоризм под ЭТОТ день (не заготовка про AI). Plain text,
+эмодзи в начале блока допустимы. Ориентир 2000–3000 знаков, `max_tokens = out_tokens(model, 2200)`, `was_truncated` →
+`trim_to_last_sentence`. Telegram 4096: `split_telegram_text(review, footer)` делит по границе абзаца, футер `/review_off` — в
+последнем сообщении; в `group_messages` уходит один целый текст без футера.
+
+**Пометка в транскрипте.** `_review_sent_note(N)` — «обзор дня по N сообщениям с прошлого обзора (21:00); …» (час —
+`DAILY_REVIEW_HOUR`). Одна формулировка для ежедневного обзора и `/review`; N — число записей лога (после фильтра прошлого обзора).
+
+**`/review`** (admin-only) — тот же сбор и ветки A/B (то же окно «с прошлого 21:00 до сейчас»), финал на модели ЧАТА через
+`call_claude` + `dialog_params`, `max_tokens = out_tokens(model, 2200)`; без футера. Можно проверить на стенде, не ожидая 21:00.
+Haiku-части идут в `usage_log` под `usage_ctx` чата (`label=daily_review_chunk`).
+
+**Деньги и контекст.** Размер входа Opus: A — до 60 000 знаков (≈ 20–25k токенов на русском, Opus 5.5 в `MODELS`); B —
+≤ 30 000 + 8 000 знаков (≈ 12–15k токенов). Haiku-частей на активный день (≈ 100–150k знаков лога) — обычно 5–10, каждая
+≤ 20 000 знаков (≈ 7k токенов) — порог ступени >100k недостижим. Точную стоимость снять на стенде из `usage_log`
+(`daily_review_chunk` / `daily_review`) — цифры в чек-листе.
+
 **С ТЗ v0.10 (`docs/claude/billing.md`) ежедневный обзор — платная фича.** Шлётся только paid-группам
 (`chat_tier == 'paid'`), не забаненным, с `daily_review_enabled=1` (`db.get_review_chats()` — все
 группы `chat_id < 0`, не только `approved`; платность проверяет код). Free-чатам не шлётся, флаг
@@ -64,7 +109,7 @@ Telegram-чата — переиспользован `is_chat_admin()` (`docs/cl
 команды управляют только ЕЖЕДНЕВНОЙ фоновой рассылкой (`run_daily` в `main()`).
 
 ## Часовой пояс (`BERLIN_TZ`)
-Дневной обзор запускается через `app.job_queue.run_daily(daily_chat_review, time=dt_time(hour=DAILY_REVIEW_HOUR, minute=0, tzinfo=BERLIN_TZ), ...)` в `main()`. `DAILY_REVIEW_HOUR = 21` (до 2026-10-25 было 22: после перехода на CET это полночь по МСК, а часть участников живёт по МСК; 21:00 Berlin = 23:00 МСК зимой / 22:00 МСК летом). Сообщения после 21:00 в обзор не попадают (окно — с полуночи до момента запуска); см. `docs/claude/open-tasks.md`. `BERLIN_TZ = ZoneInfo("Europe/Berlin")` —
+Дневной обзор запускается через `app.job_queue.run_daily(daily_chat_review, time=dt_time(hour=DAILY_REVIEW_HOUR, minute=0, tzinfo=BERLIN_TZ), ...)` в `main()`. `DAILY_REVIEW_HOUR = 21` (до 2026-10-25 было 22: после перехода на CET это полночь по МСК, а часть участников живёт по МСК; 21:00 Berlin = 23:00 МСК зимой / 22:00 МСК летом). Окно обзора с v1.10.0 — с 21:00 вчера до запуска (см. раздел вверху), сообщения после 21:00 попадают в следующий обзор. `BERLIN_TZ = ZoneInfo("Europe/Berlin")` —
 единственный источник правды для часового пояса во всём проекте (используется и здесь,
 и в `service_block` для текущей даты/времени — служебный блок последнего user-turn, `docs/claude/prompt-cache.md`). До фикса 2026-09-19 (`b72e96e`) было
 жёсткое `timezone(timedelta(hours=2))` — не учитывало переход CET/CEST, обзор съехал бы
