@@ -192,3 +192,14 @@ def test_native_search_off_means_tavily_for_claude(monkeypatch):
     monkeypatch.setattr(bot.db, "get_chat_search_mode_db", lambda c: "auto")
     monkeypatch.setattr(bot, "NATIVE_SEARCH", False)
     assert bot.search_provider_for(1, bot.MODELS["sonnet"]["id"]) == "tavily"
+
+
+def test_utm_stripped_in_text_and_sources(monkeypatch, rec):
+    body = good_body()
+    body["output"][1]["content"][0]["text"] = "курс ([xe.com](https://www.xe.com/c/?a=1&utm_source=openai)) 1.09"
+    body["output"][1]["content"][0]["annotations"] = [
+        {"type": "url_citation", "title": "XE", "url": "https://www.xe.com/c/?GL_Campaign_ID=7&utm_source=openai"}]
+    monkeypatch.setattr(bot.http_requests, "post", lambda *a, **k: Resp(200, body))
+    text, sources = run(bot._gpt_web_search("q"))
+    assert "utm_source" not in text and "(https://www.xe.com/c/?a=1)" in text
+    assert sources == [("xe.com", "https://www.xe.com/c/?GL_Campaign_ID=7")]

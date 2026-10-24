@@ -756,8 +756,9 @@ async def call_claude(context, chat_id: int | None, *, label: str, usage_label: 
     """messages.create из хендлера: не блокирует event loop, переживает 529/429/сеть.
 
     label — для логов ретраев; usage_label — метка в usage_log (по умолчанию первое слово
-    label). Ответы на реплики пользователя (диалог/фото/файл) пишутся с usage_label="dialog":
-    по нему считается дневной лимит сообщений непроверенных.
+    label). Ответы на реплики пользователя (диалог/фото/файл) пишутся с usage_label="dialog" (при ответе
+    фолбэка — "dialog_fallback"); дневной лимит сообщений непроверенных от метки не зависит — его считает
+    _count_reply.
 
     Всю паузу между попытками держит «печатает…», чтобы ожидание (до 15с) не выглядело
     зависанием. Исключение после всех попыток пробрасывается наверх — его ловит
@@ -1205,10 +1206,15 @@ async def _tavily_search(update, user_id: int, chat_id: int, is_group: bool, use
 
 
 def _clean_citation_url(url: str) -> str:
-    """Срезает utm_source=openai (OpenAI дописывает его ко всем ссылкам выдачи); остальные параметры не трогает."""
+    """Срезает utm_* (OpenAI дописывает utm_source=openai ко всем ссылкам выдачи); остальные параметры не трогает."""
     parts = urlsplit(url)
-    query = "&".join(p for p in parts.query.split("&") if p and p.lower() != "utm_source=openai")
+    query = "&".join(p for p in parts.query.split("&") if p and not p.lower().startswith("utm_"))
     return urlunsplit(parts._replace(query=query))
+
+
+def _clean_urls_in_text(text: str) -> str:
+    """Модель GPT вставляет в выжимку markdown-ссылки с теми же utm_source — чистим и в тексте (замер стенда 2026-10-24)."""
+    return re.sub(r"https?://[^\s)\]]+", lambda m: _clean_citation_url(m.group(0)), text)
 
 
 async def _gpt_web_search(query: str) -> tuple[str, list[tuple[str, str]]] | None:
@@ -1306,7 +1312,7 @@ async def _gpt_web_search(query: str) -> tuple[str, list[tuple[str, str]]] | Non
             sources.append((host, u))
             if len(sources) == SEARCH_GPT_MAX_SOURCES:
                 break
-    return text[:SEARCH_GPT_MAX_CHARS], sources
+    return _clean_urls_in_text(text)[:SEARCH_GPT_MAX_CHARS], sources
 
 
 def search_provider_for(chat_id: int, model_id: str) -> str:
