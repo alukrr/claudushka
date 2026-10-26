@@ -185,6 +185,21 @@ def init_db():
             persona TEXT NOT NULL DEFAULT 'classic'
         );
 
+        CREATE TABLE IF NOT EXISTS dev_mode (
+            user_id INTEGER PRIMARY KEY,
+            enabled INTEGER NOT NULL,
+            updated_ts INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS dev_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            ts INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_dev_messages_user ON dev_messages (user_id, id);
+
         CREATE TABLE IF NOT EXISTS usage_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts INTEGER NOT NULL,
@@ -1689,3 +1704,48 @@ def set_chat_persona_db(chat_id: int, persona: str):
     conn.execute("INSERT OR REPLACE INTO chat_persona (chat_id, persona) VALUES (?, ?)", (chat_id, persona))
     conn.commit()
     conn.close()
+
+
+# --- Режим разработчика (docs/claude/dev-mode.md) ---
+# Свои таблицы: `conversations` режим не читает и не пишет. Файлы — на диске (data/devspace/<user_id>/).
+
+def get_dev_mode_flag(user_id: int) -> bool:
+    """Сырой флаг из БД. Решение «режим активен» — bot.dev_mode_active (личка + paid + флаг)."""
+    conn = get_conn()
+    row = conn.execute("SELECT enabled FROM dev_mode WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    return bool(row and row["enabled"])
+
+
+def set_dev_mode_flag(user_id: int, enabled: bool) -> None:
+    conn = get_conn()
+    conn.execute("INSERT OR REPLACE INTO dev_mode (user_id, enabled, updated_ts) VALUES (?, ?, ?)",
+                 (user_id, 1 if enabled else 0, int(time.time())))
+    conn.commit()
+    conn.close()
+
+
+def save_dev_message(user_id: int, role: str, content: str) -> None:
+    conn = get_conn()
+    conn.execute("INSERT INTO dev_messages (user_id, role, content, ts) VALUES (?, ?, ?, ?)",
+                 (user_id, role, content, int(time.time())))
+    conn.commit()
+    conn.close()
+
+
+def get_dev_message_rows(user_id: int, limit: int) -> list[dict]:
+    """Последние limit строк треда режима С id (старые->новые); порядок по id, как get_conversation_rows."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, role, content FROM dev_messages WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+        (user_id, limit)).fetchall()
+    conn.close()
+    return [{"id": r["id"], "role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+
+def clear_dev_messages(user_id: int) -> int:
+    conn = get_conn()
+    cur = conn.execute("DELETE FROM dev_messages WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    return cur.rowcount

@@ -58,6 +58,9 @@
   `/profile` `/profile_ok` `/profile_no` `/profile_digest`, экран «Профили» в dedup TUI) — `docs/claude/profile.md`
 - Память (`memory`-таблица, `extract_memory`, `extract_all_participants_memory`,
   `/memory`, `/memory_full`, `/forget`) — `docs/claude/memory.md`
+- Режим разработчика в платной личке (`dev_mode_active`, `handle_dev_message`, `_dev_answer`, `/dev`, `/ws`, `ws_*`, `DEV_*`,
+  workspace `data/devspace/`, таблицы `dev_mode`/`dev_messages`) — `docs/claude/dev-mode.md`; ТЗ — `docs/claude/tz-dev-mode.md`;
+  чек-лист стенда `feat/dev-mode` — `docs/claude/staging-checklist-dev-mode.md`
 - История инцидентов с датами (полные дословные разборы) — `docs/claude/incidents.md`
   — сверься, если баг похож на уже виденный, прежде чем чинить с нуля
 - Открытые задачи (незакрытое, не баги) — `docs/claude/open-tasks.md`
@@ -161,6 +164,9 @@
 - Тариф чата — `chat_tier(chat_id)`; модель/провайдер — только через `get_chat_model` /
   `get_chat_image_provider` (учитывают free), не читать `chat_models`/`chat_image_provider`
   напрямую. В free записи этих таблиц не менять. `docs/claude/billing.md`.
+- Режим разработчика (только личка + paid + флаг) — ТОЛЬКО через `dev_mode_active`; свои таблицы (`dev_messages`), обычный тред
+  `conversations`, память, профиль, персону и рисование не читает и не пишет; файлы — состояние в workspace (`data/devspace/<user_id>/`),
+  в историю только пометки; вызов — `call_claude` с `usage_label="dev"`, `timeout=DEV_REQUEST_TIMEOUT`. `docs/claude/dev-mode.md`.
 - Профиль участника: модель только ПРЕДЛАГАЕТ (`profile_proposals`), в `user_profile` пишет админ через
   `db.apply_profile_ops` (бот и dedup TUI — один путь); личка — `chat_id=0`, не NULL; любое новое место, удаляющее
   память человека, обязано чистить и профиль (`db.clear_memory` уже чистит). `docs/claude/profile.md`.
@@ -209,9 +215,13 @@ SemVer:
 - Не правь файлы напрямую на сервере — это ведёт к `-dirty` версии и расхождению с git
 
 ## Пути (не перепутать)
-- Windows: `C:\Claude\claudushka`
-- WSL: `~/projects/claudushka` ← отсюда коммиты и push
+- Windows (PowerShell): `C:\Users\ukrai\projects\claudushka` — рабочая копия, из неё тоже можно править, коммитить и пушить
+- WSL: `~/projects/claudushka` — вторая рабочая копия; допустимо работать в обеих средах, главное — не терять правки между ними
+  (перед работой `git pull`, после — commit + push)
 - Сервер: `~/claudushka` ← только `git pull` и деплой, файлы не править
+- Окончания строк: в репозитории только LF — в корне `.gitattributes` с `* text=auto eol=lf`. В Windows-копии файлы на диске могут быть
+  CRLF: при правке скриптами сохранять окончания как в файле, не плодить смешанные; перед коммитом смотреть `git diff --stat`
+  (раздутый diff = «переехали» окончания строк). Python в PowerShell — `python`, не `python3`.
 - `.env` живёт ТОЛЬКО на сервере и внутри контейнера. В WSL и Windows его нет —
   скрипты вида `. ./.env` там молча ничего не подхватят.
 
@@ -232,7 +242,7 @@ SemVer:
   сети и тома не трогать.
 
 ## Workflow
-1. Правки в WSL (`~/projects/claudushka`)
+1. Правки в WSL (`~/projects/claudushka`) или в Windows/PowerShell (`C:\Users\ukrai\projects\claudushka`) — см. «Пути»
 2. Проверить синтаксис: `python3 -c "import ast; ast.parse(open('bot.py').read())"`
 3. Коммит → push в ветку → мерж в main
 4. Деплой: `/update` в Telegram (пишет Алексей) или `git pull && docker restart claudushka`
