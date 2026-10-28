@@ -9,6 +9,14 @@
 `daily_chat_review`, дубль `run_daily` в `main()`, инвертированные
 `cmd_whitelist_on` / `cmd_captcha_on` (теперь ставят `True`).
 
+## 2026-10-28 — пул закрыл модели Anthropic (403 model_blocked)
+Пул apitoken без предупреждения в боте перестал отдавать `claude-*`: `403 permission_error`, `details.error_code:
+model_blocked`. `should_fallback` считал 403 без признаков апстрима ошибкой ключа и не переключал на Gemini: в логах
+сплошные `Search decision error`, `Group memory extraction error`, `Haiku media description failed`. Хотфикс v1.11.1 —
+`CLAUDE_DISABLED` (Claude не зовём вообще, сразу Gemini) + `model_blocked` в `UPSTREAM_MARKERS`,
+`docs/claude/model-fallback.md`. Полный переезд — `docs/claude/tz-no-anthropic.md`.
+Урок: новый код ответа пула = не повод молча не переключаться; при отказе модели аккаунту (`model_blocked`) — фолбэк.
+
 ## 2026-07-26 — группа падала с «prompt is too long» (память)
 Группа падала с `400 invalid_request_error: prompt is too long: 257099 > 200000`.
 Две независимые причины, наложившиеся друг на друга:

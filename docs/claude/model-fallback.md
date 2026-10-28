@@ -9,6 +9,22 @@ Claude на пуле `router.apitoken.sale` часто падает. Если Cl
 нативного `google-genai` и без абстракции провайдеров. Ответ приходит в формате Anthropic, поэтому
 `response_text`, `_track_response`, групповой транскрипт и сохранение истории не менялись.
 
+## 2026-10-28: Claude выключен — `CLAUDE_DISABLED` (хотфикс v1.11.1)
+Пул перестал отдавать модели Anthropic: `403 permission_error`, `error_code: model_blocked` («Model 'claude-haiku-5-5' is
+blocked for this account»). 403 без признаков апстрима фолбэк НЕ переключал — служебные вызовы (решение о поиске, память,
+описание медиа) падали. Сделано:
+- `CLAUDE_DISABLED` (env, дефолт `1`): Claude-модель ВСЕГДА идёт сразу на фолбэк-модель (`_sticky_fallback` возвращает её
+  без окна) — ни попытки Claude, ни алерта админам; работает и при `FALLBACK_ENABLED=0`. Haiku и все служебные →
+  `FALLBACK_MODEL_CHEAP` (Lite), Sonnet/Opus/Fable и дневной обзор → `FALLBACK_MODEL` (3.8 Flash).
+- Обратного фолбэка Gemini → Claude нет (`fallback_model_for` → `None` для не-Anthropic моделей).
+- Поиск в платных чатах с Claude-моделью — `gpt` (`search_provider_for`), нативного `web_search` нет.
+- `model_blocked` добавлен в `UPSTREAM_MARKERS` — на случай `CLAUDE_DISABLED=0`.
+- Пробы с `fallback=False` (`_probe_model` при `/haiku /sonnet /opus /fable`) по-прежнему идут в Claude и получат 403 —
+  переключение на Claude-модель честно ответит ошибкой. Чаты, у которых в `chat_models` Claude, отвечают через Gemini;
+  в `usage_log` метка `*_fallback`, модель фактическая.
+- Тесты: `scripts/test_claude_disabled.py`; старые тесты фолбэка закреплены на `CLAUDE_DISABLED=0`.
+Это заплатка до полного переезда — `docs/claude/tz-no-anthropic.md`.
+
 ## Конфиг (env, всё с дефолтами; откат — без правки кода)
 | Переменная | Дефолт | Что |
 |---|---|---|

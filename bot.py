@@ -80,6 +80,10 @@ FALLBACK_STICKY_SECONDS = int(os.environ.get("FALLBACK_STICKY_SECONDS", "300") o
 FALLBACK_THINKING_HEADROOM = 4000
 FALLBACK_CLAUDE_DELAYS = (2,)         # на Claude одна повторная попытка, потом сразу Gemini
 FALLBACK_ALERT_COOLDOWN = 1800        # админу не чаще раза в 30 минут (как BALANCE_ALERT_COOLDOWN)
+# 2026-10-28: пул apitoken перестал отдавать модели Anthropic. CLAUDE_DISABLED=1 (дефолт): вызов Claude-модели
+# сразу уходит на фолбэк-модель (без попытки Claude и без алерта), обратного фолбэка Gemini → Claude нет, поиск в
+# платных чатах — gpt вместо нативного. Хотфикс до полного переезда (docs/claude/tz-no-anthropic.md).
+CLAUDE_DISABLED = os.environ.get("CLAUDE_DISABLED", "1").strip() != "0"
 
 MAX_HISTORY = 40
 GROUP_TRANSCRIPT_LIMIT = 50   # сколько реплик группового транскрипта тащить в messages
@@ -623,7 +627,14 @@ _last_fallback_alert = 0.0
 def fallback_model_for(model_id: str) -> str | None:
     """Модель фолбэка или None (фолбэк выключен). Claude → Gemini (FALLBACK_MODEL[_CHEAP]); Gemini-модель чата →
     Claude (обратный фолбэк, ТЗ feat/gemini-models): argon/flash → Sonnet, lite → Haiku. Только один переход."""
-    if not FALLBACK_ENABLED or not model_id:
+    if not model_id:
+        return None
+    if CLAUDE_DISABLED:
+        # Claude мёртв: Claude-модель всегда на Gemini (даже при FALLBACK_ENABLED=0), обратно на Claude — никогда.
+        if model_provider(model_id) != "anthropic":
+            return None
+        return FALLBACK_MODEL_CHEAP if model_id == DEFAULT_MODEL_ID else FALLBACK_MODEL
+    if not FALLBACK_ENABLED:
         return None
     if model_provider(model_id) == "gemini":
         return DEFAULT_MODEL_ID if model_id == MODELS["lite"]["id"] else MODELS[PAID_DEFAULT_MODEL_KEY]["id"]
@@ -633,7 +644,7 @@ def fallback_model_for(model_id: str) -> str | None:
 def _sticky_fallback(model_id: str) -> str | None:
     """Модель фолбэка, если окно после сбоя `model_id` ещё не закончилось."""
     fb = fallback_model_for(model_id)
-    if fb and _fallback_until.get(model_id, 0.0) > time.monotonic():
+    if fb and (CLAUDE_DISABLED or _fallback_until.get(model_id, 0.0) > time.monotonic()):
         return fb
     return None
 
@@ -1326,6 +1337,8 @@ def search_provider_for(chat_id: int, model_id: str) -> str:
     if mode in ("gpt", "tavily"):
         return mode
     if model_provider(model_id) == "anthropic":
+        if CLAUDE_DISABLED:
+            return "gpt"       # нативный web_search — только у Claude; ответит Gemini
         return "claude" if NATIVE_SEARCH else "tavily"
     return "gpt"
 

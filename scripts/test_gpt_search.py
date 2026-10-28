@@ -12,6 +12,7 @@ import pytest
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "x")
 os.environ.setdefault("ANTHROPIC_API_KEY", "x")
+os.environ.setdefault("CLAUDE_DISABLED", "0")   # эти тесты — про живой Claude (хотфикс 2026-10-28)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 _orig_mkdir = Path.mkdir

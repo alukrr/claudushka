@@ -139,6 +139,9 @@
   `get_chat_model` — единственная точка. Режим поиска чата — `chat_search_mode` через `search_provider_for`, не читать напрямую.
   Параметры вызова под провайдера модели — только `kwargs_for_model` (и для Gemini-модели чата, и для фолбэка в обе стороны).
   `docs/claude/models-and-costs.md`, `docs/claude/native-search.md`.
+- **С 2026-10-28 пул НЕ отдаёт модели Anthropic** (403 `model_blocked`): `CLAUDE_DISABLED=1` (дефолт) — Claude-модели
+  сразу уходят на Gemini, обратного фолбэка нет. Новые вызовы на Claude не добавлять. Переезд —
+  `docs/claude/tz-no-anthropic.md`, хотфикс — `docs/claude/model-fallback.md`.
 - Фолбэк на Gemini (и обратно, с Gemini-модели чата на Claude) живёт ТОЛЬКО в обёртках (`call_claude`/`call_claude_stream`/`sync_create`): новый вызов
   модели — через них, не `client.messages.create` напрямую. Пробам, которым нужна именно запрошенная модель,
   — `fallback=False`. На Gemini не уходят `thinking`/`output_config`/`tools`/`cache_control` (пул отвечает 400);

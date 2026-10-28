@@ -139,7 +139,8 @@ def is_retryable(exc: BaseException) -> bool:
 
 # Признаки «упал апстрим пула», а не наш ключ/запрос (из dnd-mcp, 2026-10-23). Нужны для 401/403/404:
 # пул иногда отдаёт их, когда канал/подписка модели на его стороне недоступны. Список уточнять по логу.
-UPSTREAM_MARKERS = ("subscription", "upstream", "no available", "overloaded", "channel", "quota")
+UPSTREAM_MARKERS = ("subscription", "upstream", "no available", "overloaded", "channel", "quota",
+                    "model_blocked")   # 403 model_blocked — пул закрыл модель для аккаунта (Claude, 2026-10-28)
 
 
 def should_fallback(exc: BaseException) -> bool:
