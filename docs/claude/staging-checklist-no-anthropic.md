@@ -27,3 +27,29 @@
 
 Откат: `git revert` + `docker restart`; миграция данных назад не делается (Claude-строки в `chat_models` заменены) —
 перед стендом бэкап БД.
+
+---
+
+## Результаты прогона 2026-10-28 (стенд `@claudushka_test_bot`, коммит 79d8f83 + правка каталога)
+
+БД стенда — копия прод-данных (бэкап до миграции: `~/stand-db-before-no-anthropic.db` на сервере).
+
+| # | Проверка | Итог |
+|---|---|---|
+| 1 | Миграция | OK: `chat_models` haiku→lite 1, sonnet→flash 3, opus→argon 6, fable 0; `chat_search_mode` пуста (ветка claude→auto на живых данных не проверена, только юнит-тест); маркер в `schema_migrations` |
+| 2 | Старт | OK, без warning про каталог/цены, без ошибок |
+| 3–4 | `/models`, `/cost` в free и paid, заглушки `/sonnet` | OK по сообщению Алексея («всё работает»); текст ответов в чек-лист не копировали |
+| 5 | Поиск (paid) | в `usage_log` 4444: `should_search` (Lite) + `gpt_search` (Luna) + `search/gpt` — цепочка работает |
+| 6 | Служебные на Lite | `should_search`, `media_describe`, `extract_chat_memory` в `usage_log` на `gemini-3.1-flash-lite`, непустые |
+| 7 | Голос (OGG на Lite), фото | OK по сообщению Алексея; строки `label='voice'` отдельно не выписывали |
+| 8 | Фолбэк | OK: `gemini-9-nonexistent` (в `FALLBACK_PAIRS` → Terra) → 404 пула → ответ `gpt-6.1-terra`, в `usage_log` метка `*_fallback`, модель и цена Terra |
+| 9 | `/review` | OK. Ручной `/review` идёт на МОДЕЛИ ЧАТА (Lite: 654 вых. токена, $0.0015); на Argon (чат переключён): 934 вых., $0.014, не обрезан. На Argon именно ежедневный автообзор (`DAILY_REVIEW_MODEL_ID`), его живой прогон — 21:00 Berlin, на стенде не гонялся |
+| 11 | `/cost` — старые Claude-строки | подписи из `LEGACY_PRICES` (в 4444 есть старые строки haiku) |
+
+Прямые вызовы из контейнера (`call_claude`, 2026-10-28): все 6 моделей (3 Gemini + Luna/Terra/Sol) отвечают по-русски.
+Кэш на `/v1/messages` (промпт ~9k токенов, второй вызов): **GPT Terra — `cache_read_input_tokens` приходит (9088 из 9251), цена по 0.05×**;
+`gemini-3.8-flash` — тоже приходит (4079, неявный кэш), `cache_write` у обоих 0. Открытый вопрос п. 1.7 ТЗ закрыт для чтения;
+запись в кэш GPT на этой полосе не наблюдается (множитель 1.25× не используется). Рассуждения: `gemini-3.8-flash` ~375–490 выходных
+токенов на короткий ответ (входят в `output`), Lite/Argon/GPT — единицы–десятки.
+
+Не проверено: ежедневный автообзор на Argon вживую, `/dev`, дедуп (`--limit-groups 1`), документы, WhatsApp.
