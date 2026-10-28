@@ -1,3 +1,9 @@
+> **С 2026-10-28 (v2.0.0)**: free-режим — только Gemini 3.1 Flash-Lite (выбора нет, `chat_free_model` не используется);
+> подтверждение `/fable` удалено, «дорогих» (`restricted`) моделей сейчас нет; нативный поиск Anthropic (`native_search`) не
+> считается — остался `gpt_search` (токены) и `kind=search/gpt` (цена вызова пока 0.0). Голос пишется в `usage_log` с
+> `label="voice"` (`_record_gemini_usage`). Старые Claude-строки `usage_log` читаются по `LEGACY_PRICES`. Текст ниже про Haiku/
+> Sonnet/Opus/Fable — история.
+
 # Стоимость, кошельки, тарифы, доступ (ТЗ v0.10)
 
 Перед правкой `_record_usage`, `chat_tier`, `usage_ctx`, `gate_update`, `/cost`, `/topup`,

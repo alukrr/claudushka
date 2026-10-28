@@ -1,6 +1,6 @@
 # Голос, кружочки и видео (v0.11.0)
 
-Перед правкой `_transcribe_audio_gemini`, `_extract_video_frames`, `_describe_media_haiku`,
+Перед правкой `_transcribe_audio_gemini`, `_extract_video_frames`, `_describe_media`,
 веток `voice`/`video_note`/`video`/`animation` в `handle_message` — читай этот файл.
 
 Три новых типа Telegram-сообщений: `voice` (голосовое), `video_note` (кружочек, mp4 со
@@ -49,7 +49,7 @@ Google API — сама модель не менялась при переезд
 `_extract_video_frames(video_bytes, count, duration)` — синхронная, звать только через
 `asyncio.to_thread`: пишет байты во временный файл, `ffmpeg -ss <t> -frames:v 1` на трёх
 равномерных таймстемпах (10/50/90% длительности — надёжнее fps-фильтра при непостоянном
-FPS), возвращает JPEG-байты. `_describe_media_haiku(images_b64, hint)` — Haiku-описание,
+FPS), возвращает JPEG-байты. `_describe_media(images_b64, hint)` — Haiku-описание,
 **всегда `DEFAULT_MODEL_ID`, не `get_chat_model(chat_id)`**: фоновое распознавание не
 должно платить по цене Opus/Fable, даже если у чата выставлена дорогая модель для
 основного диалога (тот же принцип, что "вспомогательные вызовы — всегда Haiku"). Вызов

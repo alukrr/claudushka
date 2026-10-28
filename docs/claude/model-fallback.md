@@ -1,101 +1,70 @@
-# Фолбэк Claude → Gemini при сбоях пула (ТЗ feat/model-fallback, 2026-10-23)
+# Фолбэк между провайдерами пула: Gemini → GPT (ТЗ no-anthropic, 2026-10-28; до того — Claude → Gemini, ТЗ feat/model-fallback)
 
-Перед правкой `call_claude` / `call_claude_stream` / `sync_create`, `_call_with_fallback`, `should_fallback`,
-`FALLBACK_*`, цен Gemini в `LEGACY_PRICES` — читай этот файл. Ошибки API вообще — `api-errors.md`.
+Перед правкой `call_claude` / `sync_create`, `_call_with_fallback`, `should_fallback`, `FALLBACK_*`, `kwargs_for_model`,
+цен GPT в `LEGACY_PRICES` — читай этот файл. Ошибки API вообще — `api-errors.md`.
 
 ## Идея
-Claude на пуле `router.apitoken.sale` часто падает. Если Claude недоступен, тот же запрос уходит на Gemini
-через тот же пул и тот же ключ: **тот же Anthropic Messages API (`/v1/messages`), другая модель**, без
-нативного `google-genai` и без абстракции провайдеров. Ответ приходит в формате Anthropic, поэтому
-`response_text`, `_track_response`, групповой транскрипт и сохранение истории не менялись.
+Все модели чата — Gemini через пул `router.apitoken.sale` (`/v1/messages`, ключ бота). Если модель недоступна, тот же
+запрос уходит на **GPT из другого провайдера** на той же полосе и с тем же ключом — один сбой пула не роняет обе модели.
+Ответ приходит в формате Anthropic, поэтому `response_text`, `_track_response`, групповой транскрипт и история не менялись.
 
-## 2026-10-28: Claude выключен — `CLAUDE_DISABLED` (хотфикс v1.11.1)
-Пул перестал отдавать модели Anthropic: `403 permission_error`, `error_code: model_blocked` («Model 'claude-haiku-5-5' is
-blocked for this account»). 403 без признаков апстрима фолбэк НЕ переключал — служебные вызовы (решение о поиске, память,
-описание медиа) падали. Сделано:
-- `CLAUDE_DISABLED` (env, дефолт `1`): Claude-модель ВСЕГДА идёт сразу на фолбэк-модель (`_sticky_fallback` возвращает её
-  без окна) — ни попытки Claude, ни алерта админам; работает и при `FALLBACK_ENABLED=0`. Haiku и все служебные →
-  `FALLBACK_MODEL_CHEAP` (Lite), Sonnet/Opus/Fable и дневной обзор → `FALLBACK_MODEL` (3.8 Flash).
-- Обратного фолбэка Gemini → Claude нет (`fallback_model_for` → `None` для не-Anthropic моделей).
-- Поиск в платных чатах с Claude-моделью — `gpt` (`search_provider_for`), нативного `web_search` нет.
-- `model_blocked` добавлен в `UPSTREAM_MARKERS` — на случай `CLAUDE_DISABLED=0`.
-- Пробы с `fallback=False` (`_probe_model` при `/haiku /sonnet /opus /fable`) по-прежнему идут в Claude и получат 403 —
-  переключение на Claude-модель честно ответит ошибкой. Чаты, у которых в `chat_models` Claude, отвечают через Gemini;
-  в `usage_log` метка `*_fallback`, модель фактическая.
-- Тесты: `scripts/test_claude_disabled.py`; старые тесты фолбэка закреплены на `CLAUDE_DISABLED=0`.
-Это заплатка до полного переезда — `docs/claude/tz-no-anthropic.md`.
+## История: Claude выключен (2026-10-28)
+Пул закрыл модели Anthropic (`403 permission_error`, `error_code: model_blocked`). Хотфикс v1.11.1 (`CLAUDE_DISABLED=1`) гнал
+Claude-модели на Gemini; v2.0.0 убрал Claude целиком: `CLAUDE_DISABLED`, обратный фолбэк Gemini → Claude, `FALLBACK_MODEL`,
+`FALLBACK_MODEL_CHEAP`, `FALLBACK_THINKING_HEADROOM`, `NativeSearchUnavailable`, `call_claude_stream` удалены.
+Старые Claude-id остались только в `LEGACY_PRICES` (подписи старых строк `usage_log`), `model_blocked` — в
+`UPSTREAM_MARKERS` (безвредно). Переезд — `docs/claude/tz-no-anthropic.md`.
 
-## Конфиг (env, всё с дефолтами; откат — без правки кода)
+## Пары и конфиг
+`FALLBACK_PAIRS` (bot.py, константа):
+
+| Основная | Фолбэк | Почему |
+|---|---|---|
+| `gemini-3.1-flash-lite` (free, служебные) | `gpt-6-luna` | дешёвая → дешёвая; служебка JSON OK (замер 28.10) |
+| `gemini-3.8-flash` (дефолт paid) | `gpt-6.1-terra` | средняя → средняя |
+| `gemini-4-argon` (обзор, дорогая) | `gpt-6.1-sol` | сильная → сильная |
+
+Обратно (GPT → Gemini) не нужно: GPT-моделей чата нет, GPT-модель в `MODELS` не добавлять (решение Алексея 2026-10-28 —
+Terra только для картинок, Шаг 2 ТЗ). **Пары предложены Claude Code, Алексей не подтверждал.**
+
 | Переменная | Дефолт | Что |
 |---|---|---|
-| `FALLBACK_ENABLED` | `1` | `0` — выключено, поведение как до ветки (старая лестница `RETRY_DELAYS`) |
-| `FALLBACK_MODEL` | `gemini-3.8-flash` | чаты на Sonnet/Opus/Fable |
-| `FALLBACK_MODEL_CHEAP` | `gemini-3.1-flash-lite` | Haiku-чаты (free) и ВСЕ служебные вызовы (они всегда на Haiku) |
+| `FALLBACK_ENABLED` | `1` | `0` — выключено, поведение без фолбэка (старая лестница `RETRY_DELAYS`) |
 | `FALLBACK_STICKY_SECONDS` | `300` | липкое окно, см. ниже |
 
-Обе модели должны быть в `LEGACY_PRICES` (иначе `usage_log` посчитает по цене Haiku); при старте
-`check_fallback_models` (фон, только warning) сверяет их с `GET /v1/models` и с таблицей цен.
-**Наличие в каталоге работу не гарантирует**: `gemini-3.6-flash`/`3.7-flash` в каталоге, а апстрим отвечает 404.
-В каталоге id с префиксом `google/`, в запросе и в `response.model` — голая строка.
+Модели пар должны быть в `LEGACY_PRICES` (иначе `usage_log` посчитает по цене дефолтной модели); при старте
+`check_fallback_models` (фон, только warning) сверяет `MODELS` и пары с `GET /v1/models` и с таблицей цен.
+**Наличие в каталоге работу не гарантирует**: `gemini-3.6/3.7-flash` были в каталоге, а апстрим отвечал 404.
 
 ## Когда переключаемся — `api_errors.should_fallback(exc)`
-Да: 5xx/529, 429, обрыв/таймаут, ошибка посреди стрима (`stream_error_type`), **404** (модель неизвестна —
-громкий `MODEL NOT FOUND` в логе), 401/403 с признаками апстрима в тексте (`UPSTREAM_MARKERS`: `subscription`,
-`upstream`, `no available`, `overloaded`, `channel`, `quota`; список уточнять по логу `FALLBACK …`).
-Нет: **402** (баланс общий, остаётся `_alert_admin_balance`), **400/422 включая `prompt is too long`** (лечит
-ветка обрезки), 401/403 без признаков (ключ).
+Да: 5xx/529, 429, обрыв/таймаут, ошибка посреди стрима, **404** (модель неизвестна — громкий `MODEL NOT FOUND`),
+401/403 с признаками апстрима (`UPSTREAM_MARKERS`). Нет: **402** (баланс общий, `_alert_admin_balance`),
+**400/422 включая `prompt is too long`** (лечит ветка обрезки), 401/403 без признаков (ключ).
 
 ## Где — одна точка, а не по месту
-- `call_claude` / `call_claude_stream` → `_call_with_fallback`: на Claude **одна** повторная попытка
-  (`FALLBACK_CLAUDE_DELAYS = (2,)`), потом Gemini с полной лестницей `RETRY_DELAYS`. Упал и Gemini — пользователь
-  получает обычное `reply_api_error` по последней ошибке. `fallback=False` — для проб (`_probe_model`: проба
-  несуществующей модели обязана упасть, а не «успешно» ответить Gemini).
-- `sync_create` / `aux_create`: SDK-ретраи Claude (как раньше), затем Gemini на том же клиенте.
-- `_fallback_kwargs` (на КОПИИ — оригиналы нужны ветке обрезки): убирает `thinking`, `output_config`, `tools`,
-  `tool_choice`, **все `cache_control`** (system и messages), `max_tokens += FALLBACK_THINKING_HEADROOM (4000)`.
+- `call_claude` → `_call_with_fallback`: на основной модели **одна** повторная попытка (`FALLBACK_PRIMARY_DELAYS = (2,)`),
+  потом пара с полной лестницей `RETRY_DELAYS`. Упала и пара — пользователь получает `reply_api_error`.
+  `fallback=False` — для проб (`_probe_model`: проба несуществующей модели обязана упасть).
+- `sync_create` / `aux_create`: SDK-ретраи, затем пара на том же клиенте.
+- `kwargs_for_model(kwargs, model)` — одна функция и для первого вызова, и для фолбэка (на КОПИИ — оригиналы нужны ветке
+  обрезки): убирает `thinking`, `output_config`, `tools`, `tool_choice`, **все `cache_control`**; `max_tokens` = видимая часть
+  + `thinking_headroom` целевой модели (Gemini 4000, GPT 2000). Для GPT `cache_control` на `/v1/messages` пул принимает
+  (200, бенч 28.10), но действие не доказано — не шлём; кэш у GPT автоматический.
 
 ## Липкое окно (circuit breaker)
-Claude-модель X упала переключаемой ошибкой → следующие `FALLBACK_STICKY_SECONDS` запросы на X сразу идут на
-Gemini, без попытки и ожидания (`_fallback_until`, в памяти процесса, по ID модели, не по чату). Сброс —
-рестарт бота или истечение окна. Без него при лежащем пуле каждое сообщение ждало бы попытку и ретрай.
+Основная модель X упала → следующие `FALLBACK_STICKY_SECONDS` запросов на X сразу идут на пару, без попытки и ожидания
+(`_fallback_until`, в памяти, по ID модели). Сброс — рестарт бота или истечение окна.
 
-## Нативный поиск
-Gemini `web_search` не получает. Запрос с `tools` при сбое/липком окне → `NativeSearchUnavailable`; хендлер
-(рядом с `_native_search_rejected`) уходит на поиск через GPT (`_gpt_web_search`, запасной — Tavily; см.
-`native-search.md`, «Провайдеры поиска») и повторяет запрос обычным `call_claude` (который в окне идёт на Gemini).
-👀 ставится только если реально искали.
+## Поиск
+Нативного поиска нет вообще (удалён). Поиск — `gpt` (`_gpt_web_search`, запасной Tavily), `docs/claude/native-search.md`.
 
-## Обратный фолбэк: Gemini-модель чата → Claude (v1.9.0)
-Gemini стала выбираемой моделью чата (`/argon /flash /lite`, `docs/claude/models-and-costs.md`). Упала она —
-ответ даёт Claude по тем же правилам `should_fallback` и с тем же липким окном (ключ — ID Gemini-модели):
-`argon`/`flash` → Sonnet 5.5, `lite` → Haiku 5.5 (`fallback_model_for`). Один переход: Claude-фолбэк дальше не
-фолбэчится. Параметры приводит та же функция `kwargs_for_model(kwargs, model)`, что чистит вызов Gemini-модели
-(и первый, и фолбэк): → Gemini без `thinking`/`output_config`/`tools`/`cache_control`; из Gemini → Claude запас
-Gemini (4000) меняется на запас целевой модели, thinking/effort не добавляются (запас покрывает adaptive-thinking Haiku).
-Метка `usage_log` фолбэк-ответа — с суффиксом `_fallback` (`dialog_fallback`; `_usage_label`), модель в строке —
-фактическая. Это и есть видимость фолбэка в `/cost`: подпись «(фолбэк)» у моделей убрана — у Gemini-моделей теперь
-обычные подписи из `MODELS`.
+## Открыто (проверить на стенде)
+- Приходят ли у GPT на `/v1/messages` `cache_read_input_tokens` в `usage` и считает ли `_track_response` их (п. 1.7 ТЗ).
+- Тарифицируется ли запись в кэш GPT (в `_GPT_MULTS` 1.25× по таблице пула; на `/v1/messages` не проверено).
+- Входят ли токены рассуждений GPT в `usage.output_tokens` (для Gemini — да, стенд 2026-10-24).
+- `thinking_headroom` GPT (2000) — стартовое значение, не замерено; поправить по `usage_log.thinking`.
 
-## Открыто (проверить на стенде): токены рассуждения на Anthropic-полосе
-Не проверено, входят ли в `usage.output_tokens` Anthropic-полосы (`/v1/messages`) для Gemini-моделей токены
-рассуждения. На нативной полосе они отдельные (`thoughtsTokenCount`, ~480 на короткий ответ в 215 токенов).
-Сравнить один запрос на обеих полосах; если на Anthropic-полосе рассуждения не попадают в `output_tokens`, `/cost`
-на фолбэке занижен — чинить отдельно. Результат записать сюда.
-
-## Стенд 2026-10-24: `gemini-4-argon` и токены рассуждения (ТЗ feat/gemini-models)
-Замер с сервера (`/v1/messages`, ключ бота), все модели через Anthropic-полосу пула:
-- **`gemini-4-argon` проходит Шаг 0:** текст, system-блоки, картинка (16×16 PNG → «Красный»), групповой транскрипт, стрим
-  (события `message_start … message_stop`, `usage`), `response.model == "gemini-4-argon"`, первым блоком пустой
-  `thinking`. `cache_control` и `output_config` → 400 (как у остальных). Нестримовый `max_tokens=32000` принят (200).
-  Argon почти не тратит токены на рассуждения: на `17*23` нативная полоса вернула `candidatesTokenCount 37` без
-  `thoughtsTokenCount`.
-- **Рассуждения Gemini входят в `usage.output_tokens` Anthropic-полосы** (п. 1.6 ТЗ закрыт). `gemini-3.8-flash`, тот же
-  вопрос ×3: Anthropic-полоса `output_tokens` 664 / 697 / 667, нативная `candidates 78/76/79 + thoughts 493/631/474`;
-  видимый ответ ~320 символов ≈ 80 токенов. Значит `/cost` на фолбэке НЕ занижен. У `gemini-3.1-flash-lite` на коротких
-  вопросах рассуждений почти нет (`output_tokens` 2–63).
-- Пул Claude 24.10 днём отвечал 529 (Overloaded) на Haiku/Sonnet часами — живой прогон фолбэка в обе стороны на стенде.
-
-## Деньги и видимость
+## Деньги и видимость (описано для Gemini-фолбэка Claude; цены GPT — LEGACY_PRICES)
 - Цена — по фактической `response.model` (`_billed_model`): Gemini-модели в `MODELS` (одна цена на строку, не
   дублируется в `LEGACY_PRICES`). Фолбэк-ответы в `/cost` — по метке `*_fallback`. Кошелёк списывается по цене
   фактической модели — так задумано.
@@ -135,6 +104,6 @@ Gemini (4000) меняется на запас целевой модели, thin
 `FALLBACK_STICKY_SECONDS`.
 
 ## Тесты
-`scripts/test_model_fallback.py` (замоканный клиент, без сети): матрица `should_fallback`, чистка параметров,
-липкое окно и возврат, 402/400/ключ не переключают, `FALLBACK_ENABLED=0`, проба без фолбэка, нативный поиск,
-`sync_create`. Запуск: `TELEGRAM_BOT_TOKEN=x ANTHROPIC_API_KEY=x python -m pytest scripts/test_model_fallback.py`.
+`scripts/test_model_fallback.py` (замоканный клиент, без сети): матрица `should_fallback`, чистка параметров и замена запаса,
+пары, липкое окно и возврат, 402/400/ключ не переключают, `FALLBACK_ENABLED=0`, проба без фолбэка, `sync_create`, сверка цен
+дедупа с `MODELS`. Запуск: `TELEGRAM_BOT_TOKEN=x ANTHROPIC_API_KEY=x python -m pytest scripts -q`.

@@ -37,25 +37,25 @@
 - Групповой чат (`build_group_messages`, `group_messages`, гейтинг доступа,
   `/ratelimit`, `is_chat_admin`) — `docs/claude/group-chat.md`
 - Голос/видео/кружочки/GIF (`_transcribe_audio_gemini`, `_extract_video_frames`,
-  `_describe_media_haiku`, ветки `voice`/`video_note`/`video`/`animation`) —
+  `_describe_media`, ветки `voice`/`video_note`/`video`/`animation`) —
   `docs/claude/media.md`
 - Дневной обзор (`daily_chat_review`, `cmd_review`, `/review_on`, `/review_off`,
   `run_daily`, `BERLIN_TZ`, `_review_window`, `build_review_log`, `split_review_sessions`, `prepare_review_input`, `REVIEW_*`, `GROUP_MESSAGES_KEEP`) — `docs/claude/daily-review.md`; ТЗ «весь день + блоки тем» — `docs/claude/tz-daily-review-topics.md`; чек-лист стенда — `docs/claude/staging-checklist-review-topics.md`
-- Модели и цены (`MODELS`, `/haiku /sonnet /opus /fable /argon /flash /lite`, Gemini-модели чата, free-выбор `chat_free_model`, `/models`, `calc_llm_cost`) —
+- Модели и цены (`MODELS` = только Gemini, `/argon /flash /lite`, заглушки `/haiku /sonnet /opus /fable`, `/models`, `calc_llm_cost`, миграция `no_anthropic_models`) —
   `docs/claude/models-and-costs.md`
 - Prompt caching (`build_system`, `service_block`, `mark_cache_tail`, `pick_history_window`,
   `PROMPT_CACHE`, `HISTORY_STEP`, `CACHE_TTL_PERSONA`) — `docs/claude/prompt-cache.md`
-- Нативный веб-поиск Anthropic в платном режиме (`call_dialog_native`, `call_claude_stream`, `native_answer`,
-  `sources_line`, `NATIVE_SEARCH*`, `pause_turn`, реакция по событию стрима; провайдеры поиска claude/gpt/tavily, `/searchmode`, `chat_search_mode`, `search_provider_for`, `_gpt_web_search`, `SEARCH_PROVIDER_FREE`, `SEARCH_GPT_*`) — `docs/claude/native-search.md`
+- Поиск (`sources_line`, провайдеры gpt/tavily, `/searchmode`, `chat_search_mode`, `search_provider_for`, `_gpt_web_search`, `SEARCH_PROVIDER_FREE`, `SEARCH_GPT_*`;
+  нативный web_search Anthropic удалён 2026-10-28, файл — история) — `docs/claude/native-search.md`
 - Деньги и доступ (`usage_log`, `chat_credits`, баланс, тарифы paid/free, `usage_ctx`,
   `_record_usage`, `gate_update`, `/cost`, `/topup`, `/verify /unverify /ban /unban`,
   лимиты непроверенных, стартовый бонус, `/fable`-подтверждение) — `docs/claude/billing.md`
 - Ошибки API, ретраи, блокирующие вызовы, `response_text`, `parse_json_lenient` —
   `docs/claude/api-errors.md`
-- Уход с Anthropic (пул закрыл Claude 2026-10-28), замеры всех моделей пула (`scripts/bench_pool.py`), рисование Terra,
-  дедуп без Claude — ТЗ `docs/claude/tz-no-anthropic.md`
-- Фолбэк Claude → Gemini при сбоях пула (`FALLBACK_*`, `should_fallback`, `_call_with_fallback`, `_fallback_kwargs`,
-  липкое окно, `NativeSearchUnavailable`, цены Gemini в `LEGACY_PRICES`) — `docs/claude/model-fallback.md`
+- Уход с Anthropic (пул закрыл Claude 2026-10-28; Шаги 1 и 3 сделаны в v2.0.0, Шаг 2 — рисование Terra `/terra` — не сделан), замеры всех моделей пула (`scripts/bench_pool.py`) —
+  ТЗ `docs/claude/tz-no-anthropic.md`; чек-лист стенда `feat/no-anthropic` — `docs/claude/staging-checklist-no-anthropic.md`
+- Фолбэк Gemini → GPT при сбоях пула (`FALLBACK_PAIRS`, `FALLBACK_*`, `should_fallback`, `_call_with_fallback`, `kwargs_for_model`,
+  липкое окно, цены GPT в `LEGACY_PRICES`) — `docs/claude/model-fallback.md`
 - Профиль участника (`user_profile`, `profile_proposals`, `_profile_text`, `profile_updates`, `send_profile_digest`,
   `/profile` `/profile_ok` `/profile_no` `/profile_digest`, экран «Профили» в dedup TUI) — `docs/claude/profile.md`
 - Память (`memory`-таблица, `extract_memory`, `extract_all_participants_memory`,
@@ -86,13 +86,10 @@
 - Python 3.12 (python:3.12-slim Docker image)
 - python-telegram-bot 22.8 (мажорное обновление с 21.10 — 2026-09-19, см.
   `docs/claude/staging.md` про прогон на тестовом стенде перед продом)
-- anthropic 1.7.0 (мажорное обновление с 0.43.0 — та же правка; HTTP-слой SDK теперь на
-  `httpx2`, ОТДЕЛЬНОМ пакете от обычного `httpx`, конфликта версий нет, см.
-  `docs/claude/api-errors.md` про смену иерархии исключений 5xx) — реестр моделей
-  `MODELS` в bot.py, `/haiku /sonnet /opus /fable`. Подробности —
-  `docs/claude/models-and-costs.md`.
-- tavily-python 0.8.4 — веб-поиск в бесплатном режиме и `/search`; платный режим — нативный `web_search`
-  Anthropic (`docs/claude/native-search.md`)
+- anthropic 1.7.0 — только как HTTP-клиент полосы `/v1/messages` пула (модели Anthropic пул не отдаёт с 2026-10-28; HTTP-слой SDK на
+  `httpx2`, ОТДЕЛЬНОМ пакете от обычного `httpx`, см. `docs/claude/api-errors.md`) — реестр моделей
+  `MODELS` в bot.py (Gemini `/argon /flash /lite`). Подробности — `docs/claude/models-and-costs.md`.
+- tavily-python 0.8.4 — веб-поиск в бесплатном режиме и `/search`; платный режим — поиск GPT через пул (`docs/claude/native-search.md`)
 - Генерация изображений — `/imagine`, DRAW-маркер, провайдеры banana/GPT Image 2/GPT Image
   2.5 Flare/Sunburst. Подробности — `docs/claude/images.md`.
 - fastapi 0.141.1 + uvicorn 0.53.0 — WhatsApp webhook. Подробности — `.claude/rules/whatsapp.md`.
@@ -137,25 +134,24 @@
 - Характер: `CORE_IDENTITY` → режим (`personas/*.md`) → `_core_rules()` → групповой аддендум; режим задаёт тон, не правила
   (честность/маркеры/служебный блок/группа). Новое место с зашитым «характером» — брать `tone`/`review_style` режима
   чата. Ключ режима в личке — `user_id`. `docs/claude/personas.md`.
-- Выбор модели в free (Haiku/Lite) хранится в `chat_free_model`, НЕ в `chat_models`: `chat_models` в free не трогаем;
-  `get_chat_model` — единственная точка. Режим поиска чата — `chat_search_mode` через `search_provider_for`, не читать напрямую.
-  Параметры вызова под провайдера модели — только `kwargs_for_model` (и для Gemini-модели чата, и для фолбэка в обе стороны).
-  `docs/claude/models-and-costs.md`, `docs/claude/native-search.md`.
-- **С 2026-10-28 пул НЕ отдаёт модели Anthropic** (403 `model_blocked`): `CLAUDE_DISABLED=1` (дефолт) — Claude-модели
-  сразу уходят на Gemini, обратного фолбэка нет. Новые вызовы на Claude не добавлять. Переезд —
-  `docs/claude/tz-no-anthropic.md`, хотфикс — `docs/claude/model-fallback.md`.
-- Фолбэк на Gemini (и обратно, с Gemini-модели чата на Claude) живёт ТОЛЬКО в обёртках (`call_claude`/`call_claude_stream`/`sync_create`): новый вызов
-  модели — через них, не `client.messages.create` напрямую. Пробам, которым нужна именно запрошенная модель,
-  — `fallback=False`. На Gemini не уходят `thinking`/`output_config`/`tools`/`cache_control` (пул отвечает 400);
-  402 и 400 (`prompt is too long`) не переключают. `docs/claude/model-fallback.md`.
+- Модель чата — только `get_chat_model` (free → всегда Lite, `chat_models` в free не трогаем; paid → `chat_models` или Flash).
+  Режим поиска чата — `chat_search_mode` через `search_provider_for`, не читать напрямую. Параметры вызова под модель — только
+  `kwargs_for_model` (первый вызов и фолбэк). `docs/claude/models-and-costs.md`, `docs/claude/native-search.md`.
+- **С 2026-10-28 пул НЕ отдаёт модели Anthropic** (403 `model_blocked`): Claude в `MODELS` нет, новых вызовов на Claude не добавлять.
+  `MODELS` — только Gemini через `/v1/messages`; фолбэк — GPT другого провайдера (`FALLBACK_PAIRS`), обратного нет, GPT-моделей
+  чата нет. Переезд — `docs/claude/tz-no-anthropic.md`.
+- Фолбэк живёт ТОЛЬКО в обёртках (`call_claude`/`sync_create`): новый вызов модели — через них, не `client.messages.create`
+  напрямую. Пробам, которым нужна именно запрошенная модель, — `fallback=False`. Ни одна модель не получает `thinking`/
+  `output_config`/`tools`/`cache_control` (Gemini → 400, у GPT действие не доказано); 402 и 400 (`prompt is too long`) не
+  переключают. `docs/claude/model-fallback.md`.
 - Уровень логов httpx не поднимать до INFO — токен бота утекает в URL.
 - Пользователь никогда не видит сырой текст исключения — только `api_errors.reply_api_error`.
 - Служебные вызовы (капча, поиск, перевод промпта, извлечение памяти, описание медиа) —
-  только `DEFAULT_MODEL_ID` и ВСЕГДА с `**aux_params()` (у Haiku 5.5 thinking иначе съест
-  `max_tokens` и ответ придёт пустым); ответы пользователю — `get_chat_model(chat_id)` с
+  только `DEFAULT_MODEL_ID` (Lite), ВСЕГДА с `**aux_params()` и `max_tokens=out_tokens(DEFAULT_MODEL_ID, N)` (Lite/Flash
+  думают, рассуждения съедят малый лимит и ответ придёт пустым); ответы пользователю — `get_chat_model(chat_id)` с
   `**dialog_params(model)` и `out_tokens(...)`.
   `MODELS["..."]["id"]` в новых вызовах не хардкодить (единственное сознательное исключение —
-  `daily_chat_review` на Opus, платная фича). `docs/claude/models-and-costs.md`.
+  `daily_chat_review` на Argon, платная фича). `docs/claude/models-and-costs.md`.
 - Начало запроса к модели (system) — СТАТИЧНО: изменчивое (время, результаты поиска, reply-контекст)
   только в `service_block` последнего user-turn, не в system, и не в БД. Система собирается через
   `build_system` (блоки с `cache_control`), длина — `system_chars`, не `len`. Окно истории — шагами
@@ -165,7 +161,7 @@
   ВСЕГДА с `label=`). Чат берётся из `usage_ctx` (contextvar, ставит `gate_update`; в джобах —
   явно) — не передавать chat_id руками и не писать в `usage_log` в обход. Цена LLM — по
   `response.model` (фактической), множители кэша — поля модели в `MODELS`/`LEGACY_PRICES`,
-  глобальных констант нет. `docs/claude/billing.md`, `docs/claude/models-and-costs.md`.
+  глобальных констант нет. Нативные вызовы `generateContent` (голос) — `_record_gemini_usage` с `label="voice"`. `docs/claude/billing.md`, `docs/claude/models-and-costs.md`.
 - Тариф чата — `chat_tier(chat_id)`; модель/провайдер — только через `get_chat_model` /
   `get_chat_image_provider` (учитывают free), не читать `chat_models`/`chat_image_provider`
   напрямую. В free записи этих таблиц не менять. `docs/claude/billing.md`.
@@ -180,7 +176,7 @@
 `/help` показывает всем пользователям базовые команды, adminам — полный список из двух блоков (`USER_HELP` + `ADMIN_HELP` в bot.py). При добавлении новой команды обновлять оба константы.
 
 ## Версионность
-Текущая версия: v1.11.0 (режим разработчика в платной личке: `/dev`, `/ws`, workspace `data/devspace/`, тред `dev_messages`, альбомы файлов одним запросом: `docs/claude/dev-mode.md`; предыдущая: v1.10.0 — дневной обзор за сутки с блоками тем: окно с прошлого обзора 21:00, ветки A/B (один вызов Opus / выжимки Haiku + итог Opus), `group_messages` 3000 строк, `/review` тем же путём: `docs/claude/daily-review.md`; предыдущая: v1.9.0 (Gemini как модели чата `/argon /flash /lite`, free-выбор Haiku/Lite в `chat_free_model`, поиск через GPT и `/searchmode`, обратный фолбэк Gemini → Claude, Gemini в дедупе: `docs/claude/models-and-costs.md`, `docs/claude/native-search.md`, `docs/claude/model-fallback.md`; предыдущая: v1.8.0 — фолбэк Claude → Gemini при сбоях пула: липкое окно, цены Gemini в /cost, `docs/claude/model-fallback.md`; предыдущая: v1.7.1 — граница признания ошибок и пометка обзора в транскрипте, инцидент 2026-10-22, `docs/claude/incidents.md`; предыдущая: v1.7.0 — режимы характера: 5 режимов per-chat, режим дня в free, `docs/claude/personas.md`; предыдущая: v1.6.0 — файлы целиком документом по `[[FILE: имя]]`, `docs/claude/files.md`; предыдущая: v1.5.1 — dedup: обрезанный кусок большой группы делится пополам, провал слияния не роняет группу, `docs/claude/open-tasks.md`; предыдущая: v1.5.0 — профиль участника: предложения модели, еженедельный дайджест .md вс 19:00 Berlin, подтверждение /profile_ok, экран «Профили» в dedup TUI, `docs/claude/profile.md`; предыдущая: v1.4.4 — промпты извлечения памяти: поездки/отпуск/командировки не пишутся в long, `docs/claude/memory.md`; предыдущая: v1.4.3 — бот удаляет просроченные факты памяти — `memory_purge` 04:30 Berlin, `docs/claude/memory.md`; dedup: только
+Текущая версия: v1.11.1 (хотфикс `CLAUDE_DISABLED`; ветка `feat/no-anthropic` ждёт тега v2.0.0 — Claude убран из бота, модели только Gemini, фолбэк на GPT, `docs/claude/tz-no-anthropic.md`); v1.11.0 (режим разработчика в платной личке: `/dev`, `/ws`, workspace `data/devspace/`, тред `dev_messages`, альбомы файлов одним запросом: `docs/claude/dev-mode.md`; предыдущая: v1.10.0 — дневной обзор за сутки с блоками тем: окно с прошлого обзора 21:00, ветки A/B (один вызов Opus / выжимки Haiku + итог Opus), `group_messages` 3000 строк, `/review` тем же путём: `docs/claude/daily-review.md`; предыдущая: v1.9.0 (Gemini как модели чата `/argon /flash /lite`, free-выбор Haiku/Lite в `chat_free_model`, поиск через GPT и `/searchmode`, обратный фолбэк Gemini → Claude, Gemini в дедупе: `docs/claude/models-and-costs.md`, `docs/claude/native-search.md`, `docs/claude/model-fallback.md`; предыдущая: v1.8.0 — фолбэк Claude → Gemini при сбоях пула: липкое окно, цены Gemini в /cost, `docs/claude/model-fallback.md`; предыдущая: v1.7.1 — граница признания ошибок и пометка обзора в транскрипте, инцидент 2026-10-22, `docs/claude/incidents.md`; предыдущая: v1.7.0 — режимы характера: 5 режимов per-chat, режим дня в free, `docs/claude/personas.md`; предыдущая: v1.6.0 — файлы целиком документом по `[[FILE: имя]]`, `docs/claude/files.md`; предыдущая: v1.5.1 — dedup: обрезанный кусок большой группы делится пополам, провал слияния не роняет группу, `docs/claude/open-tasks.md`; предыдущая: v1.5.0 — профиль участника: предложения модели, еженедельный дайджест .md вс 19:00 Berlin, подтверждение /profile_ok, экран «Профили» в dedup TUI, `docs/claude/profile.md`; предыдущая: v1.4.4 — промпты извлечения памяти: поездки/отпуск/командировки не пишутся в long, `docs/claude/memory.md`; предыдущая: v1.4.3 — бот удаляет просроченные факты памяти — `memory_purge` 04:30 Berlin, `docs/claude/memory.md`; dedup: только
 живые факты, `--mode purge-expired`, большие группы по частям, не платить дважды за обрезанное, срок слияния = минимум;
 `docs/claude/open-tasks.md`, инцидент 2026-10-18; предыдущие: v1.4.2 — построчная правка и ручная правка в dedup TUI, v1.4.1 — видимость скрытого выбора, накопительная калибровка, функция `dedup`, v1.4.0 — dedup TUI, v1.3.0 — Nano Banana 2.1, `/bananapro`, 2K по запросу, `/opus` `/fable` `/bananapro` в группе только
 админам, 2026-10-10, `docs/claude/images.md`; предыдущие: v1.2.0 — нативный web_search, `docs/claude/native-search.md`, v1.1.5 — реакции 👀/✍, `docs/claude/images.md`, v1.1.4 — prompt cache,

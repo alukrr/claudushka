@@ -15,7 +15,9 @@ db.py используется отовсюду, поэтому полная с�
 - `group_messages` (в т.ч. `is_bot`), `chat_rate_limits` — `docs/claude/group-chat.md`
 - `chat_models` — `docs/claude/models-and-costs.md`
 - `chat_image_provider` — `docs/claude/images.md`
-- `chat_free_model` (выбор Haiku/Lite в free, отдельно от `chat_models`), `chat_search_mode` (`auto|gpt|claude|tavily`) — `docs/claude/models-and-costs.md`, `docs/claude/native-search.md`
+- `chat_search_mode` (`auto|gpt|tavily`; `claude` мигрирован в `auto`) — `docs/claude/models-and-costs.md`, `docs/claude/native-search.md`.
+  `chat_free_model` с v2.0.0 не читается и не создаётся (в free единственная модель — Lite); в старых БД таблица осталась, не трогать
+- Миграция `no_anthropic_models` (`_mig_no_anthropic`, `_run_once`): `chat_models` Claude → Gemini, id заморожены в db.py — `docs/claude/models-and-costs.md`
 - `chat_persona` (режим характера чата, личка — `user_id`) — `docs/claude/personas.md`
 - `dev_mode` (флаг режима разработчика), `dev_messages` (его тред, отдельно от `conversations`; индекс `(user_id, id)`) — `docs/claude/dev-mode.md`
 - `allowed_chats` (в т.ч. `daily_review_enabled`, `status`) — `docs/claude/daily-review.md`;

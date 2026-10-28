@@ -55,6 +55,20 @@ def _mig_access(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE users SET role = 'premium', verified = 1 WHERE role = 'referral'")
 
 
+def _mig_no_anthropic(conn: sqlite3.Connection) -> None:
+    """2026-10-28 (ТЗ no-anthropic): пул закрыл Claude. Выбор модели чата переезжает на Gemini, режим поиска claude →
+    auto. Идентификаторы заморожены на момент миграции (живой реестр — bot.MODELS). chat_free_model больше не
+    читается (в free единственная модель — lite): строки не трогаем. Обратного пути нет. Счётчики — в лог."""
+    for old, new in (("LIKE 'claude-haiku-%'", "gemini-3.1-flash-lite"),
+                     ("LIKE 'claude-sonnet-%'", "gemini-3.8-flash"),
+                     ("LIKE 'claude-opus-%'", "gemini-4-argon"),
+                     ("LIKE 'claude-fable-%'", "gemini-4-argon")):
+        n = conn.execute(f"UPDATE chat_models SET model = ? WHERE model {old}", (new,)).rowcount
+        logger.info(f"no_anthropic: chat_models {old} -> {new}: {n}")
+    n = conn.execute("UPDATE chat_search_mode SET mode = 'auto' WHERE mode = 'claude'").rowcount
+    logger.info(f"no_anthropic: chat_search_mode claude -> auto: {n}")
+
+
 def _mig_defaults(conn: sqlite3.Connection) -> None:
     """Старые глобальные дефолты (haiku / gpt) писались явными строками — без их удаления
     платные чаты остались бы на Haiku/GPT вместо нового дефолта Sonnet/banana."""
@@ -162,12 +176,7 @@ def init_db():
 
         CREATE TABLE IF NOT EXISTS chat_models (
             chat_id INTEGER PRIMARY KEY,
-            model TEXT NOT NULL DEFAULT 'claude-haiku-5-5'
-        );
-
-        CREATE TABLE IF NOT EXISTS chat_free_model (
-            chat_id INTEGER PRIMARY KEY,
-            model TEXT NOT NULL
+            model TEXT NOT NULL DEFAULT 'gemini-3.1-flash-lite'
         );
 
         CREATE TABLE IF NOT EXISTS chat_search_mode (
@@ -320,6 +329,7 @@ def init_db():
     _run_once(conn, "billing_defaults", _mig_defaults)
     _run_once(conn, "billing_starter_bonus", _mig_starter_bonus)
     _run_once(conn, "user_profile_v1", _mig_profile)
+    _run_once(conn, "no_anthropic_models", _mig_no_anthropic)
     # куда переехали нерешённые предложения старого дайджеста (для ответа /profile_ok со старым номером)
     conn.execute("CREATE TABLE IF NOT EXISTS profile_digest_moves (old_id INTEGER PRIMARY KEY, new_id INTEGER NOT NULL)")
     # daily_usage нужна только за сегодня; строки старше недели — мусор.
@@ -1219,7 +1229,7 @@ def set_chat_review_enabled(chat_id: int, enabled: bool) -> bool:
 
 def get_chat_model_db(chat_id: int, default: str | None = None) -> str | None:
     """Сохранённый выбор модели или default, если строки нет. Эффективную модель с учётом
-    тарифа (free → Haiku) решает bot.get_chat_model — здесь только хранилище."""
+    тарифа (free → Lite) решает bot.get_chat_model — здесь только хранилище."""
     conn = get_conn()
     row = conn.execute("SELECT model FROM chat_models WHERE chat_id = ?", (chat_id,)).fetchone()
     conn.close()
@@ -1236,25 +1246,7 @@ def set_chat_model_db(chat_id: int, model: str):
     conn.close()
 
 
-# --- Выбор модели бесплатного режима (Haiku / Lite) — ОТДЕЛЬНО от chat_models ---
-# chat_models в free не трогаем (прошлый платный выбор восстанавливается при пополнении), поэтому выбор free —
-# своя таблица. Строки нет = Haiku. Допустимые значения решает bot.FREE_MODEL_KEYS, здесь только хранилище.
-
-def get_chat_free_model_db(chat_id: int) -> str | None:
-    conn = get_conn()
-    row = conn.execute("SELECT model FROM chat_free_model WHERE chat_id = ?", (chat_id,)).fetchone()
-    conn.close()
-    return row["model"] if row else None
-
-
-def set_chat_free_model_db(chat_id: int, model: str):
-    conn = get_conn()
-    conn.execute("INSERT OR REPLACE INTO chat_free_model (chat_id, model) VALUES (?, ?)", (chat_id, model))
-    conn.commit()
-    conn.close()
-
-
-# --- Режим поиска чата (auto | gpt | claude | tavily), по образцу chat_image_provider ---
+# --- Режим поиска чата (auto | gpt | tavily), по образцу chat_image_provider ---
 
 def get_chat_search_mode_db(chat_id: int) -> str:
     conn = get_conn()
