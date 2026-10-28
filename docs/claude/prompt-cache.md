@@ -1,3 +1,9 @@
+> **С 2026-10-28 (v2.0.0)** модели Anthropic из бота убраны: Gemini режет `cache_control` (400), у GPT кэш автоматический и
+> `kwargs_for_model` `cache_control` тоже не шлёт. Блоки `cache_control` в `build_system`/`mark_cache_tail` собираются как раньше
+> и вычищаются перед отправкой; статичный префикс остаётся обязательным (неявный кэш Gemini/GPT срабатывает на повторяющемся
+> префиксе). Описание ниже про явные точки кэша Anthropic — история. Открыто: видны ли у GPT `cache_read_input_tokens` в usage
+> (`docs/claude/model-fallback.md`, «Открыто»).
+
 # Prompt caching (ТЗ `feat/prompt-cache`, v1.1.4)
 
 Перед правкой system-prompt, сборки `messages` диалога, окна истории или чего-либо, что попадает

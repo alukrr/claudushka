@@ -170,10 +170,9 @@ def test_provider_fallback_to_tavily_when_gpt_none(monkeypatch):
 
 
 @pytest.mark.parametrize("tier,mode,model,expected", [
-    ("paid", "auto", "sonnet", "claude"), ("paid", "auto", "flash", "gpt"), ("paid", "auto", "argon", "gpt"),
-    ("paid", "claude", "sonnet", "claude"), ("paid", "claude", "flash", "gpt"),
-    ("paid", "gpt", "sonnet", "gpt"), ("paid", "tavily", "flash", "tavily"), ("paid", "tavily", "sonnet", "tavily"),
-    ("free", "gpt", "haiku", "tavily"), ("free", "auto", "lite", "tavily"),
+    ("paid", "auto", "flash", "gpt"), ("paid", "auto", "argon", "gpt"), ("paid", "gpt", "flash", "gpt"),
+    ("paid", "tavily", "flash", "tavily"), ("paid", "claude", "flash", "gpt"),   # «claude» из старой БД → auto
+    ("free", "gpt", "lite", "tavily"), ("free", "auto", "lite", "tavily"),
 ])
 def test_search_provider_for(monkeypatch, tier, mode, model, expected):
     monkeypatch.setattr(bot, "chat_tier", lambda c: tier)
@@ -186,13 +185,6 @@ def test_search_provider_free_env_gpt(monkeypatch):
     monkeypatch.setattr(bot, "chat_tier", lambda c: "free")
     monkeypatch.setattr(bot, "SEARCH_PROVIDER_FREE", "gpt")
     assert bot.search_provider_for(1, bot.DEFAULT_MODEL_ID) == "gpt"
-
-
-def test_native_search_off_means_tavily_for_claude(monkeypatch):
-    monkeypatch.setattr(bot, "chat_tier", lambda c: "paid")
-    monkeypatch.setattr(bot.db, "get_chat_search_mode_db", lambda c: "auto")
-    monkeypatch.setattr(bot, "NATIVE_SEARCH", False)
-    assert bot.search_provider_for(1, bot.MODELS["sonnet"]["id"]) == "tavily"
 
 
 def test_utm_stripped_in_text_and_sources(monkeypatch, rec):

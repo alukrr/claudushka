@@ -72,7 +72,7 @@ class Row:
 
 
 class App:
-    def __init__(self, scr, model_alias="haiku"):
+    def __init__(self, scr, model_alias="lite"):
         self.scr = scr
         self.model = dm.MODEL_ALIASES.get(model_alias, model_alias)
         self.screen = "main"
@@ -1735,7 +1735,7 @@ def _main(scr, model_alias):
         raise
 
 
-def run(model_alias="haiku") -> int:
+def run(model_alias="lite") -> int:
     """Точка входа из dedup_memory.py. 2 — не TTY."""
     import sys
     if not (sys.stdin.isatty() and sys.stdout.isatty()):

@@ -30,10 +30,9 @@ data/dedup_runs/, калибровка оценок — data/dedup_calibration.j
                  формулировке (например "Поделился фото" / "Поделился фото в чате" /
                  "Отправил фото в чат" -> один факт). Один вызов модели на группу
                  (user_id, context, chat_id, tier) — СТОИТ ДЕНЕГ, задаётся --model
-                 (короткое имя haiku/sonnet/opus/fable, как в bot.py, дефолт haiku,
-                 либо полная API-строка; есть и argon / flash / lite — Gemini 4 Argon,
-                 3.8 Flash, 3.1 Flash-Lite через пул, те же имена, что команды бота; выбор вручную, не
-                 автофолбэк; оценка цены для них приблизительна: рассуждения идут в вывод). Старые записи группы удаляются, вместо
+                 (короткое имя lite / flash / argon — Gemini 3.1 Flash-Lite, 3.8 Flash, 4 Argon через пул,
+                 те же имена, что команды бота; дефолт lite, либо полная API-строка; выбор вручную, не
+                 автофолбэк; оценка цены приблизительна: рассуждения идут в вывод). Старые записи группы удаляются, вместо
                  них вставляется объединённый список с tier и (для medium)
                  максимальным expires_at среди объединяемых записей. Нужен пакет
                  anthropic и ANTHROPIC_API_KEY — на голом хосте их обычно нет
@@ -71,13 +70,13 @@ data/dedup_runs/, калибровка оценок — data/dedup_calibration.j
 
   # --mode llm на голом хосте: нужны `pip install anthropic==1.7.0` и ключ в окружении
   set -a; source .env; set +a
-  ./dedup_memory.py --mode llm --model sonnet --user-id 592441
-  sudo -E ./dedup_memory.py --mode llm --model sonnet --user-id 592441 --apply
+  ./dedup_memory.py --mode llm --model flash --user-id 592441
+  sudo -E ./dedup_memory.py --mode llm --model flash --user-id 592441 --apply
 
   # --mode llm через контейнер — ПРОЩЕ: anthropic и ключ там уже есть, sudo не нужен
   # (процесс внутри контейнера и так root), /repo — это ~/claudushka, смонтирован туда
-  docker exec claudushka python3 /repo/dedup_memory.py --mode llm --model sonnet --user-id 592441
-  docker exec claudushka python3 /repo/dedup_memory.py --mode llm --model sonnet --user-id 592441 --apply
+  docker exec claudushka python3 /repo/dedup_memory.py --mode llm --model flash --user-id 592441
+  docker exec claudushka python3 /repo/dedup_memory.py --mode llm --model flash --user-id 592441 --apply
 
   # --mode delete — убрать конкретный неверный факт (dry-run покажет совпадения и id)
   ./dedup_memory.py --mode delete --user-id 592441 --fact "Учит сербский язык"
@@ -102,64 +101,38 @@ from typing import Iterator, Literal
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "claudushka.db"
 
-# Короткие имена — как в реестре MODELS в bot.py, чтобы не помнить точные API-строки.
+# Короткие имена — как в реестре MODELS в bot.py, чтобы не помнить точные API-строки. Только Gemini через пул
+# (тот же Anthropic Messages API и ключ); с 2026-10-28 Claude пул не отдаёт. Не автофолбэк, а выбор вручную: дедуп
+# меняет память, молчаливая смена модели посреди прогона дала бы смесь результатов двух моделей.
 MODEL_ALIASES = {
-    "haiku": "claude-haiku-5-5",
-    "sonnet": "claude-sonnet-5-5",
-    "opus": "claude-opus-5-5",
-    "fable": "claude-fable-5-1",
-    # Gemini через пул (тот же Anthropic Messages API и ключ). Не автофолбэк, а выбор вручную: дедуп меняет память,
-    # молчаливая смена модели посреди прогона дала бы смесь результатов двух моделей.
-    "argon": "gemini-4-argon",
-    "flash": "gemini-3.8-flash",
     "lite": "gemini-3.1-flash-lite",
+    "flash": "gemini-3.8-flash",
+    "argon": "gemini-4-argon",
 }
 
-# $/MTok in,out + множители кэша — дубль MODELS/LEGACY_PRICES из bot.py, менять
-# синхронно (сверено 2026-10-04 по https://platform.claude.com/docs/en/about-claude/pricing).
+# $/MTok in,out + множители кэша — дубль MODELS из bot.py (листовые цены пула), менять синхронно: расхождение ловит
+# scripts/test_model_fallback.py::test_dedup_pricing_matches_bot (общего модуля нет — решение за Алексеем, ТЗ п. 3.2).
 # Кортеж: (in, out, cache_read_mult, cache_write_5m_mult, cache_write_1h_mult).
-# cache_read_mult: 0.1 у большинства, Opus 5.5 и Sonnet 5.5 — 0.05, Fable 5.1 — 0.025.
 PRICING = {
-    "claude-haiku-5-5": (0.10, 0.50, 0.1, 1.25, 2.0),
-    "claude-haiku-4-5-20251001": (1.0, 5.0, 0.1, 1.25, 2.0),
-    "claude-sonnet-5-5": (2.0, 10.0, 0.05, 1.25, 2.0),
-    "claude-sonnet-5": (2.0, 10.0, 0.1, 1.25, 2.0),
-    "claude-opus-5-5": (4.0, 20.0, 0.05, 1.25, 2.0),
-    "claude-opus-5": (5.0, 25.0, 0.1, 1.25, 2.0),
-    "claude-opus-4-8": (5.0, 25.0, 0.1, 1.25, 2.0),
-    "claude-fable-5-1": (10.0, 50.0, 0.025, 1.25, 2.0),
-    # Gemini — синхронно с LEGACY_PRICES в bot.py (запись кэша 1.0, у фолбэка cache_control режется).
-    "gemini-4-argon": (2.0, 10.0, 0.1, 1.0, 1.0),
+    "gemini-4-argon": (2.0, 10.0, 0.05, 1.0, 1.0),
     "gemini-3.8-flash": (0.75, 3.75, 0.1, 1.0, 1.0),
     "gemini-3.1-flash-lite": (0.25, 1.50, 0.1, 1.0, 1.0),
 }
 
 # Gemini думает ВСЕГДА (thinking не выключить, output_config пул отклоняет 400) и токены рассуждения идут в вывод.
-# Запас к max_tokens — как FALLBACK_THINKING_HEADROOM в bot.py (бесплатный: платятся только реальные токены).
-# Оценка стоимости для Gemini ПРИБЛИЗИТЕЛЬНАЯ: THINKING_EST — ~480 токенов на короткий ответ (замер 2026-10-24),
+# Запас к max_tokens — как thinking_headroom в bot.py (бесплатный: платятся только реальные токены).
+# Оценка стоимости ПРИБЛИЗИТЕЛЬНАЯ: THINKING_EST — ~480 токенов на короткий ответ (замер 2026-10-24),
 # а входят ли они в usage.output_tokens Anthropic-полосы — не проверено (docs/claude/model-fallback.md).
 # Лимит нестримового вывода argon — 32K (доки пула): MAX_OUT_TOKENS + запас = 12192, в лимит укладываемся.
 THINKING_HEADROOM = {"gemini-4-argon": 4000, "gemini-3.8-flash": 4000, "gemini-3.1-flash-lite": 4000}
 THINKING_EST = {"gemini-4-argon": 500, "gemini-3.8-flash": 500, "gemini-3.1-flash-lite": 500}
 
-# Ступенчатая цена (Haiku 5.5): промпт > порога токенов тарифицируется по (in, out) верхней ступени, множители
-# кэша те же. ДОПУЩЕНИЕ (в доке не уточнено, консервативное — завышает): длина промпта =
-# input + запись + чтение кэша вместе. На группах в тысячи фактов вход может перевалить за 100k. Считается ПО ЗАПРОСУ.
-TIERS = {"claude-haiku-5-5": (100_000, 0.50, 2.50)}
-
-# Haiku 5.5 по умолчанию думает (adaptive) и съедает max_tokens: thinking выключаем, effort low
-# (disabled допустим только на low/medium/high). Как aux_params() в bot.py; другие модели — без.
-AUX_PARAMS = {"claude-haiku-5-5": {"thinking": {"type": "disabled"}, "output_config": {"effort": "low"}}}
-
 
 def request_cost(model, inp, out, cw_5m, cw_1h, cr):
-    """$ за один запрос по PRICING/TIERS; None — модели нет в PRICING."""
+    """$ за один запрос по PRICING; None — модели нет в PRICING."""
     if model not in PRICING:
         return None
     price_in, price_out, read_mult, cw5_mult, cw1h_mult = PRICING[model]
-    tier = TIERS.get(model)
-    if tier and inp + cw_5m + cw_1h + cr > tier[0]:
-        price_in, price_out = tier[1], tier[2]
     return (
         inp / 1_000_000 * price_in
         + cw_5m / 1_000_000 * price_in * cw5_mult
@@ -450,7 +423,6 @@ def run_llm(groups, model, client, stop_event=None, calib: dict | None = None) -
             resp = client.messages.create(
                 model=model,
                 max_tokens=MAX_OUT_TOKENS + THINKING_HEADROOM.get(model, 0),
-                **AUX_PARAMS.get(model, {}),
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": json.dumps(facts, ensure_ascii=False)}],
             )
@@ -979,7 +951,7 @@ def fmt_dur(sec: float) -> str:
 
 
 def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
-              model="claude-haiku-5-5", limit_groups=None, verbose=False, force_retry=False):
+              model="gemini-3.1-flash-lite", limit_groups=None, verbose=False, force_retry=False):
     """CLI-обёртка над run_llm: печатает прогресс, при apply пишет каждую группу сразу."""
     try:
         client = make_client()
@@ -1101,7 +1073,7 @@ def main():
     p.add_argument("--chat-id", type=int, default=None)
     p.add_argument("--tier", choices=["long", "medium"], default=None)
     p.add_argument("--limit-groups", type=int, default=None, help="только для --mode llm")
-    p.add_argument("--model", default="haiku",
+    p.add_argument("--model", default="lite",
                     help="только для --mode llm — короткое имя (haiku/sonnet/opus/fable, "
                          "как в bot.py) или полная API-строка")
     p.add_argument("--fact", default=None,

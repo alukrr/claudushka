@@ -1,3 +1,9 @@
+> **НЕ ДЕЙСТВУЕТ с 2026-10-28 (v2.0.0).** Нативный `web_search` Anthropic удалён вместе с моделями Claude: `call_dialog_native`,
+> `native_answer`, `NATIVE_SEARCH*`, `pause_turn`, режим `claude` в `/searchmode`, `_native_search_on` — в коде нет.
+> Действует только раздел «Провайдеры поиска» (`gpt` / `tavily`): `search_provider_for` → `auto` = `gpt` при любой модели
+> чата; free — `SEARCH_PROVIDER_FREE`; `chat_search_mode = 'claude'` мигрирован в `auto`. Реакция 👀 ставится в
+> `search_with_provider`, когда реально ищем (`should_search` сказал «да»). Остальной файл — история.
+
 # Нативный веб-поиск Anthropic в платном режиме (ТЗ `feat/native-search`, v1.2.0)
 
 ## Схема

@@ -1,4 +1,4 @@
-"""Юнит-тесты фолбэка Claude → Gemini (ТЗ feat/model-fallback, docs/claude/model-fallback.md).
+"""Юнит-тесты фолбэка Gemini → GPT (ТЗ no-anthropic, docs/claude/model-fallback.md).
 
 Без сети: клиент подменён. Запуск из корня репозитория:
     TELEGRAM_BOT_TOKEN=x ANTHROPIC_API_KEY=x python -m pytest scripts/test_model_fallback.py -q
@@ -66,17 +66,30 @@ def test_should_fallback_midstream_error():
     assert api_errors.should_fallback(exc) is True
 
 
+FLASH, LITE, ARGON = (bot.MODELS[k]["id"] for k in ("flash", "lite", "argon"))
+TERRA, LUNA, SOL = "gpt-6.1-terra", "gpt-6-luna", "gpt-6.1-sol"
+
+
 def test_fallback_kwargs_strips_and_copies():
     system = [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}]
     messages = [{"role": "user", "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]}]
-    kw = dict(model=bot.DEFAULT_MODEL_ID, system=system, messages=messages, max_tokens=100,
+    kw = dict(model=FLASH, system=system, messages=messages, max_tokens=100 + 4000,
               thinking={"type": "adaptive"}, output_config={"effort": "low"}, tools=[{"type": "web_search"}])
-    out = bot.kwargs_for_model(kw, "gemini-x")
-    assert out["model"] == "gemini-x"
-    assert out["max_tokens"] == 100 + bot.FALLBACK_THINKING_HEADROOM
+    out = bot.kwargs_for_model(kw, TERRA)
+    assert out["model"] == TERRA
+    assert out["max_tokens"] == 100 + bot._headroom(TERRA)       # запас Gemini заменён запасом GPT
     assert not {"thinking", "output_config", "tools"} & out.keys()
     assert "cache_control" not in str(out["system"]) + str(out["messages"])
     assert "cache_control" in str(system) and "cache_control" in str(messages) and "thinking" in kw  # оригиналы целы
+
+
+def test_fallback_pairs():
+    assert bot.fallback_model_for(LITE) == LUNA and bot.fallback_model_for(FLASH) == TERRA
+    assert bot.fallback_model_for(ARGON) == SOL
+    assert bot.fallback_model_for(LUNA) is None and bot.fallback_model_for("claude-haiku-5-5") is None
+    for gem, gpt in bot.FALLBACK_PAIRS.items():                  # пара — другой провайдер и с ценой
+        assert bot.model_provider(gem) == "gemini" and bot.model_provider(gpt) == "openai"
+        assert bot.price_meta(gpt) is not None and bot.price_meta(gem) is not None
 
 
 @pytest.fixture(autouse=True)
@@ -94,21 +107,20 @@ def clean(monkeypatch):
 
 
 class FakeMessages:
-    def __init__(self, claude_exc=None):
+    """Gemini-модели падают с primary_exc (если задан), GPT отвечает."""
+    def __init__(self, primary_exc=None):
         self.calls = []
-        self.claude_exc = claude_exc
+        self.primary_exc = primary_exc
 
     def create(self, **kw):
         self.calls.append(kw)
-        if kw["model"].startswith("gemini"):
-            return ok_response(kw["model"])
-        if self.claude_exc:
-            raise self.claude_exc
+        if kw["model"].startswith("gemini") and self.primary_exc:
+            raise self.primary_exc
         return ok_response(kw["model"])
 
 
-def use_fake(monkeypatch, claude_exc=None):
-    fake = FakeMessages(claude_exc)
+def use_fake(monkeypatch, primary_exc=None):
+    fake = FakeMessages(primary_exc)
     c = SimpleNamespace(messages=fake)
     monkeypatch.setattr(bot, "client", c)
     monkeypatch.setattr(bot, "client_noretry", c)
@@ -126,41 +138,41 @@ def dialog(model, **extra):
 
 def test_normal_path_no_fallback(monkeypatch, clean):
     fake = use_fake(monkeypatch)
-    run(dialog(bot.MODELS["sonnet"]["id"]))
-    assert [c["model"] for c in fake.calls] == [bot.MODELS["sonnet"]["id"]] and clean == [bot.MODELS["sonnet"]["id"]]
+    run(dialog(FLASH))
+    assert [c["model"] for c in fake.calls] == [FLASH] and clean == [FLASH]
 
 
-def test_5xx_falls_back_one_claude_retry_then_gemini(monkeypatch, clean):
+def test_5xx_falls_back_one_retry_then_gpt(monkeypatch, clean):
     fake = use_fake(monkeypatch, make_exc(529))
-    run(dialog(bot.MODELS["sonnet"]["id"]))
-    assert [c["model"] for c in fake.calls] == [bot.MODELS["sonnet"]["id"]] * 2 + [bot.FALLBACK_MODEL]
-    assert clean == [bot.FALLBACK_MODEL]            # учёт по Gemini
+    run(dialog(FLASH))
+    assert [c["model"] for c in fake.calls] == [FLASH] * 2 + [TERRA]
+    assert clean == [TERRA]                         # учёт по фактической модели
 
 
-def test_haiku_goes_to_cheap(monkeypatch):
+@pytest.mark.parametrize("model,target", [(LITE, LUNA), (FLASH, TERRA), (ARGON, SOL)])
+def test_each_model_goes_to_its_pair(monkeypatch, model, target):
     fake = use_fake(monkeypatch, make_exc(500))
-    run(dialog(bot.DEFAULT_MODEL_ID))
-    assert fake.calls[-1]["model"] == bot.FALLBACK_MODEL_CHEAP
+    run(dialog(model))
+    assert fake.calls[-1]["model"] == target
 
 
 def test_sticky_window_then_return(monkeypatch):
-    sonnet = bot.MODELS["sonnet"]["id"]
     fake = use_fake(monkeypatch, make_exc(529))
-    run(dialog(sonnet))
+    run(dialog(FLASH))
     fake.calls.clear()
-    run(dialog(sonnet))                              # окно открыто: Claude не трогаем вообще
-    assert [c["model"] for c in fake.calls] == [bot.FALLBACK_MODEL]
-    bot._fallback_until[sonnet] = time.monotonic() - 1   # окно истекло
+    run(dialog(FLASH))                               # окно открыто: основную модель не трогаем вообще
+    assert [c["model"] for c in fake.calls] == [TERRA]
+    bot._fallback_until[FLASH] = time.monotonic() - 1   # окно истекло
     fake.calls.clear()
-    fake.claude_exc = None
-    run(dialog(sonnet))
-    assert [c["model"] for c in fake.calls] == [sonnet]
+    fake.primary_exc = None
+    run(dialog(FLASH))
+    assert [c["model"] for c in fake.calls] == [FLASH]
 
 
 def test_sticky_is_per_model(monkeypatch):
     use_fake(monkeypatch, make_exc(529))
-    run(dialog(bot.MODELS["sonnet"]["id"]))
-    assert bot._sticky_fallback(bot.MODELS["opus"]["id"]) is None
+    run(dialog(FLASH))
+    assert bot._sticky_fallback(ARGON) is None
 
 
 @pytest.mark.parametrize("exc", [make_exc(402, "insufficient balance"), make_exc(400, "prompt is too long: 9"),
@@ -168,8 +180,8 @@ def test_sticky_is_per_model(monkeypatch):
 def test_no_fallback_for_402_400_key(monkeypatch, exc):
     fake = use_fake(monkeypatch, exc)
     with pytest.raises(anthropic.APIStatusError):
-        run(dialog(bot.MODELS["sonnet"]["id"]))
-    assert all(not c["model"].startswith("gemini") for c in fake.calls)
+        run(dialog(FLASH))
+    assert all(c["model"] == FLASH for c in fake.calls)
     assert not bot._fallback_until
 
 
@@ -177,67 +189,51 @@ def test_disabled(monkeypatch):
     monkeypatch.setattr(bot, "FALLBACK_ENABLED", False)
     fake = use_fake(monkeypatch, make_exc(529))
     with pytest.raises(anthropic.APIStatusError):
-        run(dialog(bot.MODELS["sonnet"]["id"]))
+        run(dialog(FLASH))
     assert len(fake.calls) == len(api_errors.RETRY_DELAYS) + 1     # старая лестница ретраев
 
 
 def test_probe_never_falls_back(monkeypatch):
     fake = use_fake(monkeypatch, make_exc(404))
     with pytest.raises(anthropic.NotFoundError):
-        run(bot._probe_model(None, 1, "claude-nonexistent"))
-    assert all(not c["model"].startswith("gemini") for c in fake.calls)
-
-
-def test_native_tools_raise_instead_of_gemini(monkeypatch):
-    fake = use_fake(monkeypatch, make_exc(529))
-    with pytest.raises(bot.NativeSearchUnavailable):
-        run(bot.call_claude(None, None, label="t", model=bot.MODELS["sonnet"]["id"], max_tokens=5, system="s",
-                            messages=[{"role": "user", "content": "x"}], tools=[{"type": "web_search_20250305"}]))
-    assert all(not c["model"].startswith("gemini") for c in fake.calls)
-    with pytest.raises(bot.NativeSearchUnavailable):   # липкое окно уже открыто
-        run(bot.call_claude(None, None, label="t", model=bot.MODELS["sonnet"]["id"], max_tokens=5, system="s",
-                            messages=[{"role": "user", "content": "x"}], tools=[{"type": "web_search_20250305"}]))
-    run(dialog(bot.MODELS["sonnet"]["id"]))             # а обычный запрос в окне идёт на Gemini
-    assert fake.calls[-1]["model"] == bot.FALLBACK_MODEL
+        run(bot._probe_model(None, 1, FLASH))
+    assert all(c["model"] == FLASH for c in fake.calls)
 
 
 def test_sync_create_fallback(monkeypatch, clean):
     fake = use_fake(monkeypatch, make_exc(500))
-    r = bot.sync_create(label="x", model=bot.DEFAULT_MODEL_ID, max_tokens=30, system="s",
+    r = bot.sync_create(label="x", model=bot.DEFAULT_MODEL_ID, max_tokens=30 + 4000, system="s",
                         messages=[{"role": "user", "content": "x"}], thinking={"type": "disabled"},
                         output_config={"effort": "low"})
     assert api_errors.response_text(r) == "ok"
-    assert fake.calls[-1]["model"] == bot.FALLBACK_MODEL_CHEAP and "thinking" not in fake.calls[-1]
-    assert clean == [bot.FALLBACK_MODEL_CHEAP]
+    assert fake.calls[-1]["model"] == LUNA and "thinking" not in fake.calls[-1]
+    assert fake.calls[-1]["max_tokens"] == 30 + bot._headroom(LUNA)
+    assert clean == [LUNA]
 
 
-def test_gemini_prices_present():
-    for m in (bot.FALLBACK_MODEL, bot.FALLBACK_MODEL_CHEAP):
+def test_prices_present():
+    for m in list(bot.FALLBACK_PAIRS) + list(bot.FALLBACK_PAIRS.values()):
         assert bot.price_meta(m) is not None
-    assert bot._billed_model("gemini-3.8-flash", SimpleNamespace(model="gemini-3.8-flash")) == "gemini-3.8-flash"
+    assert bot._billed_model(TERRA, SimpleNamespace(model=TERRA)) == TERRA
+    # старые Claude-строки usage_log по-прежнему имеют подпись
+    assert bot.price_meta("claude-haiku-5-5")["label"] == "Haiku 5.5"
+    assert bot.price_meta("claude-fable-5-1")["label"] == "Fable 5.1"
 
 
-@pytest.mark.parametrize("second_exc", [make_exc(529), None])
-def test_native_searches_recorded_when_later_iteration_fails(monkeypatch, second_exc):
-    """Поиски первой итерации (pause_turn) попадают в usage_log, даже если вторая упала."""
-    recorded = []
-    monkeypatch.setattr(bot, "_record_usage", lambda *a, **k: recorded.append(a))
-    block = SimpleNamespace(type="text", text="ищу", model_dump=lambda **k: {"type": "text", "text": "ищу"})
-    first = SimpleNamespace(
-        content=[block], stop_reason="pause_turn",
-        usage=SimpleNamespace(server_tool_use=SimpleNamespace(web_search_requests=2)))
-    exc = second_exc or bot.NativeSearchUnavailable("m")
-    calls = []
+def test_dedup_pricing_matches_bot():
+    """dedup_memory.PRICING — ручная копия MODELS из bot.py (общего модуля нет): расхождение цен/запаса — падение."""
+    import dedup_memory as dm
+    assert set(dm.MODEL_ALIASES.values()) == {m["id"] for m in bot.MODELS.values()}
+    for m in bot.MODELS.values():
+        assert dm.PRICING[m["id"]] == (m["in"], m["out"], m["cache_read_mult"], m["cache_write_5m_mult"],
+                                       m["cache_write_1h_mult"]), m["id"]
+        assert dm.THINKING_HEADROOM[m["id"]] == m["thinking_headroom"]
 
-    async def fake_stream(*a, **k):
-        calls.append(1)
-        if len(calls) == 1:
-            return first
-        raise exc
 
-    monkeypatch.setattr(bot, "call_claude_stream", fake_stream)
-    with pytest.raises(type(exc)):
-        run(bot.call_dialog_native(None, 1, None, label="t", model=bot.MODELS["sonnet"]["id"], max_tokens=50,
-                                   system="s", messages=[{"role": "user", "content": "x"}]))
-    assert len(calls) == 2
-    assert [r[:3] for r in recorded] == [("search", "anthropic", "native_search")] * 2
+def test_catalog_ids_strips_any_provider_prefix():
+    payload = {"data": [{"id": "openai/gpt-6.1-terra"}, {"id": "google/gemini-3.8-flash"},
+                        {"id": "gemini-4-argon"}, {"id": "openai/gpt-6-luna"}]}
+    ids = bot.catalog_ids(payload)
+    assert ids == {"gpt-6.1-terra", "gemini-3.8-flash", "gemini-4-argon", "gpt-6-luna"}
+    assert set(bot.FALLBACK_PAIRS.values()) - {"gpt-6.1-sol"} <= ids
+    assert bot.catalog_ids({}) == set()

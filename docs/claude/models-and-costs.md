@@ -1,18 +1,49 @@
-# Модели per-chat (реестр MODELS, v0.9.0)
+# Модели per-chat (реестр MODELS; с 2026-10-28 — только Gemini, v2.0.0)
 
-Перед правкой `MODELS`, `_set_chat_model`, `/haiku /sonnet /opus /fable`, `/models`,
-`_track_response`, `calc_llm_cost`, `/cost` — читай этот файл. С ТЗ v0.10 учёт, тарифы
-(free → только Haiku), `/cost` и подтверждение `/fable` описаны в `docs/claude/billing.md`.
+Перед правкой `MODELS`, `_set_chat_model`, `/lite /flash /argon`, `/models`, `_track_response`, `calc_llm_cost`, `/cost` —
+читай этот файл. Учёт, тарифы, `/cost` — `docs/claude/billing.md`.
 
-**`MODELS` в bot.py — единственный источник правды.** Команды, цены, гейтинг по ролям,
-окна контекста, `/models` — всё оттуда. Строки моделей по месту больше не писать.
+**`MODELS` в bot.py — единственный источник правды.** Команды, цены, гейтинг по ролям, окна контекста, `/models` — оттуда.
+Строки моделей по месту больше не писать.
 
-| ключ | id | label | $/MTok in/out | cache read | запись 5m / 1h | окно | кому |
-|---|---|---|---|---|---|---|---|
-| `haiku` | `claude-haiku-5-5` | Haiku 5.5 | **0.10 / 0.50** (промпт >100k: 0.50 / 2.50) | 0.1× | 1.25× / 2× | 1M | всем (free-режим — только она) |
-| `sonnet` | `claude-sonnet-5-5` | Sonnet 5.5 | 2 / 10 | **0.05×** | 1.25× / 2× | 1M | админ ИЛИ платный чат (дефолт платного) |
-| `opus` | `claude-opus-5-5` | Opus 5.5 | 4 / 20 | **0.05×** | 1.25× / 2× | 1M | админ ИЛИ платный чат |
-| `fable` | `claude-fable-5-1` | Fable 5.1 | 10 / 50 | **0.025×** | 1.25× / 2× | 1M | админ ИЛИ платный чат, с подтверждением |
+**С 2026-10-28 пул не отдаёт модели Anthropic** (403 `model_blocked`), Claude убран из бота (ТЗ `docs/claude/tz-no-anthropic.md`,
+v2.0.0). Всё ниже про Claude (таблица Claude-моделей, Haiku 5.5, Opus 5.5, ступенчатая цена, thinking/effort) — **история**,
+в коде этого нет; Claude-id живут только в `LEGACY_PRICES` для подписей старых строк `usage_log`.
+
+| ключ | id | label | $/MTok in/out (листовая) | cache read | запись | окно | thinking_headroom | роль |
+|---|---|---|---|---|---|---|---|---|
+| `lite` | `gemini-3.1-flash-lite` | Gemini 3.1 Flash-Lite | 0.25 / 1.50 | 0.1× | 1.0× | 1M | 4000 | **free (единственная)**, ВСЕ служебные вызовы (`DEFAULT_MODEL_ID`), описание медиа, выжимки обзора, голос |
+| `flash` | `gemini-3.8-flash` | Gemini 3.8 Flash | 0.75 / 3.75 | 0.1× | 1.0× | 1M | 4000 | дефолт платного чата (`PAID_DEFAULT_MODEL_KEY`) |
+| `argon` | `gemini-4-argon` | Gemini 4 Argon | 2 / 10 | 0.05× | 1.0× | 1M | 4000 | платный выбор, дневной обзор (`DAILY_REVIEW_MODEL_ID`) |
+
+Цены — **листовые (зачёркнутые)** со страницы пула, не со скидкой; кошельки в «виртуальных долларах» по листу. Gemini на этой
+полосе кэш промпта не даёт (`cache_control` → 400): вход каждый раз по полной цене (фактически чтение кэша может быть
+неявным — `cached_content`; не гарантировано). Gemini 3.8 Flash и Argon **думают всегда**, токены рассуждений входят в
+`usage.output_tokens` — `out_tokens(model, visible)` добавляет запас; без него ответ обрывается.
+
+Роли (решения Алексея 2026-10-28, остальное «предложено»): free — Lite без выбора (`FREE_MODEL_KEYS = ("lite",)`; таблица
+`chat_free_model` больше не читается и не пишется — выбора нет, строки оставлены на диске); платный дефолт — Flash;
+дневной обзор — Argon (нестримовый вывод ≤ 32K, обзор берёт `2200 + 4000`); `restricted` (дорогие, в группе только админам) —
+сейчас ни у одной модели нет; режим разработчика — модель чата. GPT-моделей чата нет (Terra — только для картинок, Шаг 2).
+`get_chat_model`: free → Lite; paid → `chat_models`, а строка не из реестра (старый Claude до миграции) → Flash.
+
+Параметры вызова: `aux_params()` и `dialog_params()` возвращают `{}` — ни одна модель пула не принимает `thinking` /
+`output_config` (Gemini → 400; у GPT влияние на `/v1/messages` не доказано). Функции остались единой точкой, чтобы
+не править ~20 вызовов, если управляемая модель вернётся. Служебные вызовы обязаны оборачивать лимит в
+`out_tokens(DEFAULT_MODEL_ID, N)` (иначе Lite/Flash могут обрезать ответ на рассуждениях).
+
+Команды `/haiku /sonnet /opus /fable` — заглушки `cmd_claude_gone` (подсказка выбрать модель в `/models`), на один релиз;
+подтверждение `/fable` удалено. Миграция БД `no_anthropic_models` (`db._mig_no_anthropic`, `_run_once`, один раз):
+`chat_models` haiku → lite, sonnet → flash, opus/fable → argon; `chat_search_mode` claude → auto; счётчики в лог. Без пути назад.
+
+Фолбэк — GPT другого провайдера: `docs/claude/model-fallback.md`. Цены GPT (фолбэк, поиск, Terra для картинок) в
+`LEGACY_PRICES`: Luna 0.10/0.50, Terra 1.00/5.00, Sol 2.00/10.00; запись в кэш 1.25× (непроверено на `/v1/messages`).
+
+**Дедуп** (`dedup_memory.py`, `dedup_tui.py`): `MODEL_ALIASES` = lite/flash/argon, дефолт `lite`; `PRICING` — ручная копия `MODELS`
+(общий модуль `models.py` не заводили — решение за Алексеем, п. 3.2 ТЗ; расхождение ловит
+`scripts/test_model_fallback.py::test_dedup_pricing_matches_bot`). GPT-моделей в дедупе нет (GPT-моделей чата нет).
+
+---- ИСТОРИЯ (до 2026-10-28) ---
 
 **`LEGACY_PRICES`** (bot.py) — модели с ценой, но БЕЗ выбора пользователем: `claude-haiku-4-5-20251001`
 (прошлый `/haiku`, 1 / 5, 0.1×), `claude-sonnet-5`
