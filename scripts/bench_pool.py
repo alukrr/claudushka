@@ -38,9 +38,17 @@ AUX_SYSTEM = "Ты извлекаешь факты. Ответь ТОЛЬКО JS
 AUX_USER = ('Сообщение: «Меня зовут Пётр, я живу в Казани, работаю сварщиком, на выходных еду в Сочи».\n'
             'Верни {"facts": [строки долговременных фактов], "skip": [временное]}')
 AUX_MAX = 300
-RED_PNG = base64.b64encode(bytes.fromhex(
-    "89504e470d0a1a0a0000000d4948445200000010000000100802000000909168360000001549444154789c63f8cfc0"
-    "f09f0a1a8c2a1855306c0300d6e5ff01c2d56e6e0000000049454e44ae426082")).decode()
+def _png(w=16, h=16, rgb=(220, 20, 20)):
+    """Валидный PNG одним цветом (ручной hex в первой версии был битым — все модели отвечали 400)."""
+    import zlib, struct
+    raw = b"".join(b"\x00" + bytes(rgb) * w for _ in range(h))
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+RED_PNG = base64.b64encode(_png(64, 64)).decode()
 TOOL = {"name": "get_weather", "description": "Погода в городе", "input_schema": {
     "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}
 
@@ -262,6 +270,15 @@ def bench(model, lane):
                 ok = False
             rec["aux"] = {"json_ok": ok, "time": round(aux["total"], 2), "out": aux.get("out"),
                           "reasoning": aux.get("reasoning"), "empty": not txt, "sample": short(aux.get("text"), 120)}
+        if model.startswith("gemini-3") and "lite" not in model:
+            aux2 = fn(model, AUX_SYSTEM, AUX_USER, max_tokens=AUX_MAX + 4000, stream=False)
+            t2 = (aux2.get("text") or "").strip().strip("`").removeprefix("json").strip()
+            try:
+                ok2 = isinstance(json.loads(t2), dict)
+            except ValueError:
+                ok2 = False
+            rec["aux_headroom"] = aux2.get("err") or {"json_ok": ok2, "time": round(aux2["total"], 2),
+                                                      "out": aux2.get("out"), "reasoning": aux2.get("reasoning")}
         img = fn(model, SYSTEM, [{"type": "image", "source": {"type": "base64", "media_type": "image/png",
                                                               "data": RED_PNG}},
                                  {"type": "text", "text": "Какого цвета картинка? Одним словом."}],
@@ -280,7 +297,7 @@ def bench(model, lane):
     else:
         print(f"  {model:24} {lane:9} first {rec['ttft']}s total {rec['total']}s {rec['totals']} "
               f"stream={rec['streams']} out={rec['out']} reas={rec['reasoning']} ret={rec['model_ret']!r}\n"
-              f"      aux={rec['aux']}\n      img={rec['image_in']!r} tools={rec['tools']!r} "
+              f"      aux={rec['aux']} headroom={rec.get('aux_headroom', '-')}\n      img={rec['image_in']!r} tools={rec['tools']!r} "
               f"cc={rec.get('cache_control', '-')}\n      «{rec['sample']}»", flush=True)
 
 
@@ -308,6 +325,28 @@ for m in GPT + GEMINI:
         continue
     for lane in lanes_for(m):
         bench(m, lane)
+
+print("\n== Голос: нативный generateContent, 1 с тишины audio/wav inline (проверяем только, что модель принимает аудио)")
+def _wav(sec=1, rate=16000):
+    import struct
+    data = b"\x00\x00" * rate * sec
+    return (b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16)
+            + b"data" + struct.pack("<I", len(data)) + data)
+WAV = base64.b64encode(_wav()).decode()
+for m in ("gemini-3.6-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-2.5-flash"):
+    t0 = time.monotonic()
+    try:
+        r = requests.post(f"{BASE}/v1beta/models/{m}:generateContent", headers=GOOG, timeout=60, json={
+            "contents": [{"role": "user", "parts": [{"text": "Транскрибируй аудио. Если тишина — ответь «тишина»."},
+                                                    {"inline_data": {"mime_type": "audio/wav", "data": WAV}}]}]})
+        txt = ""
+        if r.ok:
+            for c in r.json().get("candidates") or []:
+                txt += "".join(p.get("text", "") for p in (c.get("content") or {}).get("parts") or [] if not p.get("thought"))
+        print(f"  {m:24} HTTP {r.status_code} {time.monotonic() - t0:.1f}s {short(txt or r.text, 120)}", flush=True)
+        RESULTS.append({"audio_model": m, "status": r.status_code})
+    except Exception as e:
+        print(f"  {m:24} {type(e).__name__}: {e}")
 
 if A.images:
     os.makedirs("/tmp/bench_imgs", exist_ok=True)
