@@ -209,3 +209,13 @@
   `dev_messages`, и `data/devspace/<user_id>` (сейчас НЕ трогают); (2) на стенде откалибровать `DEV_*` лимиты по логам `PROMPT … kind=dev` и
   `usage_log` (метка `dev`), проверить что `max_tokens` ≈ 24000 без стриминга проходит SDK/пул (`timeout=` явно), в каких апдейтах альбома
   документов Telegram отдаёт подпись; (3) идеи после v1: версии файлов/diff, tool use (при фолбэке на Gemini `tools` не уходят). `docs/claude/dev-mode.md`.
+
+- **`/update` оставляет root-овые файлы в репозитории на сервере** (2026-10-28). `cmd_update` → `_git("pull")` выполняется
+  внутри контейнера от root (`.:/repo` в `docker-compose.yml`), поэтому каждый НОВЫЙ каталог/файл, пришедший через
+  `/update`, на хосте принадлежит root. Следующий `git pull` от `alukr` на сервере падает: `unable to create file
+  docs/claude/bench/...: Permission denied` (каталог `docs/claude/bench` создан в 19:33 UTC через `/update`), а прерванный
+  checkout оставляет изменённые файлы → `-dirty`. Разовая починка: `sudo chown -R alukr:alukr docs .git`,
+  `git checkout -- <файлы>`, `git pull`. Варианты исправления (выбирает Алексей): (1) после успешного pull в
+  `cmd_update` вернуть владельца — `chown -R` на uid/gid владельца `/repo` (взять из `os.stat("/repo")`), без `data/`;
+  (2) запускать git в контейнере от uid хоста (`user:` в compose — затронет весь сервис, `data/` и `pip install`
+  в `command:`; рискованнее). Root-овые `__pycache__/*.pyc` в корне (дедуп через `docker exec`) git не мешают.
