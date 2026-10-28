@@ -16,6 +16,8 @@ model_blocked`. `should_fallback` считал 403 без признаков а�
 `CLAUDE_DISABLED` (Claude не зовём вообще, сразу Gemini) + `model_blocked` в `UPSTREAM_MARKERS`,
 `docs/claude/model-fallback.md`. Полный переезд — `docs/claude/tz-no-anthropic.md`.
 Урок: новый код ответа пула = не повод молча не переключаться; при отказе модели аккаунту (`model_blocked`) — фолбэк.
+Тот же день: расшифровка голоса падала 404 — `gemini-3.6-flash` пропала из каталога пула. Переведена на
+`gemini-3.1-flash-lite` (env `GEMINI_AUDIO_MODEL`), `docs/claude/media.md`.
 
 ## 2026-07-26 — группа падала с «prompt is too long» (память)
 Группа падала с `400 invalid_request_error: prompt is too long: 257099 > 200000`.

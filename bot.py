@@ -1664,7 +1664,10 @@ def image_price_text(key: str) -> str:
 # found», проверено тем же запросом. У пула ЕСТЬ своя модель для картинок под другим
 # именем — GPT Image 2 (см. IMAGE_PROVIDERS ниже), это не то же самое, что «банан через
 # пул», а второй независимый провайдер.
-GEMINI_AUDIO_MODEL_NAME = "gemini-3.6-flash"
+# 2026-10-28: gemini-3.6-flash пропала из каталога пула, расшифровка отвечала 404 → gemini-3.1-flash-lite (по докам пула
+# аудио inline принимают все текстовые модели Gemini). GEMINI_AUDIO_MODEL в .env — смена без правки кода
+# (нужен --force-recreate). OGG/Opus из Telegram на Lite — проверить на первом же голосовом в проде.
+GEMINI_AUDIO_MODEL_NAME = os.environ.get("GEMINI_AUDIO_MODEL", "").strip() or "gemini-3.1-flash-lite"
 # POOL_BASE_URL — общий пул api.apitoken.sale, не только для Gemini: с добавлением
 # GPT Image 2 через него же идёт и OpenAI-совместимый /v1/images/generations.
 POOL_BASE_URL = "https://router.apitoken.sale"
