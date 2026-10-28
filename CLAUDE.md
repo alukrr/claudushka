@@ -52,6 +52,8 @@
   лимиты непроверенных, стартовый бонус, `/fable`-подтверждение) — `docs/claude/billing.md`
 - Ошибки API, ретраи, блокирующие вызовы, `response_text`, `parse_json_lenient` —
   `docs/claude/api-errors.md`
+- Уход с Anthropic (пул закрыл Claude 2026-10-28), замеры всех моделей пула (`scripts/bench_pool.py`), рисование Terra,
+  дедуп без Claude — ТЗ `docs/claude/tz-no-anthropic.md`
 - Фолбэк Claude → Gemini при сбоях пула (`FALLBACK_*`, `should_fallback`, `_call_with_fallback`, `_fallback_kwargs`,
   липкое окно, `NativeSearchUnavailable`, цены Gemini в `LEGACY_PRICES`) — `docs/claude/model-fallback.md`
 - Профиль участника (`user_profile`, `profile_proposals`, `_profile_text`, `profile_updates`, `send_profile_digest`,
