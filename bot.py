@@ -5512,6 +5512,36 @@ async def cmd_ws(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Формат: /ws — список, /ws get <имя>, /ws rm <имя>, /ws clear yes")
 
 
+PHOTO_DEFAULT_QUESTION = "Что на этом изображении? Опиши подробно."
+
+
+def _foreign_sample(text: str) -> str | None:
+    """Начало текста, если он написан не по-русски (кириллицы < половины букв), иначе None."""
+    letters = [c for c in text if c.isalpha()]
+    if len(letters) < 3:
+        return None
+    cyr = sum(1 for c in letters if "Ѐ" <= c <= "ӿ")
+    return text.strip()[:60] if cyr / len(letters) < 0.5 else None
+
+
+def _default_photo_question(user_id: int, is_group: bool) -> str:
+    """Вопрос к фото без подписи. Русская фраза по умолчанию заставляла модель отвечать по-русски даже тем, кто пишет на
+    другом языке (иракский студент, 2026-10-29): в личке смотрим последнюю реплику человека и просим ответить на его языке."""
+    if is_group:
+        return PHOTO_DEFAULT_QUESTION
+    try:
+        for row in reversed(db.get_conversation(user_id, 10)):
+            if row["role"] == "user" and not row["content"].startswith("[Фото]"):
+                sample = _foreign_sample(row["content"])
+                if sample:
+                    return (f"{PHOTO_DEFAULT_QUESTION} Ответь на том же языке, на котором пользователь пишет "
+                            f"(его последняя реплика: «{sample}»), не по-русски.")
+                break
+    except Exception:
+        logger.exception("photo question: язык не определён")
+    return PHOTO_DEFAULT_QUESTION
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
@@ -5790,9 +5820,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             photo_bytes = await photo_file.download_as_bytearray()
             image_b64 = __import__('base64').b64encode(bytes(photo_bytes)).decode()
 
-            question = user_text if user_text else "Что на этом изображении? Опиши подробно."
+            default_q = _default_photo_question(user_id, is_group)
+            question = user_text if user_text else default_q
             if is_group:
-                question = strip_trigger(question) or "Что на этом изображении? Опиши подробно."
+                question = strip_trigger(question) or default_q
 
             vision_messages = [
                 {

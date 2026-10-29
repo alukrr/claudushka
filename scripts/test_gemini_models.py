@@ -142,3 +142,16 @@ def test_migration_chat_models_and_search_mode():
     assert got == {1: LITE, 2: FLASH, 3: ARGON, 4: ARGON, 5: ARGON}
     modes = dict(conn.execute("SELECT chat_id, mode FROM chat_search_mode").fetchall())
     assert modes == {1: "auto", 2: "gpt", 3: "auto"}
+
+
+def test_default_photo_question_follows_user_language(monkeypatch):
+    rows = [{"role": "user", "content": "اريد ترجمه صوره"}, {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "[Фото] Что на этом изображении? Опиши подробно."}]
+    monkeypatch.setattr(bot.db, "get_conversation", lambda u, n: rows)
+    q = bot._default_photo_question(1, False)
+    assert "اريد ترجمه صوره" in q and "не по-русски" in q
+    assert bot._default_photo_question(1, True) == bot.PHOTO_DEFAULT_QUESTION          # группа — без изменений
+    rows[0]["content"] = "Привет, как дела"
+    assert bot._default_photo_question(1, False) == bot.PHOTO_DEFAULT_QUESTION          # русский — как раньше
+    monkeypatch.setattr(bot.db, "get_conversation", lambda u, n: [])
+    assert bot._default_photo_question(1, False) == bot.PHOTO_DEFAULT_QUESTION
