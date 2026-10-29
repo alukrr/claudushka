@@ -150,6 +150,9 @@ UNVERIFIED_SEARCH_PER_DAY = 20
 VERIFY_MIN_TOPUP = 5.0
 ADMIN_CONTACT = "@alukr"
 
+# Уже уведомлённые админы о новом «уличном» пользователе (в памяти, сбрасывается рестартом)
+_street_notified: set[int] = set()
+
 # Captcha state (in-memory, resets on restart)
 captcha_state: dict[str, dict] = {}
 
@@ -6078,8 +6081,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Notify admins on first message from street user (только личка)
         if user["role"] == "street" and not is_group:
-            msg_count = len(db.get_conversation(user_id, 2))
-            if msg_count <= 2:
+            # Считаем ВСЕ реплики треда: get_conversation(user_id, 2) отдаёт максимум 2 строки, и условие «<= 2»
+            # выполнялось на каждом сообщении (спам админам, 2026-10-29). _street_notified — от повтора после /clear.
+            if db.count_conversation(user_id) <= 2 and user_id not in _street_notified:
+                _street_notified.add(user_id)
                 uname = update.effective_user.full_name or update.effective_user.username or str(user_id)
                 username_str = f"@{update.effective_user.username}" if update.effective_user.username else "нет"
                 for admin_id in ADMIN_IDS:
