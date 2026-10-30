@@ -93,6 +93,21 @@ def is_prompt_too_long(exc: BaseException) -> bool:
     return False
 
 
+SAFETY_BLOCK_MARKER = "blocked by provider safety policy"
+
+
+def is_safety_block(exc: BaseException) -> bool:
+    """400 «blocked by provider safety policy» — фильтр провайдера модели режет ЗАПРОС целиком.
+
+    Не баг запроса и не «переформулируй»: триггер сидит в контексте (system/история), а не в
+    реплике пользователя. Инцидент 2026-10-30: дневной обзор «Вестник» с матом лежал в
+    `group_messages` и блокировал каждый ответ чата. Ретрай и фолбэк не помогают (см. should_fallback).
+    """
+    if not isinstance(exc, anthropic.BadRequestError):
+        return False
+    return SAFETY_BLOCK_MARKER in f"{exc} {getattr(exc, 'body', '')}".lower()
+
+
 def is_insufficient_balance(exc: BaseException) -> bool:
     """402 — на прокси кончились деньги или упёрлись в лимит трат по ключу.
 
@@ -179,6 +194,9 @@ def user_message(exc: BaseException, default: str | None = None, clear_hint: str
         return "Проблема с доступом к сервису. Это чинит Алексей, не ты."
     if is_prompt_too_long(exc):
         return f"Контекст переполнен — я больше не влезаю в собственную память. {clear_hint}"
+    if is_safety_block(exc):
+        return ("Фильтр модели заблокировал запрос — дело не в твоём вопросе, а в чём-то в "
+                "истории или памяти чата. Переформулировать не поможет, пусть Алексей посмотрит.")
     if isinstance(exc, anthropic.BadRequestError):
         return "Запрос не прошёл: он API не понравился. Попробуй переформулировать."
     if isinstance(exc, anthropic.NotFoundError):
