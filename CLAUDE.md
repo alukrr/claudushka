@@ -56,6 +56,8 @@
   ТЗ `docs/claude/tz-no-anthropic.md`; чек-лист стенда `feat/no-anthropic` — `docs/claude/staging-checklist-no-anthropic.md`
 - Фолбэк Gemini → GPT при сбоях пула (`FALLBACK_PAIRS`, `FALLBACK_*`, `should_fallback`, `_call_with_fallback`, `kwargs_for_model`,
   липкое окно, цены GPT в `LEGACY_PRICES`) — `docs/claude/model-fallback.md`
+- Safety-блок провайдера (`is_safety_block`): повтор без истории, фоновый поиск виновной строки и `group_messages.hidden`,
+  `/hidden /unhide /safety_scan` — ТЗ `docs/claude/tz-safety-unblock.md` (не начато, v2.1.0); ручной разбор — инциденты 2026-10-30/31
 - Профиль участника (`user_profile`, `profile_proposals`, `_profile_text`, `profile_updates`, `send_profile_digest`,
   `/profile` `/profile_ok` `/profile_no` `/profile_digest`, экран «Профили» в dedup TUI) — `docs/claude/profile.md`
 - Память (`memory`-таблица, `extract_memory`, `extract_all_participants_memory`,
