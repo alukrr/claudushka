@@ -2609,6 +2609,30 @@ def extract_all_participants_memory(chat_id: int):
         logger.error(f"Group memory extraction error (chat {chat_id}): {e}", exc_info=True)
 
 
+def _group_line(entry: dict, now: datetime) -> str:
+    """Одна реплика человека в групповом транскрипте: «[время] Имя: текст» (время — HH:MM, для другого дня с датой)."""
+    ts = entry.get("ts")
+    if ts:
+        msg_dt = datetime.fromtimestamp(ts)
+        time_prefix = f"[{msg_dt.strftime('%d.%m %H:%M') if msg_dt.date() != now.date() else msg_dt.strftime('%H:%M')}] "
+    else:
+        time_prefix = ""
+    return f"{time_prefix}{entry['sender']}: {entry['text']}"
+
+
+def build_group_tail(chat_id: int, reply_context: str = "") -> list[dict]:
+    """Группа без истории (повтор после safety-блока): ОДНА последняя реплика транскрипта — триггер. Не «последний
+    user-turn» build_group_messages: тот склеивает ВСЕ реплики людей подряд после последнего ответа бота, и виновная
+    строка (инцидент 2026-10-31) лежала именно в таком хвосте. Реплика бота последней быть не может (триггер сохранён раньше)."""
+    rows = db.get_group_transcript(chat_id, 1)
+    if not rows or rows[-1]["is_bot"]:
+        return [{"role": "user", "content": "(…)"}]
+    text = _group_line(rows[-1], datetime.now())
+    if reply_context:
+        text += f"\n[в ответ на сообщение: «{reply_context}»]"
+    return [{"role": "user", "content": text}]
+
+
 def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GROUP_TRANSCRIPT_LIMIT,
                          exclude_ids=None, min_id: int | None = None) -> list[dict]:
     """Многоголосый групповой контекст для Anthropic messages.
@@ -2645,13 +2669,7 @@ def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GRO
             elif messages:  # нельзя начинать с assistant — ведущие реплики бота отбрасываем
                 messages.append({"role": "assistant", "content": entry["text"]})
         else:
-            ts = entry.get("ts")
-            if ts:
-                msg_dt = datetime.fromtimestamp(ts)
-                time_prefix = f"[{msg_dt.strftime('%d.%m %H:%M') if msg_dt.date() != now.date() else msg_dt.strftime('%H:%M')}] "
-            else:
-                time_prefix = ""
-            buffer.append(f"{time_prefix}{entry['sender']}: {entry['text']}")
+            buffer.append(_group_line(entry, now))
     flush_human()
 
     # ведущие assistant-блоки (если транскрипт начался с бота) — срезаем
@@ -6242,8 +6260,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         try:
             # Safety-блок провайдера: один повтор без истории + счётчик для фонового скана (docs/claude/safety-unblock.md).
-            # Без истории: группа — только последний user-turn (реплики людей подряд, включая триггер), личка — user_text.
-            _tail = [base_messages[-1]] if is_group else [{"role": "user", "content": user_text}]
+            # Без истории: группа — только сама реплика-триггер (build_group_tail), личка — user_text.
+            _tail = build_group_tail(chat_id, reply_context) if is_group else [{"role": "user", "content": user_text}]
             response = await _dialog_call(
                 context, chat_id, user_id, is_group,
                 retry_messages=lambda: compose(search_query, search_results, _tail),

@@ -194,6 +194,18 @@ def test_build_group_messages_probe_params(tmpdb):
     assert "реплика номер 0" in str(only_new) and "номер 5 " not in str(only_new)
 
 
+def test_group_tail_is_only_the_trigger_line(tmpdb):
+    fill(6, bad_idx=(1, 4))                                           # плохие строки в хвосте людей подряд
+    db.save_group_message(CHAT, 7, "Аня", "последний вопрос", False)
+    tail = bot.build_group_tail(CHAT, "процитировано")
+    assert len(tail) == 1 and tail[0]["role"] == "user"
+    assert "Аня: последний вопрос" in tail[0]["content"] and "процитировано" in tail[0]["content"]
+    assert BAD not in tail[0]["content"] and "реплика номер" not in tail[0]["content"]
+    assert BAD in str(bot.build_group_messages(CHAT, "", 50)[-1])    # а «последний turn» склеил бы всё
+    db.save_group_message(CHAT, 0, "Клодушка", "ответ бота", True)
+    assert bot.build_group_tail(CHAT)[0]["content"] == "(…)"
+
+
 # --- _dialog_call: повтор без истории и счётчик ---
 
 @pytest.fixture()
