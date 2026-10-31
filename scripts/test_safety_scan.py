@@ -8,6 +8,7 @@ import os
 import sqlite3
 import sys
 import time
+from types import SimpleNamespace
 from pathlib import Path
 
 import anthropic
@@ -365,3 +366,80 @@ def test_scan_no_parallel(scan_env):
     bot._safety_scan_running.add(CHAT)
     run(bot.safety_scan(CHAT, 1, manual=True))
     assert state["calls"] == 0 and sent == []
+
+
+# --- команды /hidden /unhide /safety_scan ---
+
+class FakeMsg:
+    def __init__(self):
+        self.out = []
+
+    async def reply_text(self, text, **kw):
+        self.out.append(text)
+
+
+def fake_update(uid, chat_id, chat_type):
+    msg = FakeMsg()
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=uid), message=msg,
+                          effective_chat=SimpleNamespace(id=chat_id, type=chat_type))
+    return upd, msg
+
+
+def ctx(*args):
+    return SimpleNamespace(args=list(args))
+
+
+ADMIN = next(iter(bot.ADMIN_IDS))
+
+
+def test_commands_group_flow(tmpdb):
+    ids = fill(5, bad_idx=(2,))
+    db.hide_group_messages(CHAT, [ids[2]])
+    upd, msg = fake_update(ADMIN, CHAT, "supergroup")
+    run(bot.cmd_hidden(upd, ctx()))
+    assert f"id {ids[2]}" in msg.out[0] and BAD not in msg.out[0] and "реплика" not in msg.out[0]
+    run(bot.cmd_unhide(upd, ctx(str(ids[2]))))
+    assert msg.out[-1] == f"Вернула id {ids[2]}."
+    run(bot.cmd_unhide(upd, ctx(str(ids[2]))))
+    assert "нет" in msg.out[-1]
+    run(bot.cmd_hidden(upd, ctx()))
+    assert msg.out[-1] == "Скрытых строк нет."
+
+
+def test_commands_private_need_chat_id(tmpdb):
+    ids = fill(3)
+    db.hide_group_messages(CHAT, [ids[1]])
+    upd, msg = fake_update(ADMIN, ADMIN, "private")
+    run(bot.cmd_hidden(upd, ctx()))
+    assert "chat_id" in msg.out[-1]
+    run(bot.cmd_hidden(upd, ctx(str(CHAT))))
+    assert f"id {ids[1]}" in msg.out[-1]
+    run(bot.cmd_unhide(upd, ctx(str(CHAT), str(ids[1]))))
+    assert msg.out[-1] == f"Вернула id {ids[1]}."
+    run(bot.cmd_unhide(upd, ctx(str(ids[1]))))                         # в личке без chat_id — подсказка
+    assert "chat_id" in msg.out[-1]
+
+
+def test_commands_non_admin_silent(tmpdb):
+    fill(3)
+    upd, msg = fake_update(999, CHAT, "supergroup")
+    run(bot.cmd_hidden(upd, ctx()))
+    run(bot.cmd_unhide(upd, ctx("1")))
+    run(bot.cmd_safety_scan(upd, ctx()))
+    assert msg.out == []
+
+
+def test_safety_scan_command(tmpdb, monkeypatch):
+    started = []
+    monkeypatch.setattr(bot, "_spawn_background_task", lambda coro: (coro.close(), started.append(1)))
+    bot._safety_scan_running.clear()
+    upd, msg = fake_update(ADMIN, CHAT, "supergroup")
+    run(bot.cmd_safety_scan(upd, ctx()))
+    assert started == [1] and "Запустила" in msg.out[-1]
+    bot._safety_scan_running.add(CHAT)
+    run(bot.cmd_safety_scan(upd, ctx()))
+    assert started == [1] and "уже идёт" in msg.out[-1]
+    bot._safety_scan_running.clear()
+    upd2, msg2 = fake_update(ADMIN, ADMIN, "private")
+    run(bot.cmd_safety_scan(upd2, ctx()))
+    assert started == [1] and "группы" in msg2.out[-1]

@@ -1,6 +1,6 @@
 # Чек-лист стенда: ТЗ `feat/safety-unblock` (повтор без истории, скан, `hidden`)
 
-Правила стенда — `staging.md`; суть — `safety-unblock.md`. Юнит-тесты (`scripts/test_safety_scan.py`, 27 шт., без сети) покрывают
+Правила стенда — `staging.md`; суть — `safety-unblock.md`. Юнит-тесты (`scripts/test_safety_scan.py`, 32 шт., без сети) покрывают
 алгоритм поиска, фильтры `hidden`, миграцию, `_dialog_call`, счётчик, скан на настоящей БД; здесь — живьём, на стенде.
 
 Живую safety-блокировку провайдера вызвать нельзя, поэтому на стенде в `.env.test` задаётся `SAFETY_TEST_MARKER=ZZ-SAFETY-ZZ`
