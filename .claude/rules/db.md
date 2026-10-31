@@ -12,7 +12,10 @@ db.py используется отовсюду, поэтому полная с�
 тематическом файле её фичи, а не здесь:
 - `memory` — `docs/claude/memory.md`
 - `user_profile`, `profile_proposals` (профиль участника, `chat_id=0` для лички) — `docs/claude/profile.md`
-- `group_messages` (в т.ч. `is_bot`), `chat_rate_limits` — `docs/claude/group-chat.md`
+- `group_messages` (в т.ч. `is_bot`, `hidden`), `chat_rate_limits` — `docs/claude/group-chat.md`; `hidden=1` и функции
+  `hide_group_messages`/`unhide_group_message`/`list_hidden_group_messages` (без текста)/`group_message_ids_with_same_content` —
+  `docs/claude/safety-unblock.md`. Любое новое чтение `group_messages` в промпт — с `hidden = 0`; `get_group_transcript` принимает
+  `exclude_ids`/`min_id` (только пробы скана)
 - `chat_models` — `docs/claude/models-and-costs.md`
 - `chat_image_provider` — `docs/claude/images.md`
 - `chat_search_mode` (`auto|gpt|tavily`; `claude` мигрирован в `auto`) — `docs/claude/models-and-costs.md`, `docs/claude/native-search.md`.

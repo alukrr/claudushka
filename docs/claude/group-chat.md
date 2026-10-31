@@ -65,3 +65,8 @@
     как их отличать от реально вышедших пользователей.
   - [Историческое, до ТЗ v0.10: `cmd_ratelimit` не смотрел на whitelist-гейт. Гейта больше
     нет — бот отвечает всем неброненным, так что пункт потерял смысл.]
+
+## Скрытые строки (`group_messages.hidden`, v2.1.0)
+Строка с `hidden=1` не попадает ни в диалог, ни в дневной обзор, ни в извлечение памяти (фильтр `hidden = 0` в
+`get_group_transcript`, `get_group_messages_range`, `get_group_history`). Ставит её `safety_scan` после safety-блока провайдера,
+управление — админ-команды `/hidden`, `/unhide`, `/safety_scan`. Подробности — `docs/claude/safety-unblock.md`.
