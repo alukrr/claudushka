@@ -84,6 +84,14 @@ FALLBACK_ALERT_COOLDOWN = 1800        # админу не чаще раза в 3
 MAX_HISTORY = 40
 GROUP_TRANSCRIPT_LIMIT = 50   # сколько реплик группового транскрипта тащить в messages
 
+# Safety-блок провайдера (docs/claude/safety-unblock.md): фоновый поиск и скрытие строки истории, которую режет фильтр.
+SAFETY_SCAN_STRIKES = int(os.environ.get("SAFETY_SCAN_STRIKES", "2") or 2)           # блокировок подряд до скана
+SAFETY_SCAN_COOLDOWN_MIN = int(os.environ.get("SAFETY_SCAN_COOLDOWN_MIN", "30") or 30)  # пауза между сканами чата
+SAFETY_SCAN_ATTEMPTS = int(os.environ.get("SAFETY_SCAN_ATTEMPTS", "2") or 2)         # попыток на одну пробу (фильтр флакает)
+SAFETY_SCAN_MAX_CALLS = int(os.environ.get("SAFETY_SCAN_MAX_CALLS", "40") or 40)      # бюджет вызовов API на один скан
+# Только для стенда: если строка есть в тексте messages запроса, вызов ведёт себя как safety-блок (живой блок не вызвать).
+SAFETY_TEST_MARKER = os.environ.get("SAFETY_TEST_MARKER", "").strip()
+
 # Реакции на сообщение пользователя вместо служебных текстов («Рисую…», «ищу…»). Боту доступен только
 # фиксированный набор эмодзи (telegram.constants.ReactionEmoji): 🔍/🖌 в нём нет. REACTIONS=0 — выкл.
 # (тогда у /imagine возвращается текст «Рисую…»).
@@ -2601,7 +2609,32 @@ def extract_all_participants_memory(chat_id: int):
         logger.error(f"Group memory extraction error (chat {chat_id}): {e}", exc_info=True)
 
 
-def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GROUP_TRANSCRIPT_LIMIT) -> list[dict]:
+def _group_line(entry: dict, now: datetime) -> str:
+    """Одна реплика человека в групповом транскрипте: «[время] Имя: текст» (время — HH:MM, для другого дня с датой)."""
+    ts = entry.get("ts")
+    if ts:
+        msg_dt = datetime.fromtimestamp(ts)
+        time_prefix = f"[{msg_dt.strftime('%d.%m %H:%M') if msg_dt.date() != now.date() else msg_dt.strftime('%H:%M')}] "
+    else:
+        time_prefix = ""
+    return f"{time_prefix}{entry['sender']}: {entry['text']}"
+
+
+def build_group_tail(chat_id: int, reply_context: str = "") -> list[dict]:
+    """Группа без истории (повтор после safety-блока): ОДНА последняя реплика транскрипта — триггер. Не «последний
+    user-turn» build_group_messages: тот склеивает ВСЕ реплики людей подряд после последнего ответа бота, и виновная
+    строка (инцидент 2026-10-31) лежала именно в таком хвосте. Реплика бота последней быть не может (триггер сохранён раньше)."""
+    rows = db.get_group_transcript(chat_id, 1)
+    if not rows or rows[-1]["is_bot"]:
+        return [{"role": "user", "content": "(…)"}]
+    text = _group_line(rows[-1], datetime.now())
+    if reply_context:
+        text += f"\n[в ответ на сообщение: «{reply_context}»]"
+    return [{"role": "user", "content": text}]
+
+
+def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GROUP_TRANSCRIPT_LIMIT,
+                         exclude_ids=None, min_id: int | None = None) -> list[dict]:
     """Многоголосый групповой контекст для Anthropic messages.
 
     Берёт транскрипт чата (старые->новые), склеивает подряд идущие реплики людей
@@ -2610,9 +2643,15 @@ def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GRO
     в group_messages последней записью — оно становится финальным user-turn, повторно
     НЕ добавляется (иначе вернётся баг «ты уже говорила»). reply_context, если есть,
     привязывается inline к последнему user-блоку.
+
+    exclude_ids / min_id — ТОЛЬКО для проб safety_scan: окно берётся мимо pick_history_window (его якорь живого диалога
+    не трогаем): последние `limit` строк без exclude_ids и не старше min_id. В обычном диалоге не передавать.
     """
-    rows = db.get_group_transcript(chat_id, limit + max(HISTORY_STEP, 0))  # [{"id","sender","text","is_bot","ts"}]
-    transcript = pick_history_window(("g", chat_id), rows, limit, HISTORY_STEP)
+    if exclude_ids is not None or min_id is not None:
+        transcript = db.get_group_transcript(chat_id, limit, exclude_ids=exclude_ids, min_id=min_id)
+    else:
+        rows = db.get_group_transcript(chat_id, limit + max(HISTORY_STEP, 0))  # [{"id","sender","text","is_bot","ts"}]
+        transcript = pick_history_window(("g", chat_id), rows, limit, HISTORY_STEP)
     messages: list[dict] = []
     buffer: list[str] = []
 
@@ -2630,13 +2669,7 @@ def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GRO
             elif messages:  # нельзя начинать с assistant — ведущие реплики бота отбрасываем
                 messages.append({"role": "assistant", "content": entry["text"]})
         else:
-            ts = entry.get("ts")
-            if ts:
-                msg_dt = datetime.fromtimestamp(ts)
-                time_prefix = f"[{msg_dt.strftime('%d.%m %H:%M') if msg_dt.date() != now.date() else msg_dt.strftime('%H:%M')}] "
-            else:
-                time_prefix = ""
-            buffer.append(f"{time_prefix}{entry['sender']}: {entry['text']}")
+            buffer.append(_group_line(entry, now))
     flush_human()
 
     # ведущие assistant-блоки (если транскрипт начался с бота) — срезаем
@@ -4308,6 +4341,10 @@ ADMIN_HELP = """\
                               не только боту-админу); ответом на сообщение: <N мин.>|off,
                               без ответа: <user_id> <N|off>, без аргументов — список, "off" — сброс всем
   /review                  — AI-обзор чата прямо сейчас
+  /hidden [chat_id]        — строки истории, скрытые от модели после safety-блока (без текста; в личке chat_id обязателен)
+  /unhide [chat_id] <id>   — вернуть скрытую строку (в группе chat_id не нужен)
+  /safety_scan [chat_id]   — вручную найти и скрыть строку, которую режет фильтр модели (итог — админам в личку;
+                              сам бот запускает скан после 2 блокировок подряд)
   /review_on / /review_off — вкл/выкл ЕЖЕДНЕВНЫЙ авто-обзор этого чата (доступно и админам
                               группы; /review — разовый, admin-only)
   /update                  — git pull + рестарт контейнера\
@@ -4798,6 +4835,262 @@ async def notify_admins(text: str) -> None:
             await _admin_bot.send_message(chat_id=admin_id, text=text)
         except Exception as e:
             logger.error(f"Failed to notify admin {admin_id}: {e}")
+
+
+# --- Safety-блок провайдера: повтор без истории и фоновый поиск виновной строки (docs/claude/safety-unblock.md) ---
+
+def _messages_plain_text(messages: list) -> str:
+    """Весь текст messages одной строкой (для SAFETY_TEST_MARKER). Картинки и прочее не-text пропускаем."""
+    parts = []
+    for m in messages or []:
+        c = m.get("content")
+        if isinstance(c, str):
+            parts.append(c)
+        elif isinstance(c, list):
+            parts.extend(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+    return "\n".join(parts)
+
+
+def _synthetic_safety_error() -> anthropic.BadRequestError:
+    """Тот же 400, что отдаёт пул на safety-блок (для SAFETY_TEST_MARKER на стенде)."""
+    import httpx
+    body = {"error": {"type": "invalid_request_error", "message": "blocked by provider safety policy"}}
+    resp = httpx.Response(400, request=httpx.Request("POST", "http://stand/v1/messages"), json=body)
+    return anthropic.BadRequestError("blocked by provider safety policy (test marker)", response=resp, body=body)
+
+
+async def _model_call(context, chat_id, **kwargs):
+    """call_claude + тестовый маркер стенда: SAFETY_TEST_MARKER в тексте messages → как safety-блок. В проде пусто."""
+    if SAFETY_TEST_MARKER and SAFETY_TEST_MARKER in _messages_plain_text(kwargs.get("messages")):
+        raise _synthetic_safety_error()
+    return await call_claude(context, chat_id, **kwargs)
+
+
+_safety_strikes: dict[int, int] = {}       # chat_id -> safety-блоков полного запроса подряд (память процесса)
+_safety_last_uid: dict[int, int] = {}      # chat_id -> user_id последнего заблокированного (для build_system скана)
+_safety_scan_running: set[int] = set()
+_safety_scan_last: dict[int, float] = {}   # chat_id -> time.monotonic() старта последнего скана
+
+
+def _safety_strike(chat_id: int, user_id: int) -> None:
+    """+1 к счётчику блокировок группы; на SAFETY_SCAN_STRIKES — запустить скан (если не идёт и вышла пауза)."""
+    _safety_last_uid[chat_id] = user_id
+    n = _safety_strikes.get(chat_id, 0) + 1
+    _safety_strikes[chat_id] = n
+    if n < SAFETY_SCAN_STRIKES or chat_id in _safety_scan_running:
+        return
+    last = _safety_scan_last.get(chat_id)
+    if last is not None and time.monotonic() - last < SAFETY_SCAN_COOLDOWN_MIN * 60:
+        return
+    _safety_strikes[chat_id] = 0
+    _spawn_background_task(safety_scan(chat_id, user_id))
+
+
+async def _dialog_call(context, chat_id: int, user_id: int, is_group: bool, *, retry_messages, **kwargs):
+    """Основной вызов диалога + защита от safety-блока.
+
+    Первый запрос — полный. 400 safety → счётчик группы (+ фоновый скан) и ОДИН повтор без истории (`retry_messages()` —
+    только последний user-turn со служебным блоком; system тот же). Повтор тоже заблокирован → исключение наверх
+    (reply_api_error: «Фильтр модели заблокировал запрос…» — виновата память/system/сама реплика). Успех полного запроса
+    обнуляет счётчик группы; успех повтора — нет. Текст сообщений в лог не пишем."""
+    label = f"диалог chat={chat_id}"
+    try:
+        response = await _model_call(context, chat_id, label=label, usage_label="dialog", **kwargs)
+    except anthropic.BadRequestError as e:
+        if not api_errors.is_safety_block(e):
+            raise
+        if is_group:
+            _safety_strike(chat_id, user_id)
+        retry_kwargs = {**kwargs, "messages": retry_messages()}
+        try:
+            response = await _model_call(context, chat_id, label=f"{label} (без истории, safety)",
+                                         usage_label="dialog", **retry_kwargs)
+        except anthropic.BadRequestError as e2:
+            if api_errors.is_safety_block(e2):
+                logger.warning(f"SAFETY BLOCK chat={chat_id} uid={user_id} model={kwargs.get('model')} | "
+                               "повтор без истории: blocked")
+            raise
+        logger.warning(f"SAFETY BLOCK chat={chat_id} uid={user_id} model={kwargs.get('model')} | повтор без истории: ok")
+        return response
+    if is_group:
+        _safety_strikes[chat_id] = 0
+    return response
+
+
+class _ScanBudgetExceeded(Exception):
+    pass
+
+
+async def safety_find(cands: list, probe, base: frozenset = frozenset()) -> list:
+    """Минимальный набор id из `cands`, исключение которого (вместе с `base`) снимает блок.
+
+    probe(excluded: set) -> bool (True = заблокировано). Предусловие: probe(base | cands) == False.
+    Поиск через ИСКЛЮЧЕНИЕ половины, а не «проверить половину отдельно» — иначе не ловятся строки, которые
+    блокируют только вместе (комбинации). Случай 2026-10-31: 5 копий куска реплики, часть в обеих половинах."""
+    if len(cands) <= 1:
+        return list(cands)
+    mid = len(cands) // 2
+    a, b = cands[:mid], cands[mid:]
+    if not await probe(set(base) | set(a)):
+        return await safety_find(a, probe, base)
+    if not await probe(set(base) | set(b)):
+        return await safety_find(b, probe, base)
+    # Виноваты строки в обеих половинах.
+    fa = await safety_find(a, probe, frozenset(base) | frozenset(b))
+    fb = await safety_find(b, probe, frozenset(base) | frozenset(fa))
+    return fa + fb
+
+
+def _fmt_hidden_rows(rows: list) -> list[str]:
+    out = []
+    for r in rows:
+        who = "Клодушка" if r["is_bot"] else (r["sender"] or "?")
+        when = datetime.fromtimestamp(r["ts"], BERLIN_TZ).strftime("%d.%m %H:%M")
+        out.append(f"  id {r['id']} · {who} · {when} · {r['length']} симв.")
+    return out
+
+
+async def _safety_scan_inner(chat_id: int, user_id: int, calls: dict, suspects: list) -> tuple[str, bool]:
+    """-> (текст отчёта, слать ли админам). Все пробы — настоящий запрос диалога, собранный кодом бота
+    (build_system + build_group_messages + service_block); упрощённый «последние N строк» врёт (инцидент 2026-10-31)."""
+    model = get_chat_model(chat_id)
+    system = build_system(user_id, True, chat_id)
+    rows = db.get_group_transcript(chat_id, GROUP_TRANSCRIPT_LIMIT + max(HISTORY_STEP, 0))
+    window = pick_history_window(("g", chat_id), rows, GROUP_TRANSCRIPT_LIMIT, HISTORY_STEP)
+    cands = [r["id"] for r in window]
+    if not cands:
+        return "окно истории пусто", True
+    min_id = cands[0]
+
+    async def probe(excluded: set, shift: bool = False) -> bool:
+        """True = заблокировано хоть одной из SAFETY_SCAN_ATTEMPTS попыток. shift=False: окно не сдвигается (строки
+        просто выпадают, старые не подтягиваются — ищем в ТЕКУЩЕМ окне); shift=True: как после реального скрытия."""
+        for _ in range(SAFETY_SCAN_ATTEMPTS):
+            if calls["n"] >= SAFETY_SCAN_MAX_CALLS:
+                raise _ScanBudgetExceeded()
+            calls["n"] += 1
+            msgs = build_group_messages(chat_id, "", GROUP_TRANSCRIPT_LIMIT, exclude_ids=excluded,
+                                        min_id=None if shift else min_id)
+            msgs = mark_cache_tail(with_service_block(msgs, service_block()))
+            try:
+                await _model_call(None, chat_id, label=f"safety_scan chat={chat_id}", usage_label="safety_scan",
+                                  fallback=False, model=model, **dialog_params(model),
+                                  max_tokens=out_tokens(model, 32), system=system, messages=msgs)
+            except anthropic.BadRequestError as e:
+                if api_errors.is_safety_block(e):
+                    return True
+                raise
+        return False
+
+    if not await probe(set()):
+        return SAFETY_NOT_REPRODUCED, True
+    if await probe(set(cands)):
+        return ("блок остался и с пустой историей — виновата не история, а память чата или system; "
+                "смотреть руками (/memory_full, /forget)"), True
+    found = await safety_find(cands, probe)
+    suspects.extend(found)
+    if not found:
+        return "виновная строка не найдена", True
+    extra = db.group_message_ids_with_same_content(chat_id, found)
+    hide_ids = sorted(set(found) | set(extra[:20]))
+    if await probe(set(hide_ids), shift=True):
+        suspects[:] = hide_ids
+        return ("после исключения найденных строк запрос всё равно блокируется (сдвинутое окно подтянуло другое) — "
+                f"НЕ скрывала. Подозреваемые id: {', '.join(map(str, hide_ids))}. Запустите /safety_scan ещё раз"), True
+    n = db.hide_group_messages(chat_id, hide_ids)
+    meta = [r for r in db.list_hidden_group_messages(chat_id, 200) if r["id"] in set(hide_ids)]
+    lines = [f"Скрыла строк: {n}. Они остались в базе, но в промпты больше не попадают:"]
+    lines += _fmt_hidden_rows(meta)
+    lines.append("Вернуть: /unhide <id>; список: /hidden")
+    return "\n".join(lines), True
+
+
+SAFETY_NOT_REPRODUCED = "блок не воспроизвёлся (запрос теперь проходит) — скрывать нечего"
+
+
+async def safety_scan(chat_id: int, user_id: int, manual: bool = False) -> None:
+    """Фоновый поиск строки истории, которую режет safety-фильтр, и её скрытие (hidden=1). Ничего не удаляет, в чат не
+    пишет, текст строк не выводит — отчёт админам: id, автор, время, длина. Бюджет — SAFETY_SCAN_MAX_CALLS вызовов."""
+    if chat_id in _safety_scan_running:
+        return
+    _safety_scan_running.add(chat_id)
+    _safety_scan_last[chat_id] = time.monotonic()
+    usage_ctx.set((chat_id, "group", user_id))   # расход скана — на счёт чата, метка safety_scan
+    calls = {"n": 0}
+    suspects: list = []
+    try:
+        logger.warning(f"SAFETY SCAN start chat={chat_id} manual={manual}")
+        try:
+            report, notify = await _safety_scan_inner(chat_id, user_id, calls, suspects)
+        except _ScanBudgetExceeded:
+            report = (f"бюджет скана исчерпан ({SAFETY_SCAN_MAX_CALLS} вызовов), виновная строка не подтверждена."
+                      + (f" Подозреваемые id (НЕ скрыты): {', '.join(map(str, suspects))}" if suspects else ""))
+            notify = True
+        except Exception as e:
+            logger.exception(f"SAFETY SCAN chat={chat_id}: ошибка")
+            report, notify = f"скан упал: {type(e).__name__}. Смотрите логи.", True
+        logger.warning(f"SAFETY SCAN done chat={chat_id} calls={calls['n']}: {report.splitlines()[0][:120]}")
+        if notify and (manual or report != SAFETY_NOT_REPRODUCED):
+            await notify_admins(f"🛡 Safety-скан: {_chat_title(chat_id)} ({chat_id})\n"
+                                f"Вызовов API: {calls['n']}\n{report}")
+    finally:
+        _safety_scan_running.discard(chat_id)
+
+
+def _parse_chat_arg(update: Update, args: list) -> tuple[int | None, list]:
+    """Чат для /hidden /unhide /safety_scan: группа — текущий; личка — первый аргумент-число с минусом."""
+    chat = update.effective_chat
+    if chat.type != "private":
+        return chat.id, args
+    if args and re.fullmatch(r"-\d+", args[0]):
+        return int(args[0]), args[1:]
+    return None, args
+
+
+async def cmd_hidden(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Скрытые строки истории чата (без текста). Admin-only."""
+    if not is_admin(update.effective_user.id):
+        return
+    cid, _ = _parse_chat_arg(update, context.args or [])
+    if cid is None:
+        await update.message.reply_text("В личке: /hidden <chat_id> (число с минусом).")
+        return
+    rows = db.list_hidden_group_messages(cid, 20)
+    if not rows:
+        await update.message.reply_text("Скрытых строк нет.")
+        return
+    await update.message.reply_text(f"Скрытые строки ({_chat_title(cid)}, {cid}), новые сверху:\n"
+                                    + "\n".join(_fmt_hidden_rows(rows)) + "\nВернуть: /unhide <id>")
+
+
+async def cmd_unhide(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вернуть скрытую строку в промпты. Admin-only."""
+    if not is_admin(update.effective_user.id):
+        return
+    cid, rest = _parse_chat_arg(update, context.args or [])
+    if cid is None or not rest or not re.fullmatch(r"\d+", rest[0]):
+        await update.message.reply_text("В группе: /unhide <id>. В личке: /unhide <chat_id> <id>.")
+        return
+    if db.unhide_group_message(cid, int(rest[0])):
+        await update.message.reply_text(f"Вернула id {rest[0]}.")
+    else:
+        await update.message.reply_text(f"Скрытой строки id {rest[0]} в этом чате нет.")
+
+
+async def cmd_safety_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запустить safety-скан чата вручную (мимо счётчика и паузы). Admin-only. Отчёт — админам в личку."""
+    if not is_admin(update.effective_user.id):
+        return
+    cid, _ = _parse_chat_arg(update, context.args or [])
+    if cid is None or cid >= 0:
+        await update.message.reply_text("Скан — для группы: в группе /safety_scan, в личке /safety_scan <chat_id>.")
+        return
+    if cid in _safety_scan_running:
+        await update.message.reply_text("Скан этого чата уже идёт.")
+        return
+    await update.message.reply_text(
+        f"Запустила скан. До {SAFETY_SCAN_MAX_CALLS} вызовов модели, итог пришлю админам в личку.")
+    _spawn_background_task(safety_scan(cid, _safety_last_uid.get(cid) or update.effective_user.id, manual=True))
 
 
 # Цитаты `evidence` из ЛИЧНЫХ чатов в .md-дайджест не включаем (он уходит обоим админам; решение Алексея
@@ -5951,8 +6244,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         base_messages = messages
         topup_hint = _free_search_hint(chat_id, bool(search_results))
 
-        def compose(sq: str, sr: str) -> list:
-            return mark_cache_tail(with_service_block(base_messages, service_block(
+        def compose(sq: str, sr: str, msgs: list | None = None) -> list:
+            return mark_cache_tail(with_service_block(base_messages if msgs is None else msgs, service_block(
                 reply_context="" if is_group else reply_context,
                 search_query=sq, search_results=sr, topup_hint=topup_hint,
             )))
@@ -5966,8 +6259,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"system={system_chars(system)} history_chars={hist_chars} msgs={len(messages)} imgs={hist_imgs}"
         )
         try:
-            response = await call_claude(
-                context, chat_id, label=f"диалог chat={chat_id}", usage_label="dialog",
+            # Safety-блок провайдера: один повтор без истории + счётчик для фонового скана (docs/claude/safety-unblock.md).
+            # Без истории: группа — только сама реплика-триггер (build_group_tail), личка — user_text.
+            _tail = build_group_tail(chat_id, reply_context) if is_group else [{"role": "user", "content": user_text}]
+            response = await _dialog_call(
+                context, chat_id, user_id, is_group,
+                retry_messages=lambda: compose(search_query, search_results, _tail),
                 model=_model, **dialog_params(_model), max_tokens=out_tokens(_model, 4096), system=system, messages=messages,
             )
         except anthropic.BadRequestError as e:
@@ -6226,6 +6523,9 @@ def main():
     app.add_handler(CommandHandler("captcha_unban", cmd_captcha_unban))
     app.add_handler(CommandHandler("chats", cmd_chats))
     app.add_handler(CommandHandler("review", cmd_review))
+    app.add_handler(CommandHandler("hidden", cmd_hidden))
+    app.add_handler(CommandHandler("unhide", cmd_unhide))
+    app.add_handler(CommandHandler("safety_scan", cmd_safety_scan))
     app.add_handler(CommandHandler("review_on", cmd_review_on))
     app.add_handler(CommandHandler("review_off", cmd_review_off))
     app.add_handler(CommandHandler("verify", cmd_verify))
@@ -6251,7 +6551,7 @@ def main():
         "review", "review_on", "review_off", "verify", "unverify", "ban", "unban", "topup",
         "activity", "ratelimit", "cost", "haiku", "sonnet", "opus", "fable", "models",
         "imagemodels", "update", "profile", "profile_ok", "profile_no", "profile_digest",
-        "dev", "ws",
+        "dev", "ws", "hidden", "unhide", "safety_scan",
     }
     _image_provider_cmds = [c for meta in IMAGE_PROVIDERS.values() for c in meta["cmds"]]
     assert len(_image_provider_cmds) == len(set(_image_provider_cmds)), \

@@ -32,7 +32,8 @@ clear_hint=...)`: полный traceback (`exc_info=True`) в `logger.error`, п
 - **400 `blocked by provider safety policy` → `BadRequestError`**, ловится `api_errors.is_safety_block()`
   (текст исключения и `exc.body`). Фильтр провайдера модели режет запрос целиком; триггер — в контексте (system/история),
   не в реплике. Пользователю — отдельный текст в `user_message` (не «переформулируй»); ретрай и фолбэк не нужны
-  (400 не переключает). Что чистить — `docs/claude/incidents.md`, 2026-10-30.
+  (400 не переключает). Что чистить — `docs/claude/incidents.md`, 2026-10-30. С v2.1.0 диалог сам повторяет запрос без истории
+  и после двух блоков подряд ищет и скрывает виновную строку — `docs/claude/safety-unblock.md`.
 - **402 «insufficient balance» → голый `APIStatusError`** (своего класса в SDK нет),
   ловится `api_errors.is_insufficient_balance()` по `status_code`. Это баланс ключа
   на пуле `api.apitoken.sale`, а не на Anthropic напрямую. НЕ ретраебельно: чинится

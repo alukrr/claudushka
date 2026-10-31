@@ -56,8 +56,9 @@
   ТЗ `docs/claude/tz-no-anthropic.md`; чек-лист стенда `feat/no-anthropic` — `docs/claude/staging-checklist-no-anthropic.md`
 - Фолбэк Gemini → GPT при сбоях пула (`FALLBACK_PAIRS`, `FALLBACK_*`, `should_fallback`, `_call_with_fallback`, `kwargs_for_model`,
   липкое окно, цены GPT в `LEGACY_PRICES`) — `docs/claude/model-fallback.md`
-- Safety-блок провайдера (`is_safety_block`): повтор без истории, фоновый поиск виновной строки и `group_messages.hidden`,
-  `/hidden /unhide /safety_scan` — ТЗ `docs/claude/tz-safety-unblock.md` (не начато, v2.1.0); ручной разбор — инциденты 2026-10-30/31
+- Safety-блок провайдера (`is_safety_block`, `_dialog_call`, `safety_scan`, `safety_find`, `group_messages.hidden`, `SAFETY_*`,
+  `/hidden /unhide /safety_scan`) — `docs/claude/safety-unblock.md`; ТЗ — `docs/claude/tz-safety-unblock.md`; чек-лист стенда
+  `feat/safety-unblock` — `docs/claude/staging-checklist-safety-unblock.md`; ручной разбор — инциденты 2026-10-30/31
 - Профиль участника (`user_profile`, `profile_proposals`, `_profile_text`, `profile_updates`, `send_profile_digest`,
   `/profile` `/profile_ok` `/profile_no` `/profile_digest`, экран «Профили» в dedup TUI) — `docs/claude/profile.md`
 - Память (`memory`-таблица, `extract_memory`, `extract_all_participants_memory`,
@@ -170,6 +171,10 @@
 - Режим разработчика (только личка + paid + флаг) — ТОЛЬКО через `dev_mode_active`; свои таблицы (`dev_messages`), обычный тред
   `conversations`, память, профиль, персону и рисование не читает и не пишет; файлы — состояние в workspace (`data/devspace/<user_id>/`),
   в историю только пометки; вызов — `call_claude` с `usage_label="dev"`, `timeout=DEV_REQUEST_TIMEOUT`. `docs/claude/dev-mode.md`.
+- Чтения `group_messages`, идущие в промпт модели, — ТОЛЬКО с `hidden = 0` (`get_group_transcript`, `get_group_messages_range`,
+  `get_group_history`); скрытые строки (`hidden=1`, safety-блок) физически остаются, ничего не удаляем. Основной вызов диалога —
+  через `_dialog_call` (повтор без истории при safety-блоке), пробы скана — настоящий запрос бота через `_model_call`.
+  `docs/claude/safety-unblock.md`.
 - Профиль участника: модель только ПРЕДЛАГАЕТ (`profile_proposals`), в `user_profile` пишет админ через
   `db.apply_profile_ops` (бот и dedup TUI — один путь); личка — `chat_id=0`, не NULL; любое новое место, удаляющее
   память человека, обязано чистить и профиль (`db.clear_memory` уже чистит). `docs/claude/profile.md`.

@@ -284,6 +284,8 @@ def init_db():
         "ALTER TABLE memory ADD COLUMN context TEXT NOT NULL DEFAULT 'private'",
         "ALTER TABLE memory ADD COLUMN chat_id INTEGER",
         "ALTER TABLE group_messages ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0",
+        # v2.1.0: hidden=1 — строка не уходит ни в один промпт (safety-блок провайдера, docs/claude/safety-unblock.md)
+        "ALTER TABLE group_messages ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE memory ADD COLUMN tier TEXT NOT NULL DEFAULT 'long'",
         "ALTER TABLE memory ADD COLUMN expires_at INTEGER",
         # v0.9.0: чаты, залипшие на четвёртом поколении, переезжают на пятое.
@@ -1001,7 +1003,7 @@ def get_group_history(chat_id: int, limit: int = 30, since_ts: int = 0) -> list[
     """since_ts — брать только сообщения не старше этой метки (ежедневный обзор: с полуночи)."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT sender_name, content FROM group_messages WHERE chat_id = ? AND timestamp >= ? "
+        "SELECT sender_name, content FROM group_messages WHERE chat_id = ? AND timestamp >= ? AND hidden = 0 "
         "ORDER BY timestamp DESC LIMIT ?",
         (chat_id, since_ts, limit)
     ).fetchall()
@@ -1016,7 +1018,7 @@ def get_group_messages_range(chat_id: int, since_ts: int, until_ts: int) -> list
     conn = get_conn()
     rows = conn.execute(
         "SELECT id, sender_name, content, is_bot, timestamp FROM group_messages "
-        "WHERE chat_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp, id",
+        "WHERE chat_id = ? AND timestamp >= ? AND timestamp <= ? AND hidden = 0 ORDER BY timestamp, id",
         (chat_id, since_ts, until_ts)
     ).fetchall()
     conn.close()
@@ -1027,21 +1029,82 @@ def get_group_messages_range(chat_id: int, since_ts: int, until_ts: int) -> list
     ]
 
 
-def get_group_transcript(chat_id: int, limit: int = 40) -> list[dict]:
-    """Групповая история для многоголосого messages-контекста.
-    Возвращает старые->новые: [{"id", "sender", "text", "is_bot", "ts"}]."""
+def get_group_transcript(chat_id: int, limit: int = 40, exclude_ids=None, min_id: int | None = None) -> list[dict]:
+    """Групповая история для многоголосого messages-контекста (скрытые строки hidden=1 не отдаются).
+    Возвращает старые->новые: [{"id", "sender", "text", "is_bot", "ts"}].
+    exclude_ids — дополнительно исключить эти id (пробы safety_scan: окно сдвигается на старые строки, как после
+    реального скрытия); min_id — не брать строки с id меньше (пробы без сдвига окна)."""
     conn = get_conn()
-    rows = conn.execute(
-        "SELECT id, sender_name, content, is_bot, timestamp FROM group_messages "
-        "WHERE chat_id = ? ORDER BY timestamp DESC, id DESC LIMIT ?",
-        (chat_id, limit)
-    ).fetchall()
+    sql = ("SELECT id, sender_name, content, is_bot, timestamp FROM group_messages "
+           "WHERE chat_id = ? AND hidden = 0")
+    args: list = [chat_id]
+    if min_id is not None:
+        sql += " AND id >= ?"
+        args.append(int(min_id))
+    ids = [int(x) for x in (exclude_ids or ())]
+    if ids:
+        sql += f" AND id NOT IN ({','.join('?' * len(ids))})"
+        args.extend(ids)
+    sql += " ORDER BY timestamp DESC, id DESC LIMIT ?"
+    args.append(limit)
+    rows = conn.execute(sql, args).fetchall()
     conn.close()
     return [
         {"id": r["id"], "sender": r["sender_name"], "text": r["content"], "is_bot": bool(r["is_bot"]),
          "ts": r["timestamp"]}
         for r in reversed(rows)
     ]
+
+
+def hide_group_messages(chat_id: int, ids) -> int:
+    """hidden=1 для строк ЧАТА (чужие id игнорируются). -> сколько строк скрыто. Физически строки остаются."""
+    ids = [int(x) for x in ids]
+    if not ids:
+        return 0
+    conn = get_conn()
+    cur = conn.execute(
+        f"UPDATE group_messages SET hidden = 1 WHERE chat_id = ? AND hidden = 0 AND id IN ({','.join('?' * len(ids))})",
+        [chat_id, *ids])
+    conn.commit()
+    n = cur.rowcount
+    conn.close()
+    return n
+
+
+def unhide_group_message(chat_id: int, msg_id: int) -> bool:
+    """Вернуть строку в промпты. False — такой скрытой строки в этом чате нет."""
+    conn = get_conn()
+    cur = conn.execute("UPDATE group_messages SET hidden = 0 WHERE chat_id = ? AND id = ? AND hidden = 1",
+                       (chat_id, int(msg_id)))
+    conn.commit()
+    ok = cur.rowcount > 0
+    conn.close()
+    return ok
+
+
+def list_hidden_group_messages(chat_id: int, limit: int = 20) -> list[dict]:
+    """Скрытые строки чата, новые первыми. БЕЗ текста (сам текст в уведомления и логи не выводим)."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, sender_name, is_bot, timestamp, length(content) AS n FROM group_messages "
+        "WHERE chat_id = ? AND hidden = 1 ORDER BY id DESC LIMIT ?", (chat_id, limit)).fetchall()
+    conn.close()
+    return [{"id": r["id"], "sender": r["sender_name"], "is_bot": bool(r["is_bot"]), "ts": r["timestamp"],
+             "length": r["n"]} for r in rows]
+
+
+def group_message_ids_with_same_content(chat_id: int, ids) -> list[int]:
+    """id нескрытых строк чата, чей content ТОЧНО совпадает с content любой из `ids` (включая сами ids)."""
+    ids = [int(x) for x in ids]
+    if not ids:
+        return []
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id FROM group_messages WHERE chat_id = ? AND hidden = 0 AND content IN "
+        f"(SELECT content FROM group_messages WHERE chat_id = ? AND id IN ({','.join('?' * len(ids))})) ORDER BY id",
+        [chat_id, chat_id, *ids]).fetchall()
+    conn.close()
+    return [r["id"] for r in rows]
 
 
 def count_chat_messages(chat_id: int) -> int:
