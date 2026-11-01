@@ -4449,15 +4449,31 @@ async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
  
  
-def _chown_repo_paths(paths: list[str], uid: int, gid: int) -> list[str]:
+def _repo_parent_dirs(paths: list[str]) -> list[str]:
+    """Каталоги-родители отслеживаемых файлов (относительно /repo, без самого корня), от верхних к нижним.
+    `git ls-files` отдаёт только файлы: каталог, созданный git pull от root (живой случай 2026-10-28 —
+    `docs/claude/bench`), без этого оставался root-owned, и следующий pull от пользователя падал на создании
+    файла внутри него."""
+    dirs = set()
+    for rel in paths:
+        parent = os.path.dirname(rel.rstrip("/"))
+        while parent:
+            dirs.add(parent)
+            parent = os.path.dirname(parent)
+    return sorted(dirs, key=lambda d: (d.count("/"), d))
+
+
+def _chown_repo_paths(paths: list[str], uid: int, gid: int, walk: tuple[str, ...] = (".git",)) -> list[str]:
     """Синхронная — звать только через asyncio.to_thread. В .git могут быть тысячи
     loose-объектов, блокирующий os.walk+os.chown в цикле не должен вешать event loop.
+    Рекурсивно обходит только пути из `walk` (по умолчанию `.git`); остальные — ровно один chown
+    (каталоги-родители рекурсивно не обходим: там лежат и неотслеживаемые вещи).
     Возвращает список путей, где chown не удался (не бросает исключение)."""
     failed = []
     for rel in paths:
         full = os.path.join("/repo", rel)
         targets = [full]
-        if os.path.isdir(full):
+        if rel in walk and os.path.isdir(full):
             for root, dirs, files in os.walk(full):
                 targets.extend(os.path.join(root, n) for n in dirs + files)
         for p in targets:
@@ -4495,7 +4511,9 @@ async def _fix_repo_ownership() -> str | None:
         return f"git ls-files упал: {out}"
     tracked = [ln for ln in out.splitlines() if ln.strip()]
 
-    failed = await asyncio.to_thread(_chown_repo_paths, [".git"] + tracked, st.st_uid, st.st_gid)
+    failed = await asyncio.to_thread(
+        _chown_repo_paths, [".git"] + _repo_parent_dirs(tracked) + tracked, st.st_uid, st.st_gid,
+    )
     if failed:
         return f"не удалось сменить владельца у {len(failed)} путей, например: {failed[0]}"
     return None
@@ -4518,7 +4536,10 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
  
     rc, pull_out = await _git("pull")
     if rc != 0:
-        await update.message.reply_text(f"git pull упал:\n{pull_out}")
+        # Прерванный pull тоже успевает создать root-owned файлы/каталоги — владельца возвращаем и здесь.
+        ownership_error = await _fix_repo_ownership()
+        note = f"\n\n⚠️ Не смогла поправить владельца файлов в /repo: {ownership_error}" if ownership_error else ""
+        await update.message.reply_text(f"git pull упал:\n{pull_out}{note}")
         return
  
     rc, new_head = await _git("rev-parse", "HEAD")
