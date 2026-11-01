@@ -137,6 +137,9 @@ MEMORY_EXTRACT_EVERY_CHAT = 15  # чат-уровневый каденс изв�
 MAX_CAPTCHA_ATTEMPTS = 3
 BAN_DURATION = 3600  # бан после провала капчи (не путать с /ban: banned-колонки в БД)
 CHAT_ACTIVITY_CHANCE = 0.03
+# Reply на реплику самого бота: цитата в reply_context (сама реплика может быть далеко за окном истории,
+# а модель без цитаты не знает, КАКУЮ из её реплик процитировали). Лимит по размеру — инвариант проекта.
+BOT_REPLY_QUOTE_CHARS = 500
 
 CAPTCHA_ENABLED = False
 
@@ -2324,6 +2327,15 @@ def _free_search_hint(chat_id: int, searched: bool) -> bool:
         return True
     _free_msg_counter[chat_id] = n
     return False
+
+
+def _bot_reply_quote(text: str) -> str:
+    """reply_context для реплая на текстовую реплику самого бота: пометка «твоё сообщение» + начало текста не
+    длиннее BOT_REPLY_QUOTE_CHARS (полный текст и так в истории, если не уехал за окно)."""
+    text = " ".join(text.split())
+    if len(text) > BOT_REPLY_QUOTE_CHARS:
+        text = text[:BOT_REPLY_QUOTE_CHARS].rstrip() + "…"
+    return f"(это твоё собственное сообщение) {text}"
 
 
 def service_block(*, reply_context: str = "", search_query: str = "", search_results: str = "",
@@ -6016,7 +6028,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_context = f"(в чат была отправлена картинка; подпись: {src.caption})"
         else:
             reply_text = src.text or src.caption or ""
-            if reply_text and src.from_user and src.from_user.id != context_bot_id:
+            if reply_text and src.from_user and src.from_user.id == context_bot_id:
+                # Реплай на ТЕКСТ бота (open-tasks, найдено на стенде 2026-10-10): реплика есть в истории, но модель
+                # не знала, какую из них процитировали, и отвечала про последнюю. Нейтрально, без «нарисовала».
+                reply_context = _bot_reply_quote(reply_text)
+            elif reply_text and src.from_user:
                 reply_context = reply_text
 
     if not user_text and not has_photo and not has_document:

@@ -34,7 +34,7 @@
 - Режимы характера (`PERSONAS`, `/classic /business /toxic /flirt /granny /personas`, `_persona_text`, `CORE_IDENTITY`/`_core_rules`,
   `get_chat_persona`, `free_persona`, `personas/*.md`, volume `./personas`) — `docs/claude/personas.md`; ТЗ — `docs/claude/tz-personas.md`
 - Файлы целиком (`[[FILE: имя]]`, `FILE_MARKER_RE`, `extract_files`, `_file_sent_note`, `FILE_*`) — `docs/claude/files.md`
-- Групповой чат (`build_group_messages`, `group_messages`, гейтинг доступа,
+- Групповой чат (`build_group_messages`, `group_messages`, `reply_context`/`_bot_reply_quote`, гейтинг доступа,
   `/ratelimit`, `is_chat_admin`) — `docs/claude/group-chat.md`
 - Голос/видео/кружочки/GIF (`_transcribe_audio_gemini`, `_extract_video_frames`,
   `_describe_media`, ветки `voice`/`video_note`/`video`/`animation`) —
