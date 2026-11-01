@@ -1,5 +1,7 @@
 # Открытые задачи (не «известные баги», а запланированное)
 
+> План на ноябрь 2026 и какие пункты отсюда взяты в работу — `docs/claude/roadmap-2026-11.md`.
+
 - **Гигиена памяти**: дедуп фактов (`UNIQUE(user_id, context, chat_id, fact)` +
   `INSERT OR IGNORE`; индекс не создастся, пока в таблице есть дубликаты) и разовая
   чистка просроченных (`DELETE FROM memory WHERE expires_at IS NOT NULL AND expires_at <= now`,
