@@ -2339,7 +2339,7 @@ def _bot_reply_quote(text: str) -> str:
 
 
 def service_block(*, reply_context: str = "", search_query: str = "", search_results: str = "",
-                  topup_hint: bool = False) -> str:
+                  topup_hint: bool = False, draw_intent: bool = False, draw_size: str | None = None) -> str:
     """Изменчивый контекст запроса (время, reply, результаты поиска) — в хвост, в последний
     user-turn, а не в system: иначе он ломает префикс кэша. В БД НЕ сохраняется (в
     conversations/group_messages идёт только текст пользователя). reply_context передавать
@@ -2355,6 +2355,13 @@ def service_block(*, reply_context: str = "", search_query: str = "", search_res
         )
     if topup_hint:
         lines.append(FREE_SEARCH_HINT)
+    if draw_intent:
+        marker = "[[DRAW 2K: …]]" if draw_size == "2K" else "[[DRAW: …]]"
+        lines.append(
+            "Пользователь явно просит нарисовать картинку. Придумай промпт сам — по смыслу просьбы, контексту чата "
+            "и цитате, если есть, — не переводи его просьбу дословно. Обязательно добавь маркер "
+            f"{marker} (промпт по-английски). Отказаться можно только по правилам безопасности."
+        )
     return "\n".join(lines)
 
 
@@ -3067,7 +3074,7 @@ async def greet_new_member(chat_id: int, user_id: int, user_name: str, bot):
 # --- Group chat ---
 
 BOT_TRIGGERS = {"клод", "клодушка", "claude"}
-DRAW_TRIGGERS = {"нарисуй", "нарисуй-ка", "draw", "zeichne", "рисуй", "изобрази", "покажи"}
+DRAW_TRIGGERS = {"нарисуй", "нарисуй-ка", "draw", "zeichne", "рисуй", "изобрази"}
 
 # Маркер, которым Клодушка сама инициирует генерацию картинки внутри текстового ответа.
 # Ловит и правильный [[DRAW: ...]], и то, как модель иногда сбивается на одинарную
@@ -3078,6 +3085,41 @@ DRAW_TRIGGERS = {"нарисуй", "нарисуй-ка", "draw", "zeichne", "р
 DRAW_MARKER_RE = re.compile(r"\[{1,2}DRAW(?:\s+(?P<size>2[KК]))?:\s*(?P<prompt>.+?)(?:\]{1,2}|$)", re.IGNORECASE | re.DOTALL)
 # «нарисуй 2к закат», /imagine 2k ... — первое слово после триггера (латинская k и кириллическая к).
 IMAGE_2K_WORDS = {"2k", "2к"}
+
+DRAW_QUOTES_OPEN = "\"«„“'‘"
+DRAW_QUOTES_CLOSE = "\"»“”'’"
+DRAW_INTENT_WORDS = 3   # триггер среди первых N слов («а нарисуй …», «Клодушка, ну нарисуй …») → intent
+
+
+def parse_draw_request(text: str) -> tuple[str | None, str, str | None]:
+    """Разбор «нарисуй …» → (mode, prompt, size). docs/claude/tz-draw-intent.md.
+
+    "literal" — триггер первым словом, затем (необязательно 2к/2k) сразу открывающая кавычка:
+    prompt — текст в кавычках (+ хвост после последней закрывающей), дословно в генератор.
+    "intent" — триггер без кавычек или среди первых DRAW_INTENT_WORDS слов: prompt — исходный текст,
+    он уйдёт в обычный диалог с пометкой «явно просят картинку». None — не про рисование."""
+    words = (text or "").split()
+    norm = [w.lower().rstrip(",:.!?") for w in words]
+    idx = next((i for i, w in enumerate(norm[:DRAW_INTENT_WORDS]) if w in DRAW_TRIGGERS), None)
+    if idx is None:
+        return None, text, None
+    size = "2K" if idx + 1 < len(norm) and norm[idx + 1] in IMAGE_2K_WORDS else None
+    if idx == 0:
+        parts = text.split(None, 1)
+        rest = parts[1] if len(parts) > 1 else ""
+        if size:
+            parts = rest.split(None, 1)
+            rest = parts[1] if len(parts) > 1 else ""
+        rest = rest.lstrip()
+        if rest and rest[0] in DRAW_QUOTES_OPEN:
+            body = rest[1:]
+            end = max((body.rfind(c) for c in DRAW_QUOTES_CLOSE), default=-1)
+            if end >= 0:
+                inner, tail = body[:end].strip(), body[end + 1:].strip()
+                return "literal", (f"{inner} {tail}" if tail else inner).strip(), size
+            return "literal", body.strip(), size
+    return "intent", text, size
+
 
 # Служебная пометка о уже отправленной картинке — единый источник текста для истории
 # (group_messages/conversations, оба пути входа «нарисуй»/маркер, оба контекста
@@ -4274,6 +4316,7 @@ USER_HELP = """\
   /cost          — баланс, режим и расход (в группе — для админов группы)
   /search <q>    — веб-поиск
   /imagine <q>   — генерация изображения (/imagine 2k <q> — в 2K, документом)
+                   или «нарисуй "…"» — дословно; без кавычек Клодушка сама придумает картинку
   /models        — модели, режим (платный/бесплатный) и что сейчас у чата
   /lite          — Gemini 3.1 Flash-Lite (единственная модель бесплатного режима; кэша промпта нет)
   /flash         — Gemini 3.8 Flash (платный режим, дефолт)
@@ -6212,25 +6255,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # Check for draw request
-    first_word = user_text.split()[0].lower().rstrip(",:.!?") if user_text else ""
-    if first_word in DRAW_TRIGGERS:
-        draw_prompt = user_text[len(user_text.split()[0]):].strip()
-        draw_size = None
-        words = draw_prompt.split(None, 1)
-        if words and words[0].lower().rstrip(",:.!?") in IMAGE_2K_WORDS:   # «нарисуй 2к закат»
-            draw_size = "2K"
-            draw_prompt = words[1].strip() if len(words) > 1 else ""
-
-        if not draw_prompt and update.message.reply_to_message:
-            source_msg = update.message.reply_to_message
-            if source_msg.text:
-                draw_prompt = source_msg.text
-            elif source_msg.caption:
-                draw_prompt = source_msg.caption
-
+    # Check for draw request: literal (в кавычках) — сразу в генератор; intent — через диалог (ниже).
+    draw_mode, draw_text, intent_size = parse_draw_request(user_text)
+    draw_intent = draw_mode == "intent"
+    if draw_intent and not update.message.reply_to_message and all(
+            w.lower().rstrip(",:.!?") in DRAW_TRIGGERS or w.lower().rstrip(",:.!?") in IMAGE_2K_WORDS
+            for w in user_text.split()):
+        await update.message.reply_text("Что нарисовать? Опиши картинку или ответь на сообщение.")
+        return
+    if draw_mode == "literal":
+        draw_prompt, draw_size = draw_text, intent_size
         if not draw_prompt:
-            await update.message.reply_text("Что нарисовать? Опиши картинку или ответь на сообщение с текстом.")
+            await update.message.reply_text("Что нарисовать? Опиши картинку или ответь на сообщение.")
             return
 
         author = update.effective_user.first_name or update.effective_user.username or "Unknown"
@@ -6254,6 +6290,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 db.save_message(user_id, "assistant", "(попытка нарисовать картинку не удалась)")
         return
+    if draw_intent:
+        # Лимит free проверяем ДО вызова модели (как /imagine): исчерпан — ответ уже отправлен, в историю ничего.
+        if await _image_limit_blocked(update, chat_id, is_group, user_id):
+            return
 
     # Main conversation
     try:
@@ -6285,6 +6325,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return mark_cache_tail(with_service_block(base_messages if msgs is None else msgs, service_block(
                 reply_context="" if is_group else reply_context,
                 search_query=sq, search_results=sr, topup_hint=topup_hint,
+                draw_intent=draw_intent, draw_size=intent_size,
             )))
 
         messages = compose(search_query, search_results)
@@ -6388,6 +6429,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         draw_match = DRAW_MARKER_RE.search(assistant_text)
         draw_en_prompt = draw_match.group("prompt").strip() if draw_match else None
         draw_size = "2K" if draw_match and draw_match.group("size") else None
+        if draw_match and draw_intent and not draw_size:
+            draw_size = intent_size   # просили «2к», а модель забыла 2K в маркере
         if draw_match:
             assistant_text = DRAW_MARKER_RE.sub("", assistant_text).strip()
         if draw_en_prompt and len(re.sub(r"[^\w]", "", draw_en_prompt, flags=re.UNICODE)) < 3:
@@ -6514,8 +6557,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Клодушка сама попросила картинку — теперь реально рисуем и отправляем.
         if draw_en_prompt:
+            _author = (update.effective_user.first_name or update.effective_user.username or "Unknown") if draw_intent else None
             await _draw_and_send(update, context, chat_id, is_group, draw_en_prompt,
-                                 en_prompt=draw_en_prompt, silent_limit=True, size=draw_size)
+                                 en_prompt=draw_en_prompt, author=_author,
+                                 silent_limit=not draw_intent, size=draw_size)
+        elif draw_intent:
+            logger.warning(f"draw_intent без маркера chat={chat_id} uid={user_id}")
 
     except Exception as e:
         await api_errors.reply_api_error(
