@@ -8,7 +8,7 @@
 |---|-------|-------|--------|--------|
 | 0 | `fix/reply-to-bot` | ту-ду: reply на реплику бота не доходит до модели | patch | сделано, v2.1.1 |
 | 0 | `fix/update-chown` | ту-ду: `/update` оставляет root-файлы в репо на сервере | patch | сделано, v2.1.1 |
-| 1 | `feat/draw-intent` | п.4 рисование: дословно только в кавычках / `/imagine` | minor | ТЗ |
+| 1 | `feat/draw-intent` | п.4 рисование: дословно только в кавычках / `/imagine` | minor | ТЗ готово: `docs/claude/tz-draw-intent.md` |
 | 2 | `feat/review-persona` | п.3 характер обзора отдельно от чата + мелочи обзора из ту-ду | minor | ТЗ |
 | 3 | `feat/group-behavior` | п.2 активность + п.5 автоигнор (один участок `handle_message`) | minor | ТЗ |
 | 4 | `fix/memory-uid` | ту-ду: атрибуция групповой памяти по uid, не по нику | patch, стенд | ТЗ |

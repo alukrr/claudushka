@@ -30,7 +30,7 @@
 
 - Рисование (`react`/`REACTIONS`, `_try_gemini_image`, `_try_gpt_image`, `_draw_and_send`, `DRAW_MARKER_RE`,
   `LEAKED_DRAW_RE`, `IMAGE_PROVIDERS`, `GEMINI_IMAGE_PRICING`, `/imagine [2k]` `/banana` `/bananapro` `/gptimage` `/flare`
-  `/sunburst` `/imagemodels`) — `docs/claude/images.md`
+  `/sunburst` `/imagemodels`) — `docs/claude/images.md`; ТЗ «дословно только в кавычках» — `docs/claude/tz-draw-intent.md`
 - Режимы характера (`PERSONAS`, `/classic /business /toxic /flirt /granny /personas`, `_persona_text`, `CORE_IDENTITY`/`_core_rules`,
   `get_chat_persona`, `free_persona`, `personas/*.md`, volume `./personas`) — `docs/claude/personas.md`; ТЗ — `docs/claude/tz-personas.md`
 - Файлы целиком (`[[FILE: имя]]`, `FILE_MARKER_RE`, `extract_files`, `_file_sent_note`, `FILE_*`) — `docs/claude/files.md`
