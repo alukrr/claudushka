@@ -1907,17 +1907,23 @@ def get_last_sender_name(chat_id: int, user_id: int) -> str | None:
     return row["sender_name"] if row else None
 
 
-def get_user_bot_exchange(chat_id: int, user_id: int, own_limit: int = 6, window: int = 80) -> list[dict]:
+def get_user_bot_exchange(chat_id: int, user_id: int, own_limit: int = 6, window: int = 80,
+                          since_ts: int = 0, skip_bot_prefixes: tuple = ()) -> list[dict]:
     """Для проверки на травлю: последние own_limit реплик человека и реплики бота между ними и «сейчас»,
-    по возрастанию. Чужие реплики не берём. hidden = 0. [{"is_bot", "text"}]"""
+    по возрастанию. Чужие реплики не берём. hidden = 0. since_ts — строго ПОСЛЕ этой метки (timestamp > since_ts:
+    уже наказанное не судим второй раз; служебная пометка паузы пишется в ту же секунду и тоже отсекается).
+    skip_bot_prefixes — служебные строки бота (пометки паузы/картинки/обзора) во вход не берём.
+    [{"is_bot", "text"}]"""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT id, user_id, content, is_bot FROM group_messages WHERE chat_id = ? AND hidden = 0 "
-        "ORDER BY id DESC LIMIT ?", (chat_id, window)).fetchall()
+        "SELECT id, user_id, content, is_bot FROM group_messages WHERE chat_id = ? AND hidden = 0 AND timestamp > ? "
+        "ORDER BY id DESC LIMIT ?", (chat_id, int(since_ts or 0), window)).fetchall()
     conn.close()
     out, own = [], 0
     for r in rows:   # от новых к старым
         if r["is_bot"]:
+            if skip_bot_prefixes and (r["content"] or "").startswith(tuple(skip_bot_prefixes)):
+                continue
             out.append({"is_bot": True, "text": r["content"]})
         elif r["user_id"] == user_id:
             out.append({"is_bot": False, "text": r["content"]})

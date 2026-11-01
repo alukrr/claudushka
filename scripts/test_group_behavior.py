@@ -122,9 +122,10 @@ def test_ladder_reset_after_24h():
 
 
 def test_strike_texts_fixed():
-    assert "повторяешься" in bot.strike_text("Вася", 1) and "5 мин" in bot.strike_text("Вася", 1)
-    assert bot.strike_text("Вася", 2) == "Вася, беру паузу с тобой на 5 мин."
-    assert bot.strike_text("Вася", 3) == "Вася, беру паузу с тобой на 15 мин."
+    assert bot.strike_text("Вася", 1) == "Вася, предупреждение за повторы одной и той же фразы (флуд). Продолжишь — помолчу с тобой 5 мин."
+    assert bot.strike_text("Вася", 1, "abuse") == "Вася, предупреждение за оскорбления в адрес бота. Продолжишь — помолчу с тобой 5 мин."
+    assert bot.strike_text("Вася", 2) == "Вася, беру паузу с тобой на 5 мин за повторы одной и той же фразы (флуд)."
+    assert bot.strike_text("Вася", 3, "abuse") == "Вася, беру паузу с тобой на 15 мин за оскорбления в адрес бота."
 
 
 def test_env_steps():
@@ -145,7 +146,7 @@ def test_apply_strike_flow_and_unignore(tmpdb, monkeypatch):
     monkeypatch.setattr(bot, "context_bot_id", 1)
     m = FakeMsg()
     run(bot._apply_strike(m, CHAT, UID, "Вася", "repeat"))
-    assert "повторяешься" in m.sent[-1] and not bot.user_is_ignored(CHAT, UID)
+    assert "предупреждение за повторы" in m.sent[-1] and not bot.user_is_ignored(CHAT, UID)
     run(bot._apply_strike(m, CHAT, UID, "Вася", "repeat"))
     assert "беру паузу" in m.sent[-1] and bot.user_is_ignored(CHAT, UID)
     # оба сообщения бота — в group_messages с is_bot (инвариант)
@@ -195,7 +196,7 @@ def test_abuse_true_applies_strike(tmpdb, monkeypatch):
     _seed_exchange()
     calls, m = _abuse_run(monkeypatch, '{"abuse": true, "reason": "травля"}')
     assert calls[0]["label"] == "abuse_check" and calls[0]["model"] == bot.DEFAULT_MODEL_ID
-    assert db.get_ignore(CHAT, UID)["level"] == 1 and "повторяешься" in m.sent[-1]
+    assert db.get_ignore(CHAT, UID)["level"] == 1 and "за оскорбления в адрес бота" in m.sent[-1]
 
 
 def test_abuse_false_nothing(tmpdb, monkeypatch):
@@ -397,7 +398,7 @@ def test_pause_history_note_format():
     w = bot.pause_history_note("Вася", 1)
     assert w == "(служебное: предупреждение бота для Вася о повторах)"
     p = bot.pause_history_note("Вася", 3)
-    assert p == "(служебное: автопауза бота для Вася на 15 мин)"
+    assert p == "(служебное: автопауза бота для Вася на 15 мин за повторы)"
     for n in (w, p):
         assert n.startswith("(") and n.endswith(")")
         assert "беру паузу" not in n and "помолчу" not in n
@@ -408,17 +409,17 @@ def test_apply_strike_history_is_note_not_text(tmpdb, monkeypatch):
     m = FakeMsg()
     run(bot._apply_strike(m, CHAT, UID, "Вася", "repeat"))
     run(bot._apply_strike(m, CHAT, UID, "Вася", "repeat"))
-    assert "повторяешься" in m.sent[0] and "беру паузу" in m.sent[1]   # в Telegram — живой текст
+    assert "предупреждение за повторы" in m.sent[0] and "беру паузу" in m.sent[1]   # в Telegram — живой текст
     texts = [e["text"] for e in db.get_group_transcript(CHAT, 10) if e["is_bot"]]
     assert texts == ["(служебное: предупреждение бота для Вася о повторах)",
-                     "(служебное: автопауза бота для Вася на 5 мин)"]
+                     "(служебное: автопауза бота для Вася на 5 мин за повторы)"]
     assert not any("беру паузу" in t for t in texts)
 
 
 def test_pause_note_reason():
     assert bot.pause_history_note("Вася", 1, "repeat").endswith("о повторах)")
     assert bot.pause_history_note("Вася", 1, "abuse") == "(служебное: предупреждение бота для Вася о грубости в адрес бота)"
-    assert bot.pause_history_note("Вася", 2, "abuse") == "(служебное: автопауза бота для Вася на 5 мин)"
+    assert bot.pause_history_note("Вася", 2, "abuse") == "(служебное: автопауза бота для Вася на 5 мин за грубость в адрес бота)"
 
 
 def test_abuse_strike_history_note_reason(tmpdb, monkeypatch):
@@ -427,3 +428,74 @@ def test_abuse_strike_history_note_reason(tmpdb, monkeypatch):
     _abuse_run(monkeypatch, '{"abuse": true}')
     texts = [e["text"] for e in db.get_group_transcript(CHAT, 10) if e["is_bot"]]
     assert "(служебное: предупреждение бота для Вася о грубости в адрес бота)" in texts
+
+
+# ---------- вход Lite: since_ts, служебные строки, промпт, reason ----------
+def _save_at(user_id, name, text, ts, is_bot=False):
+    c = db.get_conn()
+    c.execute("INSERT INTO group_messages (chat_id, user_id, sender_name, content, is_bot, timestamp) VALUES (?,?,?,?,?,?)",
+              (CHAT, user_id, name, text, 1 if is_bot else 0, ts))
+    c.commit()
+    c.close()
+
+
+def test_exchange_since_ts_strictly_after(tmpdb):
+    _save_at(UID, "Вася", "до наказания", 100)
+    _save_at(UID, "Вася", "в ту же секунду", 200)
+    _save_at(1, "Клодушка", "(служебное: автопауза бота для Вася на 5 мин за повторы)", 200, is_bot=True)
+    _save_at(UID, "Вася", "после", 201)
+    rows = db.get_user_bot_exchange(CHAT, UID, since_ts=200)
+    assert [r["text"] for r in rows] == ["после"]
+    assert len(db.get_user_bot_exchange(CHAT, UID, since_ts=0)) == 4
+
+
+def test_exchange_skips_service_bot_lines(tmpdb):
+    _save_at(UID, "Вася", "привет", 10)
+    _save_at(1, "Клодушка", "(служебное: автопауза бота для Вася на 5 мин за повторы)", 11, is_bot=True)
+    _save_at(1, "Клодушка", f"({bot.DRAW_SENT_LABEL}: cat)", 12, is_bot=True)
+    _save_at(1, "Клодушка", f"({bot.REVIEW_SENT_LABEL} 7 сообщениям)\nТемы", 13, is_bot=True)
+    _save_at(1, "Клодушка", "обычный ответ", 14, is_bot=True)
+    rows = db.get_user_bot_exchange(CHAT, UID, skip_bot_prefixes=bot._abuse_skip_prefixes())
+    assert [r["text"] for r in rows] == ["привет", "обычный ответ"]
+
+
+def test_abuse_skip_prefixes_from_constants():
+    pf = bot._abuse_skip_prefixes()
+    assert f"({bot.PAUSE_NOTE_LABEL}:" in pf and f"({bot.DRAW_SENT_LABEL}" in pf and f"({bot.REVIEW_SENT_LABEL}" in pf
+
+
+def test_abuse_task_input_has_no_notes_and_no_old_lines(tmpdb, monkeypatch):
+    now = int(time.time())
+    _save_at(UID, "Вася", "старое до наказания", now - 100)
+    db.set_ignore(CHAT, UID, 2, now + 60, now - 50)
+    _save_at(1, "Клодушка", "(служебное: автопауза бота для Вася на 5 мин за повторы)", now - 50, is_bot=True)
+    _save_at(UID, "Вася", "где ключи от танка?", now - 10)
+    calls, _ = _abuse_run(monkeypatch, '{"abuse": false, "reason": "обычный вопрос"}')
+    payload = calls[0]["messages"][0]["content"]
+    assert "где ключи от танка?" in payload
+    assert "старое до наказания" not in payload and "служебное" not in payload
+
+
+def test_abuse_prompt_phrases():
+    assert "Повторы одной и той же фразы без оскорблений — не травля, их ловит другой механизм" in bot._ABUSE_SYSTEM
+    assert "Один обычный вопрос или просьба (даже странная или шуточная) — никогда не травля" in bot._ABUSE_SYSTEM
+
+
+def test_json_verdict_reason():
+    assert bot._json_verdict('{"abuse": true, "reason": "оскорбления"}', "abuse", "t") == (True, "оскорбления")
+    assert bot._json_verdict('{"abuse": false}', "abuse", "t") == (False, "")
+    assert bot._json_verdict("мусор", "abuse", "t") == (False, "")
+    assert len(bot._json_verdict('{"abuse": true, "reason": "' + "я" * 500 + '"}', "abuse", "t")[1]) == 200
+
+
+def test_abuse_reason_logged(tmpdb, monkeypatch, caplog):
+    import logging
+    _seed_exchange()
+    with caplog.at_level(logging.INFO):
+        _abuse_run(monkeypatch, '{"abuse": true, "reason": "прямые оскорбления бота"}')
+    assert any("reason=abuse" in r.message and "прямые оскорбления бота" in r.message for r in caplog.records)
+    caplog.clear()
+    db.delete_ignore(CHAT, UID)
+    with caplog.at_level(logging.INFO):
+        _abuse_run(monkeypatch, '{"abuse": false, "reason": "обычный вопрос"}')
+    assert any("abuse=false" in r.message and "обычный вопрос" in r.message for r in caplog.records)

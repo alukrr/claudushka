@@ -3393,21 +3393,30 @@ def compute_strike(prev: dict | None, now: int) -> tuple[int, int | None]:
     return level, now + ignore_step_min(level) * 60
 
 
-def strike_text(name: str, level: int) -> str:
-    """Фиксированные строки (не генерация модели): предупреждение на 1-м проступке, объявление паузы дальше."""
+STRIKE_WHY = {   # за что — в тексте для людей (фиксированные строки, не генерация модели)
+    "repeat": "за повторы одной и той же фразы (флуд)",
+    "abuse": "за оскорбления в адрес бота",
+}
+
+
+def strike_text(name: str, level: int, reason: str = "repeat") -> str:
+    """Фиксированные строки (не генерация модели): предупреждение на 1-м проступке, объявление паузы дальше.
+    Всегда говорят, ЗА ЧТО (повторы/флуд или оскорбления бота)."""
+    why = STRIKE_WHY.get(reason, STRIKE_WHY["repeat"])
     if level <= 1:
-        return (f"{name}, похоже, ты повторяешься / перегибаешь. "
+        return (f"{name}, предупреждение {why}. "
                 f"Продолжишь — помолчу с тобой {ignore_step_min(2)} мин.")
-    return f"{name}, беру паузу с тобой на {ignore_step_min(level)} мин."
+    return f"{name}, беру паузу с тобой на {ignore_step_min(level)} мин {why}."
 
 
-async def _apply_strike(message, chat_id: int, user_id: int, name: str, reason: str) -> None:
+async def _apply_strike(message, chat_id: int, user_id: int, name: str, reason: str, detail: str = "") -> None:
     """Записать проступок, отправить предупреждение/объявление паузы, сохранить его в group_messages (is_bot)."""
     now = int(time.time())
     level, until = compute_strike(db.get_ignore(chat_id, user_id), now)
     db.set_ignore(chat_id, user_id, level, until, now)
-    text = strike_text(name, level)
-    logger.info(f"autoignore chat={chat_id} uid={user_id} level={level} until={until} reason={reason}")
+    text = strike_text(name, level, reason)
+    logger.info(f"autoignore chat={chat_id} uid={user_id} level={level} until={until} reason={reason}"
+                + (f" why={detail[:200]!r}" if detail else ""))
     try:
         await message.reply_text(text)
     except Exception as e:
@@ -3422,10 +3431,11 @@ PAUSE_NOTE_LABEL = "служебное"
 
 
 def pause_history_note(name: str, level: int, reason: str = "repeat") -> str:
+    what = "о грубости в адрес бота" if reason == "abuse" else "о повторах"
     if level <= 1:
-        what = "о грубости в адрес бота" if reason == "abuse" else "о повторах"
         return f"({PAUSE_NOTE_LABEL}: предупреждение бота для {name} {what})"
-    return f"({PAUSE_NOTE_LABEL}: автопауза бота для {name} на {ignore_step_min(level)} мин)"
+    why = "за грубость в адрес бота" if reason == "abuse" else "за повторы"
+    return f"({PAUSE_NOTE_LABEL}: автопауза бота для {name} на {ignore_step_min(level)} мин {why})"
 
 
 def user_is_ignored(chat_id: int, user_id: int) -> bool:
@@ -3437,6 +3447,8 @@ _ABUSE_SYSTEM = (
     "Реши, занимается ли человек явной травлей БОТА: целенаправленные оскорбления в адрес бота, издевательский флуд, "
     "систематические попытки сломать или довести бота. НЕ травля: мат сам по себе, грубоватые шутки между друзьями, "
     "спор и несогласие с ботом, критика ответа, провокационные темы, резкий тон (у бота бывает язвительный режим). "
+    "Повторы одной и той же фразы без оскорблений — не травля, их ловит другой механизм. Один обычный вопрос или "
+    "просьба (даже странная или шуточная) — никогда не травля. "
     "Сомневаешься — false. Ответь ТОЛЬКО JSON: {\"abuse\": true|false, \"reason\": \"кратко\"}"
 )
 _ACTIVITY_SYSTEM = (
@@ -3454,6 +3466,23 @@ def _json_flag(text: str, key: str, label: str) -> bool:
     return isinstance(data, dict) and data.get(key) is True
 
 
+def _json_verdict(text: str, key: str, label: str) -> tuple[bool, str]:
+    """(флаг, reason) из JSON-ответа Lite; мусор/пусто/не-bool → (False, ""). reason — строка до 200 знаков."""
+    if not text:
+        return False, ""
+    data = api_errors.parse_json_lenient(text, "{", label=label)
+    if not isinstance(data, dict):
+        return False, ""
+    reason = data.get("reason")
+    return data.get(key) is True, (reason[:200] if isinstance(reason, str) else "")
+
+
+def _abuse_skip_prefixes() -> tuple:
+    """Служебные строки бота, которых нет во входе Lite: пометка паузы подсказывала бы модели «человек плохой»,
+    остальные — не реплики. Префиксы из констант, не хардкод."""
+    return (f"({PAUSE_NOTE_LABEL}:", f"({DRAW_SENT_LABEL}", f"({REVIEW_SENT_LABEL}")
+
+
 def build_abuse_input(rows: list[dict]) -> str:
     """[{"is_bot","text"}] → текст для Lite: каждая реплика ≤ ABUSE_ITEM_CHARS, всего ≤ ABUSE_TOTAL_CHARS (старые отбрасываем)."""
     lines = [f"{'Бот' if r['is_bot'] else 'Человек'}: {_clip(r['text'], ABUSE_ITEM_CHARS).replace(chr(10), ' ')}" for r in rows]
@@ -3466,7 +3495,9 @@ async def _abuse_check_task(message, chat_id: int, user_id: int, name: str) -> N
     """Фоновая проверка на травлю (Lite, label=abuse_check). Ответ на сообщение уже ушёл; проступок применяется после."""
     usage_ctx.set((chat_id, "group", user_id))
     try:
-        rows = db.get_user_bot_exchange(chat_id, user_id)
+        prev = db.get_ignore(chat_id, user_id)
+        rows = db.get_user_bot_exchange(chat_id, user_id, since_ts=int((prev or {}).get("last_strike_ts") or 0),
+                                        skip_bot_prefixes=_abuse_skip_prefixes())
         payload = build_abuse_input(rows)
         if not payload:
             return
@@ -3475,14 +3506,16 @@ async def _abuse_check_task(message, chat_id: int, user_id: int, name: str) -> N
             max_tokens=out_tokens(DEFAULT_MODEL_ID, 80), system=_ABUSE_SYSTEM,
             messages=[{"role": "user", "content": payload}],
         )
-        abuse = _json_flag(response_text(response), "abuse", f"abuse_check chat={chat_id}")
+        abuse, why = _json_verdict(response_text(response), "abuse", f"abuse_check chat={chat_id}")
+        if not abuse and why:
+            logger.info(f"abuse_check chat={chat_id} uid={user_id} abuse=false why={why!r}")
     except Exception as e:
         # В т.ч. safety-блок провайдера (api_errors.is_safety_block): сомнение = не проступок.
         kind = "safety-блок" if api_errors.is_safety_block(e) else "ошибка"
         logger.warning(f"abuse_check: {kind} chat={chat_id} uid={user_id}: {e}")
         return
     if abuse and not user_is_ignored(chat_id, user_id):
-        await _apply_strike(message, chat_id, user_id, name, "abuse")
+        await _apply_strike(message, chat_id, user_id, name, "abuse", detail=why)
 
 
 def activity_should_check(chat_id: int, user_id: int, text: str, now: float | None = None,
