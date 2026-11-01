@@ -37,7 +37,7 @@
   `docs/claude/models-and-costs.md` → «Учёт токенов»), для картинок — ключ провайдера (`gpt`/`banana`), для
   поиска — `tavily` (бесплатный режим) или `anthropic` (нативный `web_search` в платном, `label=native_search`, `docs/claude/native-search.md`). `label`: `dialog` (ответ на реплику: диалог/фото/файл), `should_search`,
   `search`, `image`, `draw_translate`, `extract_memory`, `extract_chat_memory`,
-  `media_describe`, `daily_review`, `greet`, `greet_filter`, `captcha_*`, `/review`, `/search`,
+  `media_describe`, `abuse_check` (Lite: проверка на травлю при каждом обращении к боту в группе, платит чат), `activity_check` (Lite: «вставлять ли реплику», только при выпавшем шансе), `activity` (спонтанная реплика модели чата), `daily_review`, `greet`, `greet_filter`, `captcha_*`, `/review`, `/search`,
   `проверка` (пробный запрос `_probe_model`) и т.д. `thinking` — токены thinking, входят в
   `output` (с 2026-09-23, старые строки 0). Индексы `(chat_id, ts)`, `(ts)` и покрывающие `usage_log(chat_id, billed, cost_usd)`, `chat_credits(chat_id, amount)` — баланс считается полным SUM по чату (не хранится), индекс не даёт читать таблицу.
 - `chat_credits` — `bonus` / `topup` / `adjust` / `writeoff`.

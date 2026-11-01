@@ -34,7 +34,7 @@
 - Режимы характера (`PERSONAS`, `/classic /business /toxic /flirt /granny /personas`, `_persona_text`, `CORE_IDENTITY`/`_core_rules`,
   `get_chat_persona`, `get_review_persona`, `chat_review_persona`, `/review_persona`, `free_persona`, `personas/*.md`, volume `./personas`) — `docs/claude/personas.md`; ТЗ — `docs/claude/tz-personas.md`; ТЗ «характер обзора отдельно» — `docs/claude/tz-review-persona.md`
 - Файлы целиком (`[[FILE: имя]]`, `FILE_MARKER_RE`, `extract_files`, `_file_sent_note`, `FILE_*`) — `docs/claude/files.md`
-- Групповой чат (`build_group_messages`, `group_messages`, `reply_context`/`_bot_reply_quote`, гейтинг доступа,
+- Групповой чат (`build_group_messages`, `group_messages`, `reply_context`/`_bot_reply_quote`, `detect_repeat`, `compute_strike`, `_apply_strike`, `chat_ignores`, `/autoignore /unignore /activity`, `activity_should_check`, гейтинг доступа,
   `/ratelimit`, `is_chat_admin`) — `docs/claude/group-chat.md`; ТЗ активности и автоигнора — `docs/claude/tz-group-behavior.md`
 - Голос/видео/кружочки/GIF (`_transcribe_audio_gemini`, `_extract_video_frames`,
   `_describe_media`, ветки `voice`/`video_note`/`video`/`animation`) —
@@ -129,6 +129,7 @@
   `asyncio.create_task` (иначе задачу может собрать GC до завершения). `docs/claude/api-errors.md`.
 - Разбор ответа Claude — только `api_errors.response_text()`, никогда `content[0].text`.
 - JSON из ответа модели — только `api_errors.parse_json_lenient()`, никогда `find`/`rfind`.
+- Автоигнор и активность — только кодом и только в группах; модель паузу не объявляет и не включает (`docs/claude/group-chat.md`, ТЗ `docs/claude/tz-group-behavior.md`, чек-лист `docs/claude/staging-checklist-group-behavior.md`).
 - Ответы бота в группе сохраняются в `group_messages` с `is_bot=True` во всех ветках
   (текст/фото/документ/рисование/обзор) — иначе Клодушка не видит собственные реплики.
 - Любой источник данных, попадающий в system-prompt или `messages`, обязан иметь лимит

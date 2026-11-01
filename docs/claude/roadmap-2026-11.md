@@ -9,8 +9,8 @@
 | 0 | `fix/reply-to-bot` | ту-ду: reply на реплику бота не доходит до модели | patch | сделано, v2.1.1 |
 | 0 | `fix/update-chown` | ту-ду: `/update` оставляет root-файлы в репо на сервере | patch | сделано, v2.1.1 |
 | 1 | `feat/draw-intent` | п.4 рисование: дословно только в кавычках / `/imagine` | minor | сделано, v2.2.0 (стенд: шаги 7–10 чек-листа не пройдены) |
-| 2 | `feat/review-persona` | п.3 характер обзора отдельно от чата + мелочи обзора из ту-ду | minor | код+тесты+доки готовы в ветке `feat/review-persona`, ждёт стенда (`docs/claude/staging-checklist-review-persona.md`), предложена v2.3.0 |
-| 3 | `feat/group-behavior` | п.2 активность + п.5 автоигнор (один участок `handle_message`) | minor | ТЗ готово: `docs/claude/tz-group-behavior.md` |
+| 2 | `feat/review-persona` | п.3 характер обзора отдельно от чата + мелочи обзора из ту-ду | minor | смержена в `main` (7864f9b); юнит-тесты на стенде зелёные (157), таблица создана; чек-лист в Telegram проходит Алексей, шаги 12–13 (БД) — после его сигнала; тег v2.3.0 — после обоих стендов |
+| 3 | `feat/group-behavior` | п.2 активность + п.5 автоигнор (один участок `handle_message`) | minor | код+тесты+доки готовы в ветке `feat/group-behavior`, ждёт стенда (`docs/claude/staging-checklist-group-behavior.md`), предложена v2.4.0 |
 | 4 | `fix/memory-uid` | ту-ду: атрибуция групповой памяти по uid, не по нику | patch, стенд | ТЗ |
 | 5 | `feat/miniapp` | п.1 мини-приложение настроек — последним, поверх реестра настроек | minor | ТЗ |
 
