@@ -7550,15 +7550,15 @@ def _ma_title(chat_id: int, row: dict | None) -> str:
 
 
 async def _ma_access(user_id: int, chat_id: int, fresh: bool = False) -> bool:
-    """Доступ к чату. Возвращает in_target_chat для can_change: True — чат из списка экрана 1 (своя личка, группа, где человек
-    писал и состоит), False — только админ бота вне своего списка. Иначе MiniappError(403)."""
+    """Доступ к чату. Возвращает in_target_chat для can_change: True — своя личка или группа, которую бот знает (allowed_chats,
+    не забанена) и где человек СОСТОИТ (getChatMember; «писал в чате» не нужно — команды в group_messages не пишутся),
+    False — только админ бота вне своего списка. Иначе MiniappError(403)."""
     if chat_id == user_id:
         return True
     row = db.get_chat_row(chat_id) if chat_id < 0 else None
     if is_admin(user_id):
         return row is not None
-    if chat_id > 0 or not row or row.get("banned") or not db.user_wrote_in_chat(user_id, chat_id) \
-            or not await _ma_is_member(chat_id, user_id, fresh):
+    if chat_id > 0 or not row or row.get("banned") or not await _ma_is_member(chat_id, user_id, fresh):
         raise MiniappError(403, "Нет доступа к этому чату.")
     return True
 

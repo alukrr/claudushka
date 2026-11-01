@@ -38,8 +38,8 @@ the Mini App» (https://core.telegram.org/bots/webapps#validating-data-received-
 для третьей стороны. Берём из `initData` только `user.id`. `initData` и токен не логируются. Нет/неверная подпись → 401.
 
 ## Эндпоинты (JSON, под `/api/`; `GET /` — `index.html` без данных)
-- `GET /api/chats` → `{chats: [{id, title, tier, is_group, is_admin, banned?}]}`: своя личка + группы, где человек писал (`group_messages`), бот их знает
-  (`allowed_chats`, не забанены) и **человек сейчас состоит** в них (`getChatMember`, не `left`/`kicked`). Админ бота — все группы из `allowed_chats` + своя личка.
+- `GET /api/chats` → `{chats: [{id, title, tier, is_group, is_admin, banned?}]}`: своя личка + группы, которые бот знает (`allowed_chats`, не забанены) и где человек
+  **писал** (`group_messages`) **или он управляющий** (`chat_managers`), и **сейчас состоит** в них (`getChatMember`, не `left`/`kicked`). Админ бота — все группы из `allowed_chats` + своя личка.
 - `GET /api/chats/{chat_id}/settings` → `{chat, settings: [{key, label, kind, choices, int_range, value, stored, note, can_change, reason}]}`; у `choice`
   каждый вариант — `{value, label, allowed, reason}` (в группе `restricted` не-админу недоступны); настройка, которую даже смотреть нельзя (автоигнор не-админу) —
   `value: null`, `can_change: false`, `reason`. В личке нет групповых ключей (`scope`).
@@ -48,7 +48,8 @@ the Mini App» (https://core.telegram.org/bots/webapps#validating-data-received-
 - Заголовки на всех ответах: `Content-Security-Policy` (скрипты — свои inline + `https://telegram.org`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`.
 
 ## Права
-- Чтение — человек должен быть в списке экрана 1 (админ бота — любой чат). Запись: `can_change(key, …, in_target_chat=…)` → `apply_setting`. **`in_target_chat=True`
+- Доступ к группе (чтение и запись) = строка в `allowed_chats` и не `banned` + человек **состоит** в группе (`getChatMember`, при записи — без кэша). «Писал в чате» НЕ требуется:
+  команды в `group_messages` не пишутся, и управляющий/админ, ни разу не писавший в группе, иначе получил бы 403 даже по диплинку из `/settings` в самой группе. Админ бота — любой чат. Запись: `can_change(key, …, in_target_chat=…)` → `apply_setting`. **`in_target_chat=True`
   для чатов из списка экрана 1** (своя личка, группа, где человек участник): иначе `can_change` отказал бы как постороннему; `False` — только админ бота вне своего списка.
 - `is_chat_admin` (в нём же управляющие чата) читается с кэшем 5 минут; **запись проверяет права и членство заново, без кэша**.
 - `usage_ctx` на запись = `(chat_id, "group"|"private", user_id)`: проба модели при смене модели уходит на счёт этого чата, `context=None` (без «печатает…» в чате).
@@ -66,6 +67,8 @@ the Mini App» (https://core.telegram.org/bots/webapps#validating-data-received-
 Менять `index.html` и `miniapp/server.py` для этого не нужно.
 
 ## Известные тонкости
+- **Ограничение v1 (список экрана 1):** админ Telegram-группы, который ни разу в ней не писал и не управляющий, в списке «Чаты» может не появиться — группа попадает в список по
+  «писал или управляющий». Такой человек открывает её через `/settings` в самой группе (диплинк `?chat=`): доступ определяется членством, не списком.
 - Подпись проверена по документации и тестами с самодельной подписью; на настоящих данных клиентов Telegram — на стенде (чек-лист).
 - Права на чтение кэшируются 5 минут: после `/manager rm` или выхода из группы список/настройки могут показываться до пяти минут, запись при этом уже отказывает.
 - Лимит частоты и кэш — в памяти процесса, после рестарта сбрасываются.

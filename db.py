@@ -1265,22 +1265,16 @@ def list_group_chats() -> list[dict]:
 
 
 def list_user_group_chats(user_id: int) -> list[dict]:
-    """Группы, где человек писал (group_messages.user_id) и которые бот знает и не забанил: экран 1 мини-приложения."""
+    """Группы, которые бот знает и не забанил и где человек писал (group_messages.user_id) ИЛИ он управляющий (chat_managers):
+    кандидаты для экрана 1 мини-приложения (дальше — фильтр по членству у Telegram)."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT a.chat_id, a.name, a.banned FROM allowed_chats a WHERE a.chat_id < 0 AND a.banned = 0 AND EXISTS "
-        "(SELECT 1 FROM group_messages g WHERE g.chat_id = a.chat_id AND g.user_id = ? AND g.is_bot = 0) ORDER BY a.name",
-        (user_id,)).fetchall()
+        "SELECT a.chat_id, a.name, a.banned FROM allowed_chats a WHERE a.chat_id < 0 AND a.banned = 0 AND ("
+        "EXISTS (SELECT 1 FROM group_messages g WHERE g.chat_id = a.chat_id AND g.user_id = ? AND g.is_bot = 0) "
+        "OR EXISTS (SELECT 1 FROM chat_managers m WHERE m.chat_id = a.chat_id AND m.user_id = ?)) ORDER BY a.name",
+        (user_id, user_id)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
-
-
-def user_wrote_in_chat(user_id: int, chat_id: int) -> bool:
-    conn = get_conn()
-    row = conn.execute("SELECT 1 FROM group_messages WHERE chat_id = ? AND user_id = ? AND is_bot = 0 LIMIT 1",
-                       (chat_id, user_id)).fetchone()
-    conn.close()
-    return row is not None
 
 
 def ensure_group(chat_id: int, name: str = None, added_by: int = None) -> bool:

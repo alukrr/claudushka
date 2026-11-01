@@ -29,7 +29,7 @@ from miniapp import server as ma_server  # noqa: E402
 Path.mkdir = _orig_mkdir
 
 TOKEN = "123456:TEST-FAKE-TOKEN"
-BOT_ADMIN, TG_ADMIN, MEMBER, MANAGER, OUTSIDER = 1, 2, 3, 4, 5
+BOT_ADMIN, TG_ADMIN, MEMBER, MANAGER, OUTSIDER, NOVICE = 1, 2, 3, 4, 5, 6
 G1, G2, G_OTHER, G_BANNED = -1001000000001, -1001000000002, -1001000000003, -1001000000004
 
 
@@ -148,6 +148,39 @@ def test_chats_member_sees_own_private_and_own_groups_only(env):
     assert ids[0] == MEMBER and set(ids[1:]) == {G1, G2}          # без чужой и забаненной группы
     byid = {c["id"]: c for c in r.json()["chats"]}
     assert byid[G1]["is_admin"] is False and byid[G1]["tier"] == "paid" and byid[G1]["is_group"] is True
+
+
+def test_group_access_does_not_require_writing(env):
+    """Участник, ни разу не писавший в группе, открывает её (в т.ч. по ?chat=): граница — членство у Telegram."""
+    env.statuses[(G2, MANAGER)] = "member"                      # MANAGER в G2 не писал и не управляющий
+    r = env.client.get(f"/api/chats/{G2}/settings", headers=auth(MANAGER))
+    assert r.status_code == 200 and r.json()["chat"]["id"] == G2
+    assert post(env, MANAGER, G2, "search_mode", "gpt").status_code == 200       # и пишет, как участник
+    ids = [c["id"] for c in env.client.get("/api/chats", headers=auth(MANAGER)).json()["chats"]]
+    assert G2 not in ids                                         # но в списке экрана 1 её нет (не писал и не управляющий)
+
+
+def test_manager_without_messages_sees_group_in_list_and_opens_it(env):
+    env.statuses[(G2, NOVICE)] = "member"
+    db.add_chat_manager(G2, NOVICE, TG_ADMIN)                    # NOVICE в G2 ни разу не писал
+    bot._ma_cache.clear()
+    chats = env.client.get("/api/chats", headers=auth(NOVICE)).json()["chats"]
+    byid = {c["id"]: c for c in chats}
+    assert G2 in byid and byid[G2]["is_admin"] is True           # управляющий — «админ» чата
+    assert env.client.get(f"/api/chats/{G2}/settings", headers=auth(NOVICE)).status_code == 200
+    assert post(env, NOVICE, G2, "activity", 15).status_code == 200 and db.get_activity_percent(G2) == 15
+
+
+def test_non_member_and_left_member_403(env):
+    assert env.client.get(f"/api/chats/{G1}/settings", headers=auth(OUTSIDER)).status_code == 403   # не участник
+    db.add_chat_manager(G1, OUTSIDER, TG_ADMIN)                  # строка управляющего есть, но он не в группе
+    bot._ma_cache.clear()
+    assert env.client.get(f"/api/chats/{G1}/settings", headers=auth(OUTSIDER)).status_code == 403
+    assert G1 not in [c["id"] for c in env.client.get("/api/chats", headers=auth(OUTSIDER)).json()["chats"]]
+    env.statuses[(G1, MEMBER)] = "left"                           # бывший участник
+    bot._ma_cache.clear()
+    assert env.client.get(f"/api/chats/{G1}/settings", headers=auth(MEMBER)).status_code == 403
+    assert post(env, MEMBER, G1, "search_mode", "gpt").status_code == 403
 
 
 def test_chats_admin_marks_and_left_member_hidden(env):
