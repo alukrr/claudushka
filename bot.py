@@ -3086,34 +3086,42 @@ DRAW_MARKER_RE = re.compile(r"\[{1,2}DRAW(?:\s+(?P<size>2[KК]))?:\s*(?P<prompt>
 # «нарисуй 2к закат», /imagine 2k ... — первое слово после триггера (латинская k и кириллическая к).
 IMAGE_2K_WORDS = {"2k", "2к"}
 
-DRAW_QUOTES_OPEN = "\"«„“'‘"
-DRAW_QUOTES_CLOSE = "\"»“”'’"
-DRAW_INTENT_WORDS = 3   # триггер среди первых N слов («а нарисуй …», «Клодушка, ну нарисуй …») → intent
+# Закрывающие кавычки для каждой открывающей: закрывающей считается последняя ПАРНАЯ кавычка, а не любая —
+# иначе «нарисуй "кот" и надпись 'привет'» давало промпт `кот" и надпись 'привет`.
+DRAW_QUOTE_PAIRS = {'"': '"“”', "«": "»", "„": "“”", "“": "”“", "'": "'’", "‘": "’"}
+DRAW_QUOTES_OPEN = "".join(DRAW_QUOTE_PAIRS)
+DRAW_INTENT_WORDS = 3   # русский триггер среди первых N слов («а нарисуй …», «ну нарисуй …») → intent
+# Триггеры, которые считаются только ПЕРВЫМ словом: «draw» — обычное английское слово («how to draw a circle»).
+DRAW_FIRST_WORD_ONLY = {"draw", "zeichne"}
+# Слово перед триггером, отменяющее просьбу: «не рисуй больше картинки» — НЕ просьба нарисовать.
+DRAW_NEGATIONS = {"не", "нельзя", "незачем", "don't", "dont", "never", "nicht", "kein"}
 
 
 def parse_draw_request(text: str) -> tuple[str | None, str, str | None]:
     """Разбор «нарисуй …» → (mode, prompt, size). docs/claude/tz-draw-intent.md.
 
-    "literal" — триггер первым словом, затем (необязательно 2к/2k) сразу открывающая кавычка:
-    prompt — текст в кавычках (+ хвост после последней закрывающей), дословно в генератор.
-    "intent" — триггер без кавычек или среди первых DRAW_INTENT_WORDS слов: prompt — исходный текст,
-    он уйдёт в обычный диалог с пометкой «явно просят картинку». None — не про рисование."""
+    Ведущее обращение к боту (`BOT_TRIGGERS`: «Клодушка, нарисуй …» в личке, где strip_trigger не работает)
+    пропускается. "literal" — триггер первым словом, затем (необязательно 2к/2k) сразу открывающая кавычка:
+    prompt — текст до последней парной закрывающей (+ хвост после неё), дословно в генератор.
+    "intent" — триггер без кавычек или русский триггер среди первых DRAW_INTENT_WORDS слов (не после отрицания):
+    prompt — исходный текст, он уйдёт в обычный диалог с пометкой «явно просят картинку». None — не про рисование."""
     words = (text or "").split()
     norm = [w.lower().rstrip(",:.!?") for w in words]
-    idx = next((i for i, w in enumerate(norm[:DRAW_INTENT_WORDS]) if w in DRAW_TRIGGERS), None)
-    if idx is None:
+    skip = 1 if norm and norm[0] in BOT_TRIGGERS else 0
+    idx = next((i for i in range(skip, min(len(norm), skip + DRAW_INTENT_WORDS))
+                if norm[i] in DRAW_TRIGGERS and (i == skip or norm[i] not in DRAW_FIRST_WORD_ONLY)), None)
+    if idx is None or (idx > 0 and norm[idx - 1] in DRAW_NEGATIONS):
         return None, text, None
     size = "2K" if idx + 1 < len(norm) and norm[idx + 1] in IMAGE_2K_WORDS else None
-    if idx == 0:
-        parts = text.split(None, 1)
-        rest = parts[1] if len(parts) > 1 else ""
-        if size:
+    if idx == skip:
+        rest = text
+        for _ in range(idx + 1 + (1 if size else 0)):   # срезаем обращение, триггер и 2к
             parts = rest.split(None, 1)
             rest = parts[1] if len(parts) > 1 else ""
         rest = rest.lstrip()
-        if rest and rest[0] in DRAW_QUOTES_OPEN:
+        if rest and rest[0] in DRAW_QUOTE_PAIRS:
             body = rest[1:]
-            end = max((body.rfind(c) for c in DRAW_QUOTES_CLOSE), default=-1)
+            end = max((body.rfind(c) for c in DRAW_QUOTE_PAIRS[rest[0]]), default=-1)
             if end >= 0:
                 inner, tail = body[:end].strip(), body[end + 1:].strip()
                 return "literal", (f"{inner} {tail}" if tail else inner).strip(), size
@@ -6258,9 +6266,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check for draw request: literal (в кавычках) — сразу в генератор; intent — через диалог (ниже).
     draw_mode, draw_text, intent_size = parse_draw_request(user_text)
     draw_intent = draw_mode == "intent"
-    if draw_intent and not update.message.reply_to_message and all(
-            w.lower().rstrip(",:.!?") in DRAW_TRIGGERS or w.lower().rstrip(",:.!?") in IMAGE_2K_WORDS
-            for w in user_text.split()):
+    if draw_intent and not update.message.reply_to_message and all(   # голое «(Клодушка,) нарисуй (2к)»
+            w.lower().rstrip(",:.!?") in DRAW_TRIGGERS | IMAGE_2K_WORDS | BOT_TRIGGERS for w in user_text.split()):
         await update.message.reply_text("Что нарисовать? Опиши картинку или ответь на сообщение.")
         return
     if draw_mode == "literal":

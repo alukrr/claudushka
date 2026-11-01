@@ -80,3 +80,30 @@ def test_service_block_draw_2k():
 def test_service_block_default_clean():
     sb = bot.service_block()
     assert "нарисовать" not in sb and "[[DRAW" not in sb
+
+
+# --- fix/draw-intent-parse (ревью 2026-11-01) ---
+
+def test_negation_is_not_a_request():
+    assert P("не рисуй больше картинки")[0] is None
+    assert P("пожалуйста не рисуй")[0] is None
+    assert P("don't draw")[0] is None
+
+
+def test_english_draw_only_first_word():
+    assert P("how to draw a circle")[0] is None
+    assert P("I can't draw")[0] is None
+    assert P("draw a cat")[0] == "intent"
+    assert P('draw "a cat"') == ("literal", "a cat", None)
+
+
+def test_literal_closes_on_paired_quote():
+    assert P("нарисуй \"кот\" и надпись 'привет'") == ("literal", "кот и надпись 'привет'", None)
+    assert P("нарисуй \"Рок'н'ролл\"") == ("literal", "Рок'н'ролл", None)
+    assert P("нарисуй «кот \"Барсик\"»") == ("literal", "кот \"Барсик\"", None)
+
+
+def test_bot_name_prefix_in_private():
+    assert P('Клодушка, нарисуй "кот"') == ("literal", "кот", None)
+    assert P("Клодушка, нарисуй 2к «кот»") == ("literal", "кот", "2K")
+    assert P("Клод нарисуй кота")[0] == "intent"
