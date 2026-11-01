@@ -1,0 +1,31 @@
+# Общий прокси `edge` для dnd-mcp и Клодушки (docs/claude/runbook-edge-proxy.md).
+# Запускать ТОЛЬКО из ~/claudushka/infra/edge/ (не из ~/claudushka-test): `docker compose up -d`.
+# Сеть `edge` и тома edge_caddy_data / edge_caddy_config создаются вручную (шаг 3 runbook), поэтому external.
+name: edge
+
+services:
+  caddy:
+    image: caddy:2
+    container_name: edge-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    env_file: .env
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - edge_caddy_data:/data
+      - edge_caddy_config:/config
+    networks:
+      - edge
+
+networks:
+  edge:
+    external: true
+
+volumes:
+  edge_caddy_data:
+    external: true
+  edge_caddy_config:
+    external: true

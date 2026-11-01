@@ -1,0 +1,16 @@
+# Общий прокси для dnd-mcp и Клодушки (docs/claude/runbook-edge-proxy.md). Имена хостов — из infra/edge/.env
+# (см. .env.example), сертификаты Caddy выпускает сам. Бэкенды резолвятся по имени сервиса в общей docker-сети `edge`.
+#
+# Пока у Клодушки нет HTTP-порта (появится с feat/miniapp), её сайты отдают 502 — это нормально.
+
+{$DND_PUBLIC_HOST} {
+	reverse_proxy dnd-mcp:8000
+}
+
+{$CLAUDUSHKA_PUBLIC_HOST} {
+	reverse_proxy claudushka:8090
+}
+
+{$CLAUDUSHKA_TEST_PUBLIC_HOST} {
+	reverse_proxy claudushka-test:8090
+}
