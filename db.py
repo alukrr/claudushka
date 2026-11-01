@@ -156,7 +156,18 @@ def init_db():
             approved_by INTEGER,
             created_at INTEGER,
             approved_at INTEGER,
-            daily_review_enabled INTEGER NOT NULL DEFAULT 1
+            daily_review_enabled INTEGER NOT NULL DEFAULT 1,
+            activity_percent INTEGER NOT NULL DEFAULT 0,
+            autoignore_enabled INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS chat_ignores (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            level INTEGER NOT NULL DEFAULT 0,
+            ignored_until INTEGER,
+            last_strike_ts INTEGER,
+            PRIMARY KEY (chat_id, user_id)
         );
 
         CREATE TABLE IF NOT EXISTS wa_conversations (
@@ -300,6 +311,9 @@ def init_db():
         # (с 2026-09-23 — сразу на Opus 5.5: claude-opus-5 из выбора убран, см. ниже)
         "UPDATE chat_models SET model='claude-opus-5-5' WHERE model LIKE 'claude-opus-4-%'",
         "ALTER TABLE allowed_chats ADD COLUMN daily_review_enabled INTEGER NOT NULL DEFAULT 1",
+        # feat/group-behavior: активность бота в группе (%) и автоигнор (docs/claude/group-chat.md).
+        "ALTER TABLE allowed_chats ADD COLUMN activity_percent INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE allowed_chats ADD COLUMN autoignore_enabled INTEGER NOT NULL DEFAULT 1",
         # 2026-09-19: Fable 5 -> Fable 5.1 (пул подтверждён живым запросом). Без этой
         # миграции чаты на старой строке попадут в model_meta() фолбэк на дефолт
         # (Haiku) и /cost посчитает их по ценам Haiku, а не Fable.
@@ -1795,6 +1809,125 @@ def clear_review_persona_db(chat_id: int):
     conn.execute("DELETE FROM chat_review_persona WHERE chat_id = ?", (chat_id,))
     conn.commit()
     conn.close()
+
+
+# --- Поведение бота в группе: активность и автоигнор (docs/claude/group-chat.md) ---
+# Настройки чата — отдельные функции (реестр настроек для мини-приложения будет потом), логика — в bot.py.
+
+def get_activity_percent(chat_id: int) -> int:
+    conn = get_conn()
+    row = conn.execute("SELECT activity_percent FROM allowed_chats WHERE chat_id = ?", (chat_id,)).fetchone()
+    conn.close()
+    return int(row["activity_percent"]) if row else 0
+
+
+def set_activity_percent(chat_id: int, percent: int) -> bool:
+    """False — чата нет в allowed_chats (записать некуда)."""
+    conn = get_conn()
+    cur = conn.execute("UPDATE allowed_chats SET activity_percent = ? WHERE chat_id = ?", (int(percent), chat_id))
+    conn.commit()
+    n = cur.rowcount
+    conn.close()
+    return n > 0
+
+
+def get_autoignore_enabled(chat_id: int) -> bool:
+    """Нет строки чата → включён (дефолт 1)."""
+    conn = get_conn()
+    row = conn.execute("SELECT autoignore_enabled FROM allowed_chats WHERE chat_id = ?", (chat_id,)).fetchone()
+    conn.close()
+    return bool(row["autoignore_enabled"]) if row else True
+
+
+def set_autoignore_enabled(chat_id: int, enabled: bool) -> bool:
+    conn = get_conn()
+    cur = conn.execute("UPDATE allowed_chats SET autoignore_enabled = ? WHERE chat_id = ?",
+                       (1 if enabled else 0, chat_id))
+    conn.commit()
+    n = cur.rowcount
+    conn.close()
+    return n > 0
+
+
+def get_ignore(chat_id: int, user_id: int) -> dict | None:
+    conn = get_conn()
+    row = conn.execute("SELECT level, ignored_until, last_strike_ts FROM chat_ignores WHERE chat_id = ? AND user_id = ?",
+                       (chat_id, user_id)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def set_ignore(chat_id: int, user_id: int, level: int, ignored_until: int | None, last_strike_ts: int):
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO chat_ignores (chat_id, user_id, level, ignored_until, last_strike_ts) "
+        "VALUES (?, ?, ?, ?, ?)", (chat_id, user_id, level, ignored_until, last_strike_ts))
+    conn.commit()
+    conn.close()
+
+
+def delete_ignore(chat_id: int, user_id: int) -> bool:
+    conn = get_conn()
+    cur = conn.execute("DELETE FROM chat_ignores WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+    conn.commit()
+    n = cur.rowcount
+    conn.close()
+    return n > 0
+
+
+def get_ignored_until(chat_id: int, user_id: int) -> int:
+    """Метка, до которой человек в игноре (0 — не в игноре / нет строки)."""
+    row = get_ignore(chat_id, user_id)
+    return int(row["ignored_until"] or 0) if row else 0
+
+
+def list_active_ignores(chat_id: int, now: int) -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT user_id, level, ignored_until FROM chat_ignores WHERE chat_id = ? AND ignored_until > ? "
+        "ORDER BY ignored_until DESC", (chat_id, now)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_last_bot_ts(chat_id: int) -> int:
+    """Метка последней реплики бота в чате (любой: ответ, обзор, активность); 0 — не было."""
+    conn = get_conn()
+    row = conn.execute("SELECT MAX(timestamp) AS ts FROM group_messages WHERE chat_id = ? AND is_bot = 1",
+                       (chat_id,)).fetchone()
+    conn.close()
+    return int(row["ts"] or 0)
+
+
+def get_last_sender_name(chat_id: int, user_id: int) -> str | None:
+    conn = get_conn()
+    row = conn.execute("SELECT sender_name FROM group_messages WHERE chat_id = ? AND user_id = ? AND is_bot = 0 "
+                       "ORDER BY id DESC LIMIT 1", (chat_id, user_id)).fetchone()
+    conn.close()
+    return row["sender_name"] if row else None
+
+
+def get_user_bot_exchange(chat_id: int, user_id: int, own_limit: int = 6, window: int = 80) -> list[dict]:
+    """Для проверки на травлю: последние own_limit реплик человека и реплики бота между ними и «сейчас»,
+    по возрастанию. Чужие реплики не берём. hidden = 0. [{"is_bot", "text"}]"""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, user_id, content, is_bot FROM group_messages WHERE chat_id = ? AND hidden = 0 "
+        "ORDER BY id DESC LIMIT ?", (chat_id, window)).fetchall()
+    conn.close()
+    out, own = [], 0
+    for r in rows:   # от новых к старым
+        if r["is_bot"]:
+            out.append({"is_bot": True, "text": r["content"]})
+        elif r["user_id"] == user_id:
+            out.append({"is_bot": False, "text": r["content"]})
+            own += 1
+            if own >= own_limit:
+                break
+    out.reverse()
+    while out and out[0]["is_bot"]:   # начинаем с реплики человека
+        out.pop(0)
+    return out
 
 
 # --- Режим разработчика (docs/claude/dev-mode.md) ---
