@@ -3357,10 +3357,12 @@ def _norm_address(text: str) -> str:
 def detect_repeat(chat_id: int, user_id: int, text: str, now: float | None = None,
                   last_bot_ts: int = 0) -> bool:
     """Третье «одно и то же» за 10 минут: текущее обращение похоже (ratio >= 0.9) минимум на ДВА предыдущих.
-    Предыдущее обращение считается только если бот после него что-то сказал в чате (last_bot_ts — метка последней
-    реплики бота, db.get_last_bot_ts; передаётся параметром, функция чистая): бот молчит/упал — человек не виноват,
-    что переспрашивает. Метки секундные, поэтому сравнение с int(ts). Текущее добавляется в память процесса в любом
-    случае (если не пустое после нормализации)."""
+    now — время ОТПРАВКИ текущего сообщения (message.date), не обработки: PTB обрабатывает апдейты по очереди, и при
+    тормозящем боте (таймаут модели 60 с) накопленные сообщения иначе выглядели бы «после ответов». Предыдущее обращение
+    считается только если бот ответил ПОСЛЕ него и ДО того, как человек написал текущее: int(ts_prev) <= last_bot_ts <=
+    int(now) (last_bot_ts — метка последней реплики бота, db.get_last_bot_ts; параметром, функция чистая). Бот
+    молчит/тормозит — человек не виноват, что переспрашивает. Метки секундные, отсюда int(). Текущее добавляется в
+    память процесса в любом случае (если не пустое после нормализации)."""
     now = time.time() if now is None else now
     norm = _norm_address(text)
     if not norm:
@@ -3368,7 +3370,7 @@ def detect_repeat(chat_id: int, user_id: int, text: str, now: float | None = Non
     dq = _recent_addresses.setdefault((chat_id, user_id), deque(maxlen=REPEAT_KEEP))
     similar = sum(
         1 for ts, prev in dq
-        if now - ts <= REPEAT_WINDOW_SEC and last_bot_ts >= int(ts)
+        if now - ts <= REPEAT_WINDOW_SEC and int(ts) <= last_bot_ts <= int(now)
         and difflib.SequenceMatcher(None, norm, prev).ratio() >= REPEAT_RATIO
     )
     dq.append((now, norm))
@@ -3411,7 +3413,7 @@ async def _apply_strike(message, chat_id: int, user_id: int, name: str, reason: 
     except Exception as e:
         logger.warning(f"autoignore: не удалось отправить сообщение chat={chat_id}: {e}")
     # В историю — служебная пометка, а не текст реплики (см. pause_history_note).
-    db.save_group_message(chat_id, context_bot_id, "Клодушка", pause_history_note(name, level), is_bot=True)
+    db.save_group_message(chat_id, context_bot_id, "Клодушка", pause_history_note(name, level, reason), is_bot=True)
 
 
 # В group_messages паузу кладём служебной пометкой, не репликой: модель копирует форматы из своей истории (инциденты
@@ -3419,9 +3421,10 @@ async def _apply_strike(message, chat_id: int, user_id: int, name: str, reason: 
 PAUSE_NOTE_LABEL = "служебное"
 
 
-def pause_history_note(name: str, level: int) -> str:
+def pause_history_note(name: str, level: int, reason: str = "repeat") -> str:
     if level <= 1:
-        return f"({PAUSE_NOTE_LABEL}: предупреждение бота для {name} о повторах)"
+        what = "о грубости в адрес бота" if reason == "abuse" else "о повторах"
+        return f"({PAUSE_NOTE_LABEL}: предупреждение бота для {name} {what})"
     return f"({PAUSE_NOTE_LABEL}: автопауза бота для {name} на {ignore_step_min(level)} мин)"
 
 
@@ -6502,7 +6505,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _autoignore_on = (not is_admin(user_id)) and db.get_autoignore_enabled(chat_id)
         if _autoignore_on and update.message:
             _addr_text = update.message.text or update.message.caption or ""
-            if detect_repeat(chat_id, user_id, _addr_text, last_bot_ts=db.get_last_bot_ts(chat_id)):
+            _sent = update.message.date.timestamp() if getattr(update.message, "date", None) else None
+            if detect_repeat(chat_id, user_id, _addr_text, now=_sent, last_bot_ts=db.get_last_bot_ts(chat_id)):
                 await _apply_strike(update.message, chat_id, user_id,
                                     update.effective_user.first_name or "Unknown", "repeat")
                 return
