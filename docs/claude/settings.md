@@ -35,6 +35,7 @@ can_change(key, *, actor_id, is_bot_admin, is_chat_admin, target_chat_id, in_tar
 передаёт флагом. `value=None` — «посмотреть» (команда без значения). `in_target_chat=False` — `chat_id` пришёл аргументом (чужой чат).
 Порядок: **чужой чат → «только группы» → значение → free → restricted → админ чата** (автоигнор проверяет значение после прав).
 Группа определяется по знаку `target_chat_id` (группы < 0, личка = user_id > 0).
+«Админ чата» в правах = результат `is_chat_admin`, включая **управляющих чата** (`chat_managers`, `docs/claude/group-chat.md` → «Управляющие чата»): для `can_change` это просто `is_chat_admin=True`.
 
 ## `apply_setting`
 ```python

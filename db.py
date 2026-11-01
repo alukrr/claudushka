@@ -170,6 +170,14 @@ def init_db():
             PRIMARY KEY (chat_id, user_id)
         );
 
+        CREATE TABLE IF NOT EXISTS chat_managers (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            added_by INTEGER,
+            added_at INTEGER,
+            PRIMARY KEY (chat_id, user_id)
+        );
+
         CREATE TABLE IF NOT EXISTS wa_conversations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             phone TEXT NOT NULL,
@@ -1847,6 +1855,42 @@ def set_autoignore_enabled(chat_id: int, enabled: bool) -> bool:
     n = cur.rowcount
     conn.close()
     return n > 0
+
+
+# --- Управляющие чата (feat/chat-managers): права админа ЭТОГО чата без админки в Telegram ---
+
+def add_chat_manager(chat_id: int, user_id: int, added_by: int | None = None) -> None:
+    """Выдать права управляющего. Повторная выдача перезаписывает added_by/added_at."""
+    conn = get_conn()
+    conn.execute("INSERT OR REPLACE INTO chat_managers (chat_id, user_id, added_by, added_at) VALUES (?, ?, ?, ?)",
+                 (chat_id, user_id, added_by, int(time.time())))
+    conn.commit()
+    conn.close()
+
+
+def remove_chat_manager(chat_id: int, user_id: int) -> bool:
+    conn = get_conn()
+    cur = conn.execute("DELETE FROM chat_managers WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+    conn.commit()
+    n = cur.rowcount
+    conn.close()
+    return n > 0
+
+
+def is_chat_manager_db(chat_id: int, user_id: int) -> bool:
+    conn = get_conn()
+    row = conn.execute("SELECT 1 FROM chat_managers WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def list_chat_managers(chat_id: int) -> list[dict]:
+    """[{user_id, added_by, added_at}] — по порядку выдачи."""
+    conn = get_conn()
+    rows = conn.execute("SELECT user_id, added_by, added_at FROM chat_managers WHERE chat_id = ? "
+                        "ORDER BY added_at, user_id", (chat_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def get_ignore(chat_id: int, user_id: int) -> dict | None:
