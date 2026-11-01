@@ -11,6 +11,8 @@ import functools
 import hashlib
 import base64
 import contextvars
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Literal
 import random
 import difflib
 from collections import deque
@@ -3915,20 +3917,15 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _set_chat_review_enabled(update: Update, context: ContextTypes.DEFAULT_TYPE, enabled: bool):
     """Включает/выключает ежедневный авто-обзор этого чата (daily_chat_review).
-    Доступно чат-админам (не только глобальным админам бота) — см. is_chat_admin,
-    тот же паттерн, что у /ratelimit. Не путать с /review — тот шлёт обзор прямо сейчас
-    и остаётся admin-only, здесь речь только про ежедневную рассылку по расписанию."""
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await update.effective_message.reply_text("Ежедневный обзор — только для групповых чатов.")
+    Доступно чат-админам (не только глобальным админам бота) — can_change("review_enabled"), тот же паттерн, что у
+    /ratelimit. Не путать с /review — тот шлёт обзор прямо сейчас и остаётся admin-only, здесь речь только про
+    ежедневную рассылку по расписанию."""
+    chat_id = update.effective_chat.id
+    if not await _check_change(update, context, "review_enabled", chat_id=chat_id, in_target=True, value=enabled):
         return
-    chat_id = chat.id
-    if not await is_chat_admin(context, chat_id, update.effective_user.id):
-        await update.effective_message.reply_text("Включать/выключать ежедневный обзор может только админ этого чата.")
-        return
-    updated = db.set_chat_review_enabled(chat_id, enabled)
-    if not updated:
-        await update.effective_message.reply_text("Этот чат ещё не известен боту — напиши что-нибудь в чат и повтори.")
+    ok, why = await apply_setting("review_enabled", chat_id, enabled)
+    if not ok:
+        await update.effective_message.reply_text(why)
         return
     state = "ВКЛЮЧЁН" if enabled else "ВЫКЛЮЧЕН"
     await update.effective_message.reply_text(f"Ежедневный обзор чата {state}.")
@@ -3956,22 +3953,23 @@ async def _group_admin_gate(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
 async def cmd_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/activity [0-100] [chat_id] — шанс спонтанной реплики бота в группе (allowed_chats.activity_percent).
-    Смотреть — все; менять — админы чата и бота; чужой чат — chat_id вторым аргументом, только админ бота."""
+    Смотреть — все; менять — админы чата и бота; чужой чат — chat_id вторым аргументом, только админ бота.
+    Права — can_change("activity")."""
     admin = is_admin(update.effective_user.id)
-    chat = update.effective_chat
     args = context.args or []
-    chat_id = chat.id
+    chat_id = update.effective_chat.id
+    in_target = True
     if len(args) >= 2:
-        if not admin:
-            await update.effective_message.reply_text("Менять настройки другого чата может только админ.")
-            return
-        try:
-            chat_id = int(args[1])
-        except ValueError:
-            await update.effective_message.reply_text("ID чата — это число. Формат: /activity 20 -1001234567890")
-            return
-    elif chat.type not in ("group", "supergroup"):
-        await update.effective_message.reply_text("/activity работает только в групповых чатах.")
+        in_target = False
+        if admin:   # у не-админа ID не разбираем: отказ (чужой чат) идёт в can_change раньше любой ошибки формата
+            try:
+                chat_id = int(args[1])
+            except ValueError:
+                await update.effective_message.reply_text("ID чата — это число. Формат: /activity 20 -1001234567890")
+                return
+
+    value = args[0] if args else None
+    if not await _check_change(update, context, "activity", chat_id=chat_id, in_target=in_target, value=value):
         return
 
     known, label = _chat_display(update, chat_id)
@@ -3986,19 +3984,10 @@ async def cmd_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += "\nℹ️ Чат в бесплатном режиме — активность не работает."
         await update.effective_message.reply_text(msg)
         return
-    try:
-        val = int(args[0])
-    except ValueError:
-        await update.effective_message.reply_text("Укажи число от 0 до 100")
-        return
-    if not 0 <= val <= 100:
-        await update.effective_message.reply_text("Значение от 0 до 100")
-        return
-    if len(args) < 2 and not await is_chat_admin(context, chat.id, update.effective_user.id):
-        await update.effective_message.reply_text("Менять активность могут только админы чата и админы бота.")
-        return
-    if not db.set_activity_percent(chat_id, val):
-        await update.effective_message.reply_text("Такого чата нет среди известных — записать некуда, проверь ID.")
+    val = int(args[0])
+    ok, why = await apply_setting("activity", chat_id, val)
+    if not ok:
+        await update.effective_message.reply_text(why)
         return
     msg = f"{label}: активность — {val}%." + (" Выключено." if val == 0 else "")
     if tier == "free":
@@ -4011,18 +4000,16 @@ def _fmt_ignore_until(ts: int) -> str:
 
 
 async def cmd_autoignore(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/autoignore [on|off] — автоигнор чата (allowed_chats.autoignore_enabled); без аргумента — состояние и кто в игноре."""
-    if not await _group_admin_gate(update, context, "autoignore"):
-        return
+    """/autoignore [on|off] — автоигнор чата (allowed_chats.autoignore_enabled); без аргумента — состояние и кто в игноре.
+    Права (и на просмотр) — can_change("autoignore"): только группа, админы чата и бота."""
     chat_id = update.effective_chat.id
     arg = (context.args[0].lower() if context.args else "")
+    if not await _check_change(update, context, "autoignore", chat_id=chat_id, in_target=True, value=arg or None):
+        return
     if arg in ("on", "off"):
-        db.set_autoignore_enabled(chat_id, arg == "on")
+        await apply_setting("autoignore", chat_id, arg == "on")
         await update.effective_message.reply_text(
             "Автоигнор включён: пауза за повторы и травлю." if arg == "on" else "Автоигнор выключен.")
-        return
-    if arg:
-        await update.effective_message.reply_text("Формат: /autoignore [on|off]")
         return
     lines = [f"Автоигнор: {'включён' if db.get_autoignore_enabled(chat_id) else 'выключен'}."]
     active = db.list_active_ignores(chat_id, int(time.time()))
@@ -4347,62 +4334,348 @@ async def _probe_model(context, chat_id: int, model_id: str) -> None:
     )
 
 
-def _parse_target_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str) -> tuple[int | None, str | None]:
-    """(chat_id, ошибка). Без аргумента — текущий чат, с аргументом — чужой, ТОЛЬКО админу:
-    иначе любой участник менял бы настройки чужого чата, зная только его ID."""
-    if not context.args:
-        return update.effective_chat.id, None
-    if not is_admin(update.effective_user.id):
-        return None, ("Менять настройки другого чата может только админ. "
-                      "Без аргумента команда переключит текущий чат.")
+# --- Реестр настроек чата (docs/claude/settings.md, ТЗ tz-settings-registry.md) ---
+# Права на настройку чата — ТОЛЬКО через can_change (чистая функция, без Telegram); запись — через apply_setting.
+# Команды и мини-приложение применяют одни и те же правила. Разбор аргументов, тексты успеха и предупреждения
+# («такого чата нет…», «чат в бесплатном режиме…») остаются в командах.
+
+_FOREIGN_SHORT = "Менять настройки другого чата может только админ."
+_FOREIGN_LONG = _FOREIGN_SHORT + " Без аргумента команда переключит текущий чат."
+_ADMINS_ONLY = "только админы чата и админы бота"
+ACTIVITY_NOT_NUMBER = "Укажи число от 0 до 100"
+ACTIVITY_OUT_OF_RANGE = "Значение от 0 до 100"
+AUTOIGNORE_USAGE = "Формат: /autoignore [on|off]"
+
+
+@dataclass(frozen=True)
+class ChatSetting:
+    key: str
+    label: str
+    scope: Literal["group", "both"]
+    kind: Literal["choice", "int", "bool"]
+    get: Callable[[int], dict]                      # {"value", "stored" (или None), "note"}
+    who: Literal["anyone", "chat_admin"]            # кто МЕНЯЕТ в группе (в личке — сам пользователь)
+    free_policy: Literal["deny", "admin_saves", "allow"]
+    apply: Callable[..., Awaitable[tuple[bool, str]]]
+    texts: dict                                     # причина отказа -> Callable[[value, target_chat_id], str]
+    choices: Callable[[int], list] | None = None    # [(значение, подпись)] из реестров-источников
+    int_range: tuple[int, int] | None = None
+    restricted_values: Callable[[], set] = field(default=lambda: set())   # в группе — только админ чата/бота
+    validate: Callable[[Any], str | None] | None = None   # None — значение годится, иначе текст ошибки
+    validate_late: bool = False                     # проверять значение ПОСЛЕ прав (как /autoignore)
+    view_who: Literal["anyone", "chat_admin"] = "anyone"   # кто СМОТРИТ (команда без значения)
+
+
+def _model_key(model_id: str) -> str:
+    return next((k for k, m in MODELS.items() if m["id"] == model_id), model_id)
+
+
+def _in_choices(key_choices: Callable[[], list], error: str) -> Callable[[Any], str | None]:
+    return lambda v: None if v in dict(key_choices()) else error
+
+
+# --- get: действующее значение, сохранённое, пояснение ---
+def _get_model(chat_id: int) -> dict:
+    stored = db.get_chat_model_db(chat_id)
+    note = "бесплатный режим — всегда Lite" if chat_tier(chat_id) == "free" else ""
+    return {"value": _model_key(get_chat_model(chat_id)), "stored": None if stored is None else _model_key(stored), "note": note}
+
+
+def _get_image(chat_id: int) -> dict:
+    note = "бесплатный режим — рисуем через GPT" if chat_tier(chat_id) == "free" else ""
+    return {"value": get_chat_image_provider(chat_id), "stored": db.get_chat_image_provider_db(chat_id), "note": note}
+
+
+def _get_persona(chat_id: int) -> dict:
+    note = "бесплатный режим — характер дня" if chat_tier(chat_id) == "free" else ""
+    return {"value": get_chat_persona(chat_id), "stored": db.get_chat_persona_db(chat_id), "note": note}
+
+
+def _get_review_persona(chat_id: int) -> dict:
+    stored = db.get_review_persona_db(chat_id)
+    return {"value": get_review_persona(chat_id), "stored": stored,
+            "note": "" if stored in PERSONAS else "как у чата"}
+
+
+def _get_review_enabled(chat_id: int) -> dict:
+    row = db.get_chat_row(chat_id)
+    enabled = bool(row["daily_review_enabled"]) if row else None
+    return {"value": enabled, "stored": enabled, "note": "" if row else "чат ещё не известен боту"}
+
+
+def _get_search_mode(chat_id: int) -> dict:
+    note = (f"бесплатный режим — поиск {SEARCH_PROVIDER_LABELS[SEARCH_PROVIDER_FREE]}"
+            if chat_tier(chat_id) == "free" else "")
+    mode = db.get_chat_search_mode_db(chat_id)
+    return {"value": mode, "stored": mode, "note": note}
+
+
+def _get_activity(chat_id: int) -> dict:
+    note = "бесплатный режим — активность не работает" if chat_tier(chat_id) == "free" else ""
+    pct = db.get_activity_percent(chat_id)
+    return {"value": pct, "stored": pct, "note": note}
+
+
+def _get_autoignore(chat_id: int) -> dict:
+    on = db.get_autoignore_enabled(chat_id)
+    return {"value": on, "stored": on, "note": ""}
+
+
+# --- apply: запись с побочными эффектами → (успех, текст ошибки) ---
+async def _apply_model(chat_id, value, *, context=None, probe_chat_id=None):
+    meta = MODELS[value]
+    # Lite — дефолт, проба ему не нужна (возврат на него не должен падать); в free (пишет только админ) пробы нет.
+    if chat_tier(chat_id) != "free" and meta["id"] != DEFAULT_MODEL_ID:
+        try:
+            await _probe_model(context, probe_chat_id if probe_chat_id is not None else chat_id, meta["id"])
+        except Exception as e:
+            api_errors.log_api_error(e, context_label=f"проверка модели {meta['id']}")
+            return False, f"{meta['label']} сейчас недоступна — модель не меняю. {api_errors.user_message(e)}"
+    db.set_chat_model_db(chat_id, meta["id"])
+    return True, ""
+
+
+async def _apply_image(chat_id, value, *, context=None, probe_chat_id=None):
+    # Пробы нет: пробная генерация картинки стоит реальных денег (см. _set_image_provider).
+    db.set_chat_image_provider_db(chat_id, value)
+    return True, ""
+
+
+async def _apply_persona(chat_id, value, *, context=None, probe_chat_id=None):
+    db.set_chat_persona_db(chat_id, value)
+    return True, ""
+
+
+async def _apply_review_persona(chat_id, value, *, context=None, probe_chat_id=None):
+    if value == "off":
+        db.clear_review_persona_db(chat_id)
+    else:
+        db.set_review_persona_db(chat_id, value)
+    return True, ""
+
+
+async def _apply_review_enabled(chat_id, value, *, context=None, probe_chat_id=None):
+    if not db.set_chat_review_enabled(chat_id, bool(value)):
+        return False, "Этот чат ещё не известен боту — напиши что-нибудь в чат и повтори."
+    return True, ""
+
+
+async def _apply_search_mode(chat_id, value, *, context=None, probe_chat_id=None):
+    db.set_chat_search_mode_db(chat_id, value)
+    return True, ""
+
+
+async def _apply_activity(chat_id, value, *, context=None, probe_chat_id=None):
+    if not db.set_activity_percent(chat_id, int(value)):
+        return False, "Такого чата нет среди известных — записать некуда, проверь ID."
+    return True, ""
+
+
+async def _apply_autoignore(chat_id, value, *, context=None, probe_chat_id=None):
+    db.set_autoignore_enabled(chat_id, bool(value))   # результат не проверяем — как было в команде
+    return True, ""
+
+
+# --- тексты отказов (дословно как у команд до реестра) ---
+def _t_model_free(value, chat_id):
+    meta = MODELS[value]
+    if value in FREE_MODEL_KEYS:
+        return f"В бесплатном режиме я и так на {meta['label']} — другой модели тут нет. Баланс — /cost."
+    return (f"{meta['label']} — доступно в платном режиме "
+            f"(${meta['in']:g}/${meta['out']:g} за миллион токенов). "
+            f"Баланс — /cost, пополнить — {ADMIN_CONTACT}.")
+
+
+def _t_model_restricted(value, chat_id):
+    meta = MODELS[value]
+    return (f"{meta['label']} дорогая (${meta['in']:g}/${meta['out']:g} за MTok) — "
+            f"переключать её могут {_ADMINS_ONLY}.")
+
+
+def _t_image_free(value, chat_id):
+    meta = IMAGE_PROVIDERS[value]
+    if value == FREE_IMAGE_PROVIDER:
+        return f"Сейчас бесплатный режим — рисую через {meta['label']} (лимит картинок в сутки). Баланс — /cost"
+    return f"{meta['label']} — доступно в платном режиме. Баланс — /cost, пополнить — {ADMIN_CONTACT}."
+
+
+def _t_image_restricted(value, chat_id):
+    meta = IMAGE_PROVIDERS[value]
+    return f"{meta['label']} дорогая (~{image_price_text(value)} за картинку) — переключать её могут {_ADMINS_ONLY}."
+
+
+def _t_persona_free(value, chat_id):
+    return ("В бесплатном режиме характер меняется сам каждый день, "
+            f"сегодня — {PERSONAS[get_chat_persona(chat_id)]['label']}. "
+            "Выбирать — в платном режиме, баланс — /cost")
+
+
+def _t_search_free(value, chat_id):
+    return (f"В бесплатном режиме поиск — {SEARCH_PROVIDER_LABELS[SEARCH_PROVIDER_FREE]}, выбрать нельзя. "
+            f"Баланс — /cost, пополнить — {ADMIN_CONTACT}.")
+
+
+def _valid_activity(value) -> str | None:
     try:
-        return int(context.args[0]), None
-    except ValueError:
-        return None, f"ID чата — это число (обычно с минусом). Формат: /{cmd} -1001234567890"
+        v = int(value)
+    except (TypeError, ValueError):
+        return ACTIVITY_NOT_NUMBER
+    return None if 0 <= v <= 100 else ACTIVITY_OUT_OF_RANGE
 
 
-async def _deny_restricted(update: Update, context: ContextTypes.DEFAULT_TYPE, what: str, hint: str) -> bool:
-    """Дорогие вещи (restricted: Opus, Fable, Nano Banana Pro) в ГРУППЕ переключают только админы бота и админы
-    этой группы; в личке пользователь сам себе хозяин. Нельзя ни обычному участнику группы, ни чужой чат без
-    chat_id (чужой чат и так только админ бота — _parse_target_chat). True — отказали и ответили."""
+def _s(text):
+    return lambda value, chat_id: text
+
+
+SETTINGS: dict[str, ChatSetting] = {
+    "model": ChatSetting(
+        key="model", label="Модель чата", scope="both", kind="choice", get=_get_model, who="anyone",
+        free_policy="admin_saves", apply=_apply_model,
+        choices=lambda chat_id=0: [(k, m["label"]) for k, m in MODELS.items()],
+        restricted_values=lambda: {k for k, m in MODELS.items() if m.get("restricted")},
+        validate=lambda v: None if v in MODELS else "Неизвестная модель.",
+        texts={"foreign": _s(_FOREIGN_LONG), "free": _t_model_free, "restricted": _t_model_restricted}),
+    "image_provider": ChatSetting(
+        key="image_provider", label="Провайдер картинок", scope="both", kind="choice", get=_get_image, who="anyone",
+        free_policy="admin_saves", apply=_apply_image,
+        choices=lambda chat_id=0: [(k, m["label"]) for k, m in IMAGE_PROVIDERS.items()],
+        restricted_values=lambda: {k for k, m in IMAGE_PROVIDERS.items() if m.get("restricted")},
+        validate=lambda v: None if v in IMAGE_PROVIDERS else "Неизвестный провайдер.",
+        texts={"foreign": _s(_FOREIGN_LONG), "free": _t_image_free, "restricted": _t_image_restricted}),
+    "persona": ChatSetting(
+        key="persona", label="Характер чата", scope="both", kind="choice", get=_get_persona, who="chat_admin",
+        free_policy="admin_saves", apply=_apply_persona,
+        choices=lambda chat_id=0: [(k, m["label"]) for k, m in PERSONAS.items()],
+        validate=lambda v: None if v in PERSONAS else "Неизвестный режим.",
+        texts={"foreign": _s(_FOREIGN_LONG), "free": _t_persona_free,
+               "chat_admin": _s(f"Менять характер в группе могут {_ADMINS_ONLY}.")}),
+    "review_persona": ChatSetting(
+        key="review_persona", label="Характер обзора", scope="group", kind="choice", get=_get_review_persona,
+        who="chat_admin", free_policy="admin_saves", apply=_apply_review_persona,
+        choices=lambda chat_id=0: [("off", "Как у чата")] + [(k, m["label"]) for k, m in PERSONAS.items()],
+        validate=lambda v: None if v == "off" or v in PERSONAS else REVIEW_PERSONA_USAGE,
+        texts={"foreign": _s(_FOREIGN_SHORT), "group_only": _s("Обзор бывает только в групповых чатах."),
+               "free": _s("Обзор — платная функция, баланс — /cost"),
+               "chat_admin": _s(f"Менять характер обзора могут {_ADMINS_ONLY}.")}),
+    "review_enabled": ChatSetting(
+        key="review_enabled", label="Ежедневный обзор", scope="group", kind="bool", get=_get_review_enabled,
+        who="chat_admin", free_policy="allow", apply=_apply_review_enabled,
+        texts={"group_only": _s("Ежедневный обзор — только для групповых чатов."),
+               "chat_admin": _s("Включать/выключать ежедневный обзор может только админ этого чата.")}),
+    "search_mode": ChatSetting(
+        key="search_mode", label="Режим поиска", scope="both", kind="choice", get=_get_search_mode, who="anyone",
+        free_policy="admin_saves", apply=_apply_search_mode,
+        choices=lambda chat_id=0: [(m, m) for m in SEARCH_MODES],
+        validate=lambda v: None if v in SEARCH_MODES else SEARCHMODE_USAGE,
+        texts={"foreign": _s(_FOREIGN_SHORT), "free": _t_search_free}),
+    "activity": ChatSetting(
+        key="activity", label="Активность бота", scope="group", kind="int", get=_get_activity, who="chat_admin",
+        free_policy="allow", apply=_apply_activity, int_range=(0, 100), validate=_valid_activity,
+        texts={"foreign": _s(_FOREIGN_SHORT), "group_only": _s("/activity работает только в групповых чатах."),
+               "chat_admin": _s(f"Менять активность могут {_ADMINS_ONLY}.")}),
+    "autoignore": ChatSetting(
+        key="autoignore", label="Автоигнор", scope="group", kind="bool", get=_get_autoignore, who="chat_admin",
+        view_who="chat_admin", free_policy="allow", apply=_apply_autoignore,
+        validate=lambda v: None if v in ("on", "off", True, False) else AUTOIGNORE_USAGE, validate_late=True,
+        texts={"group_only": _s("/autoignore работает только в групповых чатах."),
+               "chat_admin": _s("/autoignore — только для админов чата и админов бота.")}),
+}
+
+
+def can_change(key: str, *, actor_id: int, is_bot_admin: bool, is_chat_admin: bool, target_chat_id: int,
+               in_target_chat: bool, tier: str, value: Any = None) -> tuple[bool, str]:
+    """Единственное место прав на настройку чата. Чистая функция (без Telegram и записи): is_chat_admin считает
+    вызывающий (async-запрос к Telegram) и передаёт флагом. (разрешено, текст отказа — дословно как у команд).
+
+    value=None — «посмотреть» (команда без значения). in_target_chat=False — chat_id пришёл аргументом (чужой чат).
+    Порядок проверок (как в командах до реестра): чужой чат → «только группы» → значение → free → restricted → админ чата
+    (autoignore проверяет значение ПОСЛЕ прав — validate_late)."""
+    s = SETTINGS[key]
+    t = s.texts
+    viewing = value is None
+    if not in_target_chat and not is_bot_admin:
+        return False, t["foreign"](value, target_chat_id)
+    is_group_target = target_chat_id < 0
+    if s.scope == "group" and in_target_chat and not is_group_target:
+        return False, t["group_only"](value, target_chat_id)
+    if not viewing and s.validate and not s.validate_late:
+        err = s.validate(value)
+        if err:
+            return False, err
+    if not viewing and tier == "free" and (s.free_policy == "deny" or (s.free_policy == "admin_saves" and not is_bot_admin)):
+        return False, t["free"](value, target_chat_id)
+    admin_ok = is_bot_admin or is_chat_admin
+    if not viewing and is_group_target and not admin_ok and value in s.restricted_values():
+        return False, t["restricted"](value, target_chat_id)
+    need = s.view_who if viewing else s.who
+    if need == "chat_admin" and is_group_target and not admin_ok:
+        return False, t["chat_admin"](value, target_chat_id)
+    if not viewing and s.validate and s.validate_late:
+        err = s.validate(value)
+        if err:
+            return False, err
+    return True, ""
+
+
+async def apply_setting(key: str, chat_id: int, value: Any, *, context=None, probe_chat_id: int | None = None
+                        ) -> tuple[bool, str]:
+    """Валидация значения (choices / int_range / bool) и запись. (успех, текст ошибки). Неверное значение — отказ без
+    записи; для model — проба как раньше (провал пробы → отказ, ничего не пишем). Права проверяет can_change, не здесь."""
+    s = SETTINGS[key]
+    if s.validate:
+        err = s.validate(value)
+        if err:
+            return False, err
+    return await s.apply(chat_id, value, context=context, probe_chat_id=probe_chat_id)
+
+
+async def _check_change(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str, *, chat_id: int,
+                        in_target: bool, value: Any = None) -> bool:
+    """Права из команды: собрать флаги, спросить can_change, при отказе ответить пользователю. True — можно."""
+    s = SETTINGS[key]
+    user_id = update.effective_user.id
+    admin = is_admin(user_id)
     chat = update.effective_chat
-    if is_admin(update.effective_user.id) or chat.type not in ("group", "supergroup"):
-        return False
-    if await is_chat_admin(context, chat.id, update.effective_user.id):
-        return False
-    await update.effective_message.reply_text(
-        f"{what} дорогая ({hint}) — переключать её могут только админы чата и админы бота.")
-    return True
+    chat_admin = admin
+    # Запрос к Telegram — только когда он может повлиять на решение (как раньше в командах).
+    if not admin and chat.type in ("group", "supergroup") and (
+            s.who == "chat_admin" or s.view_who == "chat_admin" or (value is not None and value in s.restricted_values())):
+        chat_admin = await is_chat_admin(context, chat.id, user_id)
+    ok, why = can_change(key, actor_id=user_id, is_bot_admin=admin, is_chat_admin=chat_admin,
+                         target_chat_id=chat_id, in_target_chat=in_target, tier=chat_tier(chat_id), value=value)
+    if not ok:
+        await update.effective_message.reply_text(why)
+    return ok
+
+
+def _parse_target_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str) -> tuple[int, bool, str | None]:
+    """(chat_id, in_target_chat, ошибка). Без аргумента — текущий чат; с аргументом — чужой. ПРАВО на чужой чат
+    (только админ бота) решает can_change (in_target_chat=False у не-админа → отказ), здесь — только разбор ID:
+    у не-админа он не разбирается (отказ идёт раньше любой ошибки формата)."""
+    cur = update.effective_chat.id
+    if not context.args:
+        return cur, True, None
+    if not is_admin(update.effective_user.id):
+        return cur, False, None
+    try:
+        return int(context.args[0]), False, None
+    except ValueError:
+        return cur, False, f"ID чата — это число (обычно с минусом). Формат: /{cmd} -1001234567890"
 
 
 async def _set_chat_model(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str):
     """Переключение модели чата. key — ключ реестра MODELS, не API-строка.
 
-    Гейтинг: всё, кроме Lite, — «админ ИЛИ платный режим»; restricted в группе — ещё и только админы чата/бота
-    (_deny_restricted). В free выбора нет (get_chat_model всегда отдаёт Lite) и запись chat_models не меняем —
-    прошлый платный выбор дождётся возвращения в paid."""
+    Права — can_change("model"): всё, кроме Lite, — «админ ИЛИ платный режим»; restricted в группе — ещё и только админы
+    чата/бота. В free выбора нет (get_chat_model всегда отдаёт Lite) и запись chat_models меняет только админ бота —
+    прошлый платный выбор дождётся возвращения в paid. Запись и проба модели — apply_setting."""
     meta = MODELS[key]
-    admin = is_admin(update.effective_user.id)
-    chat_id, err = _parse_target_chat(update, context, key)
+    chat_id, in_target, err = _parse_target_chat(update, context, key)
     if err:
         await update.effective_message.reply_text(err)
         return
     tier = chat_tier(chat_id)
-
-    if tier == "free" and not admin:
-        if key in FREE_MODEL_KEYS:
-            await update.effective_message.reply_text(
-                f"В бесплатном режиме я и так на {meta['label']} — другой модели тут нет. Баланс — /cost.")
-        else:
-            await update.effective_message.reply_text(
-                f"{meta['label']} — доступно в платном режиме "
-                f"(${meta['in']:g}/${meta['out']:g} за миллион токенов). "
-                f"Баланс — /cost, пополнить — {ADMIN_CONTACT}."
-            )
-        return
-
-    if meta.get("restricted") and await _deny_restricted(
-            update, context, meta["label"], f"${meta['in']:g}/${meta['out']:g} за MTok"):
+    if not await _check_change(update, context, "model", chat_id=chat_id, in_target=in_target, value=key):
         return
 
     known, label = _chat_display(update, chat_id)
@@ -4411,21 +4684,10 @@ async def _set_chat_model(update: Update, context: ContextTypes.DEFAULT_TYPE, ke
         "\n⚠️ Такого чата нет среди разрешённых — записала, но проверь ID."
     if tier == "free":  # сюда попадает только админ
         warn += "\nℹ️ Чат в бесплатном режиме: выбор сохранён, включится после пополнения."
-        db.set_chat_model_db(chat_id, meta["id"])
-        await update.effective_message.reply_text(f"{label} → {meta['label']}.{warn}")
+    ok, why = await apply_setting("model", chat_id, key, context=context, probe_chat_id=update.effective_chat.id)
+    if not ok:
+        await update.effective_message.reply_text(why)
         return
-
-    if meta["id"] != DEFAULT_MODEL_ID:   # Lite — дефолт, проба ему не нужна (возврат на него не должен падать)
-        try:
-            await _probe_model(context, update.effective_chat.id, meta["id"])
-        except Exception as e:
-            api_errors.log_api_error(e, context_label=f"проверка модели {meta['id']}")
-            await update.effective_message.reply_text(
-                f"{meta['label']} сейчас недоступна — модель не меняю. {api_errors.user_message(e)}"
-            )
-            return
-
-    db.set_chat_model_db(chat_id, meta["id"])
     await update.effective_message.reply_text(f"{label} → {meta['label']}.{warn}")
 
 
@@ -4469,35 +4731,29 @@ SEARCHMODE_USAGE = (
 
 async def cmd_searchmode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/searchmode [auto|gpt|tavily] [chat_id] — режим поиска чата (chat_search_mode). Без аргумента —
-    текущий режим и варианты. Кто переключает — как с моделями: любой в личке и в группе; чужой чат (chat_id) —
-    только админ бота. В free ручного выбора нет (цена поиска GPT неизвестна) — действует SEARCH_PROVIDER_FREE;
-    админ может записать выбор, он включится после пополнения."""
+    текущий режим и варианты. Кто переключает — can_change("search_mode"): любой в личке и в группе; чужой чат
+    (chat_id) — только админ бота. В free ручного выбора нет (цена поиска GPT неизвестна) — действует
+    SEARCH_PROVIDER_FREE; админ может записать выбор, он включится после пополнения."""
     admin = is_admin(update.effective_user.id)
     chat_id = update.effective_chat.id
+    in_target = True
     if len(context.args) >= 2:
-        if not admin:
-            await update.effective_message.reply_text("Менять настройки другого чата может только админ.")
-            return
-        try:
-            chat_id = int(context.args[1])
-        except ValueError:
-            await update.effective_message.reply_text("ID чата — это число. Формат: /searchmode gpt -1001234567890")
-            return
+        in_target = False
+        if admin:   # у не-админа ID не разбираем: отказ (чужой чат) идёт в can_change раньше любой ошибки формата
+            try:
+                chat_id = int(context.args[1])
+            except ValueError:
+                await update.effective_message.reply_text("ID чата — это число. Формат: /searchmode gpt -1001234567890")
+                return
     if not context.args:
         await update.effective_message.reply_text(f"{_search_status_line(chat_id)}\n\n{SEARCHMODE_USAGE}")
         return
     mode = context.args[0].lower()
-    if mode not in SEARCH_MODES:
-        await update.effective_message.reply_text(SEARCHMODE_USAGE)
-        return
     tier = chat_tier(chat_id)
-    if tier == "free" and not admin:
-        await update.effective_message.reply_text(
-            f"В бесплатном режиме поиск — {SEARCH_PROVIDER_LABELS[SEARCH_PROVIDER_FREE]}, выбрать нельзя. "
-            f"Баланс — /cost, пополнить — {ADMIN_CONTACT}.")
+    if not await _check_change(update, context, "search_mode", chat_id=chat_id, in_target=in_target, value=mode):
         return
     known, label = _chat_display(update, chat_id)
-    db.set_chat_search_mode_db(chat_id, mode)
+    await apply_setting("search_mode", chat_id, mode)
     warn = "" if known or len(context.args) < 2 else "\n⚠️ Такого чата нет среди разрешённых — записала, но проверь ID."
     if tier == "free":
         warn += "\nℹ️ Чат в бесплатном режиме: выбор сохранён, включится после пополнения."
@@ -4565,26 +4821,15 @@ async def _set_image_provider(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     В free (кроме админа) переключать нечего: рисуем только через GPT, запись
     chat_image_provider не меняем — прошлый платный выбор восстановится в paid.
+    Права — can_change("image_provider"); restricted (Nano Banana Pro) в группе — админы чата/бота.
     """
     meta = IMAGE_PROVIDERS[key]
-    admin = is_admin(update.effective_user.id)
-    chat_id, err = _parse_target_chat(update, context, key)
+    chat_id, in_target, err = _parse_target_chat(update, context, key)
     if err:
         await update.effective_message.reply_text(err)
         return
     tier = chat_tier(chat_id)
-
-    if tier == "free" and not admin:
-        if key == FREE_IMAGE_PROVIDER:
-            await update.effective_message.reply_text(
-                f"Сейчас бесплатный режим — рисую через {meta['label']} (лимит картинок в сутки). Баланс — /cost")
-        else:
-            await update.effective_message.reply_text(
-                f"{meta['label']} — доступно в платном режиме. Баланс — /cost, пополнить — {ADMIN_CONTACT}.")
-        return
-
-    if meta.get("restricted") and await _deny_restricted(
-            update, context, meta["label"], f"~{image_price_text(key)} за картинку"):
+    if not await _check_change(update, context, "image_provider", chat_id=chat_id, in_target=in_target, value=key):
         return
 
     known, label = _chat_display(update, chat_id)
@@ -4593,7 +4838,7 @@ async def _set_image_provider(update: Update, context: ContextTypes.DEFAULT_TYPE
     if tier == "free":  # только админ
         warn += "\nℹ️ Чат в бесплатном режиме: выбор сохранён, но пока рисуем через GPT."
 
-    db.set_chat_image_provider_db(chat_id, key)
+    await apply_setting("image_provider", chat_id, key)
     await update.effective_message.reply_text(f"{label}: рисуем через {meta['label']}.{warn}")
 
 
@@ -4608,28 +4853,16 @@ def _make_image_provider_cmd(key: str):
 async def _set_persona(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str):
     """Переключение режима характера. key — ключ реестра PERSONAS.
 
-    Права: личка — любой пользователь (свой чат, paid); группа — админ чата или бота (строже, чем у моделей);
-    чужой чат аргументом — только админ бота (_parse_target_chat). Free: не-админу отказ с режимом дня;
-    админ бота может записать выбор («включится после пополнения»), запись free-режим дня не меняет."""
+    Права — can_change("persona"): личка — любой пользователь (свой чат, paid); группа — админ чата или бота (строже, чем
+    у моделей); чужой чат аргументом — только админ бота. Free: не-админу отказ с режимом дня; админ бота может
+    записать выбор («включится после пополнения»), запись free-режим дня не меняет."""
     meta = PERSONAS[key]
-    admin = is_admin(update.effective_user.id)
-    chat_id, err = _parse_target_chat(update, context, key)
+    chat_id, in_target, err = _parse_target_chat(update, context, key)
     if err:
         await update.effective_message.reply_text(err)
         return
     tier = chat_tier(chat_id)
-
-    if tier == "free" and not admin:
-        await update.effective_message.reply_text(
-            "В бесплатном режиме характер меняется сам каждый день, "
-            f"сегодня — {PERSONAS[get_chat_persona(chat_id)]['label']}. "
-            "Выбирать — в платном режиме, баланс — /cost")
-        return
-
-    chat = update.effective_chat
-    if (not context.args and chat.type in ("group", "supergroup")
-            and not await is_chat_admin(context, chat.id, update.effective_user.id)):
-        await update.effective_message.reply_text("Менять характер в группе могут только админы чата и админы бота.")
+    if not await _check_change(update, context, "persona", chat_id=chat_id, in_target=in_target, value=key):
         return
 
     known, label = _chat_display(update, chat_id)
@@ -4638,7 +4871,7 @@ async def _set_persona(update: Update, context: ContextTypes.DEFAULT_TYPE, key: 
     if tier == "free":  # только админ
         warn += "\nℹ️ Чат в бесплатном режиме: выбор сохранён, включится после пополнения."
 
-    db.set_chat_persona_db(chat_id, key)
+    await apply_setting("persona", chat_id, key)
     await update.effective_message.reply_text(f"{label}: характер — {meta['label']}.{warn}")
 
 
@@ -4669,49 +4902,36 @@ async def cmd_review_persona(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """/review_persona [ключ|off] [chat_id] — отдельный режим характера обзора (chat_review_persona).
     Без аргументов — показать (всем). Менять: админы чата и бота; chat_id вторым аргументом — только админ бота.
     Обзор бывает только в группах. Free: не-админу бота отказ; админ бота может записать («включится после
-    пополнения»), как в _set_persona."""
+    пополнения»), как в _set_persona. Права — can_change("review_persona")."""
     admin = is_admin(update.effective_user.id)
-    chat = update.effective_chat
-    chat_id = chat.id
+    chat_id = update.effective_chat.id
+    in_target = True
     if len(context.args) >= 2:
-        if not admin:
-            await update.effective_message.reply_text("Менять настройки другого чата может только админ.")
-            return
-        try:
-            chat_id = int(context.args[1])
-        except ValueError:
-            await update.effective_message.reply_text(
-                "ID чата — это число. Формат: /review_persona toxic -1001234567890")
-            return
-    elif chat.type not in ("group", "supergroup"):
-        await update.effective_message.reply_text("Обзор бывает только в групповых чатах.")
-        return
+        in_target = False
+        if admin:   # у не-админа ID не разбираем: отказ (чужой чат) идёт в can_change раньше любой ошибки формата
+            try:
+                chat_id = int(context.args[1])
+            except ValueError:
+                await update.effective_message.reply_text(
+                    "ID чата — это число. Формат: /review_persona toxic -1001234567890")
+                return
 
-    if not context.args:
-        await update.effective_message.reply_text(_review_persona_status(update, chat_id))
-        return
-
-    arg = context.args[0].lower()
-    if arg != "off" and arg not in PERSONAS:
-        await update.effective_message.reply_text(REVIEW_PERSONA_USAGE)
-        return
+    arg = context.args[0].lower() if context.args else None
     tier = chat_tier(chat_id)
-    if tier == "free" and not admin:
-        await update.effective_message.reply_text("Обзор — платная функция, баланс — /cost")
+    if not await _check_change(update, context, "review_persona", chat_id=chat_id, in_target=in_target, value=arg):
         return
-    if len(context.args) < 2 and not admin and not await is_chat_admin(context, chat.id, update.effective_user.id):
-        await update.effective_message.reply_text("Менять характер обзора могут только админы чата и админы бота.")
+    if arg is None:
+        await update.effective_message.reply_text(_review_persona_status(update, chat_id))
         return
 
     known, label = _chat_display(update, chat_id)
     warn = "" if known or len(context.args) < 2 else "\n⚠️ Такого чата нет среди разрешённых — записала, но проверь ID."
     if tier == "free":  # только админ бота
         warn += "\nℹ️ Чат в бесплатном режиме: выбор сохранён, включится после пополнения."
+    await apply_setting("review_persona", chat_id, arg)
     if arg == "off":
-        db.clear_review_persona_db(chat_id)
         await update.effective_message.reply_text(f"{label}: обзор снова в характере чата.{warn}")
         return
-    db.set_review_persona_db(chat_id, arg)
     await update.effective_message.reply_text(f"{label}: характер обзора — {PERSONAS[arg]['label']}.{warn}")
 
 
