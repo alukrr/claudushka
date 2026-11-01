@@ -32,7 +32,7 @@
   `LEAKED_DRAW_RE`, `IMAGE_PROVIDERS`, `GEMINI_IMAGE_PRICING`, `/imagine [2k]` `/banana` `/bananapro` `/gptimage` `/flare`
   `/sunburst` `/imagemodels`, `parse_draw_request`, `draw_intent`) — `docs/claude/images.md`; ТЗ «дословно только в кавычках» — `docs/claude/tz-draw-intent.md`; чек-лист стенда — `docs/claude/staging-checklist-draw-intent.md`
 - Режимы характера (`PERSONAS`, `/classic /business /toxic /flirt /granny /personas`, `_persona_text`, `CORE_IDENTITY`/`_core_rules`,
-  `get_chat_persona`, `free_persona`, `personas/*.md`, volume `./personas`) — `docs/claude/personas.md`; ТЗ — `docs/claude/tz-personas.md`
+  `get_chat_persona`, `free_persona`, `personas/*.md`, volume `./personas`) — `docs/claude/personas.md`; ТЗ — `docs/claude/tz-personas.md`; ТЗ «характер обзора отдельно» — `docs/claude/tz-review-persona.md`
 - Файлы целиком (`[[FILE: имя]]`, `FILE_MARKER_RE`, `extract_files`, `_file_sent_note`, `FILE_*`) — `docs/claude/files.md`
 - Групповой чат (`build_group_messages`, `group_messages`, `reply_context`/`_bot_reply_quote`, гейтинг доступа,
   `/ratelimit`, `is_chat_admin`) — `docs/claude/group-chat.md`
