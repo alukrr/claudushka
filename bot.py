@@ -19,7 +19,7 @@ from collections import deque
 from pathlib import Path
 from telegram import LinkPreviewOptions, Update
 from telegram.constants import ReactionEmoji
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden
 from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 from telegram.ext import (
@@ -3270,6 +3270,97 @@ LEAKED_DRAW_NOTE_RE = re.compile(
 LEAKED_DRAW_RE = re.compile(r"нарисовал\w*\s+картинк\w*\s*[:\-—]\s*(.+)", re.IGNORECASE | re.DOTALL)
 
 
+def _extract_draw_marker(text: str) -> tuple[str, str | None, str | None]:
+    """Ответ модели → (текст без маркера, английский промпт или None, "2K" или None). Общий для основного диалога и
+    веток фото/файла (до 2026-11-01 ветки фото/файла маркер не разбирали — `[[DRAW: …]]` уходил в чат текстом).
+
+    Порядок прежний: маркер [[DRAW: …]] / [[DRAW 2K: …]] вырезается; промпт-заглушка (< 3 букв/цифр, инцидент 2026-09-07)
+    → рисования нет; без маркера — подстраховка от утечки промпта текстом (LEAKED_DRAW_NOTE_RE, затем LEAKED_DRAW_RE;
+    инцидент 2026-09-08 и повтор 2026-09-20): хвост преимущественно латиницей (>60%) и длиннее 15 символов — рисуем по нему,
+    иначе это легитимная русская фраза («не буду рисовать картинку: это тупо»)."""
+    draw_match = DRAW_MARKER_RE.search(text)
+    prompt = draw_match.group("prompt").strip() if draw_match else None
+    size = "2K" if draw_match and draw_match.group("size") else None
+    if draw_match:
+        text = DRAW_MARKER_RE.sub("", text).strip()
+    if prompt and len(re.sub(r"[^\w]", "", prompt, flags=re.UNICODE)) < 3:
+        logger.warning(f"DRAW marker с промптом-заглушкой, рисование пропущено: {prompt!r}")
+        prompt = None
+    if prompt is None:
+        for leak_re in (LEAKED_DRAW_NOTE_RE, LEAKED_DRAW_RE):
+            leak_match = leak_re.search(text)
+            if not leak_match:
+                continue
+            candidate = leak_match.group(1).strip()
+            letters = [c for c in candidate if c.isalpha()]
+            ascii_ratio = sum(1 for c in letters if c.isascii()) / len(letters) if letters else 0
+            if ascii_ratio > 0.6 and len(candidate) > 15:
+                logger.warning(f"Промпт рисования утёк без маркера, восстанавливаю на лету: {candidate[:80]!r}")
+                prompt = candidate
+                text = (text[:leak_match.start()] + text[leak_match.end():]).strip()
+                break
+    return text, prompt, size
+
+
+async def _send_out_files(message, out_files: list[tuple[str, str, bool]], chat_id: int) -> None:
+    """Файлы из [[FILE: …]] документами (docs/claude/files.md): лимит размера, предупреждение об оборванном файле."""
+    for fname, fcontent, closed in out_files:
+        data = fcontent.encode("utf-8")
+        if len(data) > FILE_MAX_BYTES:
+            await message.reply_text(f"Файл {fname} слишком большой ({len(data) // 1024} КБ) — не отправляю.")
+            continue
+        bio = io.BytesIO(data)
+        bio.name = fname
+        try:
+            await message.reply_document(document=bio)
+        except Exception:
+            logger.exception(f"не удалось отправить файл {fname} chat={chat_id}")
+            await message.reply_text(f"Не получилось отправить файл {fname}.")
+            continue
+        if not closed:
+            await message.reply_text(
+                f"⚠️ {fname} оборвался на лимите длины ответа — файл неполный. "
+                "Попроси продолжить или разбить на части."
+            )
+
+
+async def _finish_media_answer(update, context, *, chat_id: int, user_id: int, is_group: bool, answer: str,
+                               history_user_text: str, request_text: str) -> None:
+    """Ответ на фото/файл: маркеры [[FILE]] и [[DRAW]] разбираются так же, как в основном диалоге (fix/draw-marker-media,
+    решение Алексея 2026-11-01 — рисовать). Рисуем ТОЛЬКО по английскому промпту модели: само фото в генератор не идёт.
+    request_text — текст/подпись пользователя: «нарисуй …» в нём (parse_draw_request) = явная просьба → лимит free говорится
+    вслух и в подписи автор; иначе спонтанное рисование — молча, как в диалоге."""
+    out_files: list[tuple[str, str, bool]] = []
+    text = answer
+    if FILE_MARKER_RE.search(text):
+        text, out_files = extract_files(text)
+    text, draw_prompt, draw_size = _extract_draw_marker(text)
+    saved = text or (_draw_sent_note(draw_prompt) if draw_prompt else text)
+    if out_files:
+        saved = "\n".join(filter(None, [text, *(_file_sent_note(n, c) for n, c, _ in out_files)]))
+    if is_group:
+        # Пустой текст + рисование — запись в транскрипт сделает _draw_and_send (как в основном диалоге).
+        if out_files or text:
+            db.save_group_message(chat_id, context_bot_id, "Клодушка", saved, is_bot=True)
+    else:
+        db.save_message(user_id, "user", history_user_text)
+        db.save_message(user_id, "assistant", saved or "(…)")
+
+    for i in range(0, len(text), 4096):
+        chunk = text[i:i + 4096]
+        try:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+        except Exception:
+            await update.message.reply_text(chunk)
+    await _send_out_files(update.message, out_files, chat_id)
+
+    if draw_prompt:
+        explicit = parse_draw_request(request_text)[0] is not None
+        author = (update.effective_user.first_name or update.effective_user.username or "Unknown") if explicit else None
+        await _draw_and_send(update, context, chat_id, is_group, draw_prompt, en_prompt=draw_prompt,
+                             author=author, silent_limit=not explicit, size=draw_size)
+
+
 def is_bot_mentioned(update: Update) -> bool:
     message = update.message
     if not message:
@@ -6034,6 +6125,21 @@ async def memory_purge_job(context: ContextTypes.DEFAULT_TYPE = None):
         logger.exception("memory_purge: не удалось почистить просроченные факты")
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Общий обработчик необработанных исключений хендлеров (без него PTB пишет «No error handlers are registered»).
+    Отказы Telegram при отправке (бота лишили права писать в группе, кикнули, личку заблокировали) — штатная ситуация:
+    warning одной строкой, без traceback. Остальное — error с traceback, как раньше. Пользователю ничего не шлём:
+    ответить туда, куда писать нельзя, всё равно не выйдет, а сырой текст исключения пользователь не видит никогда."""
+    err = context.error
+    chat = getattr(update, "effective_chat", None)
+    where = f"chat={chat.id}" if chat else "без чата"
+    if isinstance(err, Forbidden) or (isinstance(err, BadRequest) and any(
+            s in str(err).lower() for s in ("not enough rights", "chat_write_forbidden", "have no rights", "chat not found"))):
+        logger.warning(f"Telegram не дал отправить ({where}): {err}")
+        return
+    logger.error(f"Необработанное исключение в хендлере ({where}): {err}", exc_info=err)
+
+
 async def post_init(application):
     global context_bot_id, bot_username, _admin_bot, _main_loop
     _main_loop = asyncio.get_running_loop()
@@ -6912,20 +7018,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Пустой ответ модели (файл): {api_errors.response_debug(response)}")
                 answer = "Модель вернула пустой ответ. Попробуй ещё раз или смени модель через /models."
 
-            if is_group:
-                db.save_group_message(chat_id, context_bot_id, "Клодушка", answer, is_bot=True)
-            else:
-                db.save_message(user_id, "user", f"[Файл: {filename}] {question}")
-                db.save_message(user_id, "assistant", answer)
-
-            if len(answer) <= 4096:
-                try:
-                    await update.message.reply_text(answer, parse_mode="Markdown")
-                except Exception:
-                    await update.message.reply_text(answer)
-            else:
-                for i in range(0, len(answer), 4096):
-                    await update.message.reply_text(answer[i:i + 4096])
+            await _finish_media_answer(update, context, chat_id=chat_id, user_id=user_id, is_group=is_group,
+                                       answer=answer, history_user_text=f"[Файл: {filename}] {question}",
+                                       request_text=question)
         except Exception as e:
             await api_errors.reply_api_error(
                 update.message.reply_text, e,
@@ -6982,21 +7077,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Пустой ответ модели (фото): {api_errors.response_debug(response)}")
                 answer = "Модель вернула пустой ответ. Попробуй ещё раз или смени модель через /models."
 
-            # Save to history as text
-            if is_group:
-                db.save_group_message(chat_id, context_bot_id, "Клодушка", answer, is_bot=True)
-            else:
-                db.save_message(user_id, "user", f"[Фото] {question}")
-                db.save_message(user_id, "assistant", answer)
-
-            if len(answer) <= 4096:
-                try:
-                    await update.message.reply_text(answer, parse_mode="Markdown")
-                except Exception:
-                    await update.message.reply_text(answer)
-            else:
-                for i in range(0, len(answer), 4096):
-                    await update.message.reply_text(answer[i:i + 4096])
+            await _finish_media_answer(update, context, chat_id=chat_id, user_id=user_id, is_group=is_group,
+                                       answer=answer, history_user_text=f"[Фото] {question}", request_text=question)
         except Exception as e:
             await api_errors.reply_api_error(
                 update.message.reply_text, e,
@@ -7174,44 +7256,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if FILE_MARKER_RE.search(assistant_text):
             assistant_text, out_files = extract_files(assistant_text)
 
-        # Клодушка могла сама инициировать рисование маркером [[DRAW: ...]] внутри ответа.
-        draw_match = DRAW_MARKER_RE.search(assistant_text)
-        draw_en_prompt = draw_match.group("prompt").strip() if draw_match else None
-        draw_size = "2K" if draw_match and draw_match.group("size") else None
-        if draw_match and draw_intent and not draw_size:
+        # Клодушка могла сама инициировать рисование маркером [[DRAW: ...]] внутри ответа (разбор, заглушка, утечка
+        # промпта без маркера — _extract_draw_marker; тот же хелпер у веток фото и файла).
+        assistant_text, draw_en_prompt, draw_size = _extract_draw_marker(assistant_text)
+        if draw_en_prompt and draw_intent and not draw_size:
             draw_size = intent_size   # просили «2к», а модель забыла 2K в маркере
-        if draw_match:
-            assistant_text = DRAW_MARKER_RE.sub("", assistant_text).strip()
-        if draw_en_prompt and len(re.sub(r"[^\w]", "", draw_en_prompt, flags=re.UNICODE)) < 3:
-            # Модель иногда добавляет маркер с промптом-заглушкой вместо реального описания
-            # ("...", "-") — увидено 2026-09-07 (Клодушка на прямой вопрос про GPT Image 2
-            # сначала отрицала возможность, но всё равно приписала [[DRAW: ...]] в конец).
-            # Не шлём мусорный промпт генератору — картинка с подписью 🎨 "..." только
-            # путает пользователя, рисовать реально нечего.
-            logger.warning(f"DRAW marker с промптом-заглушкой, рисование пропущено: {draw_en_prompt!r}")
-            draw_en_prompt = None
-
-        # Модель иногда вообще не использует маркер, а прямо пишет в видимый ответ либо
-        # нашу же пометку из истории (LEAKED_DRAW_NOTE_RE), либо старую формулировку
-        # «Нарисовала картинку: <промпт>» (LEAKED_DRAW_RE) — см. docs/claude/incidents.md,
-        # инцидент 2026-09-08 и повтор 2026-09-20.
-        # Без этой подстраховки промпт целиком (по-английски) утекает в чат как обычный
-        # текст, а картинка вообще не рисуется. Восстанавливаем на лету, только если хвост
-        # после разделителя преимущественно латиница — иначе словим легитимные русские
-        # фразы вроде «не буду рисовать картинку: это тупо».
-        if draw_en_prompt is None:
-            for leak_re in (LEAKED_DRAW_NOTE_RE, LEAKED_DRAW_RE):
-                leak_match = leak_re.search(assistant_text)
-                if not leak_match:
-                    continue
-                candidate = leak_match.group(1).strip()
-                letters = [c for c in candidate if c.isalpha()]
-                ascii_ratio = sum(1 for c in letters if c.isascii()) / len(letters) if letters else 0
-                if ascii_ratio > 0.6 and len(candidate) > 15:
-                    logger.warning(f"Промпт рисования утёк без маркера, восстанавливаю на лету: {candidate[:80]!r}")
-                    draw_en_prompt = candidate
-                    assistant_text = (assistant_text[:leak_match.start()] + assistant_text[leak_match.end():]).strip()
-                    break
 
         # В историю кладём текст без маркера. Если весь ответ был маркером — для группы
         # факт рисования допишет _draw_and_send в транскрипт отдельной записью; для лички
@@ -7285,24 +7334,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     await update.message.reply_text(src_plain, **send_kw)
 
-        for fname, fcontent, closed in out_files:
-            data = fcontent.encode("utf-8")
-            if len(data) > FILE_MAX_BYTES:
-                await update.message.reply_text(f"Файл {fname} слишком большой ({len(data) // 1024} КБ) — не отправляю.")
-                continue
-            bio = io.BytesIO(data)
-            bio.name = fname
-            try:
-                await update.message.reply_document(document=bio)
-            except Exception:
-                logger.exception(f"не удалось отправить файл {fname} chat={chat_id}")
-                await update.message.reply_text(f"Не получилось отправить файл {fname}.")
-                continue
-            if not closed:
-                await update.message.reply_text(
-                    f"⚠️ {fname} оборвался на лимите длины ответа — файл неполный. "
-                    "Попроси продолжить или разбить на части."
-                )
+        await _send_out_files(update.message, out_files, chat_id)
 
         # Клодушка сама попросила картинку — теперь реально рисуем и отправляем.
         if draw_en_prompt:
@@ -7336,6 +7368,7 @@ def main():
 
     # group=-1 — раньше всех: usage_ctx, регистрация неизвестных групп, баны.
     app.add_handler(TypeHandler(Update, gate_update), group=-1)
+    app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("clear", clear))
