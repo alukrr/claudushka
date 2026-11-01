@@ -1256,6 +1256,33 @@ def get_chat_row(chat_id: int) -> dict | None:
     return dict(row) if row else None
 
 
+def list_group_chats() -> list[dict]:
+    """Все группы бота из allowed_chats (chat_id < 0): для мини-приложения админа бота."""
+    conn = get_conn()
+    rows = conn.execute("SELECT chat_id, name, banned FROM allowed_chats WHERE chat_id < 0 ORDER BY name").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def list_user_group_chats(user_id: int) -> list[dict]:
+    """Группы, где человек писал (group_messages.user_id) и которые бот знает и не забанил: экран 1 мини-приложения."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT a.chat_id, a.name, a.banned FROM allowed_chats a WHERE a.chat_id < 0 AND a.banned = 0 AND EXISTS "
+        "(SELECT 1 FROM group_messages g WHERE g.chat_id = a.chat_id AND g.user_id = ? AND g.is_bot = 0) ORDER BY a.name",
+        (user_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def user_wrote_in_chat(user_id: int, chat_id: int) -> bool:
+    conn = get_conn()
+    row = conn.execute("SELECT 1 FROM group_messages WHERE chat_id = ? AND user_id = ? AND is_bot = 0 LIMIT 1",
+                       (chat_id, user_id)).fetchone()
+    conn.close()
+    return row is not None
+
+
 def ensure_group(chat_id: int, name: str = None, added_by: int = None) -> bool:
     """Регистрирует неизвестную группу как pending (непроверенную). Существующую строку
     не трогает (не сбрасывает approved/banned), только освежает имя. True — строка создана."""

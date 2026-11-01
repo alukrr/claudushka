@@ -15,9 +15,11 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Literal
 import random
 import difflib
+import contextlib
+from types import SimpleNamespace
 from collections import deque
 from pathlib import Path
-from telegram import LinkPreviewOptions, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, MenuButtonWebApp, Update, WebAppInfo
 from telegram.constants import ReactionEmoji
 from telegram.error import BadRequest, Forbidden
 from datetime import datetime, timedelta, time as dt_time
@@ -31,6 +33,11 @@ from tavily import TavilyClient
 import requests as http_requests
 import db
 import api_errors
+try:   # каталог ./miniapp монтируется в compose; без него (выкатили /update без --force-recreate) мини-приложение выключено
+    from miniapp.server import MiniappError, create_app as _miniapp_create_app
+except ImportError:
+    MiniappError = Exception
+    _miniapp_create_app = None
 
 logging.basicConfig(level=logging.INFO)
 # httpx на INFO печатает полный URL каждого запроса, а в URL Telegram API лежит токен
@@ -5257,6 +5264,7 @@ USER_HELP = """\
   /personas      — режимы характера и какой сейчас у чата
   /classic /business /toxic /flirt /granny — сменить характер (платный режим; в группе — админам чата и бота)
   /review_persona — в группах: характер дневного обзора отдельно от характера чата (/review_persona toxic; off — как у чата)
+  /settings      — мини-приложение настроек чатов (в группе — ссылка в личку)
   /ratelimit     — в группах: ограничить частоту сообщений участника (для админов группы)
   /activity [0-100] — в группах: шанс, что Клодушка сама вставит реплику, когда её не звали (платный режим; менять — админам группы)
   /autoignore [on|off] — в группах: автопауза бота за повторы и травлю; без аргумента — кто сейчас в паузе (для админов группы)
@@ -5366,6 +5374,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Привет! Для начала ответь на вопрос:\n\n{question}")
         except Exception as e:
             logger.error(f"Captcha error: {e}")
+        return
+
+    if context.args and await _start_settings_deeplink(update, context.args[0]):
         return
 
     text = (
@@ -6275,6 +6286,11 @@ async def post_init(application):
     logger.info(f"Bot: @{bot_username} (ID: {context_bot_id})")
     _spawn_background_task(memory_purge_job())  # разовая чистка на старте, не блокируя запуск
     _spawn_background_task(check_fallback_models())  # сверка моделей фолбэка с каталогом пула, только warning
+    if miniapp_enabled():   # мини-приложение настроек: сервер внутри процесса + кнопка меню (docs/claude/miniapp.md)
+        _spawn_background_task(_run_miniapp_server())
+        _spawn_background_task(_setup_miniapp_menu(application.bot))
+    elif MINIAPP_PUBLIC_URL:
+        logger.warning("miniapp: MINIAPP_PUBLIC_URL задан, но каталога ./miniapp нет — выкатка нужна через docker compose up -d --force-recreate")
 
 
 # --- Режим разработчика в платной личке (ТЗ feat/dev-mode, docs/claude/dev-mode.md) ---
@@ -7477,6 +7493,264 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         unreact(update.message)
 
 
+# --- Мини-приложение настроек (feat/miniapp, docs/claude/miniapp.md, ТЗ docs/claude/tz-miniapp.md) ---
+# HTTP-слой — miniapp/server.py (подпись initData, лимит частоты, заголовки). ЗДЕСЬ — права и данные: ТОЛЬКО через реестр
+# (SETTINGS, can_change, apply_setting) и is_chat_admin; новых правил нет. Сервер живёт внутри процесса бота (post_init).
+
+MINIAPP_PUBLIC_URL = os.environ.get("MINIAPP_PUBLIC_URL", "").strip().rstrip("/")
+MINIAPP_PORT = int(os.environ.get("MINIAPP_PORT", "8090") or 8090)
+MINIAPP_INITDATA_MAX_AGE = int(os.environ.get("MINIAPP_INITDATA_MAX_AGE", "3600") or 3600)
+MINIAPP_CACHE_SEC = 300          # кэш «админ чата» / «состоит в чате» для чтения; запись всегда проверяет заново
+_ma_cache: dict[tuple, tuple[float, Any]] = {}
+_miniapp_server = None
+
+
+def miniapp_enabled() -> bool:
+    """Включено, если задан MINIAPP_PUBLIC_URL и есть каталог ./miniapp (иначе — как без прокси: сервер не стартует)."""
+    return bool(MINIAPP_PUBLIC_URL and _miniapp_create_app)
+
+
+def _ma_context():
+    """Эквивалент context для is_chat_admin вне хендлера: нужен только живой bot."""
+    return SimpleNamespace(bot=_admin_bot)
+
+
+async def _ma_cached(kind: str, chat_id: int, user_id: int, fetch, fresh: bool):
+    key = (kind, chat_id, user_id)
+    now = time.monotonic()
+    if not fresh:
+        hit = _ma_cache.get(key)
+        if hit and now - hit[0] < MINIAPP_CACHE_SEC:
+            return hit[1]
+    value = await fetch()
+    if len(_ma_cache) > 5000:
+        _ma_cache.clear()
+    _ma_cache[key] = (now, value)
+    return value
+
+
+async def _ma_chat_admin(chat_id: int, user_id: int, fresh: bool = False) -> bool:
+    """is_chat_admin (в нём же управляющие чата) с кэшем 5 минут; fresh=True — без кэша (запись)."""
+    return await _ma_cached("admin", chat_id, user_id, lambda: is_chat_admin(_ma_context(), chat_id, user_id), fresh)
+
+
+async def _ma_is_member(chat_id: int, user_id: int, fresh: bool = False) -> bool:
+    """Человек сейчас состоит в группе (админ, участник, ограниченный с is_member). Ошибка запроса — нет."""
+    async def fetch():
+        try:
+            m = await _admin_bot.get_chat_member(chat_id, user_id)
+        except Exception:
+            return False
+        return m.status in ("creator", "administrator", "member") or (m.status == "restricted" and getattr(m, "is_member", True))
+    return await _ma_cached("member", chat_id, user_id, fetch, fresh)
+
+
+def _ma_title(chat_id: int, row: dict | None) -> str:
+    return (row or {}).get("name") or ("Личка с ботом" if chat_id > 0 else str(chat_id))
+
+
+async def _ma_access(user_id: int, chat_id: int, fresh: bool = False) -> bool:
+    """Доступ к чату. Возвращает in_target_chat для can_change: True — чат из списка экрана 1 (своя личка, группа, где человек
+    писал и состоит), False — только админ бота вне своего списка. Иначе MiniappError(403)."""
+    if chat_id == user_id:
+        return True
+    row = db.get_chat_row(chat_id) if chat_id < 0 else None
+    if is_admin(user_id):
+        return row is not None
+    if chat_id > 0 or not row or row.get("banned") or not db.user_wrote_in_chat(user_id, chat_id) \
+            or not await _ma_is_member(chat_id, user_id, fresh):
+        raise MiniappError(403, "Нет доступа к этому чату.")
+    return True
+
+
+async def _ma_flags(user_id: int, chat_id: int, in_target: bool, fresh: bool = False) -> dict:
+    admin = is_admin(user_id)
+    chat_admin = admin or (chat_id < 0 and await _ma_chat_admin(chat_id, user_id, fresh))
+    return {"bot": admin, "chat": chat_admin, "in": in_target, "tier": chat_tier(chat_id)}
+
+
+def _ma_can(key: str, user_id: int, chat_id: int, fl: dict, value=None) -> tuple[bool, str]:
+    return can_change(key, actor_id=user_id, is_bot_admin=fl["bot"], is_chat_admin=fl["chat"], target_chat_id=chat_id,
+                      in_target_chat=fl["in"], tier=fl["tier"], value=value)
+
+
+def _ma_setting(key: str, user_id: int, chat_id: int, fl: dict) -> dict:
+    """Описание одной настройки для формы: значение, варианты (каждый — с правом), общее право и причина отказа."""
+    s = SETTINGS[key]
+    entry = {"key": key, "label": s.label, "kind": s.kind, "choices": None, "int_range": list(s.int_range) if s.int_range else None,
+             "value": None, "stored": None, "note": "", "can_change": False, "reason": ""}
+    view_ok, why = _ma_can(key, user_id, chat_id, fl, None)
+    if not view_ok:                                   # даже смотреть нельзя (автоигнор — только админам чата)
+        entry["reason"] = why
+        return entry
+    cur = s.get(chat_id)
+    entry.update(value=cur["value"], stored=cur["stored"], note=cur["note"] or "")
+    if s.kind == "choice":
+        items, first_why = [], ""
+        for val, label in s.choices(chat_id):
+            ok, w = _ma_can(key, user_id, chat_id, fl, val)
+            items.append({"value": val, "label": label, "allowed": ok, "reason": "" if ok else w})
+            first_why = first_why or ("" if ok else w)
+        entry["choices"] = items
+        entry["can_change"] = any(i["allowed"] for i in items)
+        entry["reason"] = "" if entry["can_change"] else first_why
+    else:
+        if s.kind == "int":
+            probe = cur["value"] if isinstance(cur["value"], int) and not isinstance(cur["value"], bool) else s.int_range[0]
+        else:
+            probe = cur["value"] if isinstance(cur["value"], bool) else False
+        ok, w = _ma_can(key, user_id, chat_id, fl, probe)
+        entry["can_change"], entry["reason"] = ok, "" if ok else w
+    return entry
+
+
+def _ma_keys_for(chat_id: int) -> list[str]:
+    """Ключи реестра под тип чата: в личке нет групповых (scope=group)."""
+    return [k for k, s in SETTINGS.items() if s.scope == "both" or chat_id < 0]
+
+
+async def _ma_chats(user_id: int) -> list[dict]:
+    admin = is_admin(user_id)
+    chats = [{"id": user_id, "title": "Личка с ботом", "tier": chat_tier(user_id), "is_group": False, "is_admin": admin}]
+    rows = db.list_group_chats() if admin else db.list_user_group_chats(user_id)
+    if not admin:
+        member = await asyncio.gather(*[_ma_is_member(r["chat_id"], user_id) for r in rows])
+        rows = [r for r, ok in zip(rows, member) if ok]
+    flags = await asyncio.gather(*[_ma_chat_admin(r["chat_id"], user_id) if not admin else asyncio.sleep(0, True) for r in rows])
+    groups = [{"id": r["chat_id"], "title": _ma_title(r["chat_id"], r), "tier": chat_tier(r["chat_id"]), "is_group": True,
+               "is_admin": bool(a), "banned": bool(r.get("banned"))} for r, a in zip(rows, flags)]
+    groups.sort(key=lambda c: c["title"].lower())
+    return chats + groups
+
+
+async def _ma_chat_view(user_id: int, chat_id: int, fresh: bool = False) -> dict:
+    in_target = await _ma_access(user_id, chat_id, fresh)
+    fl = await _ma_flags(user_id, chat_id, in_target, fresh)
+    row = db.get_chat_row(chat_id) if chat_id < 0 else None
+    return {"chat": {"id": chat_id, "title": _ma_title(chat_id, row), "tier": fl["tier"], "is_group": chat_id < 0,
+                     "is_admin": bool(fl["chat"])},
+            "settings": [_ma_setting(k, user_id, chat_id, fl) for k in _ma_keys_for(chat_id)]}
+
+
+def _ma_type_error(s: ChatSetting, value) -> str | None:
+    if s.kind == "bool" and not isinstance(value, bool):
+        return "Ожидается true или false."
+    if s.kind == "int" and (isinstance(value, bool) or not isinstance(value, int)):
+        return "Ожидается целое число."
+    if s.kind == "choice" and not isinstance(value, str):
+        return "Ожидается строка из списка."
+    return None
+
+
+async def _ma_set_setting(user_id: int, chat_id: int, key: str, value) -> dict:
+    s = SETTINGS.get(key)
+    if s is None:
+        raise MiniappError(404, "Такой настройки нет.")
+    in_target = await _ma_access(user_id, chat_id, fresh=True)       # запись — без кэша прав
+    err = _ma_type_error(s, value) or (s.validate(value) if s.validate and not s.validate_late else None)
+    if err:
+        raise MiniappError(400, err)
+    fl = await _ma_flags(user_id, chat_id, in_target, fresh=True)
+    ok, why = _ma_can(key, user_id, chat_id, fl, value)
+    if not ok:
+        raise MiniappError(403, why)
+    usage_ctx.set((chat_id, "group" if chat_id < 0 else "private", user_id))   # проба модели — на счёт этого чата
+    ok, why = await apply_setting(key, chat_id, value, context=None, probe_chat_id=chat_id)
+    if not ok:
+        raise MiniappError(409, why or "Не удалось сохранить.")
+    logger.info(f"miniapp set chat={chat_id} key={key} value={value!r} by uid={user_id}")
+    msg = "Сохранено."
+    if fl["tier"] == "free" and s.free_policy == "admin_saves":
+        msg += " Чат в бесплатном режиме: выбор сохранён, включится после пополнения."
+    return {"ok": True, "message": msg, "setting": _ma_setting(key, user_id, chat_id, fl)}
+
+
+class _MiniappDeps:
+    async def user_allowed(self, user_id: int) -> bool:
+        return not db.is_user_banned(user_id)
+
+    async def list_chats(self, user_id: int) -> list[dict]:
+        return await _ma_chats(user_id)
+
+    async def chat_view(self, user_id: int, chat_id: int) -> dict:
+        return await _ma_chat_view(user_id, chat_id)
+
+    async def set_setting(self, user_id: int, chat_id: int, key: str, value) -> dict:
+        return await _ma_set_setting(user_id, chat_id, key, value)
+
+
+def build_miniapp():
+    """FastAPI-приложение мини-приложения (без запуска) — для сервера и для тестов."""
+    return _miniapp_create_app(bot_token=TELEGRAM_BOT_TOKEN, deps=_MiniappDeps(), max_age=MINIAPP_INITDATA_MAX_AGE)
+
+
+async def _run_miniapp_server():
+    """uvicorn на том же event loop. Падение сервера не роняет бота: лог + notify_admins."""
+    global _miniapp_server
+    import uvicorn
+
+    class _Server(uvicorn.Server):
+        @contextlib.contextmanager
+        def capture_signals(self):   # сигналами (SIGINT/SIGTERM) управляет PTB, не uvicorn
+            yield
+
+    try:
+        server = _Server(uvicorn.Config(build_miniapp(), host="0.0.0.0", port=MINIAPP_PORT, log_level="warning"))
+        _miniapp_server = server
+        logger.info(f"miniapp: сервер на :{MINIAPP_PORT}, {MINIAPP_PUBLIC_URL}")
+        await server.serve()
+        if not server.should_exit:
+            raise RuntimeError("сервер остановился без запроса")
+    except (Exception, SystemExit) as e:
+        logger.exception("miniapp: сервер упал")
+        await notify_admins(f"⚠️ Мини-приложение настроек не работает: {type(e).__name__}. Бот продолжает работать.")
+
+
+async def _setup_miniapp_menu(bot):
+    try:
+        await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Настройки", web_app=WebAppInfo(url=f"{MINIAPP_PUBLIC_URL}/")))
+    except Exception as e:
+        logger.warning(f"miniapp: не удалось поставить кнопку меню: {e}")
+
+
+async def post_shutdown(application):
+    if _miniapp_server is not None:
+        _miniapp_server.should_exit = True
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/settings — мини-приложение. Личка: кнопка web_app. Группа: web_app-кнопки в группах не работают (Bot API:
+    «Available only in private chats between a user and the bot»), поэтому диплинк в личку (/start settings_<chat_id>)."""
+    msg = update.effective_message
+    if not miniapp_enabled():
+        await msg.reply_text("Мини-приложение не настроено.")
+        return
+    chat = update.effective_chat
+    if chat.type == "private":
+        await msg.reply_text("Настройки Клодушки:", reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Открыть настройки", web_app=WebAppInfo(url=f"{MINIAPP_PUBLIC_URL}/"))]]))
+    elif chat.type in ("group", "supergroup"):
+        await msg.reply_text("Настройки открываются в личке.", reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Открыть в личке", url=f"https://t.me/{bot_username}?start=settings_{chat.id}")]]))
+
+
+async def _start_settings_deeplink(update: Update, arg: str) -> bool:
+    """/start settings_<chat_id> в личке — кнопка web_app, открывающая приложение сразу на этом чате. ?chat= в URL не подписан и
+    ничего не разрешает: права проверяет сервер. True — обработано."""
+    if not arg.startswith("settings_") or update.effective_chat.type != "private":
+        return False
+    try:
+        target = int(arg[len("settings_"):])
+    except ValueError:
+        return False
+    if not miniapp_enabled():
+        await update.effective_message.reply_text("Мини-приложение не настроено.")
+        return True
+    await update.effective_message.reply_text("Настройки чата:", reply_markup=InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Открыть настройки", web_app=WebAppInfo(url=f"{MINIAPP_PUBLIC_URL}/?chat={target}"))]]))
+    return True
+
+
 def main():
     db.init_db()
     check_personas()  # fail-fast: файлы personas/ на месте (иначе volume не примонтирован — см. docs/claude/personas.md)
@@ -7486,7 +7760,7 @@ def main():
         db.get_or_create_user(admin_id, full_name="Aleksei" if admin_id == 592441 else None)
         db.set_role(admin_id, "admin")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
 
     # group=-1 — раньше всех: usage_ctx, регистрация неизвестных групп, баны.
     app.add_handler(TypeHandler(Update, gate_update), group=-1)
@@ -7525,6 +7799,7 @@ def main():
     app.add_handler(CommandHandler("autoignore", cmd_autoignore))
     app.add_handler(CommandHandler("unignore", cmd_unignore))
     app.add_handler(CommandHandler("manager", cmd_manager))
+    app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("managers", cmd_managers))
     app.add_handler(CommandHandler("ratelimit", cmd_ratelimit))
     app.add_handler(CommandHandler("cost", cmd_cost))
@@ -7544,7 +7819,7 @@ def main():
         "activity", "ratelimit", "cost", "haiku", "sonnet", "opus", "fable", "models",
         "imagemodels", "update", "profile", "profile_ok", "profile_no", "profile_digest",
         "dev", "ws", "hidden", "unhide", "safety_scan", "review_persona", "autoignore", "unignore",
-        "manager", "managers",
+        "manager", "managers", "settings",
     }
     _image_provider_cmds = [c for meta in IMAGE_PROVIDERS.values() for c in meta["cmds"]]
     assert len(_image_provider_cmds) == len(set(_image_provider_cmds)), \

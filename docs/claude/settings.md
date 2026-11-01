@@ -56,6 +56,7 @@ await apply_setting(key, chat_id, value, *, context=None, probe_chat_id=None) ->
 3. Тест: строки в `scripts/test_settings_units.py` (таблица `can_change`, валидация, `apply_setting`), а для команды — случаи в характеризации.
 
 **Инвариант:** права на настройку чата — только `can_change`; новая настройка чата — только через `SETTINGS`.
+Мини-приложение (`docs/claude/miniapp.md`) читает и пишет через тот же реестр: форма строится из `SETTINGS`, права — `can_change`, запись — `apply_setting`.
 
 ## Известные тонкости (сохранены намеренно)
 - `/autoignore` проверяет право и на просмотр; `/review_on|off` и `/autoignore` не принимают `chat_id` (чужого чата там не было и нет).

@@ -8,6 +8,7 @@ services:
       - ./api_errors.py:/app/api_errors.py
       - ./db.py:/app/db.py
       - ./personas:/app/personas
+      - ./miniapp:/app/miniapp
       - ./dedup_memory.py:/app/dedup_memory.py
       - ./dedup_tui.py:/app/dedup_tui.py
       - ./requirements.txt:/app/requirements.txt
@@ -17,6 +18,10 @@ services:
     # НЕТ /var/run/docker.sock и НЕТ .:/repo — /update на стенде не нужен и опасен
     # (self-update стенда не предусмотрен, обновление — только git pull + пересборка).
     # Поэтому НЕТ и git/docker.io в command: они там были только ради /update.
+    # Мини-приложение: хост стенда claudushka-test.alukr.de -> edge-caddy -> claudushka-test:8090 по сети edge (порт не публикуем).
+    networks:
+      - default
+      - edge
     command: /bin/sh -c "pip install --no-cache-dir -r requirements.txt && apt-get update -qq && apt-get install -y -qq ffmpeg && python bot.py"
     restart: unless-stopped
 
@@ -44,3 +49,7 @@ services:
       - "127.0.0.1:8081:8080"
     command: /bin/sh -c "pip install --no-cache-dir -r requirements.txt && uvicorn whatsapp:app --host 0.0.0.0 --port 8080"
     restart: unless-stopped
+
+networks:
+  edge:
+    external: true

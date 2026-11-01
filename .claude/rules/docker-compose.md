@@ -57,3 +57,10 @@ Docker ОДИН РАЗ — при создании контейнера, не п
 `edge` и внешние тома `edge_caddy_data`/`edge_caddy_config`, создаются вручную). Запускается только из `~/claudushka/infra/edge/`. Он общий для
 dnd-mcp и Клодушки, поэтому его правка затрагивает dnd — только с согласия Алексея. Для доступа через прокси сервису Клодушки понадобится сеть
 `edge` (`external: true`) — это делает `feat/miniapp`. Подробности и порядок перехода — `docs/claude/runbook-edge-proxy.md`, `docs/claude/staging.md`.
+
+## Мини-приложение: том `./miniapp` и внешняя сеть `edge` — только `--force-recreate`
+В `docker-compose.yml` (`claudushka`) и `docker-compose.test.yml` (`claudushka-test`) добавлены том `./miniapp:/app/miniapp` (`miniapp/server.py` + `index.html`;
+каталог целиком, отдельный mount для `server.py` не нужен), сети `default` + `edge` и верхнеуровневая `networks: edge: external: true` (сеть создана при
+развёртывании прокси, `docs/claude/runbook-edge-proxy.md`; без неё `docker compose up` не стартует). Порт 8090 НЕ публикуется — только `edge-caddy` →
+`claudushka:8090` / `claudushka-test:8090`. Релиз с новым томом/сетью и переменными `MINIAPP_*` — только `docker compose up -d --force-recreate claudushka`,
+`restart` и `/update` их не применяют (как с `personas`). Включается переменной `MINIAPP_PUBLIC_URL` в `.env`; `claudushka-wa` не затронут. `docs/claude/miniapp.md`.

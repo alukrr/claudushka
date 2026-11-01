@@ -72,7 +72,8 @@
 - Открытые задачи (незакрытое, не баги) — `docs/claude/open-tasks.md`
 - План работ ноябрь 2026 (мини-приложение, активность, характер обзора, рисование по кавычкам, автоигнор + пункты ту-ду):
   решения и порядок веток — `docs/claude/roadmap-2026-11.md`
-- Мини-приложение настроек: runbook прокси `edge` — `docs/claude/runbook-edge-proxy.md`; ТЗ реестра настроек —
+- Мини-приложение настроек (`miniapp/server.py`, `miniapp/index.html`, `validate_init_data`, `_ma_*`, `/settings`, `MINIAPP_PUBLIC_URL`) — `docs/claude/miniapp.md`; чек-лист стенда — `docs/claude/staging-checklist-miniapp.md`;
+  runbook прокси `edge` — `docs/claude/runbook-edge-proxy.md`; ТЗ реестра настроек —
   `docs/claude/tz-settings-registry.md`; ТЗ мини-приложения — `docs/claude/tz-miniapp.md`; ТЗ управляющих чата — `docs/claude/tz-chat-managers.md`
 - `whatsapp.py` — `.claude/rules/whatsapp.md` (грузится автоматически при чтении файла)
 - `db.py` — `.claude/rules/db.md` (автоматически)
@@ -132,6 +133,7 @@
   `asyncio.create_task` (иначе задачу может собрать GC до завершения). `docs/claude/api-errors.md`.
 - Разбор ответа Claude — только `api_errors.response_text()`, никогда `content[0].text`.
 - JSON из ответа модели — только `api_errors.parse_json_lenient()`, никогда `find`/`rfind`.
+- Мини-приложение — только через `SETTINGS`/`can_change`/`apply_setting` (новых правил в нём нет), авторизация — только подпись `initData` (`validate_init_data`, по документации Telegram); выкатка — `docker compose up -d --force-recreate` (том `./miniapp`, сеть `edge`), не `/update` (`docs/claude/miniapp.md`).
 - Права «админ этого чата» — только `is_chat_admin` (включает управляющих `chat_managers`); выдача и снятие прав управляющим — только `is_real_chat_admin` (без управляющих), иначе управляющий начнёт назначать других (`docs/claude/group-chat.md` → «Управляющие чата»).
 - Автоигнор и активность — только кодом и только в группах; модель паузу не объявляет и не включает (`docs/claude/group-chat.md`, ТЗ `docs/claude/tz-group-behavior.md`, чек-лист `docs/claude/staging-checklist-group-behavior.md`).
 - Ответы бота в группе сохраняются в `group_messages` с `is_bot=True` во всех ветках

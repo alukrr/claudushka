@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Настройки Клодушки</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #ffffff);
+    --text: var(--tg-theme-text-color, #000000);
+    --hint: var(--tg-theme-hint-color, #707579);
+    --link: var(--tg-theme-link-color, #2481cc);
+    --btn: var(--tg-theme-button-color, #2481cc);
+    --btn-text: var(--tg-theme-button-text-color, #ffffff);
+    --card: var(--tg-theme-secondary-bg-color, #f1f1f4);
+    --err: #d14343;
+    --ok: #2e9e5b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 12px 16px 32px; background: var(--bg); color: var(--text);
+         font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  h1 { font-size: 20px; margin: 4px 0 12px; }
+  .card { background: var(--card); border-radius: 12px; padding: 12px 14px; margin-bottom: 10px; }
+  .chat { display: flex; justify-content: space-between; align-items: center; gap: 8px; width: 100%; border: 0; text-align: left;
+          color: var(--text); font: inherit; cursor: pointer; }
+  .chat .title { font-weight: 600; overflow-wrap: anywhere; }
+  .chat .meta { color: var(--hint); font-size: 13px; white-space: nowrap; }
+  .tag { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--bg); color: var(--hint);
+         margin-left: 4px; }
+  .label { font-weight: 600; margin-bottom: 6px; }
+  .hint { color: var(--hint); font-size: 13px; margin-top: 6px; overflow-wrap: anywhere; }
+  .msg { font-size: 13px; margin-top: 6px; min-height: 0; overflow-wrap: anywhere; }
+  .msg.ok { color: var(--ok); } .msg.err { color: var(--err); }
+  select, input[type=number] { width: 100%; font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--hint);
+                               background: var(--bg); color: var(--text); }
+  input[type=range] { width: 100%; }
+  select:disabled, input:disabled { opacity: .5; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .switch { position: relative; width: 48px; height: 28px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider { position: absolute; inset: 0; background: var(--hint); border-radius: 28px; transition: .2s; opacity: .5; }
+  .slider:before { content: ""; position: absolute; width: 22px; height: 22px; left: 3px; top: 3px; background: #fff; border-radius: 50%;
+                   transition: .2s; }
+  .switch input:checked + .slider { background: var(--btn); opacity: 1; }
+  .switch input:checked + .slider:before { transform: translateX(20px); }
+  .switch input:disabled + .slider { opacity: .25; }
+  .center { text-align: center; color: var(--hint); padding: 40px 8px; }
+  .back { background: none; border: 0; color: var(--link); font: inherit; padding: 4px 0 8px; cursor: pointer; }
+</style>
+</head>
+<body>
+<div id="app"><div class="center">Загрузка…</div></div>
+<script>
+(function () {
+  "use strict";
+  var tg = window.Telegram && window.Telegram.WebApp;
+  var app = document.getElementById("app");
+  var initData = tg ? tg.initData : "";
+  var current = null;      // id открытого чата (null — список)
+  var directChat = null;   // ?chat=<id> из диплинка (не подписан, права проверяет сервер)
+
+  if (tg) { try { tg.ready(); tg.expand(); } catch (e) {} }
+
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined) n.textContent = text;
+    return n;
+  }
+  function clear() { while (app.firstChild) app.removeChild(app.firstChild); }
+  function message(text) { clear(); app.appendChild(el("div", "center", text)); }
+
+  function api(method, path, body) {
+    var opts = { method: method, headers: { "Authorization": "tma " + initData } };
+    if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+    return fetch(path, opts).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) { return { status: r.status, data: j }; });
+    });
+  }
+
+  function showBack(on) {
+    if (!tg || !tg.BackButton) return;
+    if (on) { tg.BackButton.show(); } else { tg.BackButton.hide(); }
+  }
+  if (tg && tg.BackButton) tg.BackButton.onClick(function () { openList(); });
+
+  function openList() {
+    current = null; showBack(false);
+    message("Загрузка…");
+    api("GET", "/api/chats").then(function (r) {
+      if (r.status !== 200) return message(r.data.message || "Ошибка загрузки.");
+      clear();
+      app.appendChild(el("h1", "", "Чаты"));
+      r.data.chats.forEach(function (c) {
+        var card = el("div", "card");
+        var b = el("button", "chat");
+        var left = el("span");
+        left.appendChild(el("span", "title", c.title));
+        b.appendChild(left);
+        var meta = el("span", "meta");
+        if (c.is_group && c.is_admin) meta.appendChild(el("span", "tag", "админ"));
+        meta.appendChild(el("span", "tag", c.tier === "paid" ? "платный" : "бесплатный"));
+        if (c.banned) meta.appendChild(el("span", "tag", "забанен"));
+        b.appendChild(meta);
+        b.addEventListener("click", function () { openChat(c.id); });
+        card.appendChild(b);
+        app.appendChild(card);
+      });
+    }).catch(function () { message("Нет связи с сервером."); });
+  }
+
+  function openChat(id) {
+    current = id; showBack(true);
+    message("Загрузка…");
+    api("GET", "/api/chats/" + id + "/settings").then(function (r) {
+      if (r.status !== 200) {
+        message(r.data.message || "Ошибка загрузки.");
+        return;
+      }
+      render(r.data);
+    }).catch(function () { message("Нет связи с сервером."); });
+  }
+
+  function render(data) {
+    clear();
+    var h = el("h1", "", data.chat.title);
+    h.appendChild(el("span", "tag", data.chat.tier === "paid" ? "платный" : "бесплатный"));
+    if (data.chat.is_group && data.chat.is_admin) h.appendChild(el("span", "tag", "админ"));
+    app.appendChild(h);
+    data.settings.forEach(function (s) { app.appendChild(settingCard(data.chat.id, s)); });
+  }
+
+  function setMsg(card, text, ok) {
+    var m = card.querySelector(".msg");
+    m.textContent = text || "";
+    m.className = "msg " + (text ? (ok ? "ok" : "err") : "");
+  }
+
+  function settingCard(chatId, s) {
+    var card = el("div", "card");
+    card.dataset.key = s.key;
+    fill(card, chatId, s);
+    return card;
+  }
+
+  function fill(card, chatId, s) {
+    while (card.firstChild) card.removeChild(card.firstChild);
+    var control;
+    if (s.value === null && !s.can_change && s.kind !== "choice") {
+      // смотреть нельзя (например, автоигнор для не-админа)
+      card.appendChild(el("div", "label", s.label));
+      card.appendChild(el("div", "hint", s.reason || "Недоступно."));
+      card.appendChild(el("div", "msg"));
+      return;
+    }
+    if (s.kind === "choice") {
+      card.appendChild(el("div", "label", s.label));
+      control = el("select");
+      (s.choices || []).forEach(function (c) {
+        var o = el("option", "", c.allowed ? c.label : c.label + " 🔒");
+        o.value = c.value; o.disabled = !c.allowed && c.value !== s.value;
+        if (c.value === s.value) o.selected = true;
+        control.appendChild(o);
+      });
+      control.disabled = !s.can_change;
+      control.addEventListener("change", function () { save(card, chatId, s, control.value); });
+      card.appendChild(control);
+    } else if (s.kind === "bool") {
+      var row = el("div", "row");
+      row.appendChild(el("div", "label", s.label));
+      var sw = el("label", "switch");
+      control = el("input"); control.type = "checkbox"; control.checked = s.value === true; control.disabled = !s.can_change;
+      sw.appendChild(control); sw.appendChild(el("span", "slider"));
+      control.addEventListener("change", function () { save(card, chatId, s, control.checked); });
+      row.appendChild(sw);
+      card.appendChild(row);
+    } else {
+      var lab = el("div", "label", s.label + ": ");
+      var val = el("span", "", String(s.value === null ? "" : s.value));
+      lab.appendChild(val);
+      card.appendChild(lab);
+      control = el("input"); control.type = "range";
+      control.min = s.int_range[0]; control.max = s.int_range[1]; control.step = 1; control.value = s.value === null ? s.int_range[0] : s.value;
+      control.disabled = !s.can_change;
+      control.addEventListener("input", function () { val.textContent = control.value; });
+      control.addEventListener("change", function () { save(card, chatId, s, parseInt(control.value, 10)); });
+      card.appendChild(control);
+    }
+    var hint = (s.note ? s.note : "");
+    if (!s.can_change && s.reason) hint = hint ? hint + ". " + s.reason : s.reason;
+    if (s.can_change && s.choices) {
+      var locked = s.choices.filter(function (c) { return !c.allowed; })[0];
+      if (locked && locked.reason) hint = hint ? hint + ". " + locked.reason : locked.reason;
+    }
+    if (hint) card.appendChild(el("div", "hint", hint));
+    card.appendChild(el("div", "msg"));
+  }
+
+  function save(card, chatId, s, value) {
+    setMsg(card, "Сохраняю…", true);
+    api("POST", "/api/chats/" + chatId + "/settings/" + s.key, { value: value }).then(function (r) {
+      if (r.status === 200 && r.data.ok) {
+        fill(card, chatId, r.data.setting);
+        setMsg(card, r.data.message || "Сохранено.", true);
+      } else {
+        setMsg(card, r.data.message || "Не удалось сохранить.", false);
+        // перечитать состояние с сервера: форма не должна показывать то, чего нет
+        api("GET", "/api/chats/" + chatId + "/settings").then(function (g) {
+          if (g.status !== 200) return;
+          var fresh = g.data.settings.filter(function (x) { return x.key === s.key; })[0];
+          if (fresh) { var msg = r.data.message; fill(card, chatId, fresh); setMsg(card, msg || "Не удалось сохранить.", false); }
+        });
+      }
+    }).catch(function () { setMsg(card, "Нет связи с сервером.", false); });
+  }
+
+  if (!initData) {
+    message("Откройте приложение из Telegram: кнопка «Настройки» в личке с ботом или команда /settings.");
+    return;
+  }
+  var q = /[?&]chat=(-?\d+)/.exec(location.search);
+  directChat = q ? parseInt(q[1], 10) : null;
+  if (directChat !== null) { openChat(directChat); } else { openList(); }
+})();
+</script>
+</body>
+</html>
