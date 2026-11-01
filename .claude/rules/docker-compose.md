@@ -51,3 +51,9 @@ Docker ОДИН РАЗ — при создании контейнера, не п
 окружением, поэтому правки `.env` он не подхватывает. Нужно пересоздать контейнер:
 `docker compose up -d --force-recreate` (или `up -d`, если состав `docker-compose.yml`
 тоже менялся — тогда пересоздание триггерится и без явного флага).
+
+## `infra/edge/` — общий прокси (отдельный compose-проект `edge`)
+`infra/edge/docker-compose.yml` — НЕ часть compose Клодушки: отдельный проект `name: edge` (контейнер `edge-caddy`, порты 80/443, внешняя сеть
+`edge` и внешние тома `edge_caddy_data`/`edge_caddy_config`, создаются вручную). Запускается только из `~/claudushka/infra/edge/`. Он общий для
+dnd-mcp и Клодушки, поэтому его правка затрагивает dnd — только с согласия Алексея. Для доступа через прокси сервису Клодушки понадобится сеть
+`edge` (`external: true`) — это делает `feat/miniapp`. Подробности и порядок перехода — `docs/claude/runbook-edge-proxy.md`, `docs/claude/staging.md`.

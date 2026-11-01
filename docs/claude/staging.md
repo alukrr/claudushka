@@ -289,3 +289,11 @@ docker start claudushka
   реальные/боевые чаты» выше; если всё же понадобилось (не рекомендуется) — `/review_off`,
   `docs/claude/daily-review.md`.
 - `/update` на стенде не работает (сознательно, см. выше) — обновление только вручную.
+
+## Прокси `edge` и мини-приложение
+Мини-приложение (`docs/claude/tz-miniapp.md`) открывается в Telegram только по HTTPS, а 80/443 раньше держал `dnd-caddy` из стека `dnd-mcp`.
+Caddy вынесен в общий стек `edge` (`infra/edge/`, контейнер `edge-caddy`, docker-сеть `edge`): он проксирует `dnd.alukr.de` на dnd-mcp,
+`claudushka.alukr.de` на `claudushka:8090` и `claudushka-test.alukr.de` на `claudushka-test:8090` (стенд). Стек запускается ТОЛЬКО из
+`~/claudushka/infra/edge/` (не из `~/claudushka-test`); имена хостов — в `infra/edge/.env` (не в git, шаблон `.env.example`). Разовое исключение
+из правила «dnd-mcp не трогать» и порядок перехода (шаги 1–7, откат) — `docs/claude/runbook-edge-proxy.md`. `~/dnd-mcp-staging` держит
+свой `dnd-caddy` на тех же портах 80/443: при работающем `edge` его не запускать (или убрать caddy из его compose).
