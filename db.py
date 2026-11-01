@@ -194,6 +194,11 @@ def init_db():
             persona TEXT NOT NULL DEFAULT 'classic'
         );
 
+        CREATE TABLE IF NOT EXISTS chat_review_persona (
+            chat_id INTEGER PRIMARY KEY,
+            persona TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS dev_mode (
             user_id INTEGER PRIMARY KEY,
             enabled INTEGER NOT NULL,
@@ -1765,6 +1770,29 @@ def get_chat_persona_db(chat_id: int) -> str | None:
 def set_chat_persona_db(chat_id: int, persona: str):
     conn = get_conn()
     conn.execute("INSERT OR REPLACE INTO chat_persona (chat_id, persona) VALUES (?, ?)", (chat_id, persona))
+    conn.commit()
+    conn.close()
+
+
+# --- Режим характера ОБЗОРА (отдельно от режима чата; нет строки = «как у чата») ---
+
+def get_review_persona_db(chat_id: int) -> str | None:
+    conn = get_conn()
+    row = conn.execute("SELECT persona FROM chat_review_persona WHERE chat_id = ?", (chat_id,)).fetchone()
+    conn.close()
+    return row["persona"] if row else None
+
+
+def set_review_persona_db(chat_id: int, persona: str):
+    conn = get_conn()
+    conn.execute("INSERT OR REPLACE INTO chat_review_persona (chat_id, persona) VALUES (?, ?)", (chat_id, persona))
+    conn.commit()
+    conn.close()
+
+
+def clear_review_persona_db(chat_id: int):
+    conn = get_conn()
+    conn.execute("DELETE FROM chat_review_persona WHERE chat_id = ?", (chat_id,))
     conn.commit()
     conn.close()
 

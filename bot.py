@@ -935,8 +935,20 @@ def persona_tone(chat_id: int) -> str:
     return PERSONAS[get_chat_persona(chat_id)]["tone"]
 
 
+def get_review_persona(chat_id: int) -> str:
+    """Режим характера обзора: отдельный выбор (chat_review_persona) или, если его нет, режим чата.
+    Ключ не из реестра → warning и режим чата, БД не трогаем. Тарифной логики нет: обзор в free не шлётся."""
+    key = db.get_review_persona_db(chat_id)
+    if key is None:
+        return get_chat_persona(chat_id)
+    if key not in PERSONAS:
+        logger.warning(f"chat {chat_id}: unknown review persona {key!r} in DB, falling back to chat persona")
+        return get_chat_persona(chat_id)
+    return key
+
+
 def persona_review_style(chat_id: int) -> str:
-    meta = PERSONAS[get_chat_persona(chat_id)]
+    meta = PERSONAS[get_review_persona(chat_id)]
     return meta.get("review_style") or meta["tone"]
 
 
@@ -2914,7 +2926,7 @@ async def _review_chunk_topics(chat_id: int, idx: int, chunk: list[dict]) -> lis
 
 def _review_system(chat_id: int) -> str:
     return (
-        f"Ты Клодушка. Подача обзора (режим характера чата): {persona_review_style(chat_id)}. "
+        f"Ты Клодушка. Подача обзора (режим характера обзора): {persona_review_style(chat_id)}. "
         "Напиши обзор чата за сутки (с прошлого вечернего обзора) — не сухой пересказ, а маленький фельетон. "
         "Структура: 1) вступление в 1-3 предложения — сюжет дня; 2) 3-6 блоков тем; 3) в самом конце одна короткая "
         "фраза-афоризм или шутка, которая подводит итог именно ЭТОМУ дню (придумай новую под конкретные события, "
@@ -3015,7 +3027,7 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
                 for part in split_telegram_text(review, DAILY_REVIEW_FOOTER):
                     await context.bot.send_message(chat_id=chat_id, text=part)
                 db.save_group_message(chat_id, context_bot_id, "Клодушка",
-                                      f"{_review_sent_note(len(entries))}\n{review}", is_bot=True)
+                                      _review_history_text(human, review), is_bot=True)
                 logger.info(f"Daily review sent to {chat_id} (branch {branch}, {len(entries)} msgs)")
             except Exception as e:
                 logger.error(f"Daily review error for {chat_id}: {e}")
@@ -3153,6 +3165,34 @@ def _review_sent_note(n) -> str:
     Префикс REVIEW_SENT_LABEL не менять: по нему build_review_log выкидывает прошлый обзор из лога."""
     return (f"({REVIEW_SENT_LABEL} {n} сообщениям с прошлого обзора ({DAILY_REVIEW_HOUR}:00); "
             "большинство из них могут быть вне твоего окна истории)")
+
+
+REVIEW_HISTORY_TITLE_CHARS = 80    # длина одного заголовка темы в записи истории
+REVIEW_HISTORY_MAX_CHARS = 800     # потолок всей записи обзора в group_messages (инвариант «лимит по размеру»)
+_REVIEW_TOPICS_LEAD = "Темы обзора (полный текст в истории не хранится; он в самом сообщении в чате): "
+
+
+def _review_history_text(n_human: int, review: str) -> str:
+    """Что писать в group_messages вместо полного обзора: пометка + заголовки тем (docs/claude/daily-review.md).
+    Полный грубый текст в истории включал safety-фильтр провайдера (инцидент 2026-10-30), а совсем без тем модель
+    «признаётся», что выдумала обзор (инцидент 2026-10-22). Префикс _review_sent_note остаётся в начале — по нему
+    build_review_log выкидывает прошлый обзор."""
+    paras = [p for p in re.split(r"\n\s*\n", review or "") if p.strip()]
+    if len(paras) > 2:
+        paras = paras[:-1]   # итоговая фраза-афоризм не тема
+    titles = []
+    for p in paras:
+        first = next((ln for ln in p.splitlines() if ln.strip()), "")
+        t = re.sub(r"^[\W_]+", "", first.strip())
+        if len(t) > REVIEW_HISTORY_TITLE_CHARS:
+            t = t[:REVIEW_HISTORY_TITLE_CHARS - 1].rstrip() + "…"
+        if t:
+            titles.append(t)
+    head = f"{_review_sent_note(n_human)}\n{_REVIEW_TOPICS_LEAD}"
+    out = head + "; ".join(titles)
+    if len(out) > REVIEW_HISTORY_MAX_CHARS:
+        out = out[:REVIEW_HISTORY_MAX_CHARS - 1].rstrip(" ;") + "…"
+    return out
 
 
 # Файл целиком: Клодушка оборачивает содержимое в [[FILE: имя.py]] ... [[/FILE]], бот вырезает блок из
@@ -3590,7 +3630,7 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for part in parts[1:]:
             await context.bot.send_message(chat_id=chat_id, text=part)
         db.save_group_message(chat_id, context_bot_id, "Клодушка",
-                              f"{_review_sent_note(len(entries))}\n{review}", is_bot=True)
+                              _review_history_text(human, review), is_bot=True)
     except Exception as e:
         await api_errors.reply_api_error(
             update.message.reply_text, e, context_label=f"/review chat={chat_id}",
@@ -4232,6 +4272,79 @@ async def _set_persona(update: Update, context: ContextTypes.DEFAULT_TYPE, key: 
     await update.effective_message.reply_text(f"{label}: характер — {meta['label']}.{warn}")
 
 
+REVIEW_PERSONA_USAGE = ("Формат: /review_persona <" + "|".join(PERSONAS) + "|off> [chat_id]\n"
+                        "off — обзор снова в характере чата.")
+
+
+def _review_persona_line(chat_id: int) -> str:
+    """«Обзор: <label> (отдельный | как у чата)» — для /personas и /review_persona."""
+    own = db.get_review_persona_db(chat_id) in PERSONAS
+    label = PERSONAS[get_review_persona(chat_id)]["label"]
+    return f"Обзор: {label} ({'отдельный' if own else 'как у чата'})"
+
+
+def _review_persona_status(update: Update, chat_id: int) -> str:
+    current = get_review_persona(chat_id)
+    _, label = _chat_display(update, chat_id)
+    own = db.get_review_persona_db(chat_id) in PERSONAS
+    mode = "отдельный режим" if own else f"как у чата — {PERSONAS[get_chat_persona(chat_id)]['label']}"
+    lines = [f"Обзор для {label}: {PERSONAS[current]['label']} ({mode})", "", "Доступно:"]
+    for key, meta in PERSONAS.items():
+        lines.append(f"{'▸' if key == current else ' '} {key} — {meta['label']}")
+    lines += ["", REVIEW_PERSONA_USAGE]
+    return "\n".join(lines)
+
+
+async def cmd_review_persona(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/review_persona [ключ|off] [chat_id] — отдельный режим характера обзора (chat_review_persona).
+    Без аргументов — показать (всем). Менять: админы чата и бота; chat_id вторым аргументом — только админ бота.
+    Обзор бывает только в группах. Free: не-админу бота отказ; админ бота может записать («включится после
+    пополнения»), как в _set_persona."""
+    admin = is_admin(update.effective_user.id)
+    chat = update.effective_chat
+    chat_id = chat.id
+    if len(context.args) >= 2:
+        if not admin:
+            await update.effective_message.reply_text("Менять настройки другого чата может только админ.")
+            return
+        try:
+            chat_id = int(context.args[1])
+        except ValueError:
+            await update.effective_message.reply_text(
+                "ID чата — это число. Формат: /review_persona toxic -1001234567890")
+            return
+    elif chat.type not in ("group", "supergroup"):
+        await update.effective_message.reply_text("Обзор бывает только в групповых чатах.")
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(_review_persona_status(update, chat_id))
+        return
+
+    arg = context.args[0].lower()
+    if arg != "off" and arg not in PERSONAS:
+        await update.effective_message.reply_text(REVIEW_PERSONA_USAGE)
+        return
+    tier = chat_tier(chat_id)
+    if tier == "free" and not admin:
+        await update.effective_message.reply_text("Обзор — платная функция, баланс — /cost")
+        return
+    if len(context.args) < 2 and not admin and not await is_chat_admin(context, chat.id, update.effective_user.id):
+        await update.effective_message.reply_text("Менять характер обзора могут только админы чата и админы бота.")
+        return
+
+    known, label = _chat_display(update, chat_id)
+    warn = "" if known or len(context.args) < 2 else "\n⚠️ Такого чата нет среди разрешённых — записала, но проверь ID."
+    if tier == "free":  # только админ бота
+        warn += "\nℹ️ Чат в бесплатном режиме: выбор сохранён, включится после пополнения."
+    if arg == "off":
+        db.clear_review_persona_db(chat_id)
+        await update.effective_message.reply_text(f"{label}: обзор снова в характере чата.{warn}")
+        return
+    db.set_review_persona_db(chat_id, arg)
+    await update.effective_message.reply_text(f"{label}: характер обзора — {PERSONAS[arg]['label']}.{warn}")
+
+
 def _make_persona_cmd(key: str):
     """Фабрика хендлера команды режима — по одному на ключ PERSONAS, регистрируется циклом в main()."""
     async def _cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4263,6 +4376,9 @@ async def cmd_personas(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mark = "▸" if key == current else " "
         lines.append(f"{mark} /{meta['cmds'][0]} {meta['label']}")
     lines.append("")
+    if update.effective_chat.type in ("group", "supergroup") or chat_id < 0:
+        lines.append(f"{_review_persona_line(chat_id)}. /review_persona")
+        lines.append("")
     if tier == "free":
         lines.append("В бесплатном режиме характер каждый день случайный (смена в полночь по Берлину). "
                      "Выбирать — в платном, баланс — /cost.")
@@ -4340,6 +4456,7 @@ USER_HELP = """\
   /ws            — файлы workspace режима разработчика: /ws get|rm <имя>, /ws clear yes
   /personas      — режимы характера и какой сейчас у чата
   /classic /business /toxic /flirt /granny — сменить характер (платный режим; в группе — админам чата и бота)
+  /review_persona — в группах: характер дневного обзора отдельно от характера чата (/review_persona toxic; off — как у чата)
   /ratelimit     — в группах: ограничить частоту сообщений участника (для админов группы)
   /review_on     — в группах: включить ежедневный авто-обзор чата (платный режим, для админов группы)
   /review_off    — в группах: выключить ежедневный авто-обзор чата (для админов группы)\
@@ -4388,6 +4505,7 @@ ADMIN_HELP = """\
 Характер (без аргумента — текущий чат; с chat_id — любой, только админу):
   /personas [chat_id]      — список режимов, ▸ = текущий (в бесплатном режиме — случайный на день)
   /classic /business /toxic /flirt /granny [chat_id] — переключить режим
+  /review_persona [ключ|off] [chat_id] — характер ОБЗОРА отдельно от чата (без аргументов — текущий; off — как у чата)
   В бесплатном режиме характер меняется сам раз в сутки (без flirt); выбор админа сохраняется и включится после пополнения.
 
 Профили (только в личке; бот предлагает изменения, раз в неделю — вс 19:00 Berlin — шлёт .md):
@@ -6642,7 +6760,7 @@ def main():
         "review", "review_on", "review_off", "verify", "unverify", "ban", "unban", "topup",
         "activity", "ratelimit", "cost", "haiku", "sonnet", "opus", "fable", "models",
         "imagemodels", "update", "profile", "profile_ok", "profile_no", "profile_digest",
-        "dev", "ws", "hidden", "unhide", "safety_scan",
+        "dev", "ws", "hidden", "unhide", "safety_scan", "review_persona",
     }
     _image_provider_cmds = [c for meta in IMAGE_PROVIDERS.values() for c in meta["cmds"]]
     assert len(_image_provider_cmds) == len(set(_image_provider_cmds)), \
@@ -6659,6 +6777,7 @@ def main():
     for _key, _meta in PERSONAS.items():
         app.add_handler(CommandHandler(_meta["cmds"], _make_persona_cmd(_key)))
     app.add_handler(CommandHandler("personas", cmd_personas))
+    app.add_handler(CommandHandler("review_persona", cmd_review_persona))
     app.add_handler(ChatMemberHandler(handle_new_chat, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(handle_chat_member, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(CommandHandler("update", cmd_update))
