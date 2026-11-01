@@ -43,7 +43,7 @@ per-chat по образцу `chat_image_provider`.
   записать выбор («включится после пополнения»).
 
 ## Обзор, поиск, остальное
-Ежедневный обзор и `/review` — «Ты Клодушка. Подача обзора (режим характера чата): {review_style}»; структура,
+Ежедневный обзор и `/review` — «Ты Клодушка. Подача обзора (режим характера обзора): {review_style}», где режим — `get_review_persona(chat_id)`: отдельный выбор из таблицы `chat_review_persona` (`db.get_review_persona_db` / `set_review_persona_db` / `clear_review_persona_db`) или, если строки нет, режим чата; неизвестный ключ → warning и режим чата, БД не трогаем. Команда `/review_persona [ключ|off] [chat_id]` (только группы; менять — админы чата и бота, `chat_id` — только админ бота; free: не-админу бота отказ, админ бота может записать; без аргументов — показать, всем); `/personas` в группе показывает строку «Обзор: …». ТЗ — `docs/claude/tz-review-persona.md`; структура,
 длина и лимиты обзора прежние (`docs/claude/daily-review.md`), старое «AI, который умнее всех» теперь `review_style`
 `classic`. `/search` и приветствие новичка (`greet_new_member`, label `greet`) — `tone` в system. Не трогали: `/start`, `whatsapp.py` (на паузе), извлечение памяти,
 профили. Обзор в free не делается.
