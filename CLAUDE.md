@@ -72,7 +72,7 @@
 - План работ ноябрь 2026 (мини-приложение, активность, характер обзора, рисование по кавычкам, автоигнор + пункты ту-ду):
   решения и порядок веток — `docs/claude/roadmap-2026-11.md`
 - Мини-приложение настроек: runbook прокси `edge` — `docs/claude/runbook-edge-proxy.md`; ТЗ реестра настроек —
-  `docs/claude/tz-settings-registry.md`; ТЗ мини-приложения — `docs/claude/tz-miniapp.md`
+  `docs/claude/tz-settings-registry.md`; ТЗ мини-приложения — `docs/claude/tz-miniapp.md`; ТЗ управляющих чата — `docs/claude/tz-chat-managers.md`
 - `whatsapp.py` — `.claude/rules/whatsapp.md` (грузится автоматически при чтении файла)
 - `db.py` — `.claude/rules/db.md` (автоматически)
 - `docker-compose.yml` — `.claude/rules/docker-compose.md` (автоматически)
