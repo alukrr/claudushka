@@ -31,6 +31,12 @@ def run(coro):
     return asyncio.run(coro)
 
 
+@pytest.fixture(autouse=True)
+def default_steps(monkeypatch):
+    # на стенде IGNORE_STEPS_MIN=1,1,1,1 в окружении — тесты проверяют лестницу по умолчанию
+    monkeypatch.setattr(bot, "IGNORE_STEPS_MIN", [5, 15, 30, 60])
+
+
 @pytest.fixture()
 def tmpdb(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "t.db")
