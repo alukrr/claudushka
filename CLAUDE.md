@@ -34,6 +34,7 @@
 - Режимы характера (`PERSONAS`, `/classic /business /toxic /flirt /granny /personas`, `_persona_text`, `CORE_IDENTITY`/`_core_rules`,
   `get_chat_persona`, `get_review_persona`, `chat_review_persona`, `/review_persona`, `free_persona`, `personas/*.md`, volume `./personas`) — `docs/claude/personas.md`; ТЗ — `docs/claude/tz-personas.md`; ТЗ «характер обзора отдельно» — `docs/claude/tz-review-persona.md`
 - Файлы целиком (`[[FILE: имя]]`, `FILE_MARKER_RE`, `extract_files`, `_file_sent_note`, `FILE_*`) — `docs/claude/files.md`
+- Настройки чата (`SETTINGS`, `ChatSetting`, `can_change`, `apply_setting`) — `docs/claude/settings.md`; ТЗ — `docs/claude/tz-settings-registry.md`; чек-лист стенда — `docs/claude/staging-checklist-settings-registry.md`
 - Групповой чат (`build_group_messages`, `group_messages`, `reply_context`/`_bot_reply_quote`, `detect_repeat`, `compute_strike`, `_apply_strike`, `chat_ignores`, `/autoignore /unignore /activity`, `activity_should_check`, гейтинг доступа,
   `/ratelimit`, `is_chat_admin`) — `docs/claude/group-chat.md`; ТЗ активности и автоигнора — `docs/claude/tz-group-behavior.md`
 - Голос/видео/кружочки/GIF (`_transcribe_audio_gemini`, `_extract_video_frames`,
@@ -142,6 +143,7 @@
 - Характер: `CORE_IDENTITY` → режим (`personas/*.md`) → `_core_rules()` → групповой аддендум; режим задаёт тон, не правила
   (честность/маркеры/служебный блок/группа). Новое место с зашитым «характером» — брать `tone`/`review_style` режима
   чата. Ключ режима в личке — `user_id`. `docs/claude/personas.md`.
+- Новая настройка чата — только через `SETTINGS`; права на неё — только `can_change`, не в хендлере (`docs/claude/settings.md`).
 - Модель чата — только `get_chat_model` (free → всегда Lite, `chat_models` в free не трогаем; paid → `chat_models` или Flash).
   Режим поиска чата — `chat_search_mode` через `search_provider_for`, не читать напрямую. Параметры вызова под модель — только
   `kwargs_for_model` (первый вызов и фолбэк). `docs/claude/models-and-costs.md`, `docs/claude/native-search.md`.

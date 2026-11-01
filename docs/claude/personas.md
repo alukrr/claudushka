@@ -39,7 +39,7 @@ per-chat по образцу `chat_image_provider`.
 - Команды `/classic /business /toxic /flirt /granny` (`_set_persona`, фабрика `_make_persona_cmd`, цикл в `main()`
   с `assert` на конфликты) и `/personas [chat_id]`. Права: личка — любой (paid); группа — `is_chat_admin`
   (админ чата или бота; строже, чем у моделей); чужой чат — `chat_id` аргументом, только админ бота
-  (`_parse_target_chat`). Free, не админ → «характер меняется сам каждый день, сегодня — X…»; админ бота в free может
+  (`_parse_target_chat` + `can_change`, `docs/claude/settings.md`). Free, не админ → «характер меняется сам каждый день, сегодня — X…»; админ бота в free может
   записать выбор («включится после пополнения»).
 
 ## Обзор, поиск, остальное
