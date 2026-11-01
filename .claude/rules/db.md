@@ -23,6 +23,7 @@ db.py используется отовсюду, поэтому полная с�
 - Миграция `no_anthropic_models` (`_mig_no_anthropic`, `_run_once`): `chat_models` Claude → Gemini, id заморожены в db.py — `docs/claude/models-and-costs.md`
 - `chat_persona` (режим характера чата, личка — `user_id`) — `docs/claude/personas.md`
 - `chat_ignores` (автоигнор: `chat_id, user_id, level, ignored_until, last_strike_ts`) и колонки `allowed_chats.activity_percent` (дефолт 0), `allowed_chats.autoignore_enabled` (дефолт 1) — `docs/claude/group-chat.md`
+- `chat_managers` (управляющие чата: `chat_id, user_id, added_by, added_at`, PK `(chat_id, user_id)`; права админа ЭТОГО чата без админки в Telegram) — `docs/claude/group-chat.md` → «Управляющие чата»
 - `chat_review_persona` (отдельный режим характера ОБЗОРА; нет строки = «как у чата») — `docs/claude/personas.md`
 - `dev_mode` (флаг режима разработчика), `dev_messages` (его тред, отдельно от `conversations`; индекс `(user_id, id)`) — `docs/claude/dev-mode.md`
 - `allowed_chats` (в т.ч. `daily_review_enabled`, `status`) — `docs/claude/daily-review.md`;

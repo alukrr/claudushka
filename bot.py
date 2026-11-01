@@ -798,9 +798,27 @@ def is_admin(user_id: int) -> bool:
 
 
 async def is_chat_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
-    """Админ бота — всегда да. Иначе — реальный статус в этом Telegram-чате
-    (administrator/creator), чтобы /ratelimit могли выставлять и админы группы,
-    а не только глобальные админы бота."""
+    """Права админа ЭТОГО чата — единая точка: /ratelimit, /review_on|off, /unignore, /cost в группе, реестр настроек
+    (`_check_change` → `can_change`), мини-приложение. True: админ бота; администратор/создатель в Telegram; УПРАВЛЯЮЩИЙ
+    чата (строка в `chat_managers`, статус member/restricted). Вышел/кикнут (left/kicked) — False, даже если строка есть
+    (строку не удаляем: вернётся в группу — права вернутся). Один запрос get_chat_member; ошибка запроса — False.
+    Выдача прав управляющим — НЕ здесь, а через is_real_chat_admin (docs/claude/group-chat.md → «Управляющие чата»)."""
+    if is_admin(user_id):
+        return True
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        if member.status in ("administrator", "creator"):
+            return True
+        if member.status == "member" or (member.status == "restricted" and getattr(member, "is_member", True)):
+            return db.is_chat_manager_db(chat_id, user_id)
+        return False
+    except Exception:
+        return False
+
+
+async def is_real_chat_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+    """Как is_chat_admin, но БЕЗ управляющих: админ бота или администратор/создатель в Telegram. Только для выдачи и
+    снятия прав управляющих (/manager add|rm) — управляющий других не добавляет."""
     if is_admin(user_id):
         return True
     try:
@@ -3951,6 +3969,94 @@ async def _group_admin_gate(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     return True
 
 
+MANAGER_USAGE = "Формат: /manager add|rm — ответом на сообщение или /manager add|rm <user_id>"
+
+
+async def _manager_target(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int
+                          ) -> tuple[int | None, str, bool, str | None]:
+    """Кого имеем в виду в /manager: (user_id, имя, это_бот, ошибка). Ответ на сообщение или числовой user_id."""
+    msg = update.effective_message
+    reply = msg.reply_to_message
+    if reply and reply.from_user:
+        u = reply.from_user
+        return u.id, u.full_name or u.username or str(u.id), bool(u.is_bot), None
+    if len(context.args or []) >= 2:
+        try:
+            uid = int(context.args[1])
+        except ValueError:
+            return None, "", False, "user_id — число. " + MANAGER_USAGE
+        try:
+            member = await context.bot.get_chat_member(chat_id, uid)
+        except Exception:
+            return None, "", False, "Не нашла такого участника в этом чате. Проверь user_id."
+        u = member.user
+        name = db.get_last_sender_name(chat_id, uid) or u.full_name or u.username or str(uid)
+        return uid, name, bool(u.is_bot), None
+    return None, "", False, MANAGER_USAGE
+
+
+async def cmd_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/manager add|rm — управляющие чата: права админа ЭТОГО чата без админки в Telegram (таблица chat_managers).
+    Выдают и снимают только настоящие админы (is_real_chat_admin: админ чата в Telegram или админ бота) — управляющий
+    других не добавляет. Только группы."""
+    chat = update.effective_chat
+    msg = update.effective_message
+    if chat.type not in ("group", "supergroup"):
+        await msg.reply_text("/manager работает только в групповых чатах.")
+        return
+    actor = update.effective_user.id
+    if not await is_real_chat_admin(context, chat.id, actor):
+        await msg.reply_text("Назначать и снимать управляющих могут только админы этого чата и админы бота.")
+        return
+    action = (context.args[0].lower() if context.args else "")
+    if action not in ("add", "rm"):
+        await msg.reply_text(MANAGER_USAGE)
+        return
+    uid, name, is_bot_user, err = await _manager_target(update, context, chat.id)
+    if err:
+        await msg.reply_text(err)
+        return
+    if action == "add":
+        if is_bot_user or uid == context.bot.id:
+            await msg.reply_text("Бота управляющим сделать нельзя.")
+            return
+        if await is_real_chat_admin(context, chat.id, uid):
+            await msg.reply_text(f"{name} и так админ.")
+            return
+        db.add_chat_manager(chat.id, uid, actor)
+        await msg.reply_text(f"{name} теперь управляет ботом в этом чате (как админ чата).")
+        return
+    if db.remove_chat_manager(chat.id, uid):
+        await msg.reply_text(f"{name} больше не управляет ботом в этом чате.")
+    else:
+        await msg.reply_text(f"{name} и так не управляет ботом в этом чате.")
+
+
+async def cmd_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/managers — список управляющих чата (имя по последней реплике, uid, кто и когда добавил). Смотрят админы чата,
+    включая управляющих (is_chat_admin). Только группы."""
+    chat = update.effective_chat
+    msg = update.effective_message
+    if chat.type not in ("group", "supergroup"):
+        await msg.reply_text("/managers работает только в групповых чатах.")
+        return
+    if not await is_chat_admin(context, chat.id, update.effective_user.id):
+        await msg.reply_text("/managers — только для админов чата и админов бота.")
+        return
+    rows = db.list_chat_managers(chat.id)
+    if not rows:
+        await msg.reply_text("Управляющих нет. Назначить: /manager add (ответом на сообщение или <user_id>).")
+        return
+    lines = ["Управляющие чата (права админа чата без админки в Telegram):"]
+    for r in rows:
+        name = db.get_last_sender_name(chat.id, r["user_id"]) or "?"
+        by = r["added_by"]
+        by_name = (db.get_last_sender_name(chat.id, by) or str(by)) if by else "?"
+        when = datetime.fromtimestamp(r["added_at"], BERLIN_TZ).strftime("%d.%m.%Y %H:%M") if r["added_at"] else "?"
+        lines.append(f"  {name} ({r['user_id']}) — добавил(а) {by_name}, {when} (Берлин)")
+    await msg.reply_text("\n".join(lines))
+
+
 async def cmd_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/activity [0-100] [chat_id] — шанс спонтанной реплики бота в группе (allowed_chats.activity_percent).
     Смотреть — все; менять — админы чата и бота; чужой чат — chat_id вторым аргументом, только админ бота.
@@ -5051,6 +5157,8 @@ USER_HELP = """\
   /activity [0-100] — в группах: шанс, что Клодушка сама вставит реплику, когда её не звали (платный режим; менять — админам группы)
   /autoignore [on|off] — в группах: автопауза бота за повторы и травлю; без аргумента — кто сейчас в паузе (для админов группы)
   /unignore      — в группах: снять паузу (ответом на сообщение или /unignore <user_id>; для админов группы)
+  /manager add|rm — в группах: дать/забрать права админа чата в боте у участника, не админа в Telegram (ответом на сообщение или <user_id>; только настоящим админам группы)
+  /managers      — в группах: список управляющих чата (для админов группы)
   /review_on     — в группах: включить ежедневный авто-обзор чата (платный режим, для админов группы)
   /review_off    — в группах: выключить ежедневный авто-обзор чата (для админов группы)\
 """
@@ -5112,6 +5220,7 @@ ADMIN_HELP = """\
   /captcha_unban <id>      — разбанить после капчи
   /activity [0-100] [chat_id] — шанс спонтанной реплики в группе, per-chat (без chat_id — текущий чат; с chat_id — любой)
   /autoignore [on|off]     — автопауза за повторы/травлю в текущей группе; /unignore [user_id] — снять паузу
+  /manager add|rm, /managers — управляющие группы (права админа чата без админки в Telegram; выдают админы группы и бота)
   /ratelimit               — лимит частоты сообщений участника в группе (доступно и админам группы,
                               не только боту-админу); ответом на сообщение: <N мин.>|off,
                               без ответа: <user_id> <N|off>, без аргументов — список, "off" — сброс всем
@@ -7369,6 +7478,8 @@ def main():
     app.add_handler(CommandHandler("activity", cmd_activity))
     app.add_handler(CommandHandler("autoignore", cmd_autoignore))
     app.add_handler(CommandHandler("unignore", cmd_unignore))
+    app.add_handler(CommandHandler("manager", cmd_manager))
+    app.add_handler(CommandHandler("managers", cmd_managers))
     app.add_handler(CommandHandler("ratelimit", cmd_ratelimit))
     app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler(["haiku", "sonnet", "opus", "fable"], cmd_claude_gone))
@@ -7387,6 +7498,7 @@ def main():
         "activity", "ratelimit", "cost", "haiku", "sonnet", "opus", "fable", "models",
         "imagemodels", "update", "profile", "profile_ok", "profile_no", "profile_digest",
         "dev", "ws", "hidden", "unhide", "safety_scan", "review_persona", "autoignore", "unignore",
+        "manager", "managers",
     }
     _image_provider_cmds = [c for meta in IMAGE_PROVIDERS.values() for c in meta["cmds"]]
     assert len(_image_provider_cmds) == len(set(_image_provider_cmds)), \
