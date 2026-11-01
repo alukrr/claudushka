@@ -128,6 +128,7 @@ def test_index_page_and_headers_without_telegram(env):
     assert "https://telegram.org" in r.headers["content-security-policy"]
     assert r.headers["x-content-type-options"] == "nosniff" and r.headers["referrer-policy"] == "no-referrer"
     assert env.client.get("/api/chats").headers["x-content-type-options"] == "nosniff"
+    assert env.client.head("/").status_code == 200          # curl -I
     assert env.client.get("/docs").status_code == 404 and env.client.get("/openapi.json").status_code == 404
 
 

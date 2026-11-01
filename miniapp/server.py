@@ -154,7 +154,7 @@ def create_app(*, bot_token: str, deps: MiniappDeps, max_age: int = 3600, rate_l
         except MiniappError as e:
             return _fail(e.status, e.message)
 
-    @app.get("/")
+    @app.api_route("/", methods=["GET", "HEAD"])
     async def index():
         return Response(INDEX_PATH.read_bytes(), media_type="text/html; charset=utf-8", headers={"Cache-Control": "no-store"})
 
