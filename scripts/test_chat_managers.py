@@ -256,3 +256,35 @@ def test_manager_cannot_use_bot_admin_features(tmpdb):
     out = settings_call(bot.cmd_activity, MANAGER, ["20", "-100777"], {MANAGER: "member"})
     assert "только админ" in out.lower() or "чужой" in out.lower() or "админ" in out.lower()
     assert _activity() == 0
+
+
+def test_managers_names_fallback_chain(tmpdb):
+    """Имя: group_messages → getChatMember (full_name, затем @username) → «?»; getChatMember — только когда реплик нет."""
+    asked = []
+    users = {
+        10: SimpleNamespace(full_name="Из Телеграма", username="tg10"),    # без реплик → full_name
+        11: SimpleNamespace(full_name="", username="tg11"),                # без full_name → @username
+        12: SimpleNamespace(full_name="", username=None),                  # совсем без имени → ?
+    }
+
+    async def get_member(chat_id, uid):
+        asked.append(uid)
+        if uid == 13:
+            raise RuntimeError("telegram down")
+        if uid == TG_ADMIN:
+            return SimpleNamespace(status="administrator", user=SimpleNamespace(full_name="Админ ТГ", username=None))
+        return SimpleNamespace(status="member", user=users[uid])
+    db.save_group_message(CHAT, 14, "Вася из чата", "привет")             # реплика есть → запрос не нужен
+    for uid in (10, 11, 12, 13, 14):
+        db.add_chat_manager(CHAT, uid, TG_ADMIN)                          # «добавил» TG_ADMIN: реплик нет → getChatMember
+    sent = []
+
+    async def reply(text, **k):
+        sent.append(text)
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=BOT_ADMIN), effective_chat=SimpleNamespace(id=CHAT, type="supergroup"),
+                          effective_message=SimpleNamespace(reply_text=reply, reply_to_message=None))
+    run(bot.cmd_managers(upd, SimpleNamespace(args=[], bot=SimpleNamespace(get_chat_member=get_member, id=BOT_ID))))
+    out = sent[-1]
+    assert "Из Телеграма (10)" in out and "@tg11 (11)" in out and "? (12)" in out and "? (13)" in out
+    assert "Вася из чата (14)" in out and 14 not in asked          # имя из group_messages — getChatMember не вызывался
+    assert "добавил(а) Админ ТГ" in out

@@ -4032,6 +4032,19 @@ async def cmd_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"{name} и так не управляет ботом в этом чате.")
 
 
+async def _member_display_name(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> str:
+    """Имя для списка: последняя реплика в group_messages → иначе getChatMember (full_name или @username) → иначе «?».
+    Запрос к Telegram — только для тех, у кого реплик нет; любая ошибка → «?» (команда не падает)."""
+    name = db.get_last_sender_name(chat_id, user_id)
+    if name:
+        return name
+    try:
+        u = (await context.bot.get_chat_member(chat_id, user_id)).user
+        return u.full_name or (f"@{u.username}" if u.username else "?")
+    except Exception:
+        return "?"
+
+
 async def cmd_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/managers — список управляющих чата (имя по последней реплике, uid, кто и когда добавил). Смотрят админы чата,
     включая управляющих (is_chat_admin). Только группы."""
@@ -4049,9 +4062,9 @@ async def cmd_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = ["Управляющие чата (права админа чата без админки в Telegram):"]
     for r in rows:
-        name = db.get_last_sender_name(chat.id, r["user_id"]) or "?"
+        name = await _member_display_name(context, chat.id, r["user_id"])
         by = r["added_by"]
-        by_name = (db.get_last_sender_name(chat.id, by) or str(by)) if by else "?"
+        by_name = await _member_display_name(context, chat.id, by) if by else "?"
         when = datetime.fromtimestamp(r["added_at"], BERLIN_TZ).strftime("%d.%m.%Y %H:%M") if r["added_at"] else "?"
         lines.append(f"  {name} ({r['user_id']}) — добавил(а) {by_name}, {when} (Берлин)")
     await msg.reply_text("\n".join(lines))
