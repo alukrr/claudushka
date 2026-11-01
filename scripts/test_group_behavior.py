@@ -24,6 +24,7 @@ Path.mkdir = _orig_mkdir
 
 CHAT = -1001234567890
 UID = 777
+BOT = 10**9   # «бот отвечал после каждого обращения»
 
 
 def run(coro):
@@ -56,36 +57,36 @@ def test_norm_placeholder_empty():
 
 def test_repeat_third_triggers(tmpdb):
     t = 1000.0
-    assert not bot.detect_repeat(CHAT, UID, "дай денег", t)
-    assert not bot.detect_repeat(CHAT, UID, "Дай денег!", t + 30)
-    assert bot.detect_repeat(CHAT, UID, "дай денег", t + 60)
+    assert not bot.detect_repeat(CHAT, UID, "дай денег", t, last_bot_ts=BOT)
+    assert not bot.detect_repeat(CHAT, UID, "Дай денег!", t + 30, last_bot_ts=BOT)
+    assert bot.detect_repeat(CHAT, UID, "дай денег", t + 60, last_bot_ts=BOT)
 
 
 def test_repeat_two_is_not_enough(tmpdb):
-    assert not bot.detect_repeat(CHAT, UID, "раз", 1000.0)
-    assert not bot.detect_repeat(CHAT, UID, "раз", 1010.0)
+    assert not bot.detect_repeat(CHAT, UID, "раз", 1000.0, last_bot_ts=BOT)
+    assert not bot.detect_repeat(CHAT, UID, "раз", 1010.0, last_bot_ts=BOT)
 
 
 def test_repeat_window_10_min(tmpdb):
-    bot.detect_repeat(CHAT, UID, "одно и то же", 1000.0)
-    bot.detect_repeat(CHAT, UID, "одно и то же", 1010.0)
-    assert not bot.detect_repeat(CHAT, UID, "одно и то же", 1010.0 + 11 * 60)
+    bot.detect_repeat(CHAT, UID, "одно и то же", 1000.0, last_bot_ts=BOT)
+    bot.detect_repeat(CHAT, UID, "одно и то же", 1010.0, last_bot_ts=BOT)
+    assert not bot.detect_repeat(CHAT, UID, "одно и то же", 1010.0 + 11 * 60, last_bot_ts=BOT)
 
 
 def test_repeat_different_texts_no(tmpdb):
     for i, t in enumerate(("привет как дела", "что делаешь вечером", "расскажи анекдот")):
-        assert not bot.detect_repeat(CHAT, UID, t, 1000.0 + i)
+        assert not bot.detect_repeat(CHAT, UID, t, 1000.0 + i, last_bot_ts=BOT)
 
 
 def test_repeat_placeholders_not_counted(tmpdb):
     for i in range(5):
-        assert not bot.detect_repeat(CHAT, UID, "[Фото]", 1000.0 + i)
+        assert not bot.detect_repeat(CHAT, UID, "[Фото]", 1000.0 + i, last_bot_ts=BOT)
 
 
 def test_repeat_per_user(tmpdb):
-    bot.detect_repeat(CHAT, 1, "спам", 1000.0)
-    bot.detect_repeat(CHAT, 2, "спам", 1001.0)
-    assert not bot.detect_repeat(CHAT, 3, "спам", 1002.0)
+    bot.detect_repeat(CHAT, 1, "спам", 1000.0, last_bot_ts=BOT)
+    bot.detect_repeat(CHAT, 2, "спам", 1001.0, last_bot_ts=BOT)
+    assert not bot.detect_repeat(CHAT, 3, "спам", 1002.0, last_bot_ts=BOT)
 
 
 # ---------- лестница ----------
@@ -346,3 +347,52 @@ def test_db_settings_roundtrip(tmpdb):
 
 def test_old_constant_removed():
     assert not hasattr(bot, "CHAT_ACTIVITY_CHANCE")
+
+
+# ---------- повтор: бот молчал ----------
+def test_repeat_bot_silent_is_not_repeat(tmpdb):
+    # бот упал/тормозит: три «ты тут?» за 2 минуты и ни одной реплики бота — не проступок
+    t = 1_000_000.0
+    assert not bot.detect_repeat(CHAT, UID, "Клодушка, ты тут?", t, last_bot_ts=0)
+    assert not bot.detect_repeat(CHAT, UID, "Клодушка, ты тут?", t + 60, last_bot_ts=0)
+    assert not bot.detect_repeat(CHAT, UID, "Клодушка, ты тут?", t + 120, last_bot_ts=0)
+    # реплика бота была ДО обращений — тоже не в счёт
+    assert not bot.detect_repeat(CHAT, UID, "Клодушка, ты тут?", t + 150, last_bot_ts=int(t) - 5)
+
+
+def test_repeat_bot_answered_each_time_is_repeat(tmpdb):
+    t = 1_000_000.0
+    assert not bot.detect_repeat(CHAT, UID, "дай денег", t, last_bot_ts=0)
+    assert not bot.detect_repeat(CHAT, UID, "дай денег", t + 60, last_bot_ts=int(t) + 5)
+    assert bot.detect_repeat(CHAT, UID, "дай денег", t + 120, last_bot_ts=int(t) + 65)
+
+
+def test_repeat_bot_answered_only_first_is_not_repeat(tmpdb):
+    t = 1_000_000.0
+    bot.detect_repeat(CHAT, UID, "дай денег", t, last_bot_ts=0)
+    bot.detect_repeat(CHAT, UID, "дай денег", t + 60, last_bot_ts=int(t) + 5)
+    # после второго обращения бот молчал → второе не считается, повторов только один
+    assert not bot.detect_repeat(CHAT, UID, "дай денег", t + 120, last_bot_ts=int(t) + 5)
+
+
+# ---------- пометка паузы в истории ----------
+def test_pause_history_note_format():
+    w = bot.pause_history_note("Вася", 1)
+    assert w == "(служебное: предупреждение бота для Вася о повторах)"
+    p = bot.pause_history_note("Вася", 3)
+    assert p == "(служебное: автопауза бота для Вася на 15 мин)"
+    for n in (w, p):
+        assert n.startswith("(") and n.endswith(")")
+        assert "беру паузу" not in n and "помолчу" not in n
+
+
+def test_apply_strike_history_is_note_not_text(tmpdb, monkeypatch):
+    monkeypatch.setattr(bot, "context_bot_id", 1)
+    m = FakeMsg()
+    run(bot._apply_strike(m, CHAT, UID, "Вася", "repeat"))
+    run(bot._apply_strike(m, CHAT, UID, "Вася", "repeat"))
+    assert "повторяешься" in m.sent[0] and "беру паузу" in m.sent[1]   # в Telegram — живой текст
+    texts = [e["text"] for e in db.get_group_transcript(CHAT, 10) if e["is_bot"]]
+    assert texts == ["(служебное: предупреждение бота для Вася о повторах)",
+                     "(служебное: автопауза бота для Вася на 5 мин)"]
+    assert not any("беру паузу" in t for t in texts)

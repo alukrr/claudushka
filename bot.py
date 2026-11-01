@@ -3354,9 +3354,13 @@ def _norm_address(text: str) -> str:
     return " ".join(t.split())
 
 
-def detect_repeat(chat_id: int, user_id: int, text: str, now: float | None = None) -> bool:
+def detect_repeat(chat_id: int, user_id: int, text: str, now: float | None = None,
+                  last_bot_ts: int = 0) -> bool:
     """Третье «одно и то же» за 10 минут: текущее обращение похоже (ratio >= 0.9) минимум на ДВА предыдущих.
-    Текущее добавляется в память процесса в любом случае (если не пустое после нормализации)."""
+    Предыдущее обращение считается только если бот после него что-то сказал в чате (last_bot_ts — метка последней
+    реплики бота, db.get_last_bot_ts; передаётся параметром, функция чистая): бот молчит/упал — человек не виноват,
+    что переспрашивает. Метки секундные, поэтому сравнение с int(ts). Текущее добавляется в память процесса в любом
+    случае (если не пустое после нормализации)."""
     now = time.time() if now is None else now
     norm = _norm_address(text)
     if not norm:
@@ -3364,7 +3368,8 @@ def detect_repeat(chat_id: int, user_id: int, text: str, now: float | None = Non
     dq = _recent_addresses.setdefault((chat_id, user_id), deque(maxlen=REPEAT_KEEP))
     similar = sum(
         1 for ts, prev in dq
-        if now - ts <= REPEAT_WINDOW_SEC and difflib.SequenceMatcher(None, norm, prev).ratio() >= REPEAT_RATIO
+        if now - ts <= REPEAT_WINDOW_SEC and last_bot_ts >= int(ts)
+        and difflib.SequenceMatcher(None, norm, prev).ratio() >= REPEAT_RATIO
     )
     dq.append((now, norm))
     return similar >= 2
@@ -3405,7 +3410,19 @@ async def _apply_strike(message, chat_id: int, user_id: int, name: str, reason: 
         await message.reply_text(text)
     except Exception as e:
         logger.warning(f"autoignore: не удалось отправить сообщение chat={chat_id}: {e}")
-    db.save_group_message(chat_id, context_bot_id, "Клодушка", text, is_bot=True)
+    # В историю — служебная пометка, а не текст реплики (см. pause_history_note).
+    db.save_group_message(chat_id, context_bot_id, "Клодушка", pause_history_note(name, level), is_bot=True)
+
+
+# В group_messages паузу кладём служебной пометкой, не репликой: модель копирует форматы из своей истории (инциденты
+# 2026-09-08 и 2026-09-28) и сама начала бы «объявлять паузы». В Telegram уходит strike_text. Без первого лица.
+PAUSE_NOTE_LABEL = "служебное"
+
+
+def pause_history_note(name: str, level: int) -> str:
+    if level <= 1:
+        return f"({PAUSE_NOTE_LABEL}: предупреждение бота для {name} о повторах)"
+    return f"({PAUSE_NOTE_LABEL}: автопауза бота для {name} на {ignore_step_min(level)} мин)"
 
 
 def user_is_ignored(chat_id: int, user_id: int) -> bool:
@@ -6485,7 +6502,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _autoignore_on = (not is_admin(user_id)) and db.get_autoignore_enabled(chat_id)
         if _autoignore_on and update.message:
             _addr_text = update.message.text or update.message.caption or ""
-            if detect_repeat(chat_id, user_id, _addr_text):
+            if detect_repeat(chat_id, user_id, _addr_text, last_bot_ts=db.get_last_bot_ts(chat_id)):
                 await _apply_strike(update.message, chat_id, user_id,
                                     update.effective_user.first_name or "Unknown", "repeat")
                 return
