@@ -3313,6 +3313,24 @@ LEAKED_DRAW_NOTE_RE = re.compile(
 LEAKED_DRAW_RE = re.compile(r"нарисовал\w*\s+картинк\w*\s*[:\-—]\s*(.+)", re.IGNORECASE | re.DOTALL)
 
 
+def strip_leaked_service_note(text: str) -> tuple[str, bool]:
+    """Ответ модели → (текст, была ли утечка служебной пометки из истории). Модель копирует форматы СВОИХ записей в group_messages
+    (инциденты 2026-09-08, 2026-09-28; 2026-11-02 — «обзор дня» в ответ на «ты че…» в Москвичах).
+    * ответ начинается с «(обзор дня по …» — это целиком выдуманный обзор (настоящий шлёт джоб/`/review`, не диалог): ответ отбрасываем;
+    * начинается с «(служебное: …)» — пометка паузы/предупреждения: вырезаем строку, остальное оставляем.
+    Если пометка не в начале ответа — не трогаем (это может быть обычный текст со скобками)."""
+    stripped = text.lstrip()
+    if stripped.startswith(f"({REVIEW_SENT_LABEL}"):
+        logger.warning(f"Утечка пометки обзора в ответ диалога, ответ отброшен: {stripped[:120]!r}")
+        return "", True
+    if stripped.startswith(f"({PAUSE_NOTE_LABEL}:"):
+        head, _, rest = stripped.partition("\n")
+        if head.rstrip().endswith(")"):
+            logger.warning(f"Утечка служебной пометки в ответ диалога, вырезана: {head[:120]!r}")
+            return rest.strip(), True
+    return text, False
+
+
 def _extract_draw_marker(text: str) -> tuple[str, str | None, str | None]:
     """Ответ модели → (текст без маркера, английский промпт или None, "2K" или None). Общий для основного диалога и
     веток фото/файла (до 2026-11-01 ветки фото/файла маркер не разбирали — `[[DRAW: …]]` уходил в чат текстом).
@@ -3374,7 +3392,7 @@ async def _finish_media_answer(update, context, *, chat_id: int, user_id: int, i
     request_text — текст/подпись пользователя: «нарисуй …» в нём (parse_draw_request) = явная просьба → лимит free говорится
     вслух и в подписи автор; иначе спонтанное рисование — молча, как в диалоге."""
     out_files: list[tuple[str, str, bool]] = []
-    text = answer
+    text, _ = strip_leaked_service_note(answer)
     if FILE_MARKER_RE.search(text):
         text, out_files = extract_files(text)
     text, draw_prompt, draw_size = _extract_draw_marker(text)
@@ -7409,7 +7427,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-        assistant_text = response_text(response)
+        assistant_text, _ = strip_leaked_service_note(response_text(response))
         if not assistant_text:
             # Запрос прошёл, но текста нет: отказ модели, только thinking, или упёрлись
             # в max_tokens. Молчать нельзя — пользователь решит, что бот сломался.
