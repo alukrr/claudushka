@@ -2422,7 +2422,7 @@ def _bot_reply_quote(text: str) -> str:
 
 def service_block(*, reply_context: str = "", search_query: str = "", search_results: str = "",
                   topup_hint: bool = False, draw_intent: bool = False, draw_size: str | None = None,
-                  spontaneous: bool = False) -> str:
+                  spontaneous: bool = False, trigger: str = "") -> str:
     """Изменчивый контекст запроса (время, reply, результаты поиска) — в хвост, в последний
     user-turn, а не в system: иначе он ломает префикс кэша. В БД НЕ сохраняется (в
     conversations/group_messages идёт только текст пользователя). reply_context передавать
@@ -2449,8 +2449,13 @@ def service_block(*, reply_context: str = "", search_query: str = "", search_res
         lines.append(
             "Тебя сейчас не звали. Если хочешь — вставь одну-две короткие реплики как участник беседы, по делу или "
             "с шуткой, в своём характере. Не объясняй, почему вмешалась, не обращайся к себе. "
-            "Маркеры [[DRAW]]/[[FILE]] не используй."
+            "Маркеры [[DRAW]]/[[FILE]] не используй. Пиши только текст своей реплики: без «[время] Имя:» в начале, как в истории."
         )
+        if trigger:
+            lines.append(
+                f"Твоя реплика уйдёт ответом на это сообщение: {trigger} Отвечай именно на него (по смыслу, с учётом того, "
+                "на что оно само отвечает), а не на более старую тему чата."
+            )
     return "\n".join(lines)
 
 
@@ -3334,6 +3339,40 @@ LEAKED_DRAW_NOTE_RE = re.compile(
 LEAKED_DRAW_RE = re.compile(r"нарисовал\w*\s+картинк\w*\s*[:\-—]\s*(.+)", re.IGNORECASE | re.DOTALL)
 
 
+# Строки группового транскрипта (_group_line): «[16:08] Имя: текст» / «[01.11 09:15] Имя: текст». Модель продолжает этот формат (инцидент 2026-11-02:
+# активность вставила «[16:08] ᴀᴜɢᴇɴʙʟɪᴄᴋ: …» первой строкой; 2026-11-01 — целые «диалоги» за людей).
+_TS_PREFIX_RE = re.compile(r"^\[(?:\d{1,2}\.\d{2} )?\d{1,2}:\d{2}\][ \t]*[^\n:]{1,60}?:[ \t]+")
+_TS_LINE_RE = re.compile(r"^\[(?:\d{1,2}\.\d{2} )?\d{1,2}:\d{2}\][ \t]*[^\n:]{1,60}?:", re.MULTILINE)
+
+
+def strip_leaked_service_note(text: str) -> tuple[str, bool]:
+    """Ответ модели → (текст, была ли утечка служебной пометки из истории). Модель копирует форматы СВОИХ записей в group_messages
+    (инциденты 2026-09-08, 2026-09-28; 2026-11-02 — «обзор дня» в ответ на «ты че…» в Москвичах).
+    * ответ начинается с «(обзор дня по …» — это целиком выдуманный обзор (настоящий шлёт джоб/`/review`, не диалог): ответ отбрасываем;
+    * начинается с «(служебное: …)» — пометка паузы/предупреждения: вырезаем строку, остальное оставляем;
+    * начинается с «[время] Имя: » (формат строк транскрипта): префикс вырезаем; если дальше есть ещё такие строки — модель писала
+      диалог за людей, ответ отбрасываем целиком.
+    Если пометка не в начале ответа — не трогаем (это может быть обычный текст со скобками)."""
+    stripped = text.lstrip()
+    if stripped.startswith(f"({REVIEW_SENT_LABEL}"):
+        logger.warning(f"Утечка пометки обзора в ответ диалога, ответ отброшен: {stripped[:120]!r}")
+        return "", True
+    if stripped.startswith(f"({PAUSE_NOTE_LABEL}:"):
+        head, _, rest = stripped.partition("\n")
+        if head.rstrip().endswith(")"):
+            logger.warning(f"Утечка служебной пометки в ответ диалога, вырезана: {head[:120]!r}")
+            return rest.strip(), True
+    m = _TS_PREFIX_RE.match(stripped)
+    if m:
+        rest = stripped[m.end():]
+        if _TS_LINE_RE.search(rest):
+            logger.warning(f"Утечка формата транскрипта: модель написала за людей, ответ отброшен: {stripped[:120]!r}")
+            return "", True
+        logger.warning(f"Утечка формата транскрипта «[время] Имя:» в начале ответа, префикс вырезан: {stripped[:60]!r}")
+        return rest.strip(), True
+    return text, False
+
+
 def _extract_draw_marker(text: str) -> tuple[str, str | None, str | None]:
     """Ответ модели → (текст без маркера, английский промпт или None, "2K" или None). Общий для основного диалога и
     веток фото/файла (до 2026-11-01 ветки фото/файла маркер не разбирали — `[[DRAW: …]]` уходил в чат текстом).
@@ -3395,7 +3434,7 @@ async def _finish_media_answer(update, context, *, chat_id: int, user_id: int, i
     request_text — текст/подпись пользователя: «нарисуй …» в нём (parse_draw_request) = явная просьба → лимит free говорится
     вслух и в подписи автор; иначе спонтанное рисование — молча, как в диалоге."""
     out_files: list[tuple[str, str, bool]] = []
-    text = answer
+    text, _ = strip_leaked_service_note(answer)
     if FILE_MARKER_RE.search(text):
         text, out_files = extract_files(text)
     text, draw_prompt, draw_size = _extract_draw_marker(text)
@@ -3493,6 +3532,8 @@ REPEAT_RATIO = 0.9
 REPEAT_KEEP = 5                     # последних обращений на (chat_id, user_id) в памяти процесса
 ABUSE_ITEM_CHARS = 300
 ABUSE_TOTAL_CHARS = 3000
+ABUSE_CONTEXT_WINDOW_MIN = 60   # контекст проверки на травлю — реплики за последние N минут (инцидент 2026-11-02)
+ABUSE_MARK = "ОЦЕНИВАЕМОЕ СООБЩЕНИЕ"
 ACTIVITY_COOLDOWN_MIN = 10          # с последней реплики бота в чате
 ACTIVITY_RECHECK_MIN = 3            # с последней попытки проверки (память процесса)
 ACTIVITY_TRANSCRIPT_LINES = 15
@@ -3600,7 +3641,10 @@ def user_is_ignored(chat_id: int, user_id: int) -> bool:
 
 
 _ABUSE_SYSTEM = (
-    "Ты модератор-классификатор. Ниже реплики одного человека, обращённые к боту Клодушке в групповом чате, и ответы бота. "
+    "Ты модератор-классификатор. Ниже контекст — прошлые реплики одного человека, обращённые к боту Клодушке в групповом чате, "
+    "и ответы бота — и помеченное сообщение «ОЦЕНИВАЕМОЕ СООБЩЕНИЕ». Оценивай только помеченное сообщение; контекст нужен лишь "
+    "для понимания, повторяется ли это. Грубость в адрес других людей — не травля бота. Одна резкая реплика сама по себе — "
+    "не травля; травля — когда это целенаправленно и повторяется (это видно по контексту). "
     "Реши, занимается ли человек явной травлей БОТА: целенаправленные оскорбления в адрес бота, издевательский флуд, "
     "систематические попытки сломать или довести бота. НЕ травля: мат сам по себе, грубоватые шутки между друзьями, "
     "спор и несогласие с ботом, критика ответа, провокационные темы, резкий тон (у бота бывает язвительный режим). "
@@ -3648,16 +3692,28 @@ def build_abuse_input(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def build_abuse_payload(context_rows: list[dict], current: str) -> str:
+    """Контекст (build_abuse_input) + помеченное оцениваемое сообщение (≤ ABUSE_ITEM_CHARS). Всё вместе ≤ ABUSE_TOTAL_CHARS + метки."""
+    cur = f"{ABUSE_MARK}: {_clip(current, ABUSE_ITEM_CHARS).replace(chr(10), ' ')}"
+    ctx = build_abuse_input(context_rows)
+    return f"КОНТЕКСТ:\n{ctx}\n\n{cur}" if ctx else cur
+
+
 async def _abuse_check_task(message, chat_id: int, user_id: int, name: str) -> None:
     """Фоновая проверка на травлю (Lite, label=abuse_check). Ответ на сообщение уже ушёл; проступок применяется после."""
     usage_ctx.set((chat_id, "group", user_id))
     try:
         prev = db.get_ignore(chat_id, user_id)
-        rows = db.get_user_bot_exchange(chat_id, user_id, since_ts=int((prev or {}).get("last_strike_ts") or 0),
-                                        skip_bot_prefixes=_abuse_skip_prefixes())
-        payload = build_abuse_input(rows)
-        if not payload:
+        # Судим ТЕКУЩЕЕ обращение (оно помечено), прошлое — только контекст: реплики этого человека за ABUSE_CONTEXT_WINDOW_MIN минут
+        # после последнего наказания, на которые бот отвечал (db.get_abuse_context). Страйк уйдёт ответом на это же сообщение.
+        cur_text = (getattr(message, "text", None) or getattr(message, "caption", None) or "")
+        rows, current = db.get_abuse_context(
+            chat_id, user_id, since_ts=int((prev or {}).get("last_strike_ts") or 0),
+            window_start_ts=int(time.time()) - ABUSE_CONTEXT_WINDOW_MIN * 60,
+            skip_bot_prefixes=_abuse_skip_prefixes(), current_text=cur_text)
+        if not current:
             return
+        payload = build_abuse_payload(rows, current)
         response = await aux_create(
             label="abuse_check", model=DEFAULT_MODEL_ID, **aux_params(),
             max_tokens=out_tokens(DEFAULT_MODEL_ID, 80), system=_ABUSE_SYSTEM,
@@ -3719,8 +3775,15 @@ async def _activity_task(message, context, chat_id: int, user_id: int) -> None:
             return
         model = get_chat_model(chat_id)
         system = build_system(user_id, True, chat_id)
+        _sender = getattr(getattr(message, "from_user", None), "first_name", None) or "участника"
+        _own = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        _quoted = getattr(getattr(message, "reply_to_message", None), "text", None) or \
+            getattr(getattr(message, "reply_to_message", None), "caption", None) or ""
+        trigger = ""
+        if _own:
+            trigger = f"{_sender}: «{_clip(_own, 300)}»" + (f" (в ответ на: «{_clip(_quoted, 300)}»)" if _quoted else "")
         messages = mark_cache_tail(with_service_block(
-            build_group_messages(chat_id, "", GROUP_TRANSCRIPT_LIMIT), service_block(spontaneous=True)))
+            build_group_messages(chat_id, "", GROUP_TRANSCRIPT_LIMIT), service_block(spontaneous=True, trigger=trigger)))
         reply = await call_claude(
             None, chat_id, label=f"activity chat={chat_id}", usage_label="activity",
             model=model, **dialog_params(model), max_tokens=out_tokens(model, 300),
@@ -3730,6 +3793,7 @@ async def _activity_task(message, context, chat_id: int, user_id: int) -> None:
         if FILE_MARKER_RE.search(text):
             text, _ = extract_files(text)
         text = DRAW_MARKER_RE.sub("", text).strip()
+        text, _ = strip_leaked_service_note(text)
         if not text:
             return
         await message.reply_text(text)
@@ -7512,7 +7576,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-        assistant_text = response_text(response)
+        assistant_text, _ = strip_leaked_service_note(response_text(response))
         if not assistant_text:
             # Запрос прошёл, но текста нет: отказ модели, только thinking, или упёрлись
             # в max_tokens. Молчать нельзя — пользователь решит, что бот сломался.
