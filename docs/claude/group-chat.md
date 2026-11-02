@@ -115,7 +115,7 @@
   (память процесса); `random` против процента.
 - **Фон** (`_activity_task`, `_spawn_background_task`, хендлер не ждёт): Lite `label="activity_check"` (последние 15 строк, ≤ 4000 знаков) →
   `{"say": bool}` → при `true` модель чата, `call_claude(..., label="activity", usage_label="activity")`, тот же `build_system` (кэш общий) +
-  `build_group_messages`, в служебном блоке `service_block(spontaneous=True)`. Маркеры `[[DRAW]]`/`[[FILE]]` вырезаются, пусто — молчим. Ответ — reply
+  `build_group_messages`, в служебном блоке `service_block(spontaneous=True, trigger=…)`: триггер — «Имя: «текст» (в ответ на: «…»)», модели прямо сказано отвечать именно на него, а не на старую тему (v2.7.1, инцидент 2026-11-02 вечер). Маркеры `[[DRAW]]`/`[[FILE]]` вырезаются, пусто — молчим. Ответ проходит `strip_leaked_service_note` (префикс «[время] Имя:», пометки обзора/паузы). Ответ — reply
   на сообщение-триггер, пишется в `group_messages` (`is_bot=True`), `_count_reply` НЕ вызывается. Любая ошибка (в т.ч. safety-блок) — warning.
 - 100% = Lite спрашивается на каждом сообщении, прошедшем кулдауны; потолок — одна реплика в 10 минут на чат (≤ 6 в час).
 

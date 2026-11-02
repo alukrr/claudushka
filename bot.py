@@ -2422,7 +2422,7 @@ def _bot_reply_quote(text: str) -> str:
 
 def service_block(*, reply_context: str = "", search_query: str = "", search_results: str = "",
                   topup_hint: bool = False, draw_intent: bool = False, draw_size: str | None = None,
-                  spontaneous: bool = False) -> str:
+                  spontaneous: bool = False, trigger: str = "") -> str:
     """Изменчивый контекст запроса (время, reply, результаты поиска) — в хвост, в последний
     user-turn, а не в system: иначе он ломает префикс кэша. В БД НЕ сохраняется (в
     conversations/group_messages идёт только текст пользователя). reply_context передавать
@@ -2449,8 +2449,13 @@ def service_block(*, reply_context: str = "", search_query: str = "", search_res
         lines.append(
             "Тебя сейчас не звали. Если хочешь — вставь одну-две короткие реплики как участник беседы, по делу или "
             "с шуткой, в своём характере. Не объясняй, почему вмешалась, не обращайся к себе. "
-            "Маркеры [[DRAW]]/[[FILE]] не используй."
+            "Маркеры [[DRAW]]/[[FILE]] не используй. Пиши только текст своей реплики: без «[время] Имя:» в начале, как в истории."
         )
+        if trigger:
+            lines.append(
+                f"Твоя реплика уйдёт ответом на это сообщение: {trigger} Отвечай именно на него (по смыслу, с учётом того, "
+                "на что оно само отвечает), а не на более старую тему чата."
+            )
     return "\n".join(lines)
 
 
@@ -3334,11 +3339,19 @@ LEAKED_DRAW_NOTE_RE = re.compile(
 LEAKED_DRAW_RE = re.compile(r"нарисовал\w*\s+картинк\w*\s*[:\-—]\s*(.+)", re.IGNORECASE | re.DOTALL)
 
 
+# Строки группового транскрипта (_group_line): «[16:08] Имя: текст» / «[01.11 09:15] Имя: текст». Модель продолжает этот формат (инцидент 2026-11-02:
+# активность вставила «[16:08] ᴀᴜɢᴇɴʙʟɪᴄᴋ: …» первой строкой; 2026-11-01 — целые «диалоги» за людей).
+_TS_PREFIX_RE = re.compile(r"^\[(?:\d{1,2}\.\d{2} )?\d{1,2}:\d{2}\][ \t]*[^\n:]{1,60}?:[ \t]+")
+_TS_LINE_RE = re.compile(r"^\[(?:\d{1,2}\.\d{2} )?\d{1,2}:\d{2}\][ \t]*[^\n:]{1,60}?:", re.MULTILINE)
+
+
 def strip_leaked_service_note(text: str) -> tuple[str, bool]:
     """Ответ модели → (текст, была ли утечка служебной пометки из истории). Модель копирует форматы СВОИХ записей в group_messages
     (инциденты 2026-09-08, 2026-09-28; 2026-11-02 — «обзор дня» в ответ на «ты че…» в Москвичах).
     * ответ начинается с «(обзор дня по …» — это целиком выдуманный обзор (настоящий шлёт джоб/`/review`, не диалог): ответ отбрасываем;
-    * начинается с «(служебное: …)» — пометка паузы/предупреждения: вырезаем строку, остальное оставляем.
+    * начинается с «(служебное: …)» — пометка паузы/предупреждения: вырезаем строку, остальное оставляем;
+    * начинается с «[время] Имя: » (формат строк транскрипта): префикс вырезаем; если дальше есть ещё такие строки — модель писала
+      диалог за людей, ответ отбрасываем целиком.
     Если пометка не в начале ответа — не трогаем (это может быть обычный текст со скобками)."""
     stripped = text.lstrip()
     if stripped.startswith(f"({REVIEW_SENT_LABEL}"):
@@ -3349,6 +3362,14 @@ def strip_leaked_service_note(text: str) -> tuple[str, bool]:
         if head.rstrip().endswith(")"):
             logger.warning(f"Утечка служебной пометки в ответ диалога, вырезана: {head[:120]!r}")
             return rest.strip(), True
+    m = _TS_PREFIX_RE.match(stripped)
+    if m:
+        rest = stripped[m.end():]
+        if _TS_LINE_RE.search(rest):
+            logger.warning(f"Утечка формата транскрипта: модель написала за людей, ответ отброшен: {stripped[:120]!r}")
+            return "", True
+        logger.warning(f"Утечка формата транскрипта «[время] Имя:» в начале ответа, префикс вырезан: {stripped[:60]!r}")
+        return rest.strip(), True
     return text, False
 
 
@@ -3754,8 +3775,15 @@ async def _activity_task(message, context, chat_id: int, user_id: int) -> None:
             return
         model = get_chat_model(chat_id)
         system = build_system(user_id, True, chat_id)
+        _sender = getattr(getattr(message, "from_user", None), "first_name", None) or "участника"
+        _own = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        _quoted = getattr(getattr(message, "reply_to_message", None), "text", None) or \
+            getattr(getattr(message, "reply_to_message", None), "caption", None) or ""
+        trigger = ""
+        if _own:
+            trigger = f"{_sender}: «{_clip(_own, 300)}»" + (f" (в ответ на: «{_clip(_quoted, 300)}»)" if _quoted else "")
         messages = mark_cache_tail(with_service_block(
-            build_group_messages(chat_id, "", GROUP_TRANSCRIPT_LIMIT), service_block(spontaneous=True)))
+            build_group_messages(chat_id, "", GROUP_TRANSCRIPT_LIMIT), service_block(spontaneous=True, trigger=trigger)))
         reply = await call_claude(
             None, chat_id, label=f"activity chat={chat_id}", usage_label="activity",
             model=model, **dialog_params(model), max_tokens=out_tokens(model, 300),
@@ -3765,6 +3793,7 @@ async def _activity_task(message, context, chat_id: int, user_id: int) -> None:
         if FILE_MARKER_RE.search(text):
             text, _ = extract_files(text)
         text = DRAW_MARKER_RE.sub("", text).strip()
+        text, _ = strip_leaked_service_note(text)
         if not text:
             return
         await message.reply_text(text)
