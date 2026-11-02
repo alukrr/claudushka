@@ -75,14 +75,19 @@ client_noretry = client.with_options(max_retries=0)  # переиспользу�
 # обрабатывает апдейты по очереди — встали ВСЕ команды (стенд, 2026-11-02). Потолок ожидания между SDK-ретраями; после ретраев —
 # обычный фолбэк (sync_create). Патчится только `client` (у client_noretry ретраев нет).
 SDK_RETRY_WAIT_CAP = 10.0
-_sdk_retry_timeout = client._calculate_retry_timeout
+# Метод приватный (anthropic 1.7.0, BaseClient._calculate_retry_timeout): при обновлении SDK его могут переименовать — тогда
+# НЕ падаем при старте, а работаем без потолка и громко пишем в лог (тест test_sdk_retry_wait_is_capped_* это поймает).
+_sdk_retry_timeout = getattr(client, "_calculate_retry_timeout", None)
 
 
 def _capped_retry_timeout(*args, **kwargs) -> float:
     return min(_sdk_retry_timeout(*args, **kwargs), SDK_RETRY_WAIT_CAP)
 
 
-client._calculate_retry_timeout = _capped_retry_timeout
+if callable(_sdk_retry_timeout):
+    client._calculate_retry_timeout = _capped_retry_timeout
+else:
+    logger.error("SDK без _calculate_retry_timeout — потолок Retry-After не стоит (docs/claude/api-errors.md); проверить после обновления anthropic")
 
 # --- Фолбэк между провайдерами пула (docs/claude/model-fallback.md, ТЗ no-anthropic) ---
 # С 2026-10-28 пул не отдаёт модели Anthropic; все модели чата — Gemini, фолбэк — GPT из ДРУГОГО провайдера (один сбой
