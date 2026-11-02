@@ -75,7 +75,7 @@ GPT Image 2.5 Flare/Sunburst (добавлены 2026-09-22, `docs/claude/images
 ## Привязка вызова к чату: `usage_ctx`
 `contextvars.ContextVar` = `(chat_id, chat_type, user_id)`. Выставляет `gate_update`
 (`TypeHandler(Update, ...)`, `group=-1`) на КАЖДЫЙ апдейт, для апдейтов без чата — `None`
-(PTB обрабатывает апдейты последовательно в одном task'е, иначе контекст протёк бы).
+(при `MAX_CONCURRENT_UPDATES > 1` каждый апдейт идёт в своей задаче asyncio — контекст изолирован; при `1` апдейты идут в одной задаче по очереди, иначе контекст протёк бы; `docs/claude/api-errors.md` → «Параллельная обработка апдейтов»).
 `asyncio.to_thread` и `create_task` копируют контекст, поэтому `sync_create`, `extract_*`,
 `web_search`, фоновые задачи наследуют чат сами — **проверено** локально на живом
 `Application.process_update` (group -1 → group 0 → to_thread). `daily_chat_review` (джоб,
