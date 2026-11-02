@@ -75,6 +75,7 @@
 - Мини-приложение настроек (`miniapp/server.py`, `miniapp/index.html`, `validate_init_data`, `_ma_*`, `/settings`, `MINIAPP_PUBLIC_URL`) — `docs/claude/miniapp.md`; чек-лист стенда — `docs/claude/staging-checklist-miniapp.md`;
   runbook прокси `edge` — `docs/claude/runbook-edge-proxy.md`; ТЗ реестра настроек —
   `docs/claude/tz-settings-registry.md`; ТЗ мини-приложения — `docs/claude/tz-miniapp.md`; ТЗ управляющих чата — `docs/claude/tz-chat-managers.md`
+- Параллельная обработка апдейтов (`PerChatUpdateProcessor`, `MAX_CONCURRENT_UPDATES`): ТЗ — `docs/claude/tz-concurrent-updates.md`
 - `whatsapp.py` — `.claude/rules/whatsapp.md` (грузится автоматически при чтении файла)
 - `db.py` — `.claude/rules/db.md` (автоматически)
 - `docker-compose.yml` — `.claude/rules/docker-compose.md` (автоматически)
