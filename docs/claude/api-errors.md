@@ -203,3 +203,42 @@ SDK при 429/5xx слепо ждёт заголовок `Retry-After` (про�
 (`concurrent_updates` не включён) — на стенде 2026-11-02 перестали отвечать все команды. Поэтому у `client` (не у `client_noretry`, у него ретраев нет)
 ожидание между ретраями ограничено `SDK_RETRY_WAIT_CAP = 10` с; короткий `Retry-After` пула уважаем. После исчерпания ретраев — обычный фолбэк
 (`sync_create` → GPT, `docs/claude/model-fallback.md`). Тест — `scripts/test_help_and_retry_cap.py`. Новый клиент SDK с ретраями — патчить так же.
+
+## Параллельная обработка апдейтов (v2.7.0, `PerChatUpdateProcessor`)
+
+ТЗ — `docs/claude/tz-concurrent-updates.md`, чек-лист — `docs/claude/staging-checklist-concurrent-updates.md`. До v2.7.0 PTB обрабатывал апдейты
+по одному (один долгий `await` стоял всем чатам; 2026-11-02 — `Retry-After: 866`, см. `incidents.md`).
+
+**Что в исходнике PTB 22.8** (читали, не по памяти): при `max_concurrent_updates > 1` `Application.__update_fetcher` делает на КАЖДЫЙ апдейт
+`create_task(__process_update_wrapper(update))` → отдельная задача asyncio, у неё своя копия contextvars (`usage_ctx` изолирован); при `== 1` апдейт
+ждётся в самой задаче-fetcher'е (старое поведение). `BaseUpdateProcessor.process_update` помечен `@final` и берёт общий семафор ДО `do_process_update`.
+
+**Как устроено** (`bot.py`, перед `post_init`):
+- `PerChatUpdateProcessor(MAX_CONCURRENT_UPDATES)` подключён `Application.builder().concurrent_updates(...)`. Ключ очереди — `effective_chat.id`,
+  иначе `effective_user.id`, иначе без очереди (только общий лимит).
+- Порядок взятия: **замок чата → общий слот** (свой `asyncio.Semaphore`; иначе флуд одного чата занял бы все слоты). Поэтому `process_update`
+  переопределён (в PTB он `@final` — это осознанный обход; контракт держит `scripts/test_concurrent_updates.py`, при апдейте PTB его запускать).
+- Порядок внутри чата: задачи стартуют в порядке создания, до `async with lock` нет `await`, `asyncio.Lock` — FIFO. НЕ вставлять `await`
+  перед взятием замка в `process_update`.
+- Запись замка живёт, пока есть держащий/ожидающий, потом удаляется. Исключение/отмена апдейта замок не держит.
+- `MAX_CONCURRENT_UPDATES` (по умолчанию 16; `1` = как раньше, строго по одному — **аварийный откат без кода**: `.env` + `docker compose up -d --force-recreate`).
+  Без переменной работает дефолт 16 — в т.ч. после `/update`.
+- `THREAD_POOL_WORKERS` (по умолчанию 32) — размер пула `asyncio.to_thread` (`loop.set_default_executor` в `post_init`).
+- SQLite: `sqlite3.connect(..., timeout=30)` в `db.get_conn` (было 5 с), WAL уже включён; `record_usage` — `BEGIN IMMEDIATE`. Длинных транзакций не вводить.
+  Обращения к SQLite в хендлерах по-прежнему синхронные прямо в event loop (короткие, как и раньше) — параллельная запись из потоков делает их ожидание
+  на блокировке чуть вероятнее; цель — не «database is locked», а короткое ожидание.
+- Логи: фильтр `_ChatLogFilter` дописывает ` [chat=<id>]` к каждой строке, записанной внутри обработки апдейта (по `usage_ctx`), если `chat=` в ней уже нет.
+
+**Правило для нового кода:** модульное изменяемое состояние — с ключом по чату (тогда очередь чата его защищает) или с явной защитой; проверка-и-запись
+через `await` по ключу, общему для РАЗНЫХ чатов (модель, пользователь в двух чатах, глобальный флаг), — гонка. Проверка-и-запись без `await` между ними
+в event loop атомарна (но не из `to_thread`-потоков).
+
+**Аудит глобального состояния (2026-11, v2.7.0)** — ни одной гонки, требующей правки кода:
+- ключ = чат / (чат, пользователь) / личка пользователя (= чат): `_known_groups`, `_bonus_checked`, `_free_msg_counter`, `_activity_last_check`, `_recent_addresses`,
+  `_safety_*`, `_reaction_chain`, `_reacted`, `_HISTORY_ANCHORS`, `_dev_albums`, `_street_notified`, `captcha_state` — защищены очередью чата (и проверка-запись у них без `await`);
+- глобальные/по модели — только косметика: `_fallback_until`, `_last_fallback_alert`, `_unknown_model_warned`, `api_errors._last_balance_alert` (из потоков `sync_create`: возможен
+  лишний дубль предупреждения/сообщения админам — не ущерб);
+- `_ma_cache` — мини-приложение, свой сервер на том же loop, от очереди апдейтов не зависело и не зависит; `_background_tasks`, `usage_ctx` — безопасны;
+- установленные один раз в `post_init`: `_admin_bot`, `_main_loop`, `context_bot_id`, `bot_username`, `_miniapp_server`; `CAPTCHA_ENABLED` — булев флаг админ-команды.
+- Известное допущение: дневной лимит непроверенного участника, пишущего одновременно в двух группах, может пропустить +1 ответ.
+- Известный риск: лимиты Telegram на отправку (флуд в нескольких чатах сразу) — `AIORateLimiter` не подключали (новых зависимостей нет), смотреть 429 от Telegram в логах.

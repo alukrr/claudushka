@@ -18,6 +18,7 @@ import difflib
 import contextlib
 from types import SimpleNamespace
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, MenuButtonWebApp, Update, WebAppInfo
 from telegram.constants import ReactionEmoji
@@ -25,7 +26,7 @@ from telegram.error import BadRequest, Forbidden
 from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 from telegram.ext import (
-    Application, ApplicationHandlerStop, CommandHandler, MessageHandler, ChatMemberHandler,
+    Application, ApplicationHandlerStop, BaseUpdateProcessor, CommandHandler, MessageHandler, ChatMemberHandler,
     TypeHandler, filters, ContextTypes,
 )
 import anthropic
@@ -45,6 +46,26 @@ logging.basicConfig(level=logging.INFO)
 # и шум, в котором тонут настоящие ошибки.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+
+class _ChatLogFilter(logging.Filter):
+    """Параллельные апдейты перемешивают строки лога разных чатов. Если запись сделана внутри обработки апдейта (usage_ctx
+    выставлен gate_update; он копируется в фоновые задачи и to_thread) и в самой строке chat= нет, дописываем « [chat=<id>]»."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            ctx = usage_ctx.get()
+            if ctx:
+                msg = record.getMessage()
+                if "chat=" not in msg:
+                    record.msg, record.args = f"{msg} [chat={ctx[0]}]", None
+        except Exception:
+            pass   # лог не должен ронять обработку
+        return True
+
+
+for _h in logging.getLogger().handlers:
+    _h.addFilter(_ChatLogFilter())
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
@@ -5864,8 +5885,9 @@ async def gate_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Первый хендлер (group=-1) на КАЖДЫЙ апдейт: выставляет usage_ctx, регистрирует
     неизвестную группу и режет забаненных.
 
-    usage_ctx выставляется ВСЕГДА, в т.ч. в None для апдейтов без чата: PTB обрабатывает
-    апдейты последовательно в одном task'е, и контекст предыдущего чата иначе протёк бы.
+    usage_ctx выставляется ВСЕГДА, в т.ч. в None для апдейтов без чата. При MAX_CONCURRENT_UPDATES > 1 каждый апдейт идёт
+    в своей задаче asyncio (копия contextvars, PerChatUpdateProcessor) — контексты разных чатов не пересекаются; при
+    MAX_CONCURRENT_UPDATES=1 апдейты идут по очереди в одной задаче, и контекст предыдущего чата без этой записи протёк бы.
     Бан режем только для апдейтов с сообщением: my_chat_member/chat_member — служебные."""
     chat, user = update.effective_chat, update.effective_user
     if chat is None:
@@ -6315,9 +6337,90 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(f"Необработанное исключение в хендлере ({where}): {err}", exc_info=err)
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, "") or default))
+    except ValueError:
+        return default
+
+
+# Параллельные апдейты (docs/claude/api-errors.md → «Параллельная обработка апдейтов», ТЗ docs/claude/tz-concurrent-updates.md).
+MAX_CONCURRENT_UPDATES = _env_positive_int("MAX_CONCURRENT_UPDATES", 16)   # 1 = как раньше, строго по одному (аварийный откат)
+THREAD_POOL_WORKERS = _env_positive_int("THREAD_POOL_WORKERS", 32)         # пул to_thread (SQLite-обёртки, sync_create, ffmpeg)
+
+
+class PerChatUpdateProcessor(BaseUpdateProcessor):
+    """Апдейты РАЗНЫХ чатов — параллельно, одного чата — по очереди в порядке прихода, всего не больше `max_concurrent_updates`.
+
+    Что показал исходник PTB 22.8 (telegram/ext/_application.py, _baseupdateprocessor.py), а не память:
+    * `Application.__update_fetcher` при `max_concurrent_updates > 1` создаёт на КАЖДЫЙ апдейт отдельную задачу
+      (`create_task(__process_update_wrapper(update))`) — contextvars (`usage_ctx`) у каждого апдейта свой, копия на задачу;
+      при `== 1` апдейт ждётся прямо в задаче-fetcher'е (так работал бот до v2.7.0: один task, апдейты по очереди);
+    * `__process_update_wrapper` зовёт `processor.process_update(update, coroutine)`; в базовом классе он помечен `@final`
+      и берёт ОБЩИЙ семафор до `do_process_update` — так слот занял бы апдейт, ждущий очередь своего чата, и флуд одного чата
+      остановил бы остальных. Поэтому `process_update` переопределён здесь: сначала замок чата, потом слот (свой семафор;
+      базовый `_semaphore` не используется). Если PTB изменит этот контракт — упадёт `test_concurrent_updates.py`.
+    Порядок внутри чата: задачи стартуют в порядке создания, до взятия замка нет ни одного `await`, а `asyncio.Lock` отдаёт
+    замок ожидающим по очереди (FIFO) — порядок апдейтов сохраняется. Замок чата живёт, пока есть держащий или ожидающий;
+    потом запись удаляется (память не растёт). Исключение апдейта замок не держит (`async with`)."""
+
+    def __init__(self, max_concurrent_updates: int):
+        super().__init__(max_concurrent_updates)
+        self._slots = asyncio.Semaphore(max_concurrent_updates)
+        self._chat_locks: dict[int, list] = {}   # ключ -> [Lock, число держащих и ожидающих]
+        self._active = 0
+
+    @property
+    def current_concurrent_updates(self) -> int:
+        return self._active
+
+    @staticmethod
+    def queue_key(update: object) -> int | None:
+        """Чат апдейта; нет чата — пользователь (в личке chat_id == user_id: та же очередь); нет и его — без очереди."""
+        chat = getattr(update, "effective_chat", None)
+        if chat is not None:
+            return chat.id
+        user = getattr(update, "effective_user", None)
+        return user.id if user is not None else None
+
+    async def do_process_update(self, update: object, coroutine) -> None:
+        self._active += 1
+        try:
+            await coroutine
+        finally:
+            self._active -= 1
+
+    async def process_update(self, update: object, coroutine) -> None:   # noqa: переопределение @final — см. докстринг класса
+        key = self.queue_key(update)
+        if key is None:
+            async with self._slots:
+                await self.do_process_update(update, coroutine)
+            return
+        entry = self._chat_locks.get(key)
+        if entry is None:
+            entry = self._chat_locks[key] = [asyncio.Lock(), 0]
+        entry[1] += 1
+        try:
+            async with entry[0]:            # 1) очередь своего чата
+                async with self._slots:     # 2) общий лимит
+                    await self.do_process_update(update, coroutine)
+        finally:
+            entry[1] -= 1
+            if entry[1] == 0 and self._chat_locks.get(key) is entry:
+                del self._chat_locks[key]
+
+    async def initialize(self) -> None:
+        pass
+
+    async def shutdown(self) -> None:
+        pass
+
+
 async def post_init(application):
     global context_bot_id, bot_username, _admin_bot, _main_loop
     _main_loop = asyncio.get_running_loop()
+    # Пул to_thread: по умолчанию min(32, cpu+4) — мало, когда sync_create/извлечение памяти/ffmpeg идут параллельно из разных чатов.
+    _main_loop.set_default_executor(ThreadPoolExecutor(max_workers=THREAD_POOL_WORKERS, thread_name_prefix="claudushka"))
     me = await application.bot.get_me()
     context_bot_id = me.id
     bot_username = me.username.lower()
@@ -6749,7 +6852,7 @@ async def _dev_album_flush(key: tuple, context) -> None:
 
 def _dev_album_add(message, context, user_id: int, *, stored=None, image: str | None = None) -> None:
     """Добавить элемент альбома и перезапустить таймер. Ожидание — фоном (_spawn_background_task), не в хендлере:
-    PTB обрабатывает апдейты по очереди, и спящий хендлер задержал бы остальные файлы альбома."""
+    апдейты одного чата идут по очереди (PerChatUpdateProcessor), и спящий хендлер задержал бы остальные файлы альбома."""
     key = (user_id, message.media_group_id)
     st = _dev_albums.get(key)
     if st is None:
@@ -7802,7 +7905,8 @@ def main():
         db.get_or_create_user(admin_id, full_name="Aleksei" if admin_id == 592441 else None)
         db.set_role(admin_id, "admin")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
+    app = (Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown)
+           .concurrent_updates(PerChatUpdateProcessor(MAX_CONCURRENT_UPDATES)).build())
 
     # group=-1 — раньше всех: usage_ctx, регистрация неизвестных групп, баны.
     app.add_handler(TypeHandler(Update, gate_update), group=-1)

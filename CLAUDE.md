@@ -51,8 +51,9 @@
 - Деньги и доступ (`usage_log`, `chat_credits`, баланс, тарифы paid/free, `usage_ctx`,
   `_record_usage`, `gate_update`, `/cost`, `/topup`, `/verify /unverify /ban /unban`,
   лимиты непроверенных, стартовый бонус, `/fable`-подтверждение) — `docs/claude/billing.md`
-- Ошибки API, ретраи, блокирующие вызовы, `response_text`, `parse_json_lenient` —
-  `docs/claude/api-errors.md`
+- Ошибки API, ретраи, блокирующие вызовы, `response_text`, `parse_json_lenient`, параллельные апдейты (`PerChatUpdateProcessor`, `MAX_CONCURRENT_UPDATES`,
+  `THREAD_POOL_WORKERS`, `_ChatLogFilter`) — `docs/claude/api-errors.md`; ТЗ — `docs/claude/tz-concurrent-updates.md`; чек-лист стенда —
+  `docs/claude/staging-checklist-concurrent-updates.md`
 - Уход с Anthropic (пул закрыл Claude 2026-10-28; Шаги 1 и 3 сделаны в v2.0.0, Шаг 2 — рисование Terra `/terra` — не сделан), замеры всех моделей пула (`scripts/bench_pool.py`) —
   ТЗ `docs/claude/tz-no-anthropic.md`; чек-лист стенда `feat/no-anthropic` — `docs/claude/staging-checklist-no-anthropic.md`
 - Фолбэк Gemini → GPT при сбоях пула (`FALLBACK_PAIRS`, `FALLBACK_*`, `should_fallback`, `_call_with_fallback`, `kwargs_for_model`,
@@ -136,6 +137,8 @@
 - JSON из ответа модели — только `api_errors.parse_json_lenient()`, никогда `find`/`rfind`.
 - Мини-приложение — только через `SETTINGS`/`can_change`/`apply_setting` (новых правил в нём нет), авторизация — только подпись `initData` (`validate_init_data`, по документации Telegram); выкатка — `docker compose up -d --force-recreate` (том `./miniapp`, сеть `edge`), не `/update` (`docs/claude/miniapp.md`).
 - Права «админ этого чата» — только `is_chat_admin` (включает управляющих `chat_managers`); выдача и снятие прав управляющим — только `is_real_chat_admin` (без управляющих), иначе управляющий начнёт назначать других (`docs/claude/group-chat.md` → «Управляющие чата»).
+- Апдейты ОДНОГО чата — по очереди, РАЗНЫХ — параллельно (`PerChatUpdateProcessor`, `MAX_CONCURRENT_UPDATES`, `1` = аварийный откат на «по одному»). Новое глобальное изменяемое состояние — с ключом по чату
+  или с явной защитой; проверка-и-запись через `await` по ключу, общему для разных чатов, — гонка; перед взятием замка чата в процессоре `await` не вставлять (`docs/claude/api-errors.md`).
 - Автоигнор и активность — только кодом и только в группах; модель паузу не объявляет и не включает (`docs/claude/group-chat.md`, ТЗ `docs/claude/tz-group-behavior.md`, чек-лист `docs/claude/staging-checklist-group-behavior.md`).
 - Ответы бота в группе сохраняются в `group_messages` с `is_bot=True` во всех ветках
   (текст/фото/документ/рисование/обзор) — иначе Клодушка не видит собственные реплики.

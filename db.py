@@ -19,7 +19,8 @@ PAID_MIN_BALANCE = 0.0001
 
 
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
+    # timeout=30: параллельные апдейты (to_thread-пул) ждут друг друга на записи, а не падают «database is locked» (дефолт 5 с)
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
