@@ -3511,6 +3511,8 @@ REPEAT_RATIO = 0.9
 REPEAT_KEEP = 5                     # последних обращений на (chat_id, user_id) в памяти процесса
 ABUSE_ITEM_CHARS = 300
 ABUSE_TOTAL_CHARS = 3000
+ABUSE_CONTEXT_WINDOW_MIN = 60   # контекст проверки на травлю — реплики за последние N минут (инцидент 2026-11-02)
+ABUSE_MARK = "ОЦЕНИВАЕМОЕ СООБЩЕНИЕ"
 ACTIVITY_COOLDOWN_MIN = 10          # с последней реплики бота в чате
 ACTIVITY_RECHECK_MIN = 3            # с последней попытки проверки (память процесса)
 ACTIVITY_TRANSCRIPT_LINES = 15
@@ -3618,7 +3620,10 @@ def user_is_ignored(chat_id: int, user_id: int) -> bool:
 
 
 _ABUSE_SYSTEM = (
-    "Ты модератор-классификатор. Ниже реплики одного человека, обращённые к боту Клодушке в групповом чате, и ответы бота. "
+    "Ты модератор-классификатор. Ниже контекст — прошлые реплики одного человека, обращённые к боту Клодушке в групповом чате, "
+    "и ответы бота — и помеченное сообщение «ОЦЕНИВАЕМОЕ СООБЩЕНИЕ». Оценивай только помеченное сообщение; контекст нужен лишь "
+    "для понимания, повторяется ли это. Грубость в адрес других людей — не травля бота. Одна резкая реплика сама по себе — "
+    "не травля; травля — когда это целенаправленно и повторяется (это видно по контексту). "
     "Реши, занимается ли человек явной травлей БОТА: целенаправленные оскорбления в адрес бота, издевательский флуд, "
     "систематические попытки сломать или довести бота. НЕ травля: мат сам по себе, грубоватые шутки между друзьями, "
     "спор и несогласие с ботом, критика ответа, провокационные темы, резкий тон (у бота бывает язвительный режим). "
@@ -3666,16 +3671,28 @@ def build_abuse_input(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def build_abuse_payload(context_rows: list[dict], current: str) -> str:
+    """Контекст (build_abuse_input) + помеченное оцениваемое сообщение (≤ ABUSE_ITEM_CHARS). Всё вместе ≤ ABUSE_TOTAL_CHARS + метки."""
+    cur = f"{ABUSE_MARK}: {_clip(current, ABUSE_ITEM_CHARS).replace(chr(10), ' ')}"
+    ctx = build_abuse_input(context_rows)
+    return f"КОНТЕКСТ:\n{ctx}\n\n{cur}" if ctx else cur
+
+
 async def _abuse_check_task(message, chat_id: int, user_id: int, name: str) -> None:
     """Фоновая проверка на травлю (Lite, label=abuse_check). Ответ на сообщение уже ушёл; проступок применяется после."""
     usage_ctx.set((chat_id, "group", user_id))
     try:
         prev = db.get_ignore(chat_id, user_id)
-        rows = db.get_user_bot_exchange(chat_id, user_id, since_ts=int((prev or {}).get("last_strike_ts") or 0),
-                                        skip_bot_prefixes=_abuse_skip_prefixes())
-        payload = build_abuse_input(rows)
-        if not payload:
+        # Судим ТЕКУЩЕЕ обращение (оно помечено), прошлое — только контекст: реплики этого человека за ABUSE_CONTEXT_WINDOW_MIN минут
+        # после последнего наказания, на которые бот отвечал (db.get_abuse_context). Страйк уйдёт ответом на это же сообщение.
+        cur_text = (getattr(message, "text", None) or getattr(message, "caption", None) or "")
+        rows, current = db.get_abuse_context(
+            chat_id, user_id, since_ts=int((prev or {}).get("last_strike_ts") or 0),
+            window_start_ts=int(time.time()) - ABUSE_CONTEXT_WINDOW_MIN * 60,
+            skip_bot_prefixes=_abuse_skip_prefixes(), current_text=cur_text)
+        if not current:
             return
+        payload = build_abuse_payload(rows, current)
         response = await aux_create(
             label="abuse_check", model=DEFAULT_MODEL_ID, **aux_params(),
             max_tokens=out_tokens(DEFAULT_MODEL_ID, 80), system=_ABUSE_SYSTEM,

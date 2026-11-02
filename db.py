@@ -2002,6 +2002,50 @@ def get_user_bot_exchange(chat_id: int, user_id: int, own_limit: int = 6, window
     return out
 
 
+def get_abuse_context(chat_id: int, user_id: int, since_ts: int = 0, window_start_ts: int = 0, own_limit: int = 6,
+                      window: int = 80, skip_bot_prefixes: tuple = (), current_text: str = "") -> tuple[list[dict], str]:
+    """Вход проверки на травлю (инцидент 2026-11-02, Москвичи): (контекст, оцениваемое сообщение).
+    Оцениваемое — последняя реплика человека; если передан current_text, она снимается только когда совпадает с ним (иначе её нет в
+    БД — подпись/голос — и оценивается current_text, а строки не трогаем). Контекст — реплики ЭТОГО человека строго после
+    max(since_ts, window_start_ts), на которые бот ответил до следующей реплики этого человека (эвристика «обращено к боту»: грубость
+    другим людям и болтовня без ответа бота во вход не идут), плюс ответы бота на них. Чужие реплики, hidden=1, служебные строки бота
+    (skip_bot_prefixes) не берутся. Не больше own_limit реплик. [{"is_bot","text"}] по возрастанию."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT user_id, content, is_bot FROM group_messages WHERE chat_id = ? AND hidden = 0 AND timestamp > ? "
+        "ORDER BY id DESC LIMIT ?", (chat_id, max(int(since_ts or 0), int(window_start_ts or 0)), window)).fetchall()
+    conn.close()
+    seq = []   # [(is_bot, text)] по возрастанию; чужие реплики опущены
+    for r in reversed(rows):
+        if r["is_bot"]:
+            if skip_bot_prefixes and (r["content"] or "").startswith(tuple(skip_bot_prefixes)):
+                continue
+            seq.append((True, r["content"]))
+        elif r["user_id"] == user_id:
+            seq.append((False, r["content"]))
+    current = (current_text or "").strip()
+    last_own = next((i for i in range(len(seq) - 1, -1, -1) if not seq[i][0]), None)
+    if last_own is not None and (not current or seq[last_own][1].strip() == current):
+        current = seq[last_own][1]
+        seq = seq[:last_own]            # всё после оцениваемой реплики (ответ бота на неё) в контекст не входит
+    groups = []                          # [(реплика человека, [ответы бота до следующей реплики человека])]
+    for is_bot, text in seq:
+        if not is_bot:
+            groups.append((text, []))
+        elif groups:
+            groups[-1][1].append(text)
+    out = []
+    for own_text, bot_texts in groups:
+        if bot_texts:                    # бот ответил → обращено к боту
+            out.append({"is_bot": False, "text": own_text})
+            out.extend({"is_bot": True, "text": t} for t in bot_texts)
+    # лимит по числу реплик человека: последние own_limit
+    kept_own = [i for i, x in enumerate(out) if not x["is_bot"]]
+    if len(kept_own) > own_limit:
+        out = out[kept_own[-own_limit]:]
+    return out, current
+
+
 # --- Режим разработчика (docs/claude/dev-mode.md) ---
 # Свои таблицы: `conversations` режим не читает и не пишет. Файлы — на диске (data/devspace/<user_id>/).
 
