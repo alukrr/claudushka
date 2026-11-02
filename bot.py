@@ -2661,6 +2661,51 @@ def build_memory_participants(transcript: list[dict]) -> dict:
             "lines": lines, "roster": roster}
 
 
+_MEMORY_TAG_RE = re.compile(r"\[\s*P(\d+)\s*\]|\bP(\d+)\b")
+
+
+def replace_memory_tags(text: str, info: dict) -> tuple[str, int]:
+    """Метки P1… живут только в одном запросе (через 15 сообщений P3 — другой человек), а факт ложится в память навсегда:
+    отдельные метки ТЕКУЩЕГО окна (в т.ч. «[P2]») в тексте факта/значения профиля заменяются на последний ник этой метки;
+    метка, которой нет в окне, не трогается. -> (текст, число замен)."""
+    n = 0
+
+    def _sub(m):
+        nonlocal n
+        nick = info["primary"].get(f"P{m.group(1) or m.group(2)}")
+        if not nick:
+            return m.group(0)
+        n += 1
+        return nick
+
+    return _MEMORY_TAG_RE.sub(_sub, text), n
+
+
+def _clean_memory_texts(items, info: dict) -> tuple[list, int]:
+    """Строки фактов -> без меток (replace_memory_tags); не строки отбрасываются."""
+    out, total = [], 0
+    for f in items if isinstance(items, list) else []:
+        if isinstance(f, str):
+            t, n = replace_memory_tags(f, info)
+            out.append(t)
+            total += n
+    return out, total
+
+
+def _clean_profile_updates(updates, info: dict) -> tuple[list, int]:
+    """profile_updates -> строковые поля (value, evidence…) без меток; прочее не меняется."""
+    out, total = [], 0
+    for u in updates if isinstance(updates, list) else []:
+        if isinstance(u, dict):
+            u = dict(u)
+            for k, v in list(u.items()):
+                if isinstance(v, str):
+                    u[k], n = replace_memory_tags(v, info)
+                    total += n
+        out.append(u)
+    return out, total
+
+
 def resolve_memory_participant(p: dict, info: dict):
     """Ответ модели -> user_id. Решает метка «id» («P1», допускаются «[P1]»/«p1»); неизвестная метка — пропуск.
     Нет «id», есть только «name» — берём, только если этот ник в окне принадлежит ровно одному user_id. По нику из БД
@@ -2728,7 +2773,8 @@ def extract_all_participants_memory(chat_id: int):
                 "Конкретные события.\n"
                 "Не больше 3 фактов каждого типа на человека — только самые важные.\n"
                 "Каждый участник помечен меткой [P1], [P2]… — это и есть человек: ник может меняться и совпадать у разных людей. "
-                "В ответе указывай метку в поле \"id\".\n"
+                "В ответе указывай метку в поле \"id\". Метки P1, P2… — только для поля \"id\". В текстах фактов и в значениях "
+                "profile_updates меток не пиши: факт и так привязан к человеку; другого участника упоминай по нику.\n"
                 "Верни JSON: {\"participants\": [{\"id\": \"P1\", \"long_term\": [...], \"medium_term\": [...], "
                 "\"profile_updates\": [...]}]}\n"
                 "Если фактов нет — пустые массивы []. Клодушку не включай. Только факты прямо из чата.\n"
@@ -2758,24 +2804,26 @@ def extract_all_participants_memory(chat_id: int):
             return
         medium_expiry = int(time.time()) + 7 * 86400
         saved = 0
+        replaced = 0
         parts = [p for p in (data.get("participants") or []) if isinstance(p, dict)] if isinstance(data, dict) else []
         for p in parts:
             uid = resolve_memory_participant(p, info)
             if not uid:
                 continue
-            updates = p.get("profile_updates")
-            if isinstance(updates, list) and updates:
+            updates, n1 = _clean_profile_updates(p.get("profile_updates"), info)
+            long_facts, n2 = _clean_memory_texts(p.get("long_term"), info)
+            medium_facts, n3 = _clean_memory_texts(p.get("medium_term"), info)
+            replaced += n1 + n2 + n3
+            if updates:
                 res = db.add_profile_proposals(uid, "group", chat_id, updates)
                 logger.info(f"Profile proposals chat={chat_id} uid={uid}: {res}")
-            long_facts = [f for f in p.get("long_term", []) if isinstance(f, str)]
-            medium_facts = [f for f in p.get("medium_term", []) if isinstance(f, str)]
             if long_facts:
                 db.add_memory_facts(uid, long_facts, "group", chat_id, tier="long")
                 saved += len(long_facts)
             if medium_facts:
                 db.add_memory_facts(uid, medium_facts, "group", chat_id, tier="medium", expires_at=medium_expiry)
                 saved += len(medium_facts)
-        logger.info(f"Group memory extracted for chat {chat_id}: {len(parts)} participants, +{saved} facts")
+        logger.info(f"Group memory extracted for chat {chat_id}: {len(parts)} participants, +{saved} facts, меток в текстах заменено: {replaced}")
     except Exception as e:
         logger.error(f"Group memory extraction error (chat {chat_id}): {e}", exc_info=True)
 

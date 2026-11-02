@@ -17,3 +17,4 @@
 | 8 | TG-юзер A и B | `/memory` у каждого | Каждый видит свои факты |
 | 9 | Сервер | `logs 200 \| grep -i "group memory"` | Нет Traceback; нет «Group memory extraction error» |
 | 10 | TG-юзер B | Вернуть своё имя профиля | Новые факты B — по-прежнему на B (метки по user_id, ник не важен) |
+| 11 | Сервер | `q "SELECT user_id, fact FROM memory WHERE context='group' AND chat_id=<id> AND fact GLOB '*P[0-9]*'"` и `q "SELECT user_id, new_value, evidence FROM profile_proposals WHERE chat_id=<id> AND (new_value GLOB '*P[0-9]*' OR evidence GLOB '*P[0-9]*')"` | Пусто за время теста: меток `P<число>` в свежих фактах и предложениях нет (в логе извлечения — число замен) |
