@@ -64,7 +64,7 @@
 - Профиль участника (`user_profile`, `profile_proposals`, `_profile_text`, `profile_updates`, `send_profile_digest`,
   `/profile` `/profile_ok` `/profile_no` `/profile_digest`, экран «Профили» в dedup TUI) — `docs/claude/profile.md`
 - Память (`memory`-таблица, `extract_memory`, `extract_all_participants_memory`,
-  `/memory`, `/memory_full`, `/forget`) — `docs/claude/memory.md`
+  `/memory`, `/memory_full`, `/forget`, метки участников `P1…` в групповом извлечении) — `docs/claude/memory.md`; ТЗ — `docs/claude/tz-memory-uid.md`; чек-лист стенда — `docs/claude/staging-checklist-memory-uid.md`
 - Режим разработчика в платной личке (`dev_mode_active`, `handle_dev_message`, `_dev_answer`, `/dev`, `/ws`, `ws_*`, `DEV_*`,
   workspace `data/devspace/`, таблицы `dev_mode`/`dev_messages`) — `docs/claude/dev-mode.md`; ТЗ — `docs/claude/tz-dev-mode.md`;
   чек-лист стенда `feat/dev-mode` — `docs/claude/staging-checklist-dev-mode.md`
@@ -190,6 +190,8 @@
   `get_group_history`); скрытые строки (`hidden=1`, safety-блок) физически остаются, ничего не удаляем. Основной вызов диалога —
   через `_dialog_call` (повтор без истории при safety-блоке), пробы скана — настоящий запрос бота через `_model_call`.
   `docs/claude/safety-unblock.md`.
+- Факты и профили участников группы — только по `user_id` (метки `P1…` в запросе извлечения), не по нику: ник меняется и совпадает у разных людей
+  (инцидент 2026-09-28); поиск `user_id` по нику не делать (`docs/claude/memory.md`).
 - Профиль участника: модель только ПРЕДЛАГАЕТ (`profile_proposals`), в `user_profile` пишет админ через
   `db.apply_profile_ops` (бот и dedup TUI — один путь); личка — `chat_id=0`, не NULL; любое новое место, удаляющее
   память человека, обязано чистить и профиль (`db.clear_memory` уже чистит). `docs/claude/profile.md`.

@@ -2550,7 +2550,8 @@ PROFILE_PROMPT_MAX_CHARS = 6000  # текущие профили в запрос
 
 
 def _profile_prompt_text(context: str, chat_id, people: dict) -> str:
-    """Текущие профили + ожидающие предложения для запроса извлечения. people: {имя: user_id}."""
+    """Текущие профили + ожидающие предложения для запроса извлечения. people: {подпись: user_id}; в группе подпись —
+    «P1 (Ник)» (метка участника, docs/claude/tz-memory-uid.md), в личке — «пользователь»."""
     pending = db.get_pending_map(context, chat_id)
     lines = []
     for name, uid in people.items():
@@ -2622,6 +2623,108 @@ def extract_memory(user_id: int, messages: list, is_group: bool = False, chat_id
         logger.error(f"Memory extraction error (uid={user_id}): {e}", exc_info=True)
 
 
+def build_memory_participants(transcript: list[dict]) -> dict:
+    """Метки участников для группового извлечения памяти (docs/claude/tz-memory-uid.md): человек = user_id, а не ник.
+    Берутся только реплики людей (is_bot=0) с user_id; метки P1, P2… в порядке первого появления.
+    -> {"tag_to_uid", "tag_nicks" (метка -> ники по порядку первого появления), "primary" (метка -> последний ник),
+    "name_to_uids" (ник -> {uid}), "lines" (строки «[P1] Ник: текст»), "roster" (список участников для запроса)}."""
+    tag_of: dict = {}
+    tag_to_uid: dict = {}
+    tag_nicks: dict = {}
+    name_to_uids: dict = {}
+    primary: dict = {}
+    lines = []
+    for e in transcript:
+        uid = e.get("user_id")
+        if e.get("is_bot") or uid is None:
+            continue
+        tag = tag_of.get(uid)
+        if tag is None:
+            tag = tag_of[uid] = f"P{len(tag_of) + 1}"
+            tag_to_uid[tag] = uid
+            tag_nicks[tag] = []
+        nick = e["sender"]
+        if nick not in tag_nicks[tag]:
+            tag_nicks[tag].append(nick)
+        primary[tag] = nick
+        name_to_uids.setdefault(nick, set()).add(uid)
+        lines.append(f"[{tag}] {nick}: {e['text']}")
+    roster = []
+    for tag, nicks in tag_nicks.items():
+        others = [n for n in nicks if n != primary[tag]]
+        roster.append(f"{tag} — {primary[tag]}" + (f" (также писал как: {', '.join(others)})" if others else ""))
+    for nick, uids in name_to_uids.items():
+        if len(uids) > 1:
+            tags = [t for t, u in tag_to_uid.items() if u in uids]
+            roster.append(f"{' и '.join(tags)} — РАЗНЫЕ люди с одинаковым ником «{nick}»")
+    return {"tag_to_uid": tag_to_uid, "tag_nicks": tag_nicks, "primary": primary, "name_to_uids": name_to_uids,
+            "lines": lines, "roster": roster}
+
+
+_MEMORY_TAG_RE = re.compile(r"\[\s*P(\d+)\s*\]|\bP(\d+)\b")
+
+
+def replace_memory_tags(text: str, info: dict) -> tuple[str, int]:
+    """Метки P1… живут только в одном запросе (через 15 сообщений P3 — другой человек), а факт ложится в память навсегда:
+    отдельные метки ТЕКУЩЕГО окна (в т.ч. «[P2]») в тексте факта/значения профиля заменяются на последний ник этой метки;
+    метка, которой нет в окне, не трогается. -> (текст, число замен)."""
+    n = 0
+
+    def _sub(m):
+        nonlocal n
+        nick = info["primary"].get(f"P{m.group(1) or m.group(2)}")
+        if not nick:
+            return m.group(0)
+        n += 1
+        return nick
+
+    return _MEMORY_TAG_RE.sub(_sub, text), n
+
+
+def _clean_memory_texts(items, info: dict) -> tuple[list, int]:
+    """Строки фактов -> без меток (replace_memory_tags); не строки отбрасываются."""
+    out, total = [], 0
+    for f in items if isinstance(items, list) else []:
+        if isinstance(f, str):
+            t, n = replace_memory_tags(f, info)
+            out.append(t)
+            total += n
+    return out, total
+
+
+def _clean_profile_updates(updates, info: dict) -> tuple[list, int]:
+    """profile_updates -> строковые поля (value, evidence…) без меток; прочее не меняется."""
+    out, total = [], 0
+    for u in updates if isinstance(updates, list) else []:
+        if isinstance(u, dict):
+            u = dict(u)
+            for k, v in list(u.items()):
+                if isinstance(v, str):
+                    u[k], n = replace_memory_tags(v, info)
+                    total += n
+        out.append(u)
+    return out, total
+
+
+def resolve_memory_participant(p: dict, info: dict):
+    """Ответ модели -> user_id. Решает метка «id» («P1», допускаются «[P1]»/«p1»); неизвестная метка — пропуск.
+    Нет «id», есть только «name» — берём, только если этот ник в окне принадлежит ровно одному user_id. По нику из БД
+    (get_user_id_by_name_in_chat, удалена) не ищем — это и был баг атрибуции (инцидент 2026-09-28)."""
+    raw = p.get("id")
+    if isinstance(raw, str) and raw.strip():
+        tag = raw.strip().strip("[]").strip().upper()
+        uid = info["tag_to_uid"].get(tag)
+        if uid is None:
+            logger.warning(f"Group memory: неизвестная метка участника {raw!r} в ответе модели, пропуск")
+        return uid
+    name = p.get("name")
+    uids = info["name_to_uids"].get(name) if isinstance(name, str) else None
+    if uids and len(uids) == 1:
+        return next(iter(uids))
+    logger.warning(f"Group memory: в ответе нет метки и ник {name!r} не однозначен, пропуск")
+    return None
+
+
 def extract_all_participants_memory(chat_id: int):
     """Извлекает долго- и среднесрочную память для ВСЕХ участников из транскрипта чата.
 
@@ -2629,22 +2732,22 @@ def extract_all_participants_memory(chat_id: int):
     интересы, возраст, взгляды. Без TTL.
     Среднесрочные (tier='medium'): временные события этой недели — что случилось, купил,
     с кем поругался, что болит. TTL 7 дней.
-    Атрибуция по sender_name → user_id через group_messages. Изоляция по chat_id.
+    Атрибуция по user_id через метки участников [P1], [P2]… (ник меняется и совпадает у разных людей — инцидент 2026-09-28,
+    docs/claude/tz-memory-uid.md). Изоляция по chat_id.
     Запускается каждые MEMORY_EXTRACT_EVERY_CHAT сообщений в чате, независимо от упоминания бота.
     """
     try:
         transcript = db.get_group_transcript(chat_id, GROUP_TRANSCRIPT_LIMIT)
         if not transcript:
             return
-        participants = list({e["sender"] for e in transcript if not e["is_bot"]})
-        if not participants:
-            return
         # Реплики Клодушки в транскрипт извлечения не идут: факты о людях — только из того,
         # что пишут люди. Запрет в промпте Haiku не держал — её «блокировки» записывались
-        # фактами об участниках (инцидент 2026-09-28, docs/claude/incidents.md).
-        lines = [f"{e['sender']}: {e['text']}" for e in transcript if not e["is_bot"]]
-        dialog = "\n".join(lines)
-        uid_by_name = {n: db.get_user_id_by_name_in_chat(chat_id, n) for n in participants}
+        # фактами об участниках (инцидент 2026-09-28, docs/claude/incidents.md). Строки без user_id тоже не идут.
+        info = build_memory_participants(transcript)
+        if not info["tag_to_uid"]:
+            return
+        dialog = "\n".join(info["lines"])
+        people = {f"{t} ({info['primary'][t]})": u for t, u in info["tag_to_uid"].items()}
         response = sync_create(
             label="extract_chat_memory",
             model=DEFAULT_MODEL_ID,
@@ -2669,7 +2772,10 @@ def extract_all_participants_memory(chat_id: int):
                 "с кем поссорился, что болит, что планирует на этой неделе, где сейчас в поездке. "
                 "Конкретные события.\n"
                 "Не больше 3 фактов каждого типа на человека — только самые важные.\n"
-                "Верни JSON: {\"participants\": [{\"name\": \"Имя\", \"long_term\": [...], \"medium_term\": [...], "
+                "Каждый участник помечен меткой [P1], [P2]… — это и есть человек: ник может меняться и совпадать у разных людей. "
+                "В ответе указывай метку в поле \"id\". Метки P1, P2… — только для поля \"id\". В текстах фактов и в значениях "
+                "profile_updates меток не пиши: факт и так привязан к человеку; другого участника упоминай по нику.\n"
+                "Верни JSON: {\"participants\": [{\"id\": \"P1\", \"long_term\": [...], \"medium_term\": [...], "
                 "\"profile_updates\": [...]}]}\n"
                 "Если фактов нет — пустые массивы []. Клодушку не включай. Только факты прямо из чата.\n"
                 "В чате есть бот Клодушка, её реплик тут нет — обращения к ней в тексте нормальны. "
@@ -2679,14 +2785,14 @@ def extract_all_participants_memory(chat_id: int):
                 + _profile_rules()
             ),
             messages=[{"role": "user", "content": (
-                f"Участники: {', '.join(participants)}\n\n"
-                f"Текущие профили участников:\n{_profile_prompt_text('group', chat_id, uid_by_name) or '(пусто)'}\n\n"
+                "Участники:\n" + "\n".join(info["roster"]) + "\n\n"
+                f"Текущие профили участников:\n{_profile_prompt_text('group', chat_id, people) or '(пусто)'}\n\n"
                 f"Чат:\n{dialog}")}],
         )
         if api_errors.was_truncated(response):
             logger.warning(
                 f"Group memory extraction: ответ обрезан по max_tokens в чате {chat_id}, "
-                f"{len(participants)} участников — {api_errors.response_debug(response)}"
+                f"{len(info['tag_to_uid'])} участников — {api_errors.response_debug(response)}"
             )
         text = response_text(response)
         data = api_errors.parse_json_lenient(text, "{", label=f"group memory chat={chat_id}")
@@ -2698,26 +2804,26 @@ def extract_all_participants_memory(chat_id: int):
             return
         medium_expiry = int(time.time()) + 7 * 86400
         saved = 0
-        for p in data.get("participants", []):
-            name = p.get("name", "")
-            if not name:
-                continue
-            uid = uid_by_name.get(name) or db.get_user_id_by_name_in_chat(chat_id, name)
+        replaced = 0
+        parts = [p for p in (data.get("participants") or []) if isinstance(p, dict)] if isinstance(data, dict) else []
+        for p in parts:
+            uid = resolve_memory_participant(p, info)
             if not uid:
                 continue
-            updates = p.get("profile_updates")
-            if isinstance(updates, list) and updates:
+            updates, n1 = _clean_profile_updates(p.get("profile_updates"), info)
+            long_facts, n2 = _clean_memory_texts(p.get("long_term"), info)
+            medium_facts, n3 = _clean_memory_texts(p.get("medium_term"), info)
+            replaced += n1 + n2 + n3
+            if updates:
                 res = db.add_profile_proposals(uid, "group", chat_id, updates)
                 logger.info(f"Profile proposals chat={chat_id} uid={uid}: {res}")
-            long_facts = [f for f in p.get("long_term", []) if isinstance(f, str)]
-            medium_facts = [f for f in p.get("medium_term", []) if isinstance(f, str)]
             if long_facts:
                 db.add_memory_facts(uid, long_facts, "group", chat_id, tier="long")
                 saved += len(long_facts)
             if medium_facts:
                 db.add_memory_facts(uid, medium_facts, "group", chat_id, tier="medium", expires_at=medium_expiry)
                 saved += len(medium_facts)
-        logger.info(f"Group memory extracted for chat {chat_id}: {len(data.get('participants', []))} participants, +{saved} facts")
+        logger.info(f"Group memory extracted for chat {chat_id}: {len(parts)} participants, +{saved} facts, меток в текстах заменено: {replaced}")
     except Exception as e:
         logger.error(f"Group memory extraction error (chat {chat_id}): {e}", exc_info=True)
 

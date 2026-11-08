@@ -1059,11 +1059,12 @@ def get_group_messages_range(chat_id: int, since_ts: int, until_ts: int) -> list
 
 def get_group_transcript(chat_id: int, limit: int = 40, exclude_ids=None, min_id: int | None = None) -> list[dict]:
     """Групповая история для многоголосого messages-контекста (скрытые строки hidden=1 не отдаются).
-    Возвращает старые->новые: [{"id", "sender", "text", "is_bot", "ts"}].
+    Возвращает старые->новые: [{"id", "sender", "text", "is_bot", "ts", "user_id"}] (user_id может быть None; его читает только
+    групповое извлечение памяти — extract_all_participants_memory, метки участников; остальные потребители ключ не используют).
     exclude_ids — дополнительно исключить эти id (пробы safety_scan: окно сдвигается на старые строки, как после
     реального скрытия); min_id — не брать строки с id меньше (пробы без сдвига окна)."""
     conn = get_conn()
-    sql = ("SELECT id, sender_name, content, is_bot, timestamp FROM group_messages "
+    sql = ("SELECT id, sender_name, content, is_bot, timestamp, user_id FROM group_messages "
            "WHERE chat_id = ? AND hidden = 0")
     args: list = [chat_id]
     if min_id is not None:
@@ -1079,7 +1080,7 @@ def get_group_transcript(chat_id: int, limit: int = 40, exclude_ids=None, min_id
     conn.close()
     return [
         {"id": r["id"], "sender": r["sender_name"], "text": r["content"], "is_bot": bool(r["is_bot"]),
-         "ts": r["timestamp"]}
+         "ts": r["timestamp"], "user_id": r["user_id"]}
         for r in reversed(rows)
     ]
 
@@ -1179,18 +1180,6 @@ def should_extract_chat_memory(chat_id: int, every: int) -> bool:
     conn.commit()
     conn.close()
     return True
-
-
-def get_user_id_by_name_in_chat(chat_id: int, sender_name: str) -> int | None:
-    """Ищет user_id по sender_name в group_messages — для атрибуции фактов при извлечении памяти."""
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT user_id FROM group_messages WHERE chat_id = ? AND sender_name = ? "
-        "AND user_id IS NOT NULL ORDER BY timestamp DESC LIMIT 1",
-        (chat_id, sender_name)
-    ).fetchone()
-    conn.close()
-    return row["user_id"] if row else None
 
 
 MEMORY_LONG_PER_USER = 12

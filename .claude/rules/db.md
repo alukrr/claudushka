@@ -57,7 +57,7 @@ db.py используется отовсюду, поэтому полная с�
 `{id, ts, sender, text, is_bot}` по возрастанию времени, БЕЗ LIMIT по числу (размер ограничивает вызывающий:
 `build_review_log` режет реплики, ветки A/B держат общий лимит; `docs/claude/daily-review.md`). `get_group_history`
 остаётся для остальных потребителей.
-`get_group_transcript()` отдаёт и `id` строки, а `get_conversation_rows()` (личка, порядок по `id`) — строки с `id`:
+`get_group_transcript()` отдаёт `user_id` каждой строки (может быть None; читает его только групповое извлечение памяти — метки участников, `docs/claude/memory.md`; `build_group_messages`, обзор и скан ключ не используют). `get_user_id_by_name_in_chat` удалена (v2.7.2) — факты и профили группы только по `user_id`, не по нику. `get_group_transcript()` отдаёт и `id` строки, а `get_conversation_rows()` (личка, порядок по `id`) — строки с `id`:
 по ним якорь окна истории шагами (`pick_history_window`, `docs/claude/prompt-cache.md`). `get_conversation()` (без id)
 остался для счётчика сообщений.
 
