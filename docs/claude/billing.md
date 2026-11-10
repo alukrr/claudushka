@@ -59,7 +59,7 @@
    Haiku/GPT). **Побочный эффект**: проверенные чаты после миграции — paid с дефолтами
    Sonnet/banana вместо прежних Haiku/GPT, без специального уведомления.
 3. `billing_starter_bonus`: approved-группам и admin/premium с активностью за 30 дней
-   (`group_messages` / `conversations`) — $10 / $5 (`kind='bonus'`, `note='starter'`).
+   (`group_messages` / `conversations`) — $10 / $5 (`kind='bonus'`, `note='starter'`; суммы миграции заморожены в `db._MIG_BONUS_*`, живые — `STARTER_BONUS_*`).
 Ошибка миграции → откат, маркер не ставится, повтор при следующем старте (лог `Migration FAILED`).
 
 ## Конфиг (bot.py, рядом с MODELS)
@@ -67,7 +67,7 @@
 GPT Image 2.5 Flare/Sunburst (добавлены 2026-09-22, `docs/claude/images.md`) — тот же пул,
 та же цена $0.02, что у gpt.
 `PRICE_MARKUP`, `IMAGE_PRICES`, `SEARCH_PRICE`, `STARTER_BONUS_*`, `FREE_IMAGES_*`,
-`UNVERIFIED_*`, `VERIFY_MIN_TOPUP`, `ADMIN_CONTACT`, `FABLE_CONFIRM_WINDOW`. Сутки/неделя —
+`UNVERIFIED_*`, `VERIFY_MIN_TOPUP_GROUP`/`VERIFY_MIN_TOPUP_PRIVATE` (читать только через `_verify_min_topup(chat_id)`), `ADMIN_CONTACT`, `FABLE_CONFIRM_WINDOW`. Сутки/неделя —
 `BERLIN_TZ`, неделя с понедельника (`_day_start`, `_week_start`).
 `PRICE_MARKUP` умножается в ОДНОМ месте — `_record_usage`; `calc_llm_cost()` возвращает
 цену без наценки. Замороженные строки задним числом не пересчитываются.
@@ -138,9 +138,9 @@ out текущей модели чата`; повтор в течение `FABLE
   `db.daily_limit_notice_claim`), дальше тишина. Поиск — 20/сутки (группа — на чат, личка — на юзера),
   сверх лимита автопоиск молча пропускается; явный `/search` получает сообщение (отклонение от ТЗ:
   иначе команда выглядела бы сломанной).
-- **Как проверяют**: авто — `SUM(topup) >= VERIFY_MIN_TOPUP` (в `/topup`) → группа `approved` / юзер
+- **Как проверяют**: авто — `SUM(topup) >= _verify_min_topup(chat_id)` (личка $2, группа $5; в `apply_topup` — `/topup` и Stars) → группа `approved` / юзер
   `premium` + стартовый бонус; вручную — `/verify <id>`, `/unverify <id>` (id < 0 → группа).
-  `verify_target` идемпотентно выдаёт бонус ($10 группе / $5 личке), если не выдавался; остальные
+  `verify_target` идемпотентно выдаёт бонус (с 2026-11-10: **$5 группе / $2 личке**, раньше $10/$5; ранее выданные не пересчитываются и не отзываются), если не выдавался — точнее, **довыдаёт до полного**: `db._grant_bonus_conn` пишет разницу между положенным бонусом и ЧИСТОЙ суммой строк `kind='bonus'` (отзыв — отрицательная строка), чат с полным или большим бонусом не получает ничего; остальные
   проверенные получают его при первом сообщении (`_ensure_starter_bonus`, кэш `_bonus_checked`).
   Непроверенные — только в момент проверки; новая группа без проверки бонуса не получает.
 - **Бан** (`/ban`, `/unban`; реплаем в группе без аргумента — автор сообщения): барьер — `gate_update`
@@ -164,6 +164,7 @@ out текущей модели чата`; повтор в течение `FABLE
   (в т.ч. если не-админ передал аргумент). Работает в любом тарифе. Основные суммы — только
   `billed=1`. «Прошлая неделя (±%)» — изменение прошлой недели к позапрошлой (обе полные).
   `/cost <chat_id>` (админ) — детализация за 7 дней: модели, метки, дни, платное/бесплатное, блок «По неделям» (12 ISO-недель KW, строка `KW 46 (09.11–15.11): $x / $y (по сегодня)`, между «По дням» и «По месяцам»; на стыке ISO-годов — `KW 52/2025`) и блок «По месяцам» (12 календарных месяцев по `BERLIN_TZ`, платное / бесплатное, текущий — «по сегодня»); третьей строкой — оценка цены подписки (см. «Оценка цены подписки»). Строка оценки есть и в `/cost` группы и личке (`scope` = чат / user_id; второй строкой, после баланса); общий `/cost` админа (все чаты) её не показывает. Данные собирает `_cost_data(chat_id, show_free)` (границы месяцев — `_cost_month_windows`, по дате, не «+30 дней»), та же функция питает экран «Расходы» мини-приложения (`docs/claude/miniapp.md` → «Расходы»; бесплатное там только админу бота). Текст `/cost <chat_id>` режется по строкам под лимит Telegram (`split_lines_for_telegram`).
+- `/pay` (и `/topup` не-админа), `/terms`, `/paysupport` — всем; `/refund` — только админ бота (раздел «Пополнение Stars»).
 - `/verify /unverify /ban /unban /topup` — только `is_admin`. Удалены: `/whitelist(_on/_off)`,
   `/approve`, `/promote`, `/premium`, `/approve_chat`, `/reject_chat`, `/allow_chat`, `/deny_chat`,
   `/role`, `/pending` (покрыт `/chats`), `/migrate` (+ `db.migrate_from_json`, `allowed.json` и его
@@ -180,6 +181,23 @@ out текущей модели чата`; повтор в течение `FABLE
 - **Инвариант проверки:** `_record_usage` ставит `billed=1` только когда `chat_tier == paid` на момент записи, значит каждая `billed=1` должна лежать внутри восстановленного платного интервала (`db.billed_outside_paid` = 0). Ненулевое — гонка параллельных вызовов одного чата в секунду перехода paid→free или дыра в восстановлении. Проверяется тестами и `scripts/check_subscription_estimate.py` на копии прод-БД (только чтение, без бота).
 - **Формула:** `spent = Σ cost_usd billed=1` за окно; `paid_days < SUBSCRIPTION_MIN_DAYS` (7) → `{enough: false}`, цену не показываем («мало данных: N дн. в платном режиме»); иначе `per_day = spent / paid_days`, **месяц = per_day × 30** (`SUBSCRIPTION_MONTH_DAYS`), **неделя = per_day × 7 × 1.05** (`SUBSCRIPTION_WEEK_MARKUP`). `PRICE_MARKUP` уже внутри `cost_usd` — второй раз не умножать.
 - Блокирующий SQLite-код (`_subscription_estimate`, `_paid_seconds`) вызывается из `_cost_data`/`_cost_report`/`_cost_detail`, которые сами запускаются через `asyncio.to_thread`. Схема БД не менялась. На размер контекста модели не влияет.
+
+## Пополнение Stars (`feat/stars-topup`, ТЗ `docs/claude/tz-stars-topup.md`)
+Человек пополняет баланс чата сам, звёздами Telegram (XTR): `/pay` (и `/topup` не-админа) в личке или группе → кнопки-пакеты `STARS_PACKS` (дефолт 100/200/500/1000/2500 ⭐; 200 ⭐ = $2 — ровно порог лички, 500 ⭐ = $5 — порог группы) → `sendInvoice` в тот же чат.
+В группе платит ЛЮБОЙ участник, зачисляется группе (решение Алексея). Возврат — только админ бота (`/refund`).
+- **Курс** `STARS_USD_RATE` (`.env`, дефолт **0.010** — решение Алексея 2026-11-10): сколько $ баланса даёт одна звезда. В `star_payments.rate`/`usd` пишется зафиксированное на момент оплаты — смена курса прошлое не трогает. Фактический курс вывода через Fragment/TON не подтверждён (в обзорах $0.013 или $0.0087–0.0092) — после первого реального вывода поправить.
+- **Единственный путь зачисления — `successful_payment`** (`on_successful_payment`). Кнопка пакета (`on_pay_button`), `pre_checkout_query` и колбэк `openInvoice` мини-приложения денег не трогают.
+- **Схема:** `star_payments(charge_id PK, ts, payer_id, chat_id, stars, usd, rate, status paid|refunded, refunded_ts)`; зачисление — `db.star_payment_record`: `INSERT OR IGNORE` в `star_payments` + строка `chat_credits` (`kind='topup'`, `note='stars:<charge_id>'`, `by_user=payer`) в ОДНОЙ транзакции (`BEGIN IMMEDIATE`). `charge_id` = `telegram_payment_charge_id`; повтор апдейта → `False`, ничего не пишется и не отвечается.
+- **`apply_topup(chat_id, amount, note, by_user, *, before, credit_written)`** — общий хвост для `/topup` и Stars: запись кредита (если не `credit_written`), writeoff отрицательной корректировки, авто-проверка при `topup_total ≥ VERIFY_MIN_TOPUP` (`verify_target` + стартовый бонус). Сообщения чату — `notify_topup` (смена тарифа; «Ура, баланс пополнен» — только у `/topup`, у Stars `thanks=False`: плательщик уже получил «✅ Зачислено…»). Поведение `/topup` зафиксировано характеризационными тестами (`scripts/test_stars_topup.py`).
+- **`pre_checkout_query`** (`on_pre_checkout` → `check_star_payment`, чистая функция): отвечать надо за 10 с. Проверяет формат payload `topup:<chat_id>:<stars>` (`STARS_PAYLOAD_RE`), `currency == XTR`, сумму = payload, пакет из `STARS_PACKS`, бан плательщика, чат (группа — известна и не забанена; личка — только своя). **`PerChatUpdateProcessor` пропускает такие апдейты без замка и слота** (у `pre_checkout_query` нет чата, ключ очереди = `user_id` = очередь лички, а в ней может идти долгий ответ модели — 10 с не хватило бы).
+- **`gate_update` пропускает сообщения с `successful_payment`** мимо проверок бана: деньги уже взяты (бан между `pre_checkout` и оплатой иначе потерял бы зачисление).
+- **Сбои:** payload не распознан / сумма не совпала / запись в БД упала после оплаты → `notify_admins` с `charge_id` («деньги взяты, баланс не пополнен — разобрать вручную») и сообщение плательщику «админ уже знает».
+- **Возврат** `/refund <charge_id>` (только админ бота; без аргумента — последние 10 платежей): `db.star_refund_begin` атомарно проверяет, что платёж `paid` и на балансе чата лежит не меньше `usd`, пишет отрицательный `adjust` (`note='stars-refund:<charge_id>'`) и ставит `status='refunded'`; затем `refundStarPayment`; отказ Telegram → `db.star_refund_revert(charge_id, pay["undo"])` откатывает ВСЁ (adjust, отзыв бонуса, снятие проверки). Недостаточно баланса → отказ (часть уже потрачена; админ сам корректирует `/topup <id> +сумма` и повторяет).
+- **Возврат единственного платежа (П4 ТЗ)**: если нет других `star_payments paid` и других строк `chat_credits kind='topup'`, в той же транзакции (а) снимается проверка (группа `approved → pending`, личка `premium → street`; для личек админов бота не трогаем — `unverify_ok=False`), (б) отзывается неистраченный остаток бонуса = `min(чистый бонус, баланс после возврата)` строкой `kind='bonus'`, `note='revoke:<charge_id>'` — баланс не уходит в минус. При новой оплате бонус довыдаётся до полного (см. «Как проверяют»), истраченная часть повторно не дарится. Известное ограничение: если чат был проверен вручную `/verify` до платежа, проверка тоже снимется (причину проверки БД не хранит) — сообщение `/refund` об этом говорит, админ возвращает `/verify`. `topup_total` возврат не уменьшает (строка `topup` остаётся). Оценка подписки (`paid_seconds`) читает все строки `chat_credits`, отрицательный бонус учитывается сама (тест `test_reconstructed_balance_equals_get_balance_after_bonus_revoke`).
+- **Обязательные команды Telegram для платных ботов:** `/terms` (`STARS_TERMS_TEXT`) и `/paysupport` (`STARS_PAYSUPPORT_TEXT`; пометка, что поддержка Telegram по покупкам в ботах не помогает). Тексты — черновики, утверждает Алексей. `/pay help` и экран мини-приложения показывают справку «Как купить звёзды из России» из `miniapp/stars_help_ru.md` (правится без кода; **не проверена на живом аккаунте из РФ** — см. ТЗ).
+- **`/cost`:** строка «Пополнения Stars за неделю: N ⭐ / $X» в общем `/cost` админа и в `/cost <chat_id>` (`_stars_week_line`, `db.star_payments_sum`; возвращённые не входят).
+- Мини-приложение: кнопка «Пополнить» (`can_topup`) → `GET/POST /api/chats/{id}/topup` — `docs/claude/miniapp.md`.
+- Деньги: Stars идут Алексею (вывод в TON вручную через Fragment) — это НЕ расход `usage_log`, в «расходах» не учитывается. `chat_tier`, `PRICE_MARKUP`, подписки не затронуты. На размер контекста модели не влияет.
 
 ## Ежедневный обзор
 Только paid, только группы, не banned, `daily_review_enabled=1`. Модель — `MODELS["opus"]["id"]`

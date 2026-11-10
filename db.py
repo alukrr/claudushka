@@ -95,12 +95,18 @@ def _mig_starter_bonus(conn: sqlite3.Connection) -> None:
 
 
 def _grant_bonus_conn(conn: sqlite3.Connection, chat_id: int, amount: float) -> bool:
-    cur = conn.execute(
-        "INSERT INTO chat_credits (ts, chat_id, amount, kind, note, by_user) "
-        "SELECT ?, ?, ?, 'bonus', 'starter', NULL "
-        "WHERE NOT EXISTS (SELECT 1 FROM chat_credits WHERE chat_id = ? AND kind = 'bonus')",
-        (int(time.time()), chat_id, amount, chat_id))
-    return cur.rowcount > 0
+    """Выдаёт стартовый бонус так, чтобы ЧИСТАЯ сумма строк kind='bonus' по чату (с учётом отзыва — отрицательных строк) не превышала `amount`:
+    пишет разницу до полного бонуса, если чистая сумма меньше. Чат с полным (или большим — бонусы $10/$5 до 2026-11-10 не пересчитываются)
+    бонусом ничего не получает — как раньше; чат с отозванным бонусом (возврат единственного платежа) получает отозванную часть, истраченная
+    повторно не дарится. True — выдано сейчас. Вызывающий держит транзакцию."""
+    net = conn.execute("SELECT COALESCE(SUM(amount), 0) FROM chat_credits WHERE chat_id = ? AND kind = 'bonus'", (chat_id,)).fetchone()[0]
+    deficit = round(amount - net, 8)
+    if deficit <= 1e-9:
+        return False
+    conn.execute(
+        "INSERT INTO chat_credits (ts, chat_id, amount, kind, note, by_user) VALUES (?, ?, ?, 'bonus', 'starter', NULL)",
+        (int(time.time()), chat_id, deficit))
+    return True
 
 
 def init_db():
@@ -261,6 +267,21 @@ def init_db():
             note TEXT,
             by_user INTEGER
         );
+
+        -- Пополнения через Telegram Stars (feat/stars-topup, docs/claude/billing.md → «Пополнение Stars»).
+        -- charge_id — telegram_payment_charge_id: PRIMARY KEY = идемпотентность (повтор апдейта не зачисляет дважды).
+        CREATE TABLE IF NOT EXISTS star_payments (
+            charge_id TEXT PRIMARY KEY,
+            ts INTEGER NOT NULL,
+            payer_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            stars INTEGER NOT NULL,
+            usd REAL NOT NULL,
+            rate REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'paid',
+            refunded_ts INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_star_payments_chat_ts ON star_payments(chat_id, ts);
 
         CREATE TABLE IF NOT EXISTS daily_usage (
             day TEXT NOT NULL,
@@ -1569,6 +1590,148 @@ def topup_total(chat_id: int) -> float:
     return round(row[0], 8)
 
 
+# --- Пополнение через Telegram Stars (feat/stars-topup) ---
+
+def star_payment_record(charge_id: str, payer_id: int, chat_id: int, stars: int, usd: float, rate: float) -> bool:
+    """Зачисление платежа Stars: строка star_payments + chat_credits (kind='topup', note='stars:<charge_id>', by_user=payer)
+    в ОДНОЙ транзакции. True — зачислено сейчас, False — этот charge_id уже был (повтор апдейта: ничего не пишем)."""
+    now = int(time.time())
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO star_payments (charge_id, ts, payer_id, chat_id, stars, usd, rate, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'paid')", (charge_id, now, payer_id, chat_id, stars, usd, rate))
+        if cur.rowcount == 0:
+            conn.rollback()
+            return False
+        conn.execute(
+            "INSERT INTO chat_credits (ts, chat_id, amount, kind, note, by_user) VALUES (?, ?, ?, 'topup', ?, ?)",
+            (now, chat_id, usd, f"stars:{charge_id}", payer_id))
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def star_payment_get(charge_id: str) -> dict | None:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM star_payments WHERE charge_id = ?", (charge_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def star_refund_begin(charge_id: str, unverify_ok: bool = True) -> tuple[str, dict | None]:
+    """Первый шаг возврата, атомарно: платёж найден и в статусе paid, на балансе чата лежит не меньше возвращаемой суммы →
+    отрицательный `adjust` (note='stars-refund:<charge_id>') и status='refunded'. Возвращает (код, платёж): 'ok' | 'not_found' | 'already' |
+    'low_balance'.
+
+    П4 ТЗ: если это ЕДИНСТВЕННОЕ пополнение чата (нет других paid-платежей Stars и других строк chat_credits kind='topup'), в той же транзакции
+    (а) снимается проверка (группа approved → pending; личка premium → street; `unverify_ok=False` — не трогать, для админов бота) и (б) отзывается
+    неистраченный остаток бонуса: min(чистый бонус, баланс после возврата) отрицательной строкой kind='bonus', note='revoke:<charge_id>'.
+    В `pay` при 'ok' добавлены: single (bool), unverified (bool), bonus_revoked ($), undo (что нужно `star_refund_revert`). Второй шаг
+    (refundStarPayment) делает вызывающий; отказ Telegram → `star_refund_revert(charge_id, pay["undo"])`."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM star_payments WHERE charge_id = ?", (charge_id,)).fetchone()
+        if row is None:
+            conn.rollback()
+            return "not_found", None
+        pay = dict(row)
+        if pay["status"] != "paid":
+            conn.rollback()
+            return "already", pay
+        chat_id = pay["chat_id"]
+        balance = _balance_conn(conn, chat_id)
+        if balance + 1e-9 < pay["usd"]:
+            conn.rollback()
+            return "low_balance", pay
+        now = int(time.time())
+        conn.execute("UPDATE star_payments SET status = 'refunded', refunded_ts = ? WHERE charge_id = ?", (now, charge_id))
+        conn.execute(
+            "INSERT INTO chat_credits (ts, chat_id, amount, kind, note, by_user) VALUES (?, ?, ?, 'adjust', ?, NULL)",
+            (now, chat_id, -pay["usd"], f"stars-refund:{charge_id}"))
+        other_pay = conn.execute("SELECT 1 FROM star_payments WHERE chat_id = ? AND status = 'paid' AND charge_id != ?",
+                                 (chat_id, charge_id)).fetchone()
+        other_topup = conn.execute("SELECT 1 FROM chat_credits WHERE chat_id = ? AND kind = 'topup' AND note IS NOT ?",
+                                   (chat_id, f"stars:{charge_id}")).fetchone()
+        single = other_pay is None and other_topup is None
+        revoked, unverified, undo = 0.0, False, {}
+        if single:
+            net_bonus = conn.execute("SELECT COALESCE(SUM(amount), 0) FROM chat_credits WHERE chat_id = ? AND kind = 'bonus'",
+                                     (chat_id,)).fetchone()[0]
+            revoked = round(min(max(net_bonus, 0.0), max(balance - pay["usd"], 0.0)), 8)
+            if revoked > 1e-9:
+                conn.execute(
+                    "INSERT INTO chat_credits (ts, chat_id, amount, kind, note, by_user) VALUES (?, ?, ?, 'bonus', ?, NULL)",
+                    (now, chat_id, -revoked, f"revoke:{charge_id}"))
+            else:
+                revoked = 0.0
+            if unverify_ok:
+                if chat_id < 0:
+                    g = conn.execute("SELECT status, approved_by, approved_at FROM allowed_chats WHERE chat_id = ?", (chat_id,)).fetchone()
+                    if g is not None and g["status"] == "approved":
+                        conn.execute("UPDATE allowed_chats SET status = 'pending', approved_by = NULL, approved_at = NULL WHERE chat_id = ?", (chat_id,))
+                        undo["group"] = {"status": g["status"], "approved_by": g["approved_by"], "approved_at": g["approved_at"]}
+                        unverified = True
+                else:
+                    u = conn.execute("SELECT role, verified FROM users WHERE telegram_id = ?", (chat_id,)).fetchone()
+                    if u is not None and u["role"] == "premium":
+                        conn.execute("UPDATE users SET role = 'street' WHERE telegram_id = ?", (chat_id,))
+                        undo["user"] = {"role": u["role"], "verified": u["verified"]}
+                        unverified = True
+        conn.commit()
+        pay.update(single=single, unverified=unverified, bonus_revoked=revoked, undo=undo)
+        return "ok", pay
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def star_refund_revert(charge_id: str, undo: dict | None = None) -> None:
+    """Откат `star_refund_begin`, если Telegram отказал: платёж снова paid, строки adjust и revoke удалены, проверка возвращена (`undo` из `pay["undo"]`)."""
+    undo = undo or {}
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT chat_id FROM star_payments WHERE charge_id = ?", (charge_id,)).fetchone()
+        conn.execute("UPDATE star_payments SET status = 'paid', refunded_ts = NULL WHERE charge_id = ?", (charge_id,))
+        conn.execute("DELETE FROM chat_credits WHERE note IN (?, ?)", (f"stars-refund:{charge_id}", f"revoke:{charge_id}"))
+        if row is not None:
+            if "group" in undo:
+                g = undo["group"]
+                conn.execute("UPDATE allowed_chats SET status = ?, approved_by = ?, approved_at = ? WHERE chat_id = ?",
+                             (g["status"], g["approved_by"], g["approved_at"], row["chat_id"]))
+            if "user" in undo:
+                conn.execute("UPDATE users SET role = ?, verified = ? WHERE telegram_id = ?",
+                             (undo["user"]["role"], undo["user"]["verified"], row["chat_id"]))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def star_payments_sum(since_ts: int, until_ts: int, chat_id: int = None) -> tuple[int, float]:
+    """(звёзды, $) по платежам status='paid' за [since_ts, until_ts); chat_id=None — по всем чатам. Возвращённые не считаются."""
+    sql = "SELECT COALESCE(SUM(stars), 0), COALESCE(SUM(usd), 0) FROM star_payments WHERE status = 'paid' AND ts >= ? AND ts < ?"
+    params: list = [since_ts, until_ts]
+    if chat_id is not None:
+        sql += " AND chat_id = ?"
+        params.append(chat_id)
+    conn = get_conn()
+    stars, usd = conn.execute(sql, params).fetchone()
+    conn.close()
+    return int(stars), round(usd, 8)
+
+
 def has_bonus(chat_id: int) -> bool:
     conn = get_conn()
     row = conn.execute("SELECT 1 FROM chat_credits WHERE chat_id = ? AND kind = 'bonus'", (chat_id,)).fetchone()
@@ -1577,12 +1740,18 @@ def has_bonus(chat_id: int) -> bool:
 
 
 def grant_starter_bonus(chat_id: int, amount: float) -> bool:
-    """Идемпотентно: не выдаёт, если у chat_id уже есть kind='bonus'. True — выдан сейчас."""
+    """Идемпотентно: выдаёт только недостающее до полного `amount` (см. `_grant_bonus_conn`). True — выдан сейчас."""
     conn = get_conn()
-    granted = _grant_bonus_conn(conn, chat_id, amount)
-    conn.commit()
-    conn.close()
-    return granted
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        granted = _grant_bonus_conn(conn, chat_id, amount)
+        conn.commit()
+        return granted
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def settle_negative_balance(chat_id: int) -> float:
