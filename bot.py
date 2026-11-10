@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, LinkPreviewOptions, MenuButtonWebApp, Update, WebAppInfo
 from telegram.constants import ReactionEmoji
-from telegram.error import BadRequest, Forbidden
+from telegram.error import BadRequest, ChatMigrated, Forbidden, NetworkError, RetryAfter, TelegramError
 from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 from telegram.ext import (
@@ -4495,6 +4495,209 @@ async def cmd_refund(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _notice_tier_change(chat_id, before or "paid")
 
 
+# --- Рассылка админа бота (feat/broadcast, docs/claude/broadcast.md) ---
+# Админ в личке отвечает `/broadcast` на своё сообщение (текст/стикер/фото…) → предпросмотр с числом получателей → «Отправить» →
+# фоновая копия через copyMessage (без «переслано от») → отчёт. Модели не вызываются, usage_log не пишется.
+
+def _env_num(name: str, default, cast):
+    try:
+        return cast(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+BROADCAST_ACTIVE_DAYS = _env_num("BROADCAST_ACTIVE_DAYS", 30, int)
+BROADCAST_RATE_PER_SEC = max(0.5, min(_env_num("BROADCAST_RATE_PER_SEC", 20.0, float), 30.0))   # Telegram: ~30 сообщений/с на всех
+BROADCAST_CONFIRM_TTL = 900          # сколько живёт предпросмотр с кнопкой, с
+BROADCAST_NOTE_MAX = 1500            # лимит по РАЗМЕРУ пометки, что кладём в group_messages (инвариант CLAUDE.md)
+_broadcast_pending: dict[str, dict] = {}     # token -> предпросмотр, ждущий кнопки (только в памяти: рестарт = запусти заново)
+_broadcast_run: dict = {}                    # {"id", "task", "stop"} — одна рассылка одновременно
+
+
+def _broadcast_active() -> bool:
+    t = _broadcast_run.get("task")
+    return t is not None and not t.done()
+
+
+def _broadcast_note(m) -> str:
+    """Пометка для group_messages: модель видит объявление как служебное, а не как ответ на чьё-то сообщение."""
+    kind = ("стикер" if m.sticker else "фото" if m.photo else "видео" if m.video else "анимация" if m.animation
+            else "документ" if m.document else "голосовое" if m.voice else "")
+    body = (m.text or m.caption or "").strip()
+    if kind:
+        body = f"[{kind}] {body}".strip()
+    return ("(служебное объявление от администратора бота, не ответ на чьё-то сообщение) " + body)[:BROADCAST_NOTE_MAX]
+
+
+async def _broadcast_send_one(bot, src_chat_id: int, src_message_id: int, chat_id: int) -> str:
+    """Одна копия. -> sent | blocked (бот заблокирован/выгнан) | gone (чата нет/мигрировал) | error. Не бросает."""
+    for _ in range(4):
+        try:
+            await bot.copy_message(chat_id=chat_id, from_chat_id=src_chat_id, message_id=src_message_id)
+            return "sent"
+        except RetryAfter as e:
+            ra = e.retry_after
+            await asyncio.sleep((ra.total_seconds() if hasattr(ra, "total_seconds") else float(ra)) + 1)
+        except ChatMigrated:
+            return "gone"
+        except Forbidden:
+            return "blocked"
+        except BadRequest as e:
+            low = str(e).lower()
+            return "gone" if ("chat not found" in low or "group chat was upgraded" in low) else "error"
+        except NetworkError:
+            return "error"            # мог дойти — повтор рискует дублем; resume повторит только error-строки
+        except TelegramError:
+            return "error"
+    return "error"
+
+
+async def _broadcast_report(bot, b: dict, started: float, stopped: bool) -> None:
+    c = db.broadcast_counts(b["id"])
+    left = c.get("pending", 0)
+    text = (f"📣 Рассылка №{b['id']} {'остановлена' if stopped else 'завершена'}: отправлено {c.get('sent', 0)}, "
+            f"бот заблокирован/выгнан {c.get('blocked', 0)}, чат недоступен {c.get('gone', 0)}, ошибок {c.get('error', 0)}"
+            + (f", не дошло до {left}" if left else "") + f". Время: {int(time.time() - started)} с.")
+    if left or c.get("error", 0):
+        text += " Дослать оставшимся: /broadcast resume."
+    try:
+        await bot.send_message(chat_id=b["admin_id"], text=text)
+    except Exception:
+        logger.exception(f"broadcast {b['id']}: отчёт не доставлен")
+
+
+async def _broadcast_worker(bot, bid: int, chat_ids: list) -> None:
+    b = db.broadcast_get(bid)
+    started, stopped = time.time(), False
+    try:
+        for cid in chat_ids:
+            if _broadcast_run.get("stop"):
+                stopped = True
+                break
+            status = await _broadcast_send_one(bot, b["src_chat_id"], b["src_message_id"], cid)
+            db.broadcast_mark(bid, cid, status)
+            if status == "sent" and cid < 0:
+                try:
+                    db.save_group_message(cid, bot.id, "Клодушка", b["note"], is_bot=True)
+                except Exception:
+                    logger.exception(f"[chat={cid}] broadcast {bid}: не записал объявление в group_messages")
+            await asyncio.sleep(1.0 / BROADCAST_RATE_PER_SEC)
+        db.broadcast_set_status(bid, "stopped" if stopped else "done")
+    except Exception:
+        logger.exception(f"broadcast {bid} упала")
+        stopped = True
+        db.broadcast_set_status(bid, "stopped")
+    finally:
+        await _broadcast_report(bot, db.broadcast_get(bid), started, stopped)
+
+
+def _broadcast_start(bot, bid: int, chat_ids: list) -> None:
+    _broadcast_run.clear()
+    _broadcast_run.update({"id": bid, "stop": False})
+    _broadcast_run["task"] = _spawn_background_task(_broadcast_worker(bot, bid, chat_ids))
+
+
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/broadcast` ответом на сообщение (админ бота, только личка): предпросмотр + кнопка. `test` — только админам, сразу;
+    `all` — без фильтра активности; `stop` — остановить; `resume` — дослать тем, кому не ушло."""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+    msg = update.effective_message
+    if update.effective_chat.type != "private":
+        await msg.reply_text("Рассылка запускается только из личного чата с ботом.")
+        return
+    arg = context.args[0].lower() if context.args else ""
+    if arg == "stop":
+        if _broadcast_active():
+            _broadcast_run["stop"] = True
+            await msg.reply_text("Останавливаю: текущее сообщение дойдёт, остальным не уйдёт. Отчёт придёт следом.")
+        else:
+            await msg.reply_text("Сейчас рассылки нет.")
+        return
+    if arg == "resume":
+        if _broadcast_active():
+            await msg.reply_text("Рассылка уже идёт — дождись отчёта или /broadcast stop.")
+            return
+        b = db.broadcast_last_unfinished()
+        if not b:
+            await msg.reply_text("Нечего досылать: незавершённых рассылок нет.")
+            return
+        todo = db.broadcast_pending(b["id"])
+        if not todo:
+            db.broadcast_set_status(b["id"], "done")
+            await msg.reply_text(f"В рассылке №{b['id']} всем уже отправлено или недоступно.")
+            return
+        db.broadcast_set_status(b["id"], "running")
+        _broadcast_start(context.bot, b["id"], todo)
+        await msg.reply_text(f"Дошлю рассылку №{b['id']}: осталось {len(todo)}. Отчёт придёт по окончании.")
+        return
+    if arg not in ("", "test", "all"):
+        await msg.reply_text("Использование: ответом на своё сообщение — /broadcast (предпросмотр), /broadcast test (только админам), "
+                             "/broadcast all (без фильтра активности), /broadcast stop, /broadcast resume.")
+        return
+    src = msg.reply_to_message
+    if src is None:
+        await msg.reply_text("Напиши сообщение (текст, стикер, фото…) и ответь на него командой /broadcast.")
+        return
+    if _broadcast_active():
+        await msg.reply_text("Рассылка уже идёт — дождись отчёта или /broadcast stop.")
+        return
+    if arg == "test":
+        chat_ids = sorted(ADMIN_IDS)
+        bid = db.broadcast_create(user.id, src.chat_id, src.message_id, "test", chat_ids, _broadcast_note(src))
+        _broadcast_start(context.bot, bid, chat_ids)
+        await msg.reply_text(f"Тест: отправляю {len(chat_ids)} админам бота (рассылка №{bid}).")
+        return
+    days = None if arg == "all" else BROADCAST_ACTIVE_DAYS
+    rec = db.broadcast_recipients(days, ADMIN_IDS)
+    now = time.time()
+    for t in [k for k, v in _broadcast_pending.items() if now - v["ts"] > BROADCAST_CONFIRM_TTL]:
+        _broadcast_pending.pop(t, None)
+    token = os.urandom(4).hex()
+    _broadcast_pending[token] = {"admin": user.id, "ts": now, "src_chat": src.chat_id, "src_msg": src.message_id,
+                                 "mode": "all" if days is None else "active", "rec": rec, "note": _broadcast_note(src)}
+    scope = "все известные, без фильтра активности" if days is None else f"активные за {days} дн."
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Отправить", callback_data=f"bc:go:{token}"),
+                                InlineKeyboardButton("Отмена", callback_data=f"bc:no:{token}")]])
+    await msg.reply_text(f"Уйдёт в {len(rec['groups'])} групп и {len(rec['private'])} личек ({scope}; админы получают всегда). "
+                         f"Это сообщение будет скопировано как есть. Нажми «Отправить» в течение {BROADCAST_CONFIRM_TTL // 60} мин.",
+                         reply_markup=kb)
+
+
+async def on_broadcast_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки предпросмотра: работают только у запустившего и один раз (токен снимается при первом нажатии)."""
+    q = update.callback_query
+    parts = (q.data or "").split(":")
+    if len(parts) != 3 or not is_admin(q.from_user.id):
+        await q.answer()
+        return
+    token = parts[2]
+    pend = _broadcast_pending.get(token)
+    if pend is None or time.time() - pend["ts"] > BROADCAST_CONFIRM_TTL:
+        _broadcast_pending.pop(token, None)
+        await q.answer("Предпросмотр устарел или уже обработан — запусти /broadcast заново.", show_alert=True)
+        return
+    if pend["admin"] != q.from_user.id:
+        await q.answer("Это предпросмотр другого админа.", show_alert=True)
+        return
+    if parts[1] == "no":
+        _broadcast_pending.pop(token, None)
+        await q.answer("Отменено")
+        await q.edit_message_text("Рассылка отменена.")
+        return
+    if _broadcast_active():
+        await q.answer("Другая рассылка ещё идёт.", show_alert=True)
+        return
+    _broadcast_pending.pop(token, None)
+    chat_ids = list(pend["rec"]["groups"]) + list(pend["rec"]["private"])
+    bid = db.broadcast_create(pend["admin"], pend["src_chat"], pend["src_msg"], pend["mode"], chat_ids, pend["note"])
+    _broadcast_start(context.bot, bid, chat_ids)
+    await q.answer("Поехали")
+    await q.edit_message_text(f"Рассылка №{bid} запущена: {len(chat_ids)} получателей. Отчёт придёт по окончании "
+                              "(остановить — /broadcast stop).")
+
+
 async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Разовый обзор (admin-only): тот же сбор лога и ветки A/B, что у ежедневного (окно «с прошлого 21:00 до
     сейчас»), финал — на модели чата с dialog_params. Позволяет проверить фичу, не дожидаясь 21:00."""
@@ -5937,6 +6140,8 @@ USER_HELP = """\
 ADMIN_HELP = """\
 Доступ и баланс:
   /topup <id> <сумма> [коммент] [force] — пополнить баланс ($); отрицательная = корректировка; ID вне базы — только с force.
+  /broadcast       — ТОЛЬКО В ЛИЧКЕ: ответом на своё сообщение (текст/стикер/фото) разослать его активным чатам: предпросмотр «в N групп и M личек» + кнопка «Отправить», в конце отчёт.
+                     /broadcast test — только админам; /broadcast all — без фильтра активности; /broadcast stop; /broadcast resume — дослать, кому не ушло.
   /refund [charge_id] — вернуть платёж Stars (без аргумента — последние 10); только если на балансе чата есть эта сумма.
                            От $2 суммарных пополнений (личка) / $5 (группа) чат проверяется автоматически
   /verify <id>             — проверить группу (id с минусом) или пользователя + стартовый бонус
@@ -8651,6 +8856,8 @@ def main():
     app.add_handler(CommandHandler("terms", cmd_terms))
     app.add_handler(CommandHandler("paysupport", cmd_paysupport))
     app.add_handler(CommandHandler("refund", cmd_refund))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CallbackQueryHandler(on_broadcast_button, pattern=r"^bc:(go|no):[0-9a-f]+$"))
     app.add_handler(CallbackQueryHandler(on_pay_button, pattern=r"^pay:\d+$"))
     app.add_handler(PreCheckoutQueryHandler(on_pre_checkout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_successful_payment))

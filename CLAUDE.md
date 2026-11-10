@@ -71,6 +71,7 @@
 - Режим разработчика в платной личке (`dev_mode_active`, `handle_dev_message`, `_dev_answer`, `/dev`, `/ws`, `ws_*`, `DEV_*`,
   workspace `data/devspace/`, таблицы `dev_mode`/`dev_messages`) — `docs/claude/dev-mode.md`; ТЗ — `docs/claude/tz-dev-mode.md`;
   чек-лист стенда `feat/dev-mode` — `docs/claude/staging-checklist-dev-mode.md`
+- Рассылка админа бота (`/broadcast` ответом на сообщение: текст/стикер/фото, предпросмотр + кнопка, `test`/`all`/`stop`/`resume`, `copyMessage`, `broadcast_log`, `BROADCAST_*`) — `docs/claude/broadcast.md`; ТЗ — `docs/claude/tz-broadcast.md`; чек-лист стенда — `docs/claude/staging-checklist-broadcast.md`
 - История инцидентов с датами (полные дословные разборы) — `docs/claude/incidents.md`
   — сверься, если баг похож на уже виденный, прежде чем чинить с нуля
 - Открытые задачи (незакрытое, не баги) — `docs/claude/open-tasks.md`

@@ -283,6 +283,27 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_star_payments_chat_ts ON star_payments(chat_id, ts);
 
+        -- Рассылка админа бота (feat/broadcast, docs/claude/broadcast.md). broadcasts — что слали, broadcast_log — кому и чем кончилось:
+        -- строки status='pending' создаются сразу на всех получателей, поэтому /broadcast resume после рестарта дошлёт только им.
+        CREATE TABLE IF NOT EXISTS broadcasts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            admin_id INTEGER NOT NULL,
+            src_chat_id INTEGER NOT NULL,
+            src_message_id INTEGER NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'active',
+            note TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'running',
+            finished_ts INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS broadcast_log (
+            broadcast_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            ts INTEGER,
+            PRIMARY KEY (broadcast_id, chat_id)
+        );
+
         CREATE TABLE IF NOT EXISTS daily_usage (
             day TEXT NOT NULL,
             chat_id INTEGER NOT NULL,
@@ -2321,3 +2342,96 @@ def clear_dev_messages(user_id: int) -> int:
     conn.commit()
     conn.close()
     return cur.rowcount
+
+
+# --- Рассылка админа бота (feat/broadcast, docs/claude/broadcast.md) ---
+
+def broadcast_recipients(active_days: int | None, admin_ids=()) -> dict:
+    """Кому слать. active_days=None — всем известным незабаненным (`/broadcast all`).
+    Группы: в allowed_chats (не rejected, не забанены) + от человека есть сообщение в group_messages за active_days.
+    Лички: users не забанены (колонка и роль), last_active за active_days, писал боту (строки conversations). admin_ids — всегда в личках."""
+    cutoff = None if active_days is None else int(time.time()) - int(active_days) * 86400
+    conn = get_conn()
+    gq = "SELECT a.chat_id FROM allowed_chats a WHERE a.chat_id < 0 AND a.banned = 0 AND a.status != 'rejected'"
+    gp: tuple = ()
+    if cutoff is not None:
+        gq += (" AND EXISTS (SELECT 1 FROM group_messages g WHERE g.chat_id = a.chat_id AND g.is_bot = 0 AND g.timestamp >= ?)")
+        gp = (cutoff,)
+    groups = [r["chat_id"] for r in conn.execute(gq + " ORDER BY a.chat_id", gp)]
+    pq = ("SELECT u.telegram_id FROM users u WHERE u.telegram_id > 0 AND u.banned = 0 AND u.role != 'banned' "
+          "AND EXISTS (SELECT 1 FROM conversations c WHERE c.user_id = u.telegram_id)")
+    pp: tuple = ()
+    if cutoff is not None:
+        pq += " AND u.last_active >= ?"
+        pp = (cutoff,)
+    private = [r["telegram_id"] for r in conn.execute(pq + " ORDER BY u.telegram_id", pp)]
+    conn.close()
+    for a in admin_ids:
+        if a not in private:
+            private.append(a)
+    return {"groups": groups, "private": private}
+
+
+def broadcast_create(admin_id: int, src_chat_id: int, src_message_id: int, mode: str, chat_ids: list, note: str = "") -> int:
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO broadcasts (ts, admin_id, src_chat_id, src_message_id, mode, note) VALUES (?, ?, ?, ?, ?, ?)",
+        (int(time.time()), admin_id, src_chat_id, src_message_id, mode, note))
+    bid = cur.lastrowid
+    conn.executemany("INSERT OR IGNORE INTO broadcast_log (broadcast_id, chat_id, status) VALUES (?, ?, 'pending')",
+                     [(bid, c) for c in chat_ids])
+    conn.commit()
+    conn.close()
+    return bid
+
+
+def broadcast_get(bid: int) -> dict | None:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM broadcasts WHERE id = ?", (bid,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def broadcast_last_unfinished(admin_id: int | None = None) -> dict | None:
+    """Последняя рассылка, не доведённая до конца (running после рестарта бота / stopped), и не тест."""
+    conn = get_conn()
+    q = "SELECT * FROM broadcasts WHERE status IN ('running', 'stopped') AND mode != 'test'"
+    args: tuple = ()
+    if admin_id is not None:
+        q += " AND admin_id = ?"
+        args = (admin_id,)
+    row = conn.execute(q + " ORDER BY id DESC LIMIT 1", args).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def broadcast_pending(bid: int) -> list[int]:
+    """Кому ещё не ушло: pending и error (повторяем), но не sent/blocked/gone."""
+    conn = get_conn()
+    rows = conn.execute("SELECT chat_id FROM broadcast_log WHERE broadcast_id = ? AND status IN ('pending', 'error') "
+                        "ORDER BY chat_id", (bid,)).fetchall()
+    conn.close()
+    return [r["chat_id"] for r in rows]
+
+
+def broadcast_mark(bid: int, chat_id: int, status: str) -> None:
+    conn = get_conn()
+    conn.execute("UPDATE broadcast_log SET status = ?, ts = ? WHERE broadcast_id = ? AND chat_id = ?",
+                 (status, int(time.time()), bid, chat_id))
+    conn.commit()
+    conn.close()
+
+
+def broadcast_set_status(bid: int, status: str) -> None:
+    conn = get_conn()
+    conn.execute("UPDATE broadcasts SET status = ?, finished_ts = ? WHERE id = ?",
+                 (status, int(time.time()) if status != "running" else None, bid))
+    conn.commit()
+    conn.close()
+
+
+def broadcast_counts(bid: int) -> dict:
+    conn = get_conn()
+    rows = conn.execute("SELECT status, COUNT(*) n FROM broadcast_log WHERE broadcast_id = ? GROUP BY status", (bid,)).fetchall()
+    conn.close()
+    return {r["status"]: r["n"] for r in rows}

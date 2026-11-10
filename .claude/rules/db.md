@@ -28,6 +28,7 @@ db.py используется отовсюду, поэтому полная с�
 - `dev_mode` (флаг режима разработчика), `dev_messages` (его тред, отдельно от `conversations`; индекс `(user_id, id)`) — `docs/claude/dev-mode.md`
 - `allowed_chats` (в т.ч. `daily_review_enabled`, `status`) — `docs/claude/daily-review.md`;
   колонки `banned` (и `users.banned`), смысл `status` как «проверена/нет» — `docs/claude/billing.md`
+- `broadcasts` / `broadcast_log` (рассылка админа бота: что слали и кому/чем кончилось; `pending` создаются сразу на всех получателей — основа `/broadcast resume`; `broadcast_recipients` — отбор активных чатов) — `docs/claude/broadcast.md`
 - `star_payments` (платежи Telegram Stars, `charge_id` PK = идемпотентность; `star_payment_record` пишет платёж и `chat_credits` одной транзакцией, `star_refund_begin`/`star_refund_revert` — при возврате единственного платежа снимают проверку и отзывают остаток бонуса отрицательной строкой `kind='bonus'`, `star_payments_sum`). `grant_starter_bonus`/`_grant_bonus_conn` довыдают бонус до полного по ЧИСТОЙ сумме строк `kind='bonus'`, а не «если строка есть» — `docs/claude/billing.md` → «Пополнение Stars»
 - `usage_log`, `chat_credits`, `daily_usage`, `schema_migrations` (баланс, тарифы, лимиты,
   однократные миграции) — `docs/claude/billing.md`
