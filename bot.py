@@ -4555,10 +4555,12 @@ async def _broadcast_send_one(bot, src_chat_id: int, src_message_id: int, chat_i
 async def _broadcast_report(bot, b: dict, started: float, stopped: bool) -> None:
     c = db.broadcast_counts(b["id"])
     left = c.get("pending", 0)
+    # resume ищет только running/stopped и не-тесты (db.broadcast_last_unfinished): советуем его, лишь когда он реально сработает
+    can_resume = b["status"] in ("running", "stopped") and b["mode"] != "test" and bool(db.broadcast_pending(b["id"]))
     text = (f"📣 Рассылка №{b['id']} {'остановлена' if stopped else 'завершена'}: отправлено {c.get('sent', 0)}, "
             f"бот заблокирован/выгнан {c.get('blocked', 0)}, чат недоступен {c.get('gone', 0)}, ошибок {c.get('error', 0)}"
             + (f", не дошло до {left}" if left else "") + f". Время: {int(time.time() - started)} с.")
-    if left or c.get("error", 0):
+    if can_resume:
         text += " Дослать оставшимся: /broadcast resume."
     try:
         await bot.send_message(chat_id=b["admin_id"], text=text)
@@ -4582,7 +4584,9 @@ async def _broadcast_worker(bot, bid: int, chat_ids: list) -> None:
                 except Exception:
                     logger.exception(f"[chat={cid}] broadcast {bid}: не записал объявление в group_messages")
             await asyncio.sleep(1.0 / BROADCAST_RATE_PER_SEC)
-        db.broadcast_set_status(bid, "stopped" if stopped else "done")
+        # «done» только если досылать нечего: строки pending/error оставляют рассылку «stopped» — её находит /broadcast resume (тест — не resume'ится)
+        unfinished = bool(db.broadcast_pending(bid)) and b["mode"] != "test"
+        db.broadcast_set_status(bid, "stopped" if (stopped or unfinished) else "done")
     except Exception:
         logger.exception(f"broadcast {bid} упала")
         stopped = True

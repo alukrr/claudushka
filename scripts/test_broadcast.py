@@ -326,3 +326,51 @@ def test_note_placeholders():
     assert "[стикер]" in bot._broadcast_note(src_message(text=None, sticker=object()))
     assert "[фото] подпись" in bot._broadcast_note(src_message(text=None, caption="подпись", photo=[1]))
     assert len(bot._broadcast_note(src_message("я" * 5000))) <= bot.BROADCAST_NOTE_MAX
+
+
+def cmd_resume(fb):
+    async def go():
+        msg = FakeMsg()
+        upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN), effective_chat=SimpleNamespace(type="private", id=ADMIN),
+                              effective_message=msg)
+        await bot.cmd_broadcast(upd, SimpleNamespace(args=["resume"], bot=fb))
+        task = bot._broadcast_run.get("task")
+        if task is not None and not task.done():
+            await task
+        return msg
+    return asyncio.run(go())
+
+
+def test_finished_run_with_error_is_resumable(env):
+    fb = FakeBot(errors={102: NetworkError("timeout")})
+    ids = [101, 102, 103]
+    bid = db.broadcast_create(ADMIN, ADMIN, 10, "active", ids, "n")
+    run_broadcast(fb, bid, ids)                                          # дошла до конца, но у 102 — error
+    assert db.broadcast_counts(bid) == {"sent": 2, "error": 1}
+    assert db.broadcast_get(bid)["status"] == "stopped"                  # не «done», пока есть error
+    assert db.broadcast_last_unfinished()["id"] == bid
+    assert "/broadcast resume" in fb.sent[-1][1]                         # совет есть, потому что resume сработает
+    fb.errors.clear()
+    fb.copies.clear()
+    msg = cmd_resume(fb)
+    assert "осталось 1" in msg.replies[0][0]
+    assert [c[0] for c in fb.copies] == [102]                            # только строке с ошибкой, без дублей
+    assert db.broadcast_counts(bid) == {"sent": 3}
+    assert db.broadcast_get(bid)["status"] == "done"
+    assert "/broadcast resume" not in fb.sent[-1][1]                     # всё дошло — совета нет
+    assert "Нечего досылать" in cmd_resume(fb).replies[0][0]
+    assert len(fb.copies) == 1
+
+
+def test_clean_run_report_has_no_resume_advice(env):
+    fb = FakeBot()
+    bid = db.broadcast_create(ADMIN, ADMIN, 10, "active", [101], "n")
+    run_broadcast(fb, bid, [101])
+    assert db.broadcast_get(bid)["status"] == "done" and "resume" not in fb.sent[-1][1]
+
+
+def test_test_mode_error_does_not_advise_resume(env):
+    fb = FakeBot(errors={101: NetworkError("timeout")})
+    bid = db.broadcast_create(ADMIN, ADMIN, 10, "test", [101], "n")
+    run_broadcast(fb, bid, [101])
+    assert "resume" not in fb.sent[-1][1] and db.broadcast_last_unfinished() is None
