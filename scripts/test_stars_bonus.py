@@ -178,3 +178,10 @@ def test_reconstructed_balance_equals_get_balance_after_bonus_revoke(env, monkey
 
 def test_terms_mention_thresholds(env):
     assert "$2" in bot.STARS_TERMS_TEXT and "$5" in bot.STARS_TERMS_TEXT and "бонус" in bot.STARS_TERMS_TEXT
+
+
+def test_refund_list_has_tappable_monospace_ids(env):
+    pay(USER, 100, "LIST_1-x_y")
+    replies = refund("", RefundBot())
+    assert "<code>LIST_1-x_y</code>" in replies[0]
+    assert "&lt;charge_id&gt;" in replies[0]

@@ -4451,10 +4451,10 @@ async def cmd_refund(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rows:
             await msg.reply_text("Платежей Stars пока нет. Возврат: /refund <charge_id>")
             return
-        lines = ["Последние платежи Stars (возврат: /refund <charge_id>):"]
+        lines = ["Последние платежи Stars. Нажми на charge_id — скопируется; отправь: /refund &lt;charge_id&gt;"]
         for r in rows:
-            lines.append(f"{r['status']} · {r['stars']} ⭐ · ${r['usd']:.2f} · чат {r['chat_id']} · от {r['payer_id']}\n  {r['charge_id']}")
-        await msg.reply_text("\n".join(lines))
+            lines.append(f"{r['status']} · {r['stars']} ⭐ · ${r['usd']:.2f} · чат {r['chat_id']} · от {r['payer_id']}\n<code>{html.escape(r['charge_id'])}</code>")
+        await msg.reply_text("\n".join(lines), parse_mode="HTML")
         return
     charge = context.args[0].strip()
     before = None
