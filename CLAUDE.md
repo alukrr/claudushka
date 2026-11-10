@@ -75,7 +75,7 @@
   решения и порядок веток — `docs/claude/roadmap-2026-11.md`
 - Мини-приложение настроек (`miniapp/server.py`, `miniapp/index.html`, `validate_init_data`, `_ma_*`, `/settings`, `MINIAPP_PUBLIC_URL`) — `docs/claude/miniapp.md`; чек-лист стенда — `docs/claude/staging-checklist-miniapp.md`;
   runbook прокси `edge` — `docs/claude/runbook-edge-proxy.md`; ТЗ реестра настроек —
-  `docs/claude/tz-settings-registry.md`; ТЗ мини-приложения — `docs/claude/tz-miniapp.md`; ТЗ v2 (экран «Расходы», открытие из группы через Main Mini App `startapp`, «По месяцам» в `/cost <chat_id>`) — `docs/claude/tz-miniapp-v2.md`; ТЗ управляющих чата — `docs/claude/tz-chat-managers.md`
+  `docs/claude/tz-settings-registry.md`; ТЗ мини-приложения — `docs/claude/tz-miniapp.md`; ТЗ v2 (экран «Расходы», открытие из группы через Main Mini App `startapp`, «По месяцам» в `/cost <chat_id>`; `_cost_data`, `_ma_chat_costs`, `MINIAPP_MAIN_APP`) — `docs/claude/tz-miniapp-v2.md`; чек-лист стенда v2 — `docs/claude/staging-checklist-miniapp-v2.md`; ТЗ управляющих чата — `docs/claude/tz-chat-managers.md`
 - Параллельная обработка апдейтов (`PerChatUpdateProcessor`, `MAX_CONCURRENT_UPDATES`): ТЗ — `docs/claude/tz-concurrent-updates.md`
 - Атрибуция групповой памяти по uid (метки участников `P1…`): ТЗ — `docs/claude/tz-memory-uid.md`
 - `whatsapp.py` — `.claude/rules/whatsapp.md` (грузится автоматически при чтении файла)
