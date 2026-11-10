@@ -4815,6 +4815,24 @@ async def _manager_target(update: Update, context: ContextTypes.DEFAULT_TYPE, ch
     return None, "", False, MANAGER_USAGE
 
 
+async def _manager_assign(context, chat_id: int, actor: int, uid: int, name: str, is_bot_user: bool) -> tuple[str, str]:
+    """Назначить управляющего — ОБЩАЯ логика `/manager add` и мини-приложения. Права `actor` вызывающий проверил сам (is_real_chat_admin).
+    -> (код, текст): ok | bot (бота нельзя) | admin (и так админ — строку не пишем)."""
+    if is_bot_user or uid == context.bot.id:
+        return "bot", "Бота управляющим сделать нельзя."
+    if await is_real_chat_admin(context, chat_id, uid):
+        return "admin", f"{name} и так админ."
+    db.add_chat_manager(chat_id, uid, actor)
+    return "ok", f"{name} теперь управляет ботом в этом чате (как админ чата)."
+
+
+def _manager_unassign(chat_id: int, uid: int, name: str) -> tuple[str, str]:
+    """Снять управляющего — общая логика `/manager rm` и мини-приложения. -> (ok | none, текст)."""
+    if db.remove_chat_manager(chat_id, uid):
+        return "ok", f"{name} больше не управляет ботом в этом чате."
+    return "none", f"{name} и так не управляет ботом в этом чате."
+
+
 async def cmd_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/manager add|rm — управляющие чата: права админа ЭТОГО чата без админки в Telegram (таблица chat_managers).
     Выдают и снимают только настоящие админы (is_real_chat_admin: админ чата в Telegram или админ бота) — управляющий
@@ -4837,19 +4855,11 @@ async def cmd_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(err)
         return
     if action == "add":
-        if is_bot_user or uid == context.bot.id:
-            await msg.reply_text("Бота управляющим сделать нельзя.")
-            return
-        if await is_real_chat_admin(context, chat.id, uid):
-            await msg.reply_text(f"{name} и так админ.")
-            return
-        db.add_chat_manager(chat.id, uid, actor)
-        await msg.reply_text(f"{name} теперь управляет ботом в этом чате (как админ чата).")
+        _, text = await _manager_assign(context, chat.id, actor, uid, name, is_bot_user)
+        await msg.reply_text(text)
         return
-    if db.remove_chat_manager(chat.id, uid):
-        await msg.reply_text(f"{name} больше не управляет ботом в этом чате.")
-    else:
-        await msg.reply_text(f"{name} и так не управляет ботом в этом чате.")
+    _, text = _manager_unassign(chat.id, uid, name)
+    await msg.reply_text(text)
 
 
 async def _member_display_name(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> str:
@@ -8631,7 +8641,9 @@ async def _ma_chat_view(user_id: int, chat_id: int, fresh: bool = False) -> dict
                      "is_admin": bool(fl["chat"]),
                      # кнопка «Расходы» на экране чата (при открытии по startapp списка чатов нет); сервер всё равно проверяет сам
                      "can_view_costs": (bool(fl["chat"]) and in_target) if chat_id < 0 else (chat_id == user_id or fl["bot"]),
-                     "can_topup": bool(in_target)},   # кнопка «Пополнить» (Stars): свой чат / группа, где человек состоит
+                     "can_topup": bool(in_target),
+                     # раздел «Управляющие» на экране группы: видят те же, кто видит /managers; правит только can_edit из GET …/managers
+                     "can_view_managers": chat_id < 0 and bool(fl["chat"]) and bool(in_target)},   # кнопка «Пополнить» (Stars): свой чат / группа, где человек состоит
             "settings": [_ma_setting(k, user_id, chat_id, fl) for k in _ma_keys_for(chat_id)]}
 
 
@@ -8680,6 +8692,100 @@ async def _ma_topup_link(user_id: int, chat_id: int, stars: int) -> dict:
         logger.exception(f"miniapp topup link chat={chat_id} uid={user_id} stars={stars}")
         raise MiniappError(502, "Не удалось создать счёт. Попробуйте позже.")
     return {"invoice_link": link}
+
+
+# --- Управляющие чата в мини-приложении (feat/miniapp-managers, docs/claude/miniapp.md → «Управляющие») ---
+_MA_USERNAME_RE = re.compile(r"^@?[A-Za-z][A-Za-z0-9_]{3,31}$")
+
+
+async def _ma_managers_scope(user_id: int, chat_id: int) -> tuple[str, bool]:
+    """Кто может смотреть раздел: те же, кто видит /managers (is_chat_admin: админы чата, управляющие, админ бота) в группе, которую бот знает.
+    Права читаются свежо (без кэша). -> (название чата, can_edit = is_real_chat_admin: настоящий админ группы или админ бота).
+    Иначе MiniappError."""
+    if chat_id >= 0:
+        raise MiniappError(400, "Управляющие бывают только в группах.")
+    await _ma_access(user_id, chat_id, fresh=True)          # 403: не участник / забанена / чужая
+    row = db.get_chat_row(chat_id)
+    if row is None:
+        raise MiniappError(404, "Чат не найден.")
+    if not await _ma_chat_admin(chat_id, user_id, fresh=True):
+        raise MiniappError(403, "Нет доступа к управляющим этого чата.")
+    return _ma_title(chat_id, row), await is_real_chat_admin(_ma_context(), chat_id, user_id)
+
+
+async def _ma_managers_edit_scope(user_id: int, chat_id: int) -> None:
+    _, can_edit = await _ma_managers_scope(user_id, chat_id)
+    if not can_edit:
+        raise MiniappError(403, "Назначать и снимать управляющих могут только админы этого чата и админы бота.")
+
+
+async def _ma_managers_list(user_id: int, chat_id: int) -> dict:
+    title, can_edit = await _ma_managers_scope(user_id, chat_id)
+    ctx = _ma_context()
+    managers = []
+    for r in db.list_chat_managers(chat_id):
+        by = r["added_by"]
+        managers.append({
+            "id": r["user_id"], "name": await _member_display_name(ctx, chat_id, r["user_id"]),
+            "added_by": (await _member_display_name(ctx, chat_id, by)) if by else None,
+            "added_at": datetime.fromtimestamp(r["added_at"], BERLIN_TZ).strftime("%d.%m.%Y %H:%M") if r["added_at"] else None})
+    return {"chat": {"id": chat_id, "title": title}, "can_edit": can_edit, "managers": managers}
+
+
+async def _ma_member_lookup(chat_id: int, uid: int):
+    """(ChatMember, состоит_в_группе) по getChatMember без кэша; нет такого/ошибка → (None, False)."""
+    try:
+        m = await _admin_bot.get_chat_member(chat_id, uid)
+    except Exception:
+        return None, False
+    here = m.status in ("creator", "administrator", "member") or (m.status == "restricted" and getattr(m, "is_member", True))
+    return m, here
+
+
+async def _ma_managers_add(user_id: int, chat_id: int, user, confirm: bool) -> dict:
+    """Назначить по user_id или @username. @username — только поиск в нашей БД (`db.find_users_by_username`), без confirm запись не создаётся:
+    возвращаем найденного (`found`), назначаем после подтверждения. В chat_managers пишется user_id, не ник."""
+    await _ma_managers_edit_scope(user_id, chat_id)
+    raw = str(user).strip() if isinstance(user, (str, int)) and not isinstance(user, bool) else ""
+    by_name = False
+    if re.fullmatch(r"\d{1,15}", raw):
+        uid = int(raw)
+    elif _MA_USERNAME_RE.match(raw):
+        by_name = True
+        found = db.find_users_by_username(raw)
+        if not found:
+            raise MiniappError(404, "Этот человек ещё не писал боту. Попросите его написать что-нибудь в группе или пришлите его user_id (команда /id).")
+        if len(found) > 1:
+            raise MiniappError(409, "Под этим ником в базе несколько человек — укажите user_id.")
+        uid = found[0]["telegram_id"]
+    else:
+        raise MiniappError(400, "Укажите user_id (число) или @username.")
+    member, here = await _ma_member_lookup(chat_id, uid)
+    if not here:
+        raise MiniappError(409, "Этот человек не состоит в этой группе.")
+    u = member.user
+    name = db.get_last_sender_name(chat_id, uid) or u.full_name or (f"@{u.username}" if u.username else str(uid))
+    if by_name and not confirm:
+        return {"ok": True, "found": {"id": uid, "name": name}, "message": f"Найден: {name} ({uid}). Подтвердите, чтобы добавить."}
+    if db.is_chat_manager_db(chat_id, uid):
+        raise MiniappError(409, f"{name} уже управляет ботом в этом чате.")
+    code, text = await _manager_assign(_ma_context(), chat_id, user_id, uid, name, bool(u.is_bot))
+    if code == "bot":
+        raise MiniappError(400, text)
+    if code == "admin":
+        raise MiniappError(409, text)
+    logger.info(f"miniapp manager add chat={chat_id} uid={uid} by={user_id}" + (" (по нику)" if by_name else ""))
+    return {"ok": True, "message": text, "manager": {"id": uid, "name": name}}
+
+
+async def _ma_managers_remove(user_id: int, chat_id: int, target_id: int) -> dict:
+    await _ma_managers_edit_scope(user_id, chat_id)
+    name = await _member_display_name(_ma_context(), chat_id, target_id)
+    code, text = _manager_unassign(chat_id, target_id, name)
+    if code == "none":
+        raise MiniappError(404, text)
+    logger.info(f"miniapp manager rm chat={chat_id} uid={target_id} by={user_id}")
+    return {"ok": True, "message": text}
 
 
 def _ma_type_error(s: ChatSetting, value) -> str | None:
@@ -8736,6 +8842,15 @@ class _MiniappDeps:
 
     async def topup_link(self, user_id: int, chat_id: int, stars: int) -> dict:
         return await _ma_topup_link(user_id, chat_id, stars)
+
+    async def managers_list(self, user_id: int, chat_id: int) -> dict:
+        return await _ma_managers_list(user_id, chat_id)
+
+    async def managers_add(self, user_id: int, chat_id: int, user, confirm: bool) -> dict:
+        return await _ma_managers_add(user_id, chat_id, user, confirm)
+
+    async def managers_remove(self, user_id: int, chat_id: int, target_id: int) -> dict:
+        return await _ma_managers_remove(user_id, chat_id, target_id)
 
 
 def build_miniapp():

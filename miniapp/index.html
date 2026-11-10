@@ -33,7 +33,7 @@
   .hint { color: var(--hint); font-size: 13px; margin-top: 6px; overflow-wrap: anywhere; }
   .msg { font-size: 13px; margin-top: 6px; min-height: 0; overflow-wrap: anywhere; }
   .msg.ok { color: var(--ok); } .msg.err { color: var(--err); }
-  select, input[type=number] { width: 100%; font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--hint);
+  select, input[type=number], input[type=text] { width: 100%; font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--hint);
                                background: var(--bg); color: var(--text); }
   input[type=range] { width: 100%; }
   select:disabled, input:disabled { opacity: .5; }
@@ -62,6 +62,13 @@
   .pack .usd { color: var(--hint); font-weight: 400; }
   details.help { background: var(--card); border-radius: 12px; padding: 10px 14px; margin: 12px 0; }
   details.help summary { font-weight: 600; cursor: pointer; }
+  .mini { font: inherit; font-size: 13px; padding: 4px 10px; border: 1px solid var(--hint); border-radius: 8px; cursor: pointer; flex: none; }
+  .mini.primary { background: var(--btn); color: var(--btn-text); border-color: var(--btn); }
+  .mgr { padding: 6px 0; border-bottom: 1px solid var(--bg); }
+  .mgr:last-child { border-bottom: 0; }
+  .mgr .who { overflow-wrap: anywhere; }
+  .addrow { display: flex; gap: 8px; margin-top: 10px; }
+  .addrow button { flex: none; }
   .helptext { white-space: pre-wrap; font-size: 14px; margin-top: 8px; overflow-wrap: anywhere; }
 </style>
 </head>
@@ -162,7 +169,87 @@
       cb.addEventListener("click", function () { openCosts(data.chat.id); });
       app.appendChild(cb);
     }
+    if (data.chat.can_view_managers) app.appendChild(managersCard(data.chat.id));
     data.settings.forEach(function (s) { app.appendChild(settingCard(data.chat.id, s)); });
+  }
+
+  // ---- Раздел «Управляющие» на экране группы (ТЗ tz-miniapp-managers.md). Права проверяет сервер; здесь только textContent. ----
+  function managersCard(id) {
+    var box = el("div", "card");
+    box.appendChild(el("div", "label", "Управляющие"));
+    var body = el("div");
+    box.appendChild(body);
+    box.appendChild(el("div", "hint", "Управляющий получает в боте права админа этого чата (настройки, расходы), но не админа бота и не может назначать других."));
+    function setNote(parent, text, ok) { parent.className = "msg" + (ok ? " ok" : " err"); parent.textContent = text; }
+    function load(note) {
+      api("GET", "/api/chats/" + id + "/managers").then(function (r) {
+        while (body.firstChild) body.removeChild(body.firstChild);
+        if (r.status !== 200) { body.appendChild(el("div", "hint", r.data.message || "Не удалось загрузить список.")); return; }
+        draw(r.data, note);
+      }).catch(function () { body.appendChild(el("div", "hint", "Нет связи с сервером.")); });
+    }
+    function draw(d, note) {
+      if (!d.managers.length) body.appendChild(el("div", "hint", "Управляющих нет."));
+      d.managers.forEach(function (m) {
+        var row = el("div", "row mgr");
+        var who = el("div", "who");
+        who.appendChild(el("div", "", m.name + " (" + m.id + ")"));
+        who.appendChild(el("div", "hint", "добавил(а) " + (m.added_by || "?") + (m.added_at ? ", " + m.added_at : "")));
+        row.appendChild(who);
+        if (d.can_edit) {
+          var rb = el("button", "mini", "Убрать");
+          rb.addEventListener("click", function () {
+            rb.disabled = true;
+            api("DELETE", "/api/chats/" + id + "/managers/" + m.id).then(function (r) {
+              load(r.data.message || (r.status === 200 ? "Готово." : "Не удалось убрать."));
+            }).catch(function () { rb.disabled = false; });
+          });
+          row.appendChild(rb);
+        }
+        body.appendChild(row);
+      });
+      var msg = el("div", "msg");
+      if (note) setNote(msg, note, true);
+      if (d.can_edit) {
+        var add = el("div", "addrow");
+        var inp = el("input"); inp.type = "text"; inp.placeholder = "user_id или @username"; inp.maxLength = 40;
+        inp.setAttribute("autocomplete", "off");
+        var ab = el("button", "mini primary", "Добавить");
+        add.appendChild(inp); add.appendChild(ab);
+        body.appendChild(add);
+        var confirmBox = el("div");
+        body.appendChild(confirmBox);
+        ab.addEventListener("click", function () {
+          var v = inp.value.trim();
+          msg.className = "msg"; msg.textContent = "";
+          while (confirmBox.firstChild) confirmBox.removeChild(confirmBox.firstChild);
+          if (!v) return;
+          ab.disabled = true;
+          api("POST", "/api/chats/" + id + "/managers", { user: v, confirm: false }).then(function (r) {
+            ab.disabled = false;
+            if (r.status !== 200) { setNote(msg, r.data.message || "Не удалось добавить.", false); return; }
+            if (r.data.found) {
+              // ник найден в нашей БД: сначала показываем, кого нашли, назначаем только после подтверждения (по user_id, не по нику)
+              confirmBox.appendChild(el("div", "hint", "Найден: " + r.data.found.name + " (" + r.data.found.id + "). Добавить управляющим?"));
+              var yes = el("button", "mini primary", "Да, добавить"), no = el("button", "mini", "Отмена");
+              var act = el("div", "addrow"); act.appendChild(yes); act.appendChild(no); confirmBox.appendChild(act);
+              no.addEventListener("click", function () { while (confirmBox.firstChild) confirmBox.removeChild(confirmBox.firstChild); });
+              yes.addEventListener("click", function () {
+                yes.disabled = true;
+                api("POST", "/api/chats/" + id + "/managers", { user: String(r.data.found.id), confirm: true }).then(function (r2) {
+                  if (r2.status === 200) { load(r2.data.message); } else { setNote(msg, r2.data.message || "Не удалось добавить.", false); yes.disabled = false; }
+                }).catch(function () { yes.disabled = false; setNote(msg, "Нет связи с сервером.", false); });
+              });
+              return;
+            }
+            load(r.data.message);
+          }).catch(function () { ab.disabled = false; setNote(msg, "Нет связи с сервером.", false); });
+        });
+      }
+      body.appendChild(msg);
+    }
+    load();
+    return box;
   }
 
   // ---- Экран «Расходы» (ТЗ tz-miniapp-v2.md, часть A). Только textContent, без innerHTML и внешних библиотек. ----

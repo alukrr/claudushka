@@ -51,6 +51,9 @@ class MiniappDeps(Protocol):
     async def chat_costs(self, user_id: int, chat_id: int) -> dict: ...
     async def topup_info(self, user_id: int, chat_id: int) -> dict: ...
     async def topup_link(self, user_id: int, chat_id: int, stars: int) -> dict: ...
+    async def managers_list(self, user_id: int, chat_id: int) -> dict: ...
+    async def managers_add(self, user_id: int, chat_id: int, user: Any, confirm: bool) -> dict: ...
+    async def managers_remove(self, user_id: int, chat_id: int, target_id: int) -> dict: ...
 
 
 def validate_init_data(init_data: str, bot_token: str, *, max_age: int = 3600, now: float | None = None) -> dict:
@@ -192,6 +195,30 @@ def create_app(*, bot_token: str, deps: MiniappDeps, max_age: int = 3600, rate_l
                 raise MiniappError(400, "Ожидается JSON {\"stars\": N}.")
             return await deps.topup_link(uid, chat_id, stars)
         return await _run(request, call)
+
+    @app.get("/api/chats/{chat_id}/managers")
+    async def api_managers(chat_id: int, request: Request):
+        return await _run(request, lambda uid: deps.managers_list(uid, chat_id))
+
+    @app.post("/api/chats/{chat_id}/managers")
+    async def api_managers_add(chat_id: int, request: Request):
+        """{"user": "123" | "@name", "confirm": false}. @name без confirm — только поиск (`found`), запись создаётся с confirm=true."""
+        async def call(uid):
+            try:
+                body = await request.json()
+            except Exception:
+                body = None
+            if not isinstance(body, dict) or "user" not in body or isinstance(body["user"], bool) or not isinstance(body["user"], (str, int)):
+                raise MiniappError(400, "Ожидается JSON {\"user\": \"123\" или \"@name\", \"confirm\": false}.")
+            confirm = body.get("confirm", False)
+            if not isinstance(confirm, bool):
+                raise MiniappError(400, "confirm — true или false.")
+            return await deps.managers_add(uid, chat_id, body["user"], confirm)
+        return await _run(request, call)
+
+    @app.delete("/api/chats/{chat_id}/managers/{user_id}")
+    async def api_managers_remove(chat_id: int, user_id: int, request: Request):
+        return await _run(request, lambda uid: deps.managers_remove(uid, chat_id, user_id))
 
     @app.post("/api/chats/{chat_id}/settings/{key}")
     async def api_set(chat_id: int, key: str, request: Request):
