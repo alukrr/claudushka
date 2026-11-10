@@ -109,3 +109,8 @@ DELETE FROM allowed_chats WHERE chat_id > 0;
 `PAID_MIN_BALANCE` (0.0001), а не «> 0»: пыль от float-сложений не должна оставлять чат в
 платном режиме. Новые функции, меняющие баланс, — тем же паттерном. Однократные миграции данных
 — только через `_run_once` (маркер в `schema_migrations`), не голыми `UPDATE` в списке `ALTER`.
+
+## Платные интервалы по журналам (только чтение)
+`subscription_events` / `paid_seconds_from_events` / `billed_outside_paid` / `paid_seconds` восстанавливают, сколько времени чат был в paid, из
+`chat_credits` (все `kind`) и `usage_log billed=1` — те же слагаемые, что `_BALANCE_SQL`. Схему не трогают; чистая часть не ходит в БД (её берёт
+`scripts/check_subscription_estimate.py` без импорта bot.py). Изменишь формулу баланса — поправь и их. `docs/claude/billing.md` → «Оценка цены подписки».

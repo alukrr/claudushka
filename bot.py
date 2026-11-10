@@ -197,6 +197,13 @@ CAPTCHA_ENABLED = False
 # Все суммы в $. PRICE_MARKUP умножается на КАЖДУЮ запись usage_log при вставке (цена
 # заморожена в строке, пересчёта задним числом нет).
 PRICE_MARKUP = 1.0
+# Оценка цены подписки (feat/cost-weeks-subscription, docs/claude/billing.md → «Оценка цены подписки»). Только ОЦЕНКА по прошлому.
+# Деньги в usage_log уже с PRICE_MARKUP — второй раз не умножать; SUBSCRIPTION_WEEK_MARKUP — надбавка недели к 7 дням месяца.
+SUBSCRIPTION_EST_DAYS = 90                                           # окно оценки, дней назад от «сейчас»…
+SUBSCRIPTION_EST_SINCE = datetime(2026, 10, 28, tzinfo=BERLIN_TZ)    # …но не раньше: с этой даты модели только Gemini, траты на Claude нерепрезентативны
+SUBSCRIPTION_MIN_DAYS = 7                                            # платных дней меньше — цену не показываем («мало данных»)
+SUBSCRIPTION_MONTH_DAYS = 30                                         # месяц подписки = 30 дней
+SUBSCRIPTION_WEEK_MARKUP = 0.05                                      # неделя = 7 дней +5%
 # Цена картинки для pool-провайдеров (константа). У gemini-провайдеров цена зависит от модели и разрешения и
 # считается по usageMetadata ответа — GEMINI_IMAGE_PRICING / gemini_image_cost (рядом с IMAGE_PROVIDERS).
 IMAGE_PRICES = {"gpt": 0.02, "flare": 0.02, "sunburst": 0.02}
@@ -4592,6 +4599,8 @@ def _cost_report(scope: int | None, viewer_id: int) -> str:
     if balance > 0 and rate > 0:
         bal_line += f" (≈ на {int(balance / rate)} дн. при темпе последних 7 дней)"
     lines.append(bal_line)
+    if scope is not None:   # общий /cost админа (все чаты) оценку не показывает
+        lines.append(_subscription_line(_subscription_estimate(scope, now)))
 
     if scope is not None:
         is_group = scope < 0
@@ -4669,6 +4678,55 @@ def _cost_month_windows(now: datetime, count: int = 12) -> list[tuple[str, datet
     return out
 
 
+def _cost_week_windows(now: datetime, count: int = 12) -> list[tuple[str, datetime, datetime, bool]]:
+    """`count` последних недель по ISO 8601 / DIN 1355 (понедельник — начало, KW 1 — неделя с первым четвергом года), новые сверху:
+    (\"YYYY-Www\", понедельник 00:00, следующий понедельник 00:00, partial). Год в подписи — ISO-год понедельника (29.12.2025 → 2026-W01).
+    Границы строятся по ДАТЕ через datetime.combine, не «+7*86400 с»: на переходе CET/CEST неделя 167 или 169 часов.
+    partial=True — текущая неделя (данные «по сегодня»)."""
+    monday = now.astimezone(BERLIN_TZ).date()
+    monday -= timedelta(days=monday.weekday())
+    out = []
+    for i in range(count):
+        d0 = monday - timedelta(days=7 * i)
+        iso = d0.isocalendar()
+        out.append((f"{iso[0]:04d}-W{iso[1]:02d}", datetime.combine(d0, dt_time(0, 0), tzinfo=BERLIN_TZ),
+                    datetime.combine(d0 + timedelta(days=7), dt_time(0, 0), tzinfo=BERLIN_TZ), i == 0))
+    return out
+
+
+def _paid_seconds(chat_id: int, since_ts: int, until_ts: int) -> float:
+    """Секунды в [since_ts, until_ts), когда чат был в тарифе paid: баланс восстанавливается по chat_credits и usage_log billed=1
+    (`db.paid_seconds`, чистая часть — `db.paid_seconds_from_events`), личка админа бота — всё окно платное. Блокирующий (SQLite)."""
+    return db.paid_seconds(chat_id, since_ts, until_ts, always_paid=is_admin(chat_id))
+
+
+def _subscription_estimate(chat_id: int, now: datetime) -> dict:
+    """Оценка цены подписки по расходу в платном режиме (ТЗ tz-cost-weeks-subscription.md). Окно: max(now − 90 дней, 2026-10-28 Berlin) … now.
+    paid_days — по ВОССТАНОВЛЕННОМУ балансу (`_paid_seconds`), а не по «дням с тратами» (тихий день в платном режиме иначе выпал бы из
+    знаменателя). Бесплатное (billed=0) в оценку не входит. paid_days < SUBSCRIPTION_MIN_DAYS → enough=False, month/week=None.
+    Блокирующий (SQLite) — вызывать через asyncio.to_thread."""
+    end = int(now.timestamp()) + 1                                   # как в _cost_data: включает текущую секунду
+    start = max(now - timedelta(days=SUBSCRIPTION_EST_DAYS), SUBSCRIPTION_EST_SINCE)
+    since = int(start.timestamp())
+    paid_days = _paid_seconds(chat_id, since, end) / 86400 if end > since else 0.0
+    spent = _sum_cost(db.usage_grouped(since, end, (), chat_id=chat_id, billed=True)) if end > since else 0.0
+    out = {"enough": False, "month": None, "week": None, "paid_days": round(paid_days, 2), "spent": spent,
+           "window_days": round(max(end - since, 0) / 86400, 2), "since": start.strftime("%Y-%m-%d")}
+    if paid_days >= SUBSCRIPTION_MIN_DAYS:
+        per_day = spent / paid_days
+        out.update(enough=True, month=per_day * SUBSCRIPTION_MONTH_DAYS, week=per_day * 7 * (1 + SUBSCRIPTION_WEEK_MARKUP))
+    return out
+
+
+def _subscription_line(sub: dict) -> str:
+    """Строка оценки для /cost: «≈» обязательно — это оценка по прошлому, не тариф."""
+    if not sub["enough"]:
+        return f"Цена подписки: мало данных ({sub['paid_days']:.1f} дн. в платном режиме, нужно {SUBSCRIPTION_MIN_DAYS})"
+    since = f"{sub['since'][8:10]}.{sub['since'][5:7]}"
+    return (f"В режиме подписки: месяц ≈ {_money(sub['month'])}, неделя ≈ {_money(sub['week'])} "
+            f"(по {sub['paid_days']:.1f} дн. платного режима с {since})")
+
+
 def _cost_data(chat_id: int, show_free: bool, now: datetime | None = None) -> dict:
     """Данные расходов одного чата — ОДИН источник для текста `/cost <chat_id>` (`_cost_detail`) и для JSON мини-приложения
     (`GET /api/chats/{id}/costs`, docs/claude/miniapp.md). Суммы — `db.usage_grouped` по `usage_log` (cost_usd заморожен в момент вызова).
@@ -4693,6 +4751,16 @@ def _cost_data(chat_id: int, show_free: bool, now: datetime | None = None) -> di
             if billed in modes:
                 row[key] = _sum_cost(db.usage_grouped(ts(m0), min(ts(m1), end), (), billed=billed, **kw))
         months.append(row)
+
+    weeks = []   # 12 ISO-недель (KW), новые сверху; последняя неделя — по сегодня (partial), правая граница — min(начало следующей, end)
+    for label, w0, w1, partial in _cost_week_windows(now):
+        iso = w0.date().isocalendar()
+        row = {"week": label, "kw": iso[1], "iso_year": iso[0], "start": w0.strftime("%Y-%m-%d"),
+               "end": (w1.date() - timedelta(days=1)).strftime("%Y-%m-%d"), "partial": partial}
+        for billed, key in ((True, "paid"), (False, "free")):
+            if billed in modes:
+                row[key] = _sum_cost(db.usage_grouped(ts(w0), min(ts(w1), end), (), billed=billed, **kw))
+        weeks.append(row)
 
     days = []
     for i in range(7):
@@ -4722,17 +4790,20 @@ def _cost_data(chat_id: int, show_free: bool, now: datetime | None = None) -> di
 
     return {"chat": {"id": chat_id, "title": _chat_title(chat_id), "tier": chat_tier(chat_id), "verified": is_chat_verified(chat_id)},
             "balance": balance, "rate_7d_per_day": rate, "days_left": days_left,
-            "months": months, "days": days, "by_model": by_model, "by_label": by_label,
-            "by_kind_week": by_kind_week, "show_free": show_free}
+            "months": months, "weeks": weeks, "days": days, "by_model": by_model, "by_label": by_label,
+            "by_kind_week": by_kind_week, "show_free": show_free,
+            "subscription": _subscription_estimate(chat_id, now)}   # только платное (billed=1) — видно всем, кто видит расходы
 
 
 def _cost_detail(target: int) -> str:
-    """/cost <chat_id> (только админ бота): модели, метки, дни за последние 7 дней и 12 месяцев. Данные — `_cost_data`."""
+    """/cost <chat_id> (только админ бота): модели, метки, дни за последние 7 дней, 12 недель (KW) и 12 месяцев, оценка цены подписки.
+    Данные — `_cost_data`."""
     d = _cost_data(target, True)
     lines = [
         f"{d['chat']['title']} ({target}) — детализация за 7 дней",
         f"Баланс: {_money(d['balance'])} · {'платный' if d['chat']['tier'] == 'paid' else 'бесплатный'} · "
         f"{'проверен' if d['chat']['verified'] else 'не проверен'}",
+        _subscription_line(d["subscription"]),
     ]
     for billed, title in ((True, "Платное (billed=1)"), (False, "Бесплатное (billed=0)")):
         models = [r for r in d["by_model"] if r["billed"] == billed]
@@ -4755,6 +4826,12 @@ def _cost_detail(target: int) -> str:
     lines.append("По дням (платное / бесплатное):")
     for r in d["days"]:
         lines.append(f"  {r['date'][8:10]}.{r['date'][5:7]}: {_money(r['paid'])} / {_money(r['free'])}")
+    lines.append("")
+    lines.append("По неделям (платное / бесплатное):")
+    for r in d["weeks"]:
+        kw = f"KW {r['kw']}" + (f"/{r['iso_year']}" if r["iso_year"] != d["weeks"][0]["iso_year"] else "")   # год — только на стыке ISO-годов
+        rng = f"{r['start'][8:10]}.{r['start'][5:7]}–{r['end'][8:10]}.{r['end'][5:7]}"
+        lines.append(f"  {kw} ({rng}): {_money(r['paid'])} / {_money(r['free'])}" + (" (по сегодня)" if r["partial"] else ""))
     lines.append("")
     lines.append("По месяцам (платное / бесплатное):")
     for r in d["months"]:
@@ -5524,7 +5601,7 @@ USER_HELP = """\
   /forget        — забыть всё о тебе (память и профиль)
   /id            — показать Telegram ID и статус
   /version       — версия бота
-  /cost          — баланс, режим и расход (в группе — для админов группы)
+  /cost          — баланс, режим, расход и оценка цены подписки (в группе — для админов группы)
   /search <q>    — веб-поиск
   /imagine <q>   — генерация изображения (/imagine 2k <q> — в 2K, документом)
                    или «нарисуй "…"» — дословно; без кавычек Клодушка сама придумает картинку
@@ -5564,7 +5641,7 @@ ADMIN_HELP = """\
   /ban <id>                — бан (id < 0 — группа; в группе можно ответом на сообщение)
   /unban <id>              — разбан. Бан не трогает баланс и проверку
   /cost                    — в личке: расход по ВСЕМ чатам (+ бесплатный режим, служебное, writeoff)
-  /cost <chat_id>          — детализация чата за 7 дней (модели, метки, дни) и по месяцам (12)
+  /cost <chat_id>          — детализация чата за 7 дней (модели, метки, дни), по неделям KW (12) и месяцам (12), оценка цены подписки
 
 Пользователи и чаты:
   /users                   — все пользователи
