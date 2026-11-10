@@ -53,7 +53,7 @@
   лимиты непроверенных, стартовый бонус, `/fable`-подтверждение; пополнение звёздами Telegram — `/pay` `/terms` `/paysupport` `/refund`,
   `STARS_USD_RATE`/`STARS_PACKS`, `star_payments`, `apply_topup`/`notify_topup`, `check_star_payment`, `on_pre_checkout`/`on_successful_payment`,
   `star_payment_record`/`star_refund_begin`) — `docs/claude/billing.md` → «Пополнение Stars»; ТЗ — `docs/claude/tz-stars-topup.md`; чек-лист стенда —
-  `docs/claude/staging-checklist-stars-topup.md`
+  `docs/claude/staging-checklist-stars-topup.md`; `/pay` без засорения чата (URL-кнопки `createInvoiceLink`, кэш ссылок, одно меню на чат, v2.12.1) — `docs/claude/staging-checklist-pay-links.md`
 - Ошибки API, ретраи, блокирующие вызовы, `response_text`, `parse_json_lenient`, параллельные апдейты (`PerChatUpdateProcessor`, `MAX_CONCURRENT_UPDATES`,
   `THREAD_POOL_WORKERS`, `_ChatLogFilter`) — `docs/claude/api-errors.md`; ТЗ — `docs/claude/tz-concurrent-updates.md`; чек-лист стенда —
   `docs/claude/staging-checklist-concurrent-updates.md`

@@ -4336,40 +4336,83 @@ def check_star_payment(payload: str, payer_id: int, currency: str, total: int) -
     return None, chat_id, stars
 
 
+# Кэш ссылок на счёт Stars: (chat_id, stars, STARS_USD_RATE) -> invoice_link. Ссылка createInvoiceLink не протухает и оплачивается каждым, кто
+# её открыл; смена курса меняет ключ и сумму в описании. Один /pay не должен делать пять запросов к Bot API.
+_pay_link_cache: dict[tuple, str] = {}
+_pay_menu: dict[int, int] = {}      # chat_id -> message_id последнего меню /pay (одно меню на чат; только в памяти)
+
+
+async def _pay_invoice_link(bot, chat_id: int, stars: int) -> str | None:
+    """Ссылка на счёт пакета (из кэша или createInvoiceLink с теми же `_stars_invoice_kwargs`, что и у мини-приложения). Ошибка — лог и None."""
+    key = (chat_id, stars, STARS_USD_RATE)
+    link = _pay_link_cache.get(key)
+    if link:
+        return link
+    try:
+        link = await bot.create_invoice_link(**_stars_invoice_kwargs(chat_id, stars))
+    except Exception:
+        logger.exception(f"[chat={chat_id}] create_invoice_link stars={stars}")
+        return None
+    if len(_pay_link_cache) > 2000:
+        _pay_link_cache.clear()
+    _pay_link_cache[key] = link
+    return link
+
+
+def _pay_app_button(chat) -> InlineKeyboardButton | None:
+    """«Открыть в приложении» под пакетами: личка — web_app; группа — startapp на Main Mini App (MINIAPP_MAIN_APP) или диплинк в личку — как в cmd_settings."""
+    if not miniapp_enabled():
+        return None
+    label = "Открыть в приложении"
+    if chat.type == "private":
+        return InlineKeyboardButton(label, web_app=WebAppInfo(url=f"{MINIAPP_PUBLIC_URL}/?chat={chat.id}"))
+    if chat.type in ("group", "supergroup") and bot_username:
+        if MINIAPP_MAIN_APP:
+            return InlineKeyboardButton(label, url=f"https://t.me/{bot_username}?startapp={_settings_startapp_param(chat.id)}")
+        return InlineKeyboardButton(label, url=f"https://t.me/{bot_username}?start=settings_{chat.id}")
+    return None
+
+
 async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/pay` (и `/topup` не-админа): кнопки-пакеты Stars для ЭТОГО чата; в группе платит любой участник. `/pay help` — как купить звёзды."""
+    """`/pay` (и `/topup` не-админа): пакеты Stars для ЭТОГО чата; в группе платит любой участник. `/pay help` — как купить звёзды.
+    Кнопки пакетов — URL-кнопки со ссылкой на счёт (createInvoiceLink): нажатие открывает оплату у нажавшего, в чат ничего не уходит.
+    Одно меню на чат: новый /pay удаляет прежнее сообщение-меню бота."""
     msg = update.effective_message
     if context.args and context.args[0].lower() == "help":
         await msg.reply_text(_stars_help_plain())
         return
-    chat_id = update.effective_chat.id
-    rows = [[InlineKeyboardButton(f"{n} ⭐ — ≈ ${_stars_usd(n):.2f} на баланс", callback_data=f"pay:{n}")] for n in STARS_PACKS]
-    await msg.reply_text(
+    chat = update.effective_chat
+    chat_id = chat.id
+    links = await asyncio.gather(*[_pay_invoice_link(context.bot, chat_id, n) for n in STARS_PACKS])
+    rows = [[InlineKeyboardButton(f"{n} ⭐ — ≈ ${_stars_usd(n):.2f} на баланс", url=link)] for n, link in zip(STARS_PACKS, links) if link]
+    if not rows:
+        await msg.reply_text("Не удалось подготовить счета. Попробуйте позже или напишите в /paysupport.")
+        return
+    app_btn = _pay_app_button(chat)
+    if app_btn:
+        rows.append([app_btn])
+    sent = await msg.reply_text(
         f"Пополнение баланса «{_chat_title(chat_id)}» звёздами Telegram (1 ⭐ = ${STARS_USD_RATE:.3f}). "
-        f"Выберите пакет — придёт счёт, зачисление сразу после оплаты.\n"
+        f"Выберите пакет — откроется окно оплаты, зачисление сразу после оплаты.\n"
         "Как купить звёзды — /pay help · условия — /terms · проблемы — /paysupport",
         reply_markup=InlineKeyboardMarkup(rows),
     )
+    prev = _pay_menu.get(chat_id)
+    new_id = getattr(sent, "message_id", None)
+    if new_id is not None:
+        _pay_menu[chat_id] = new_id
+    if prev and prev != new_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=prev)
+        except Exception:
+            pass    # сообщение уже удалено/старше 48 ч/нет прав на удаление — не мешает
 
 
 async def on_pay_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Нажатие на пакет: счёт в тот же чат. Деньги не трогает — зачисление только по successful_payment."""
+    """Callback-кнопки `pay:<n>` остались только в СТАРЫХ сообщениях /pay (до v2.12.1). Счёт больше не выставляем — иначе каждый клик
+    засоряет чат новым счётом внизу; просим открыть свежее меню. Деньги не трогает."""
     q = update.callback_query
-    try:
-        stars = int((q.data or "").split(":", 1)[1])
-    except (IndexError, ValueError):
-        await q.answer()
-        return
-    if stars not in STARS_PACKS or q.message is None:
-        await q.answer("Пакет недоступен — откройте /pay заново.", show_alert=True)
-        return
-    chat_id = q.message.chat_id
-    await q.answer()
-    try:
-        await context.bot.send_invoice(chat_id=chat_id, **_stars_invoice_kwargs(chat_id, stars))
-    except Exception:
-        logger.exception(f"[chat={chat_id}] send_invoice stars={stars}")
-        await q.message.reply_text("Не удалось выставить счёт. Попробуйте позже или напишите в /paysupport.")
+    await q.answer("Это меню устарело — отправьте /pay.", show_alert=True)
 
 
 async def on_pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
