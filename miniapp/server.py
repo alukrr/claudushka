@@ -49,6 +49,8 @@ class MiniappDeps(Protocol):
     async def chat_view(self, user_id: int, chat_id: int) -> dict: ...
     async def set_setting(self, user_id: int, chat_id: int, key: str, value: Any) -> dict: ...
     async def chat_costs(self, user_id: int, chat_id: int) -> dict: ...
+    async def topup_info(self, user_id: int, chat_id: int) -> dict: ...
+    async def topup_link(self, user_id: int, chat_id: int, stars: int) -> dict: ...
 
 
 def validate_init_data(init_data: str, bot_token: str, *, max_age: int = 3600, now: float | None = None) -> dict:
@@ -172,6 +174,24 @@ def create_app(*, bot_token: str, deps: MiniappDeps, max_age: int = 3600, rate_l
     @app.get("/api/chats/{chat_id}/costs")
     async def api_costs(chat_id: int, request: Request):
         return await _run(request, lambda uid: deps.chat_costs(uid, chat_id))
+
+    @app.get("/api/chats/{chat_id}/topup")
+    async def api_topup_info(chat_id: int, request: Request):
+        return await _run(request, lambda uid: deps.topup_info(uid, chat_id))
+
+    @app.post("/api/chats/{chat_id}/topup")
+    async def api_topup_link(chat_id: int, request: Request):
+        """Ссылка на счёт в Stars. Баланс НЕ зачисляется здесь: только бот по `successful_payment` (docs/claude/billing.md)."""
+        async def call(uid):
+            try:
+                body = await request.json()
+            except Exception:
+                raise MiniappError(400, "Ожидается JSON {\"stars\": N}.")
+            stars = body.get("stars") if isinstance(body, dict) else None
+            if not isinstance(stars, int) or isinstance(stars, bool):
+                raise MiniappError(400, "Ожидается JSON {\"stars\": N}.")
+            return await deps.topup_link(uid, chat_id, stars)
+        return await _run(request, call)
 
     @app.post("/api/chats/{chat_id}/settings/{key}")
     async def api_set(chat_id: int, key: str, request: Request):

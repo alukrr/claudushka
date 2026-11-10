@@ -20,14 +20,14 @@ from types import SimpleNamespace
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, MenuButtonWebApp, Update, WebAppInfo
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, LinkPreviewOptions, MenuButtonWebApp, Update, WebAppInfo
 from telegram.constants import ReactionEmoji
 from telegram.error import BadRequest, Forbidden
 from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 from telegram.ext import (
-    Application, ApplicationHandlerStop, BaseUpdateProcessor, CommandHandler, MessageHandler, ChatMemberHandler,
-    TypeHandler, filters, ContextTypes,
+    Application, ApplicationHandlerStop, BaseUpdateProcessor, CallbackQueryHandler, CommandHandler, MessageHandler, ChatMemberHandler,
+    PreCheckoutQueryHandler, TypeHandler, filters, ContextTypes,
 )
 import anthropic
 from tavily import TavilyClient
@@ -208,15 +208,42 @@ SUBSCRIPTION_WEEK_MARKUP = 0.05                                      # неде�
 # считается по usageMetadata ответа — GEMINI_IMAGE_PRICING / gemini_image_cost (рядом с IMAGE_PROVIDERS).
 IMAGE_PRICES = {"gpt": 0.02, "flare": 0.02, "sunburst": 0.02}
 SEARCH_PRICE = 0.008
-STARTER_BONUS_GROUP = 10.0
-STARTER_BONUS_PRIVATE = 5.0
+STARTER_BONUS_GROUP = 5.0       # с 2026-11-10 (П1 ТЗ stars-topup; было 10); уже выданные бонусы не пересчитываются
+STARTER_BONUS_PRIVATE = 2.0     # было 5
 FREE_IMAGES_PRIVATE_PER_DAY = 10
 FREE_IMAGES_GROUP_PER_USER_PER_DAY = 5
 UNVERIFIED_MSG_PRIVATE_PER_DAY = 50
 UNVERIFIED_MSG_GROUP_PER_USER_PER_DAY = 20
 UNVERIFIED_SEARCH_PER_DAY = 20
-VERIFY_MIN_TOPUP = 5.0
+VERIFY_MIN_TOPUP_GROUP = 5.0    # порог авто-проверки по сумме пополнений в $; читать ТОЛЬКО через _verify_min_topup(chat_id)
+VERIFY_MIN_TOPUP_PRIVATE = 2.0
 ADMIN_CONTACT = "@alukr"
+
+
+# --- Пополнение через Telegram Stars (feat/stars-topup, docs/claude/billing.md → «Пополнение Stars», ТЗ docs/claude/tz-stars-topup.md) ---
+def _parse_stars_rate(raw: str) -> float:
+    """Курс зачисления: сколько $ баланса даёт одна звезда. Мусор, ноль, отрицательное → дефолт 0.010 (решение Алексея 2026-11-10)."""
+    try:
+        v = float((raw or "").replace(",", "."))
+    except ValueError:
+        return 0.010
+    return v if 0 < v < 1 else 0.010
+
+
+def _parse_stars_packs(raw: str) -> tuple[int, ...]:
+    """Пакеты звёзд из .env (`100,250,500`): целые >0, без повторов, по возрастанию. Пусто/мусор → дефолт. Предел 10000 — потолок одного платежа Telegram с запасом."""
+    out = []
+    for part in (raw or "").replace(";", ",").split(","):
+        part = part.strip()
+        if part.isdigit() and 0 < int(part) <= 10000 and int(part) not in out:
+            out.append(int(part))
+    return tuple(sorted(out)) or (100, 200, 500, 1000, 2500)
+
+
+STARS_USD_RATE = _parse_stars_rate(os.environ.get("STARS_USD_RATE", ""))
+STARS_PACKS = _parse_stars_packs(os.environ.get("STARS_PACKS", ""))
+STARS_PAYLOAD_RE = re.compile(r"^topup:(-?\d+):(\d+)$")
+STARS_HELP_PATH = Path(__file__).resolve().parent / "miniapp" / "stars_help_ru.md"
 
 # Уже уведомлённые админы о новом «уличном» пользователе (в памяти, сбрасывается рестартом)
 _street_notified: set[int] = set()
@@ -1062,6 +1089,11 @@ async def _notice_tier_change(chat_id: int, before: str) -> None:
 _bonus_checked: set[int] = set()
 
 
+def _verify_min_topup(chat_id: int) -> float:
+    """Порог суммарных пополнений ($), с которого чат проверяется автоматически: личка 2, группа 5 (П1 ТЗ stars-topup). Один для Stars, /topup, /verify-бонуса."""
+    return VERIFY_MIN_TOPUP_GROUP if chat_id < 0 else VERIFY_MIN_TOPUP_PRIVATE
+
+
 def _starter_bonus_amount(chat_id: int) -> float:
     return STARTER_BONUS_GROUP if chat_id < 0 else STARTER_BONUS_PRIVATE
 
@@ -1130,7 +1162,7 @@ async def _check_message_limit(update: Update, user_id: int, chat_id: int, is_gr
     if db.daily_limit_notice_claim(day, chat_id, user_id):
         await update.effective_message.reply_text(
             "Дневной лимит для непроверенных исчерпан, сброс в 00:00. "
-            f"Снять лимиты навсегда: пополнить баланс от ${VERIFY_MIN_TOPUP:g} или написать {ADMIN_CONTACT}."
+            f"Снять лимиты навсегда: пополнить баланс от ${_verify_min_topup(chat_id):g} или написать {ADMIN_CONTACT}."
         )
     return False
 
@@ -4141,11 +4173,44 @@ TOPUP_USAGE = (
 )
 
 
+def apply_topup(chat_id: int, amount: float, note: str | None, by_user: int | None, *,
+                before: str | None = None, credit_written: bool = False) -> dict:
+    """Единая точка пополнения/корректировки баланса (`/topup` админа и Stars): запись кредита, writeoff для отрицательной корректировки,
+    авто-проверка при `topup_total >= _verify_min_topup(chat_id)` (+ стартовый бонус). Блокирующая (SQLite) — как и сам cmd_topup, зовётся из хендлера.
+    `credit_written=True` — кредит уже записан вызывающим в своей транзакции (Stars: вместе со строкой star_payments), тогда `before`
+    (тариф ДО записи) обязателен. Сообщения чату — отдельно, `notify_topup`. Возвращает {before, kind, written_off, bonus, verified_now}."""
+    if before is None:
+        before = chat_tier(chat_id)
+    kind = "topup" if amount > 0 else "adjust"
+    if not credit_written:
+        db.add_credit(chat_id, amount, kind, note, by_user)
+    written_off = db.settle_negative_balance(chat_id) if amount < 0 else 0.0
+    bonus = False
+    verified_now = False
+    if amount > 0 and not is_chat_verified(chat_id) and db.topup_total(chat_id) >= _verify_min_topup(chat_id):
+        bonus = verify_target(chat_id, by_user)
+        verified_now = True
+    return {"before": before, "kind": kind, "written_off": written_off, "bonus": bonus, "verified_now": verified_now}
+
+
+async def notify_topup(chat_id: int, res: dict, amount: float, *, thanks: bool = True) -> None:
+    """Уведомления чату после `apply_topup`: смена тарифа; если тариф не сменился — «Ура, баланс пополнен» (`thanks=False` — Stars:
+    подтверждение «Зачислено…» уже отправлено плательщику, второе сообщение лишнее)."""
+    before = res["before"]
+    await _notice_tier_change(chat_id, before)
+    if thanks and res["kind"] == "topup" and chat_tier(chat_id) == before:
+        # Тариф не сменился — «Платный режим включён» не придёт, а чат должен узнать о пополнении.
+        await _send_chat_notice(
+            chat_id, f"Ура, баланс пополнен на ${amount:.2f}! Теперь на счету {_money(db.get_balance(chat_id))}."
+        )
+
+
 async def cmd_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Пополнение (или корректировка) баланса чата. Только админ бота. Пополнения от
-    VERIFY_MIN_TOPUP суммарно автоматически проверяют чат и выдают стартовый бонус."""
+    _verify_min_topup(чата) суммарно автоматически проверяют чат и выдают стартовый бонус."""
     admin_id = update.effective_user.id
     if not is_admin(admin_id):
+        await cmd_pay(update, context)   # не админ: /topup открывает пакеты Stars (ТЗ stars-topup)
         return
     if len(context.args) < 2:
         await update.effective_message.reply_text(TOPUP_USAGE)
@@ -4163,7 +4228,7 @@ async def cmd_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     note = " ".join(rest[:-1] if force else rest) or None
     known = db.get_chat_row(cid) is not None if cid < 0 else db.get_user(cid) is not None
     if not known and not force:
-        # Опечатка в ID иначе молча создала бы проверенный «фантом» с бонусом (авто-проверка от $5).
+        # Опечатка в ID иначе молча создала бы проверенный «фантом» с бонусом (авто-проверка от порога).
         await update.effective_message.reply_text(
             f"ID {cid} нет в базе — ничего не записала. Проверь ID; если так и надо: "
             f"/topup {cid} {context.args[1]} force"
@@ -4175,15 +4240,8 @@ async def cmd_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             db.get_or_create_user(cid)
 
-    before = chat_tier(cid)
-    kind = "topup" if amount > 0 else "adjust"
-    db.add_credit(cid, amount, kind, note, admin_id)
-    written_off = db.settle_negative_balance(cid) if amount < 0 else 0.0
-    bonus = False
-    verified_now = False
-    if amount > 0 and not is_chat_verified(cid) and db.topup_total(cid) >= VERIFY_MIN_TOPUP:
-        bonus = verify_target(cid, admin_id)
-        verified_now = True
+    res = apply_topup(cid, amount, note, admin_id)
+    kind, written_off, bonus, verified_now = res["kind"], res["written_off"], res["bonus"], res["verified_now"]
 
     lines = [f"💰 {_chat_title(cid)} ({cid}): {amount:+.2f}$ ({kind})"]
     if not known:
@@ -4191,17 +4249,250 @@ async def cmd_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Баланс: {_money(db.get_balance(cid))}")
     lines.append(f"Режим: {_tier_label(cid)} · {'проверен' if is_chat_verified(cid) else 'не проверен'}")
     if verified_now:
-        lines.append(f"Авто-проверка (пополнения ≥ ${VERIFY_MIN_TOPUP:g})"
+        lines.append(f"Авто-проверка (пополнения ≥ ${_verify_min_topup(cid):g})"
                      + (f", стартовый бонус ${_starter_bonus_amount(cid):g}." if bonus else "."))
     if written_off:
         lines.append(f"Корректировка больше баланса — списано в ноль ещё {_money(written_off)} (writeoff).")
     await update.effective_message.reply_text("\n".join(lines))
-    await _notice_tier_change(cid, before)
-    if kind == "topup" and chat_tier(cid) == before:
-        # Тариф не сменился — «Платный режим включён» не придёт, а чат должен узнать о пополнении.
-        await _send_chat_notice(
-            cid, f"Ура, баланс пополнен на ${amount:.2f}! Теперь на счету {_money(db.get_balance(cid))}."
-        )
+    await notify_topup(cid, res, amount)
+
+
+# --- Пополнение через Telegram Stars (feat/stars-topup; docs/claude/billing.md → «Пополнение Stars») ---
+# Зачисление — ТОЛЬКО по `successful_payment` (on_successful_payment); колбэк мини-приложения и кнопки баланс не трогают.
+# Идемпотентность — PRIMARY KEY star_payments.charge_id (db.star_payment_record). Курс фиксируется в строке платежа.
+
+STARS_TERMS_TEXT = (
+    "Условия пополнения баланса Клодушки\n\n"
+    "• Что покупается: пополнение баланса чата (личного или группового) звёздами Telegram (⭐). Баланс расходуется на ответы моделей, "
+    "картинки и поиск; платный режим работает, пока на балансе есть деньги.\n"
+    f"• Курс зачисления: 1 ⭐ = ${STARS_USD_RATE:.3f} на баланс. Сумма фиксируется в момент оплаты.\n"
+    "• Возврат: баланс не обменивается на деньги. Если оплатили по ошибке — напишите в /paysupport: возврат звёздами делает админ бота, "
+    "пока на балансе чата лежит не меньше возвращаемой суммы.\n"
+    "• Платёж зачисляется сразу после подтверждения оплаты Telegram.\n"
+    f"• Проверка и стартовый бонус: пополнения от ${VERIFY_MIN_TOPUP_PRIVATE:g} (личка) / ${VERIFY_MIN_TOPUP_GROUP:g} (группа) суммарно снимают лимиты "
+    f"непроверенных и дают бонус ${STARTER_BONUS_PRIVATE:g} / ${STARTER_BONUS_GROUP:g} (один раз). Если вернуть единственный платёж, проверка снимается, "
+    "а неистраченный остаток бонуса списывается.\n"
+    f"• Контакт: {ADMIN_CONTACT}"
+)
+STARS_PAYSUPPORT_TEXT = (
+    "Поддержка по оплатам в Клодушке\n\n"
+    f"Не пришло зачисление, оплатили по ошибке, нужен возврат — напишите {ADMIN_CONTACT} и приложите время платежа и чат, который пополняли.\n"
+    "Поддержка самого Telegram по покупкам в ботах не помогает — только мы.\n"
+    "Как купить звёзды: /pay help"
+)
+STARS_HELP_FALLBACK = (
+    "Как купить звёзды Telegram\n\nНастройки → «Мои звёзды» → «Купить», или через бота @PremiumBot. "
+    f"Не получается — /paysupport ({ADMIN_CONTACT})."
+)
+
+
+def _stars_usd(stars: int) -> float:
+    return round(stars * STARS_USD_RATE, 6)
+
+
+def stars_help_md() -> str:
+    """Справка «Как купить звёзды из России» — из `miniapp/stars_help_ru.md` (правится без кода); нет файла → короткий запасной текст."""
+    try:
+        text = STARS_HELP_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return STARS_HELP_FALLBACK
+    return text or STARS_HELP_FALLBACK
+
+
+def _stars_help_plain() -> str:
+    return stars_help_md().replace("**", "")
+
+
+def _stars_invoice_kwargs(chat_id: int, stars: int) -> dict:
+    """Общие параметры счёта в Stars (sendInvoice и createInvoiceLink): XTR, ровно одна позиция, provider_token пустой/не задан.
+    title ≤ 32 символов, description ≤ 255, payload ≤ 128 байт (ограничения Bot API)."""
+    return dict(
+        title="Пополнение баланса",
+        description=f"{stars} ⭐ → ≈ ${_stars_usd(stars):.2f} на баланс чата «{_chat_title(chat_id)}»"[:255],
+        payload=f"topup:{chat_id}:{stars}",
+        currency="XTR",
+        prices=[LabeledPrice("Баланс", stars)],
+    )
+
+
+def check_star_payment(payload: str, payer_id: int, currency: str, total: int) -> tuple[str | None, int, int]:
+    """Проверка счёта в `pre_checkout_query` (чистая, без сети; ответ нужен за 10 с): (ошибка для плательщика | None, chat_id, stars).
+    Проверяет формат payload, XTR и совпадение суммы с payload, пакет из STARS_PACKS, бан плательщика, чат: группа — известна и не
+    забанена; личка — только своя."""
+    m = STARS_PAYLOAD_RE.match(payload or "")
+    if not m:
+        return "Счёт не распознан. Запросите новый: /pay.", 0, 0
+    chat_id, stars = int(m.group(1)), int(m.group(2))
+    if currency != "XTR" or total != stars or stars not in STARS_PACKS:
+        return "Сумма счёта не подходит. Запросите новый: /pay.", chat_id, stars
+    if not is_admin(payer_id) and db.is_user_banned(payer_id):
+        return "Оплата недоступна.", chat_id, stars
+    if chat_id < 0:
+        row = db.get_chat_row(chat_id)
+        if not row or row.get("banned"):
+            return "Этот чат не может получать пополнения.", chat_id, stars
+    elif chat_id != payer_id or db.get_user(chat_id) is None:
+        return "Личный баланс можно пополнить только из своей лички.", chat_id, stars
+    return None, chat_id, stars
+
+
+async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/pay` (и `/topup` не-админа): кнопки-пакеты Stars для ЭТОГО чата; в группе платит любой участник. `/pay help` — как купить звёзды."""
+    msg = update.effective_message
+    if context.args and context.args[0].lower() == "help":
+        await msg.reply_text(_stars_help_plain())
+        return
+    chat_id = update.effective_chat.id
+    rows = [[InlineKeyboardButton(f"{n} ⭐ — ≈ ${_stars_usd(n):.2f} на баланс", callback_data=f"pay:{n}")] for n in STARS_PACKS]
+    await msg.reply_text(
+        f"Пополнение баланса «{_chat_title(chat_id)}» звёздами Telegram (1 ⭐ = ${STARS_USD_RATE:.3f}). "
+        f"Выберите пакет — придёт счёт, зачисление сразу после оплаты.\n"
+        "Как купить звёзды — /pay help · условия — /terms · проблемы — /paysupport",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def on_pay_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Нажатие на пакет: счёт в тот же чат. Деньги не трогает — зачисление только по successful_payment."""
+    q = update.callback_query
+    try:
+        stars = int((q.data or "").split(":", 1)[1])
+    except (IndexError, ValueError):
+        await q.answer()
+        return
+    if stars not in STARS_PACKS or q.message is None:
+        await q.answer("Пакет недоступен — откройте /pay заново.", show_alert=True)
+        return
+    chat_id = q.message.chat_id
+    await q.answer()
+    try:
+        await context.bot.send_invoice(chat_id=chat_id, **_stars_invoice_kwargs(chat_id, stars))
+    except Exception:
+        logger.exception(f"[chat={chat_id}] send_invoice stars={stars}")
+        await q.message.reply_text("Не удалось выставить счёт. Попробуйте позже или напишите в /paysupport.")
+
+
+async def on_pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`pre_checkout_query`: ответить за 10 с. Только проверки по БД, без замка чата (PerChatUpdateProcessor пропускает такие апдейты)."""
+    q = update.pre_checkout_query
+    err, _, _ = check_star_payment(q.invoice_payload, q.from_user.id, q.currency, q.total_amount)
+    try:
+        await q.answer(ok=err is None, error_message=err)
+    except Exception:
+        logger.exception(f"pre_checkout answer payer={q.from_user.id}")
+    if err:
+        logger.warning(f"pre_checkout отклонён payer={q.from_user.id} payload={q.invoice_payload!r}: {err}")
+
+
+async def on_successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`successful_payment` → зачисление (идемпотентно по charge_id) → подтверждение плательщику, уведомление чата и админов."""
+    msg = update.effective_message
+    sp = msg.successful_payment
+    if sp is None or sp.currency != "XTR":
+        return
+    payer = update.effective_user
+    charge = sp.telegram_payment_charge_id
+    m = STARS_PAYLOAD_RE.match(sp.invoice_payload or "")
+    if not m or int(m.group(2)) != sp.total_amount:
+        logger.error(f"successful_payment с чужим payload: charge={charge} payload={sp.invoice_payload!r}")
+        await notify_admins(f"⚠️ Платёж Stars не распознан: {sp.total_amount} ⭐ от {payer.id}, payload {sp.invoice_payload!r}, charge_id {charge}. "
+                            "Деньги взяты, баланс НЕ пополнен — разобрать вручную (/refund или /topup).")
+        await msg.reply_text("Платёж получен, но зачисление не прошло. Админ уже знает — напишите в /paysupport.")
+        return
+    chat_id, stars = int(m.group(1)), int(m.group(2))
+    usd = _stars_usd(stars)
+    before = chat_tier(chat_id)
+    try:
+        fresh = db.star_payment_record(charge, payer.id, chat_id, stars, usd, STARS_USD_RATE)
+    except Exception:
+        logger.exception(f"[chat={chat_id}] star_payment_record charge={charge}")
+        await notify_admins(f"⚠️ Платёж Stars не записан: {stars} ⭐ от {payer.id} для чата {chat_id}, charge_id {charge}. Зачислить вручную.")
+        await msg.reply_text("Платёж получен, но запись не удалась. Админ уже знает — напишите в /paysupport.")
+        return
+    if not fresh:
+        logger.info(f"successful_payment повтор charge={charge} — пропуск")
+        return
+    try:
+        res = apply_topup(chat_id, usd, f"stars:{charge}", payer.id, before=before, credit_written=True)
+    except Exception:
+        logger.exception(f"[chat={chat_id}] apply_topup после Stars charge={charge}")
+        res = {"before": before, "kind": "topup", "written_off": 0.0, "bonus": False, "verified_now": False}
+    name = payer.first_name or payer.username or str(payer.id)
+    lines = [f"✅ Зачислено ${usd:.2f} ({stars} ⭐). Баланс: {_money(db.get_balance(chat_id))}"]
+    if res["verified_now"]:
+        lines.append("Чат проверен — лимиты непроверенных сняты" + (f", стартовый бонус ${_starter_bonus_amount(chat_id):g}." if res["bonus"] else "."))
+    await msg.reply_text("\n".join(lines))
+    if update.effective_chat.id != chat_id:   # платили из мини-приложения (личка с ботом), а пополняли группу
+        await _send_chat_notice(chat_id, f"Баланс чата пополнен на ${usd:.2f} ({stars} ⭐, от {name}). Теперь на счету {_money(db.get_balance(chat_id))}.")
+    await notify_topup(chat_id, res, usd, thanks=False)
+    await notify_admins(f"⭐ Stars: {stars} ⭐ → ${usd:.2f} чату {_chat_title(chat_id)} ({chat_id}) от {name} ({payer.id}). charge_id: {charge}")
+
+
+async def cmd_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/terms — обязательная команда ботов с платежами в Stars (core.telegram.org/bots/payments-stars)."""
+    await update.effective_message.reply_text(STARS_TERMS_TEXT)
+
+
+async def cmd_paysupport(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/paysupport — обязательная команда ботов с платежами в Stars; с пометкой, что поддержка Telegram по покупкам в ботах не помогает."""
+    await update.effective_message.reply_text(STARS_PAYSUPPORT_TEXT)
+
+
+async def cmd_refund(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/refund [charge_id]` (только админ бота). Без аргумента — последние 10 платежей. Возврат: сначала БД атомарно (платёж paid, на балансе
+    чата ≥ суммы → отрицательный adjust + status=refunded), потом refundStarPayment; отказ Telegram → откат БД."""
+    if not is_admin(update.effective_user.id):
+        return
+    msg = update.effective_message
+    if not context.args:
+        conn = db.get_conn()
+        rows = [dict(r) for r in conn.execute("SELECT * FROM star_payments ORDER BY ts DESC LIMIT 10")]
+        conn.close()
+        if not rows:
+            await msg.reply_text("Платежей Stars пока нет. Возврат: /refund <charge_id>")
+            return
+        lines = ["Последние платежи Stars (возврат: /refund <charge_id>):"]
+        for r in rows:
+            lines.append(f"{r['status']} · {r['stars']} ⭐ · ${r['usd']:.2f} · чат {r['chat_id']} · от {r['payer_id']}\n  {r['charge_id']}")
+        await msg.reply_text("\n".join(lines))
+        return
+    charge = context.args[0].strip()
+    before = None
+    pay = db.star_payment_get(charge)
+    if pay:
+        before = chat_tier(pay["chat_id"])
+    code, pay = db.star_refund_begin(charge, unverify_ok=not (pay and is_admin(pay["chat_id"])))
+    if code == "not_found":
+        await msg.reply_text("Такого charge_id нет в star_payments.")
+        return
+    if code == "already":
+        await msg.reply_text("Этот платёж уже возвращён.")
+        return
+    if code == "low_balance":
+        await msg.reply_text(
+            f"Не возвращаю: на балансе чата {_money(db.get_balance(pay['chat_id']))}, а возврат — {_money(pay['usd'])}. "
+            "Часть уже потрачена. Если нужно вернуть всё равно — сначала скорректируй баланс вручную (/topup <id> +сумма), потом /refund.")
+        return
+    try:
+        await context.bot.refund_star_payment(user_id=pay["payer_id"], telegram_payment_charge_id=charge)
+    except Exception as e:
+        db.star_refund_revert(charge, pay.get("undo"))     # откатывает и adjust, и отзыв бонуса, и снятие проверки
+        logger.exception(f"refundStarPayment charge={charge}")
+        await msg.reply_text(f"Telegram отказал в возврате ({type(e).__name__}: {str(e)[:200]}). Баланс и проверка чата не менялись.")
+        return
+    chat_id = pay["chat_id"]
+    lines = [f"↩️ Возвращено {pay['stars']} ⭐ (плательщик {pay['payer_id']}); с баланса чата {chat_id} снято {_money(pay['usd'])}."]
+    if pay["single"]:
+        lines.append(("Проверка снята" if pay["unverified"] else "Проверка не менялась") + f", бонус отозван на {_money(pay['bonus_revoked'])}.")
+        if pay["unverified"]:
+            lines.append("Если чат был проверен вручную (/verify) ещё до этого платежа — верни проверку командой /verify.")
+    lines.append(f"Баланс: {_money(db.get_balance(chat_id))}")
+    await msg.reply_text("\n".join(lines))
+    note = f"Платёж {pay['stars']} ⭐ возвращён, с баланса списано {_money(pay['usd'])}."
+    if pay["single"] and pay["bonus_revoked"]:
+        note += f" Неистраченный остаток стартового бонуса ({_money(pay['bonus_revoked'])}) тоже снят."
+    await _send_chat_notice(chat_id, note)
+    await _notice_tier_change(chat_id, before or "paid")
 
 
 async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4660,7 +4951,14 @@ def _cost_report(scope: int | None, viewer_id: int) -> str:
         lines.append(f"Бесплатный режим (неделя): {_money(free_cost)}")
         lines.append(f"Служебное, без чата (неделя): {_money(service)}")
         lines.append(f"Списано writeoff (неделя): {_money(writeoff)}")
+        lines.append(_stars_week_line(ts(wk0), end, None))
     return "\n".join(lines)
+
+
+def _stars_week_line(since_ts: int, until_ts: int, chat_id: int | None) -> str:
+    """Строка «Пополнения Stars за неделю: N ⭐ / $X» (возвращённые не входят). Блокирующая (SQLite)."""
+    stars, usd = db.star_payments_sum(since_ts, until_ts, chat_id)
+    return f"Пополнения Stars за неделю: {stars} ⭐ / {_money(usd)}"
 
 
 def _cost_month_windows(now: datetime, count: int = 12) -> list[tuple[str, datetime, datetime, bool]]:
@@ -4805,6 +5103,8 @@ def _cost_detail(target: int) -> str:
         f"{'проверен' if d['chat']['verified'] else 'не проверен'}",
         _subscription_line(d["subscription"]),
     ]
+    _now = _berlin_now()
+    lines.append(_stars_week_line(int(_day_start(_week_start(_now)).timestamp()), int(_now.timestamp()) + 1, target))
     for billed, title in ((True, "Платное (billed=1)"), (False, "Бесплатное (billed=0)")):
         models = [r for r in d["by_model"] if r["billed"] == billed]
         if not models:
@@ -5602,6 +5902,8 @@ USER_HELP = """\
   /id            — показать Telegram ID и статус
   /version       — версия бота
   /cost          — баланс, режим, расход и оценка цены подписки (в группе — для админов группы)
+  /pay           — пополнить баланс звёздами Telegram (⭐), в группе может любой участник; /pay help — как купить звёзды
+  /terms         — условия пополнения; /paysupport — поддержка по оплатам
   /search <q>    — веб-поиск
   /imagine <q>   — генерация изображения (/imagine 2k <q> — в 2K, документом)
                    или «нарисуй "…"» — дословно; без кавычек Клодушка сама придумает картинку
@@ -5635,7 +5937,8 @@ USER_HELP = """\
 ADMIN_HELP = """\
 Доступ и баланс:
   /topup <id> <сумма> [коммент] [force] — пополнить баланс ($); отрицательная = корректировка; ID вне базы — только с force.
-                           От $5 суммарных пополнений чат проверяется автоматически
+  /refund [charge_id] — вернуть платёж Stars (без аргумента — последние 10); только если на балансе чата есть эта сумма.
+                           От $2 суммарных пополнений (личка) / $5 (группа) чат проверяется автоматически
   /verify <id>             — проверить группу (id с минусом) или пользователя + стартовый бонус
   /unverify <id>           — снять проверку (баланс не трогается)
   /ban <id>                — бан (id < 0 — группа; в группе можно ответом на сообщение)
@@ -5767,6 +6070,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/forget — забыть всё о тебе\n"
         "/search — поиск в интернете\n"
         "/cost — баланс и расход\n"
+        "/pay — пополнить баланс звёздами ⭐\n"
         "/id — показать Telegram ID\n"
         "/help — все команды\n"
     )
@@ -6022,7 +6326,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Явная команда — не «молча», как автопоиск: иначе она выглядит сломанной.
         await update.message.reply_text(
             f"Дневной лимит поиска для непроверенных исчерпан ({UNVERIFIED_SEARCH_PER_DAY}), сброс в 00:00. "
-            f"Снять лимиты навсегда: пополнить баланс от ${VERIFY_MIN_TOPUP:g} или написать {ADMIN_CONTACT}."
+            f"Снять лимиты навсегда: пополнить баланс от ${_verify_min_topup(update.effective_chat.id):g} или написать {ADMIN_CONTACT}."
         )
         return
     query = " ".join(context.args)
@@ -6215,6 +6519,8 @@ async def gate_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usage_ctx.set((chat.id, "group" if is_group else "private", user.id if user else None))
     if update.effective_message is None:
         return
+    if update.effective_message.successful_payment is not None:
+        return   # деньги уже взяты: бан чата/плательщика после pre_checkout не должен терять зачисление (разбор — в on_successful_payment)
 
     if is_group:
         if chat.id not in _known_groups:
@@ -6709,6 +7015,11 @@ class PerChatUpdateProcessor(BaseUpdateProcessor):
             self._active -= 1
 
     async def process_update(self, update: object, coroutine) -> None:   # noqa: переопределение @final — см. докстринг класса
+        if getattr(update, "pre_checkout_query", None) is not None:
+            # pre_checkout_query (оплата Stars) надо подтвердить за 10 с: у него нет чата, ключ очереди = user_id, а в личке это тот же
+            # ключ, что у чата с долгим ответом модели — ждать замок/слот нельзя. Хендлер лёгкий (проверки по БД).
+            await self.do_process_update(update, coroutine)
+            return
         key = self.queue_key(update)
         if key is None:
             async with self._slots:
@@ -8098,7 +8409,8 @@ async def _ma_chat_view(user_id: int, chat_id: int, fresh: bool = False) -> dict
     return {"chat": {"id": chat_id, "title": _ma_title(chat_id, row), "tier": fl["tier"], "is_group": chat_id < 0,
                      "is_admin": bool(fl["chat"]),
                      # кнопка «Расходы» на экране чата (при открытии по startapp списка чатов нет); сервер всё равно проверяет сам
-                     "can_view_costs": (bool(fl["chat"]) and in_target) if chat_id < 0 else (chat_id == user_id or fl["bot"])},
+                     "can_view_costs": (bool(fl["chat"]) and in_target) if chat_id < 0 else (chat_id == user_id or fl["bot"]),
+                     "can_topup": bool(in_target)},   # кнопка «Пополнить» (Stars): свой чат / группа, где человек состоит
             "settings": [_ma_setting(k, user_id, chat_id, fl) for k in _ma_keys_for(chat_id)]}
 
 
@@ -8119,6 +8431,34 @@ async def _ma_chat_costs(user_id: int, chat_id: int) -> dict:
     except Exception:
         logger.exception(f"miniapp costs chat={chat_id} uid={user_id}")
         raise MiniappError(500, "Не удалось загрузить расходы.")
+
+
+async def _ma_topup_access(user_id: int, chat_id: int) -> None:
+    """Пополнять можно тот чат, где человек свой (личка) или состоит (группа; ТЗ stars-topup, решение 2: платить может любой участник).
+    Админ бота вне списка / чужая личка — нет (`_ma_access` вернул False). Свежая проверка членства: деньги."""
+    if not await _ma_access(user_id, chat_id, fresh=True):
+        raise MiniappError(403, "Нет доступа к этому чату.")
+
+
+async def _ma_topup_info(user_id: int, chat_id: int) -> dict:
+    await _ma_topup_access(user_id, chat_id)
+    row = db.get_chat_row(chat_id) if chat_id < 0 else None
+    return {"title": _ma_title(chat_id, row), "balance": db.get_balance(chat_id), "rate": STARS_USD_RATE,
+            "packs": [{"stars": n, "usd": _stars_usd(n)} for n in STARS_PACKS], "help": stars_help_md()}
+
+
+async def _ma_topup_link(user_id: int, chat_id: int, stars: int) -> dict:
+    """Ссылка createInvoiceLink на пакет; те же проверки, что в pre_checkout (`check_star_payment`), чтобы отказ был сразу, а не после оплаты."""
+    await _ma_topup_access(user_id, chat_id)
+    err, _, _ = check_star_payment(f"topup:{chat_id}:{stars}", user_id, "XTR", stars)
+    if err:
+        raise MiniappError(400, err)
+    try:
+        link = await _admin_bot.create_invoice_link(**_stars_invoice_kwargs(chat_id, stars))
+    except Exception:
+        logger.exception(f"miniapp topup link chat={chat_id} uid={user_id} stars={stars}")
+        raise MiniappError(502, "Не удалось создать счёт. Попробуйте позже.")
+    return {"invoice_link": link}
 
 
 def _ma_type_error(s: ChatSetting, value) -> str | None:
@@ -8169,6 +8509,12 @@ class _MiniappDeps:
 
     async def chat_costs(self, user_id: int, chat_id: int) -> dict:
         return await _ma_chat_costs(user_id, chat_id)
+
+    async def topup_info(self, user_id: int, chat_id: int) -> dict:
+        return await _ma_topup_info(user_id, chat_id)
+
+    async def topup_link(self, user_id: int, chat_id: int, stars: int) -> dict:
+        return await _ma_topup_link(user_id, chat_id, stars)
 
 
 def build_miniapp():
@@ -8301,6 +8647,13 @@ def main():
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("unban", cmd_unban))
     app.add_handler(CommandHandler("topup", cmd_topup))
+    app.add_handler(CommandHandler("pay", cmd_pay))
+    app.add_handler(CommandHandler("terms", cmd_terms))
+    app.add_handler(CommandHandler("paysupport", cmd_paysupport))
+    app.add_handler(CommandHandler("refund", cmd_refund))
+    app.add_handler(CallbackQueryHandler(on_pay_button, pattern=r"^pay:\d+$"))
+    app.add_handler(PreCheckoutQueryHandler(on_pre_checkout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_successful_payment))
     app.add_handler(CommandHandler("activity", cmd_activity))
     app.add_handler(CommandHandler("autoignore", cmd_autoignore))
     app.add_handler(CommandHandler("unignore", cmd_unignore))

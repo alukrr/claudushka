@@ -50,7 +50,10 @@
   нативный web_search Anthropic удалён 2026-10-28, файл — история) — `docs/claude/native-search.md`
 - Деньги и доступ (`usage_log`, `chat_credits`, баланс, тарифы paid/free, `usage_ctx`,
   `_record_usage`, `gate_update`, `/cost`, `/topup`, `/verify /unverify /ban /unban`,
-  лимиты непроверенных, стартовый бонус, `/fable`-подтверждение) — `docs/claude/billing.md`
+  лимиты непроверенных, стартовый бонус, `/fable`-подтверждение; пополнение звёздами Telegram — `/pay` `/terms` `/paysupport` `/refund`,
+  `STARS_USD_RATE`/`STARS_PACKS`, `star_payments`, `apply_topup`/`notify_topup`, `check_star_payment`, `on_pre_checkout`/`on_successful_payment`,
+  `star_payment_record`/`star_refund_begin`) — `docs/claude/billing.md` → «Пополнение Stars»; ТЗ — `docs/claude/tz-stars-topup.md`; чек-лист стенда —
+  `docs/claude/staging-checklist-stars-topup.md`
 - Ошибки API, ретраи, блокирующие вызовы, `response_text`, `parse_json_lenient`, параллельные апдейты (`PerChatUpdateProcessor`, `MAX_CONCURRENT_UPDATES`,
   `THREAD_POOL_WORKERS`, `_ChatLogFilter`) — `docs/claude/api-errors.md`; ТЗ — `docs/claude/tz-concurrent-updates.md`; чек-лист стенда —
   `docs/claude/staging-checklist-concurrent-updates.md`
@@ -183,6 +186,9 @@
 - Тариф чата — `chat_tier(chat_id)`; модель/провайдер — только через `get_chat_model` /
   `get_chat_image_provider` (учитывают free), не читать `chat_models`/`chat_image_provider`
   напрямую. В free записи этих таблиц не менять. `docs/claude/billing.md`.
+- Деньги Stars: баланс пополняется ТОЛЬКО по `successful_payment` (`on_successful_payment` → `db.star_payment_record`, идемпотентно по `charge_id`) и только через
+  `apply_topup` (общий хвост с `/topup`); `pre_checkout_query` — только лёгкие проверки (`check_star_payment`), `PerChatUpdateProcessor` пропускает его без замка
+  (10 с на ответ); возврат — только `/refund` админа (`star_refund_begin` → `refundStarPayment`, отказ → `star_refund_revert`) (`docs/claude/billing.md`). Порог авто-проверки — только `_verify_min_topup(chat_id)` (личка $2, группа $5), бонус `STARTER_BONUS_*` ($2/$5) — одно правило для Stars, `/topup`, `/verify`.
 - Режим разработчика (только личка + paid + флаг) — ТОЛЬКО через `dev_mode_active`; свои таблицы (`dev_messages`), обычный тред
   `conversations`, память, профиль, персону и рисование не читает и не пишет; файлы — состояние в workspace (`data/devspace/<user_id>/`),
   в историю только пометки; вызов — `call_claude` с `usage_label="dev"`, `timeout=DEV_REQUEST_TIMEOUT`. `docs/claude/dev-mode.md`.

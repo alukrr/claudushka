@@ -223,6 +223,7 @@ SDK при 429/5xx слепо ждёт заголовок `Retry-After` (про�
 - Запись замка живёт, пока есть держащий/ожидающий, потом удаляется. Исключение/отмена апдейта замок не держит.
 - `MAX_CONCURRENT_UPDATES` (по умолчанию 16; `1` = как раньше, строго по одному — **аварийный откат без кода**: `.env` + `docker compose up -d --force-recreate`).
   Без переменной работает дефолт 16 — в т.ч. после `/update`.
+- **Исключение: `pre_checkout_query`** (оплата Stars, `docs/claude/billing.md` → «Пополнение Stars») идёт мимо замка и слота (`process_update` проверяет `update.pre_checkout_query` первым): ответить надо за 10 с, у него нет чата → ключ = `user_id` = очередь лички, где может идти многосекундный ответ модели. Хендлер `on_pre_checkout` лёгкий (только проверки по БД) — держать таким; тест `test_processor_does_not_queue_pre_checkout`. `gate_update` пропускает мимо проверок бана сообщения с `successful_payment` (деньги уже взяты).
 - `THREAD_POOL_WORKERS` (по умолчанию 32) — размер пула `asyncio.to_thread` (`loop.set_default_executor` в `post_init`).
 - SQLite: `sqlite3.connect(..., timeout=30)` в `db.get_conn` (было 5 с), WAL уже включён; `record_usage` — `BEGIN IMMEDIATE`. Длинных транзакций не вводить.
   Обращения к SQLite в хендлерах по-прежнему синхронные прямо в event loop (короткие, как и раньше) — параллельная запись из потоков делает их ожидание

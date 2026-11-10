@@ -56,6 +56,13 @@
   .bar { height: 6px; border-radius: 3px; background: var(--bg); margin: 2px 0 6px; overflow: hidden; }
   .bar .fill { height: 100%; background: var(--btn); border-radius: 3px; }
   .free { color: var(--hint); font-size: 13px; }
+  .pack { display: flex; justify-content: space-between; align-items: center; gap: 12px; width: 100%; font: inherit; font-weight: 600;
+          padding: 12px 14px; margin-bottom: 8px; border: 0; border-radius: 10px; background: var(--card); color: var(--text); cursor: pointer; }
+  .pack:disabled { opacity: .5; }
+  .pack .usd { color: var(--hint); font-weight: 400; }
+  details.help { background: var(--card); border-radius: 12px; padding: 10px 14px; margin: 12px 0; }
+  details.help summary { font-weight: 600; cursor: pointer; }
+  .helptext { white-space: pre-wrap; font-size: 14px; margin-top: 8px; overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -68,7 +75,7 @@
   var initData = tg ? tg.initData : "";
   var current = null;      // id открытого чата (null — список)
   var directChat = null;   // чат из start_param (ссылка ?startapp=chat_n<id>) или ?chat=<id> из диплинка — не подписанный выбор экрана, права проверяет сервер
-  var screen = "list";     // "list" | "chat" | "costs" — что назад вернёт BackButton
+  var screen = "list";     // "list" | "chat" | "costs" | "topup" — что назад вернёт BackButton
 
   if (tg) { try { tg.ready(); tg.expand(); } catch (e) {} }
 
@@ -94,7 +101,7 @@
     if (on) { tg.BackButton.show(); } else { tg.BackButton.hide(); }
   }
   if (tg && tg.BackButton) tg.BackButton.onClick(function () {
-    if (screen === "costs" && current !== null) { openChat(current); } else { openList(); }
+    if ((screen === "costs" || screen === "topup") && current !== null) { openChat(current); } else { openList(); }
   });
 
   function openList() {
@@ -145,6 +152,11 @@
     h.appendChild(el("span", "tag", data.chat.tier === "paid" ? "платный" : "бесплатный"));
     if (data.chat.is_group && data.chat.is_admin) h.appendChild(el("span", "tag", "админ"));
     app.appendChild(h);
+    if (data.chat.can_topup) {
+      var tb = el("button", "btn", "Пополнить баланс ⭐");
+      tb.addEventListener("click", function () { openTopup(data.chat.id); });
+      app.appendChild(tb);
+    }
     if (data.chat.can_view_costs) {
       var cb = el("button", "btn", "Расходы");
       cb.addEventListener("click", function () { openCosts(data.chat.id); });
@@ -200,6 +212,9 @@
     var h = el("h1", "", "Расходы · " + d.chat.title);
     h.appendChild(el("span", "tag", d.chat.tier === "paid" ? "платный" : "бесплатный"));
     app.appendChild(h);
+    var tbtn = el("button", "btn", "Пополнить баланс ⭐");
+    tbtn.addEventListener("click", function () { openTopup(current); });
+    app.appendChild(tbtn);
     var free = d.show_free === true;
 
     var head = section("Баланс");
@@ -256,6 +271,64 @@
     }
     var wk = d.by_kind_week;
     app.appendChild(el("div", "hint", "За неделю: LLM " + money(wk.llm) + " · картинки " + money(wk.image) + " · поиск " + money(wk.search)));
+  }
+
+  // ---- Экран «Пополнить» (ТЗ tz-stars-topup.md). Баланс зачисляет ТОЛЬКО бот по successful_payment; статус openInvoice — лишь подсказка UI. ----
+  function openTopup(id, note) {
+    current = id; screen = "topup"; showBack(true);
+    message("Загрузка…");
+    api("GET", "/api/chats/" + id + "/topup").then(function (r) {
+      if (r.status !== 200) { message(r.data.message || "Ошибка загрузки."); return; }
+      renderTopup(id, r.data, note);
+    }).catch(function () { message("Нет связи с сервером."); });
+  }
+
+  function renderTopup(id, d, note) {
+    clear();
+    app.appendChild(el("h1", "", "Пополнить · " + d.title));
+    var head = section("Баланс");
+    kv(head, "Сейчас", money(d.balance));
+    head.appendChild(el("div", "hint", "1 ⭐ = " + money(d.rate) + " на баланс. Оплата звёздами Telegram."));
+    var msg = el("div", "msg" + (note ? " ok" : ""), note || "");
+    var buttons = [];
+    d.packs.forEach(function (p) {
+      var b = el("button", "pack");
+      b.appendChild(el("span", "", p.stars + " ⭐"));
+      b.appendChild(el("span", "usd", "≈ " + money(p.usd)));
+      b.addEventListener("click", function () { pay(id, p.stars, buttons, msg); });
+      buttons.push(b);
+      app.appendChild(b);
+    });
+    app.appendChild(msg);
+    var det = el("details", "help");
+    det.appendChild(el("summary", "", "Как купить звёзды из России"));
+    det.appendChild(el("div", "helptext", String(d.help || "").replace(/\*\*/g, "")));
+    app.appendChild(det);
+    app.appendChild(el("div", "hint", "Условия — команда /terms, проблемы с оплатой — /paysupport в чате с ботом."));
+  }
+
+  function setBusy(buttons, on) { buttons.forEach(function (b) { b.disabled = on; }); }
+
+  function pay(id, stars, buttons, msg) {
+    msg.className = "msg"; msg.textContent = "";
+    if (!tg || !tg.openInvoice) { msg.className = "msg err"; msg.textContent = "Обновите Telegram: эта версия не умеет открывать оплату."; return; }
+    setBusy(buttons, true);
+    api("POST", "/api/chats/" + id + "/topup", { stars: stars }).then(function (r) {
+      if (r.status !== 200 || !r.data.invoice_link) {
+        setBusy(buttons, false); msg.className = "msg err"; msg.textContent = r.data.message || "Не удалось создать счёт."; return;
+      }
+      tg.openInvoice(r.data.invoice_link, function (status) {
+        if (status === "paid") {
+          // зачисление делает бот по successful_payment — даём ему секунду-две и перечитываем баланс
+          msg.className = "msg ok"; msg.textContent = "Оплачено! Зачисляю…";
+          setTimeout(function () { if (screen === "topup" && current === id) openTopup(id, "Оплата прошла. Если баланс ещё не вырос — обновите экран через пару секунд."); }, 2500);
+        } else {
+          setBusy(buttons, false);
+          msg.className = "msg " + (status === "failed" ? "err" : "");
+          msg.textContent = status === "failed" ? "Оплата не прошла." : (status === "pending" ? "Платёж обрабатывается, баланс обновится сам." : "Оплата отменена.");
+        }
+      });
+    }).catch(function () { setBusy(buttons, false); msg.className = "msg err"; msg.textContent = "Нет связи с сервером."; });
   }
 
   // start_param ссылки t.me/<bot>?startapp=chat_n<abs(chat_id)> → id чата (n — минус группы, p — плюс). Ничего не разрешает: права проверяет сервер.
