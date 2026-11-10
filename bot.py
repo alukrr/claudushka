@@ -6295,7 +6295,7 @@ async def safety_scan(chat_id: int, user_id: int, manual: bool = False) -> None:
         _safety_scan_running.discard(chat_id)
 
 
-def _parse_chat_arg(update: Update, args: list) -> tuple[int | None, list]:
+def _parse_safety_chat(update: Update, args: list) -> tuple[int | None, list]:
     """Чат для /hidden /unhide /safety_scan: группа — текущий; личка — первый аргумент-число с минусом."""
     chat = update.effective_chat
     if chat.type != "private":
@@ -6309,7 +6309,7 @@ async def cmd_hidden(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Скрытые строки истории чата (без текста). Admin-only."""
     if not is_admin(update.effective_user.id):
         return
-    cid, _ = _parse_chat_arg(update, context.args or [])
+    cid, _ = _parse_safety_chat(update, context.args or [])
     if cid is None:
         await update.message.reply_text("В личке: /hidden <chat_id> (число с минусом).")
         return
@@ -6325,7 +6325,7 @@ async def cmd_unhide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Вернуть скрытую строку в промпты. Admin-only."""
     if not is_admin(update.effective_user.id):
         return
-    cid, rest = _parse_chat_arg(update, context.args or [])
+    cid, rest = _parse_safety_chat(update, context.args or [])
     if cid is None or not rest or not re.fullmatch(r"\d+", rest[0]):
         await update.message.reply_text("В группе: /unhide <id>. В личке: /unhide <chat_id> <id>.")
         return
@@ -6339,7 +6339,7 @@ async def cmd_safety_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Запустить safety-скан чата вручную (мимо счётчика и паузы). Admin-only. Отчёт — админам в личку."""
     if not is_admin(update.effective_user.id):
         return
-    cid, _ = _parse_chat_arg(update, context.args or [])
+    cid, _ = _parse_safety_chat(update, context.args or [])
     if cid is None or cid >= 0:
         await update.message.reply_text("Скан — для группы: в группе /safety_scan, в личке /safety_scan <chat_id>.")
         return
