@@ -9,6 +9,15 @@
 `daily_chat_review`, дубль `run_daily` в `main()`, инвертированные
 `cmd_whitelist_on` / `cmd_captcha_on` (теперь ставят `True`).
 
+## 2026-11-10 — `/cost <chat_id>`, `/verify`, `/unverify`, `/ban <id>`, `/unban <id>` падали с TypeError
+`/cost -1001032770549` отвечал «Что-то сломалось на моей стороне». В логе:
+`TypeError: _parse_chat_arg() missing 1 required positional argument: 'args'`. Причина — в bot.py две функции
+верхнего уровня `_parse_chat_arg`: `(args)` для `/verify /unverify /ban /unban /cost` и `(update, args)` из v2.1.0
+(safety-unblock, `/hidden /unhide /safety_scan`). Вторая определена ниже и молча перекрыла первую, поэтому все
+команды с id в аргументе были сломаны с v2.1.0. `ast.parse` такое не ловит. Исправлено в v2.7.3: вторая
+переименована в `_parse_safety_chat` (имя `_parse_target_chat` уже занято настройками — чуть не повторили ту же
+ошибку). Урок: перед новым хелпером проверять имя через grep; проверка на дубли — см. Definition of Done, п. 4.
+
 ## 2026-10-28 — пул закрыл модели Anthropic (403 model_blocked)
 Пул apitoken без предупреждения в боте перестал отдавать `claude-*`: `403 permission_error`, `details.error_code:
 model_blocked`. `should_fallback` считал 403 без признаков апстрима ошибкой ключа и не переключал на Gemini: в логах
