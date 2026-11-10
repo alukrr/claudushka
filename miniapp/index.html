@@ -48,6 +48,14 @@
   .switch input:disabled + .slider { opacity: .25; }
   .center { text-align: center; color: var(--hint); padding: 40px 8px; }
   .back { background: none; border: 0; color: var(--link); font: inherit; padding: 4px 0 8px; cursor: pointer; }
+  .btn { display: block; width: 100%; font: inherit; font-weight: 600; padding: 10px 14px; margin-bottom: 10px; border: 0; border-radius: 10px;
+         background: var(--btn); color: var(--btn-text); cursor: pointer; }
+  .kv { display: flex; justify-content: space-between; gap: 12px; padding: 2px 0; }
+  .kv .k { color: var(--hint); overflow-wrap: anywhere; }
+  .kv .v { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .bar { height: 6px; border-radius: 3px; background: var(--bg); margin: 2px 0 6px; overflow: hidden; }
+  .bar .fill { height: 100%; background: var(--btn); border-radius: 3px; }
+  .free { color: var(--hint); font-size: 13px; }
 </style>
 </head>
 <body>
@@ -59,7 +67,8 @@
   var app = document.getElementById("app");
   var initData = tg ? tg.initData : "";
   var current = null;      // id открытого чата (null — список)
-  var directChat = null;   // ?chat=<id> из диплинка (не подписан, права проверяет сервер)
+  var directChat = null;   // чат из start_param (ссылка ?startapp=chat_n<id>) или ?chat=<id> из диплинка — не подписанный выбор экрана, права проверяет сервер
+  var screen = "list";     // "list" | "chat" | "costs" — что назад вернёт BackButton
 
   if (tg) { try { tg.ready(); tg.expand(); } catch (e) {} }
 
@@ -84,10 +93,12 @@
     if (!tg || !tg.BackButton) return;
     if (on) { tg.BackButton.show(); } else { tg.BackButton.hide(); }
   }
-  if (tg && tg.BackButton) tg.BackButton.onClick(function () { openList(); });
+  if (tg && tg.BackButton) tg.BackButton.onClick(function () {
+    if (screen === "costs" && current !== null) { openChat(current); } else { openList(); }
+  });
 
   function openList() {
-    current = null; showBack(false);
+    current = null; screen = "list"; showBack(false);
     message("Загрузка…");
     api("GET", "/api/chats").then(function (r) {
       if (r.status !== 200) return message(r.data.message || "Ошибка загрузки.");
@@ -106,13 +117,18 @@
         b.appendChild(meta);
         b.addEventListener("click", function () { openChat(c.id); });
         card.appendChild(b);
+        if (c.can_view_costs) {
+          var cb = el("button", "back", "Расходы");
+          cb.addEventListener("click", function () { openCosts(c.id); });
+          card.appendChild(cb);
+        }
         app.appendChild(card);
       });
     }).catch(function () { message("Нет связи с сервером."); });
   }
 
   function openChat(id) {
-    current = id; showBack(true);
+    current = id; screen = "chat"; showBack(true);
     message("Загрузка…");
     api("GET", "/api/chats/" + id + "/settings").then(function (r) {
       if (r.status !== 200) {
@@ -129,7 +145,103 @@
     h.appendChild(el("span", "tag", data.chat.tier === "paid" ? "платный" : "бесплатный"));
     if (data.chat.is_group && data.chat.is_admin) h.appendChild(el("span", "tag", "админ"));
     app.appendChild(h);
+    if (data.chat.can_view_costs) {
+      var cb = el("button", "btn", "Расходы");
+      cb.addEventListener("click", function () { openCosts(data.chat.id); });
+      app.appendChild(cb);
+    }
     data.settings.forEach(function (s) { app.appendChild(settingCard(data.chat.id, s)); });
+  }
+
+  // ---- Экран «Расходы» (ТЗ tz-miniapp-v2.md, часть A). Только textContent, без innerHTML и внешних библиотек. ----
+  var MONTHS = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"];
+
+  function money(x) {
+    x = Number(x) || 0;
+    return "$" + ((x === 0 || Math.abs(x) >= 0.005) ? x.toFixed(2) : x.toFixed(4));
+  }
+  function monthLabel(m) { return MONTHS[parseInt(m.slice(5, 7), 10) - 1] + " " + m.slice(0, 4); }
+  function dayLabel(d) { return d.slice(8, 10) + "." + d.slice(5, 7); }
+  function num(n) { return String(Number(n) || 0).replace(/\B(?=(\d{3})+(?!\d))/g, " "); }
+
+  function kv(parent, k, v, freeText) {
+    var row = el("div", "kv");
+    row.appendChild(el("span", "k", k));
+    var val = el("span", "v", v);
+    if (freeText) val.appendChild(el("span", "free", " · бесплатно " + freeText));
+    row.appendChild(val);
+    parent.appendChild(row);
+    return row;
+  }
+  function bar(parent, share) {
+    var b = el("div", "bar"), f = el("div", "fill");
+    f.style.width = Math.max(0, Math.min(100, share * 100)) + "%";
+    b.appendChild(f);
+    parent.appendChild(b);
+  }
+  function section(title) {
+    var card = el("div", "card");
+    card.appendChild(el("div", "label", title));
+    app.appendChild(card);
+    return card;
+  }
+
+  function openCosts(id) {
+    current = id; screen = "costs"; showBack(true);
+    message("Загрузка…");
+    api("GET", "/api/chats/" + id + "/costs").then(function (r) {
+      if (r.status !== 200) { message(r.data.message || "Ошибка загрузки."); return; }
+      renderCosts(r.data);
+    }).catch(function () { message("Нет связи с сервером."); });
+  }
+
+  function renderCosts(d) {
+    clear();
+    var h = el("h1", "", "Расходы · " + d.chat.title);
+    h.appendChild(el("span", "tag", d.chat.tier === "paid" ? "платный" : "бесплатный"));
+    app.appendChild(h);
+    var free = d.show_free === true;
+
+    var head = section("Баланс");
+    kv(head, "Баланс", money(d.balance));
+    if (d.days_left !== null && d.days_left !== undefined) kv(head, "Хватит примерно", "на " + d.days_left + " дн.");
+    kv(head, "Темп (последние 7 дней)", money(d.rate_7d_per_day) + " / день");
+
+    var any = d.months.some(function (m) { return m.paid > 0 || (free && m.free > 0); }) || d.by_model.length > 0;
+    if (!any) { app.appendChild(el("div", "center", "Расходов пока нет.")); return; }
+
+    var mo = section("По месяцам");
+    var maxM = Math.max.apply(null, d.months.map(function (m) { return m.paid; }).concat([0.000001]));
+    d.months.forEach(function (m) {
+      kv(mo, monthLabel(m.month) + (m.partial ? " (по сегодня)" : ""), money(m.paid), free ? money(m.free) : null);
+      bar(mo, m.paid / maxM);
+    });
+
+    var dy = section("По дням (7)");
+    d.days.forEach(function (x) { kv(dy, dayLabel(x.date), money(x.paid), free ? money(x.free) : null); });
+
+    if (d.by_model.length) {
+      var md = section("По моделям (7 дней)");
+      d.by_model.forEach(function (r) {
+        var t = r.label + (free && !r.billed ? " · бесплатное" : "");
+        kv(md, t, money(r.cost));
+        var det = r.calls + " выз.";
+        if (r.kind === "llm") det += ", вх " + num(r.input) + " / вых " + num(r.output);
+        md.appendChild(el("div", "hint", det));
+      });
+    }
+    if (d.by_label.length) {
+      var lb = section("По меткам (7 дней)");
+      d.by_label.forEach(function (r) { kv(lb, r.label + (free && !r.billed ? " · бесплатное" : ""), money(r.cost)); });
+    }
+    var wk = d.by_kind_week;
+    app.appendChild(el("div", "hint", "За неделю: LLM " + money(wk.llm) + " · картинки " + money(wk.image) + " · поиск " + money(wk.search)));
+  }
+
+  // start_param ссылки t.me/<bot>?startapp=chat_n<abs(chat_id)> → id чата (n — минус группы, p — плюс). Ничего не разрешает: права проверяет сервер.
+  function parseStartParam(p) {
+    var m = /^chat_([np])(\d{1,15})$/.exec(p || "");
+    return m ? (m[1] === "n" ? -1 : 1) * parseInt(m[2], 10) : null;
   }
 
   function setMsg(card, text, ok) {
@@ -220,8 +332,11 @@
     message("Откройте приложение из Telegram: кнопка «Настройки» в личке с ботом или команда /settings.");
     return;
   }
+  // Выбор экрана: start_param (Main Mini App из группы) → ?chat= (диплинк из личной переписки, v1) → список чатов.
+  var sp = tg && tg.initDataUnsafe ? tg.initDataUnsafe.start_param : "";
   var q = /[?&]chat=(-?\d+)/.exec(location.search);
-  directChat = q ? parseInt(q[1], 10) : null;
+  directChat = parseStartParam(sp);
+  if (directChat === null) directChat = q ? parseInt(q[1], 10) : null;
   if (directChat !== null) { openChat(directChat); } else { openList(); }
 })();
 </script>

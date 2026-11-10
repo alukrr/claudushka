@@ -4654,43 +4654,111 @@ def _cost_report(scope: int | None, viewer_id: int) -> str:
     return "\n".join(lines)
 
 
-def _cost_detail(target: int) -> str:
-    """/cost <chat_id> (только админ): модели, метки и дни за последние 7 дней."""
-    now = _berlin_now()
+def _cost_month_windows(now: datetime, count: int = 12) -> list[tuple[str, datetime, datetime, bool]]:
+    """`count` последних календарных месяцев по BERLIN_TZ, новые сверху: (\"YYYY-MM\", начало, начало следующего, partial).
+    Границы строятся по ДАТЕ (первое число, 00:00 Берлина), не «+30 дней»: переход CET/CEST месяц не сдвигает.
+    partial=True — текущий месяц (идёт, данные «по сегодня»)."""
+    out = []
+    for i in range(count):
+        y, m = now.year, now.month - i
+        while m <= 0:
+            m += 12
+            y -= 1
+        ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
+        out.append((f"{y:04d}-{m:02d}", datetime(y, m, 1, 0, 0, tzinfo=BERLIN_TZ), datetime(ny, nm, 1, 0, 0, tzinfo=BERLIN_TZ), i == 0))
+    return out
+
+
+def _cost_data(chat_id: int, show_free: bool, now: datetime | None = None) -> dict:
+    """Данные расходов одного чата — ОДИН источник для текста `/cost <chat_id>` (`_cost_detail`) и для JSON мини-приложения
+    (`GET /api/chats/{id}/costs`, docs/claude/miniapp.md). Суммы — `db.usage_grouped` по `usage_log` (cost_usd заморожен в момент вызова).
+    show_free=False — бесплатное (billed=0, расходы владельца) в результат НЕ попадает совсем: ни ключей `free`, ни free-строк моделей/меток.
+    Блокирующий (SQLite) — вызывать через asyncio.to_thread."""
+    now = now or _berlin_now()
     end = int(now.timestamp()) + 1
-    start = datetime.combine(now.date() - timedelta(days=6), dt_time(0, 0), tzinfo=BERLIN_TZ)
     ts = lambda d: int(d.timestamp())
-    lines = [
-        f"{_chat_title(target)} ({target}) — детализация за 7 дней",
-        f"Баланс: {_money(db.get_balance(target))} · {_tier_label(target)} · "
-        f"{'проверен' if is_chat_verified(target) else 'не проверен'}",
-    ]
-    for billed, title in ((True, "Платное (billed=1)"), (False, "Бесплатное (billed=0)")):
-        rows = db.usage_grouped(ts(start), end, ("kind", "model"), chat_id=target, billed=billed)
-        if not rows:
-            continue
-        lines.append("")
-        lines.append(f"{title}: {_money(_sum_cost(rows))}")
-        for r in sorted(rows, key=lambda r: -r["cost"]):
-            tokens = ""
-            if r["kind"] == "llm":
-                tokens = f", вх {r['input'] or 0:,} / вых {r['output'] or 0:,}"
-                if r.get("thinking"):
-                    tokens += f" (из них thinking {r['thinking']:,})"
-                if r["cache_write"] or r["cache_read"]:
-                    tokens += f", кэш зап {r['cache_write']:,} / чтен {r['cache_read']:,}"
-            lines.append(f"  {_usage_model_label(r['kind'], r['model'])}: {r['calls']} выз.{tokens} — {_money(r['cost'])}")
-        labels = db.usage_grouped(ts(start), end, ("label",), chat_id=target, billed=billed)
-        lines.append("  по меткам: " + " · ".join(
-            f"{r['label']} {_money(r['cost'])}" for r in sorted(labels, key=lambda r: -r["cost"])[:8]))
-    lines.append("")
-    lines.append("По дням (платное / бесплатное):")
+    start = datetime.combine(now.date() - timedelta(days=6), dt_time(0, 0), tzinfo=BERLIN_TZ)
+    wk0 = _week_start(now)
+    modes = (True, False) if show_free else (True,)
+    kw = dict(chat_id=chat_id)
+
+    balance = db.get_balance(chat_id)
+    rate = _sum_cost(db.usage_grouped(end - 7 * 86400, end, (), billed=True, **kw)) / 7
+    days_left = int(balance / rate) if balance > 0 and rate > 0 else None
+
+    months = []
+    for label, m0, m1, partial in _cost_month_windows(now):
+        row = {"month": label, "partial": partial}
+        for billed, key in ((True, "paid"), (False, "free")):
+            if billed in modes:
+                row[key] = _sum_cost(db.usage_grouped(ts(m0), min(ts(m1), end), (), billed=billed, **kw))
+        months.append(row)
+
+    days = []
     for i in range(7):
         d0 = datetime.combine(start.date() + timedelta(days=i), dt_time(0, 0), tzinfo=BERLIN_TZ)
         d1 = datetime.combine(start.date() + timedelta(days=i + 1), dt_time(0, 0), tzinfo=BERLIN_TZ)
-        paid = _sum_cost(db.usage_grouped(ts(d0), ts(d1), (), chat_id=target, billed=True))
-        free = _sum_cost(db.usage_grouped(ts(d0), ts(d1), (), chat_id=target, billed=False))
-        lines.append(f"  {d0.strftime('%d.%m')}: {_money(paid)} / {_money(free)}")
+        row = {"date": d0.strftime("%Y-%m-%d")}
+        for billed, key in ((True, "paid"), (False, "free")):
+            if billed in modes:
+                row[key] = _sum_cost(db.usage_grouped(ts(d0), ts(d1), (), billed=billed, **kw))
+        days.append(row)
+
+    by_model, by_label = [], []
+    for billed in modes:
+        rows = db.usage_grouped(ts(start), end, ("kind", "model"), billed=billed, **kw)
+        for r in sorted(rows, key=lambda r: -r["cost"]):
+            by_model.append({"label": _usage_model_label(r["kind"], r["model"]), "kind": r["kind"], "calls": r["calls"],
+                             "input": r["input"] or 0, "output": r["output"] or 0, "thinking": r["thinking"] or 0,
+                             "cache_write": r["cache_write"] or 0, "cache_read": r["cache_read"] or 0,
+                             "cost": r["cost"], "billed": billed})
+        labels = db.usage_grouped(ts(start), end, ("label",), billed=billed, **kw)
+        for r in sorted(labels, key=lambda r: -r["cost"])[:8]:
+            by_label.append({"label": r["label"], "cost": r["cost"], "billed": billed})
+
+    by_kind_week = {"llm": 0.0, "image": 0.0, "search": 0.0}
+    for r in db.usage_grouped(ts(wk0), end, ("kind",), billed=True, **kw):
+        by_kind_week[r["kind"]] = by_kind_week.get(r["kind"], 0.0) + r["cost"]
+
+    return {"chat": {"id": chat_id, "title": _chat_title(chat_id), "tier": chat_tier(chat_id), "verified": is_chat_verified(chat_id)},
+            "balance": balance, "rate_7d_per_day": rate, "days_left": days_left,
+            "months": months, "days": days, "by_model": by_model, "by_label": by_label,
+            "by_kind_week": by_kind_week, "show_free": show_free}
+
+
+def _cost_detail(target: int) -> str:
+    """/cost <chat_id> (только админ бота): модели, метки, дни за последние 7 дней и 12 месяцев. Данные — `_cost_data`."""
+    d = _cost_data(target, True)
+    lines = [
+        f"{d['chat']['title']} ({target}) — детализация за 7 дней",
+        f"Баланс: {_money(d['balance'])} · {'платный' if d['chat']['tier'] == 'paid' else 'бесплатный'} · "
+        f"{'проверен' if d['chat']['verified'] else 'не проверен'}",
+    ]
+    for billed, title in ((True, "Платное (billed=1)"), (False, "Бесплатное (billed=0)")):
+        models = [r for r in d["by_model"] if r["billed"] == billed]
+        if not models:
+            continue
+        lines.append("")
+        lines.append(f"{title}: {_money(sum(r['cost'] for r in models))}")
+        for r in models:
+            tokens = ""
+            if r["kind"] == "llm":
+                tokens = f", вх {r['input']:,} / вых {r['output']:,}"
+                if r["thinking"]:
+                    tokens += f" (из них thinking {r['thinking']:,})"
+                if r["cache_write"] or r["cache_read"]:
+                    tokens += f", кэш зап {r['cache_write']:,} / чтен {r['cache_read']:,}"
+            lines.append(f"  {r['label']}: {r['calls']} выз.{tokens} — {_money(r['cost'])}")
+        lines.append("  по меткам: " + " · ".join(
+            f"{r['label']} {_money(r['cost'])}" for r in d["by_label"] if r["billed"] == billed))
+    lines.append("")
+    lines.append("По дням (платное / бесплатное):")
+    for r in d["days"]:
+        lines.append(f"  {r['date'][8:10]}.{r['date'][5:7]}: {_money(r['paid'])} / {_money(r['free'])}")
+    lines.append("")
+    lines.append("По месяцам (платное / бесплатное):")
+    for r in d["months"]:
+        lines.append(f"  {r['month']}: {_money(r['paid'])} / {_money(r['free'])}" + (" (по сегодня)" if r["partial"] else ""))
     return "\n".join(lines)
 
 
@@ -4710,6 +4778,9 @@ async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.effective_message.reply_text("Использование: /cost [chat_id]")
                 return
             text = await asyncio.to_thread(_cost_detail, target)
+            for chunk in split_lines_for_telegram(text):   # с «По месяцам» длиннее 4096 бывает
+                await update.effective_message.reply_text(chunk)
+            return
         else:
             if is_group:
                 if not await is_chat_admin(context, chat.id, user_id):
@@ -5473,7 +5544,7 @@ USER_HELP = """\
   /personas      — режимы характера и какой сейчас у чата
   /classic /business /toxic /flirt /granny — сменить характер (платный режим; в группе — админам чата и бота)
   /review_persona — в группах: характер дневного обзора отдельно от характера чата (/review_persona toxic; off — как у чата)
-  /settings      — мини-приложение настроек чатов (в группе — ссылка в личку)
+  /settings      — мини-приложение настроек чатов (в группе — кнопка открытия; админам чата там же экран «Расходы»)
   /ratelimit     — в группах: ограничить частоту сообщений участника (для админов группы)
   /activity [0-100] — в группах: шанс, что Клодушка сама вставит реплику, когда её не звали (платный режим; менять — админам группы)
   /autoignore [on|off] — в группах: автопауза бота за повторы и травлю; без аргумента — кто сейчас в паузе (для админов группы)
@@ -5493,7 +5564,7 @@ ADMIN_HELP = """\
   /ban <id>                — бан (id < 0 — группа; в группе можно ответом на сообщение)
   /unban <id>              — разбан. Бан не трогает баланс и проверку
   /cost                    — в личке: расход по ВСЕМ чатам (+ бесплатный режим, служебное, writeoff)
-  /cost <chat_id>          — детализация чата за 7 дней: модели, метки, дни
+  /cost <chat_id>          — детализация чата за 7 дней (модели, метки, дни) и по месяцам (12)
 
 Пользователи и чаты:
   /users                   — все пользователи
@@ -7815,6 +7886,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 MINIAPP_PUBLIC_URL = os.environ.get("MINIAPP_PUBLIC_URL", "").strip().rstrip("/")
 MINIAPP_PORT = int(os.environ.get("MINIAPP_PORT", "8090") or 8090)
 MINIAPP_INITDATA_MAX_AGE = int(os.environ.get("MINIAPP_INITDATA_MAX_AGE", "3600") or 3600)
+# Main Mini App настроен в BotFather (docs/claude/miniapp.md, ТЗ tz-miniapp-v2.md, часть B): /settings в группе открывает приложение прямо
+# в группе по ссылке t.me/<bot>?startapp=…. Пока флаг выключен — поведение v1 (диплинк в личку).
+MINIAPP_MAIN_APP = os.environ.get("MINIAPP_MAIN_APP", "").strip().lower() in ("1", "true", "yes", "on")
 MINIAPP_CACHE_SEC = 300          # кэш «админ чата» / «состоит в чате» для чтения; запись всегда проверяет заново
 _ma_cache: dict[tuple, tuple[float, Any]] = {}
 _miniapp_server = None
@@ -7926,14 +8000,16 @@ def _ma_keys_for(chat_id: int) -> list[str]:
 
 async def _ma_chats(user_id: int) -> list[dict]:
     admin = is_admin(user_id)
-    chats = [{"id": user_id, "title": "Личка с ботом", "tier": chat_tier(user_id), "is_group": False, "is_admin": admin}]
+    chats = [{"id": user_id, "title": "Личка с ботом", "tier": chat_tier(user_id), "is_group": False, "is_admin": admin,
+              "can_view_costs": True}]      # своя личка: расходы видны самому человеку (бесплатное — только админу бота)
     rows = db.list_group_chats() if admin else db.list_user_group_chats(user_id)
     if not admin:
         member = await asyncio.gather(*[_ma_is_member(r["chat_id"], user_id) for r in rows])
         rows = [r for r, ok in zip(rows, member) if ok]
     flags = await asyncio.gather(*[_ma_chat_admin(r["chat_id"], user_id) if not admin else asyncio.sleep(0, True) for r in rows])
     groups = [{"id": r["chat_id"], "title": _ma_title(r["chat_id"], r), "tier": chat_tier(r["chat_id"]), "is_group": True,
-               "is_admin": bool(a), "banned": bool(r.get("banned"))} for r, a in zip(rows, flags)]
+               "is_admin": bool(a), "banned": bool(r.get("banned")),
+               "can_view_costs": bool(a)} for r, a in zip(rows, flags)]   # расходы группы — is_chat_admin (+ админ бота)
     groups.sort(key=lambda c: c["title"].lower())
     return chats + groups
 
@@ -7943,8 +8019,29 @@ async def _ma_chat_view(user_id: int, chat_id: int, fresh: bool = False) -> dict
     fl = await _ma_flags(user_id, chat_id, in_target, fresh)
     row = db.get_chat_row(chat_id) if chat_id < 0 else None
     return {"chat": {"id": chat_id, "title": _ma_title(chat_id, row), "tier": fl["tier"], "is_group": chat_id < 0,
-                     "is_admin": bool(fl["chat"])},
+                     "is_admin": bool(fl["chat"]),
+                     # кнопка «Расходы» на экране чата (при открытии по startapp списка чатов нет); сервер всё равно проверяет сам
+                     "can_view_costs": (bool(fl["chat"]) and in_target) if chat_id < 0 else (chat_id == user_id or fl["bot"])},
             "settings": [_ma_setting(k, user_id, chat_id, fl) for k in _ma_keys_for(chat_id)]}
+
+
+async def _ma_chat_costs(user_id: int, chat_id: int) -> dict:
+    """Экран «Расходы» (ТЗ tz-miniapp-v2.md, часть A). Права — только существующие функции: `_ma_access` (членство, allowed_chats,
+    не banned) + `is_chat_admin` (админы чата и управляющие) для группы; своя личка — самому человеку; чужая личка — админу бота.
+    Бесплатное (billed=0) — только админу бота: для остальных `_cost_data(show_free=False)` не кладёт эти поля в ответ вовсе."""
+    in_target = await _ma_access(user_id, chat_id)
+    admin = is_admin(user_id)
+    if chat_id < 0:
+        if not in_target:                          # админ бота вне allowed_chats
+            raise MiniappError(403, "Нет доступа к этому чату.")
+        fl = await _ma_flags(user_id, chat_id, in_target)
+        if not fl["chat"]:
+            raise MiniappError(403, "Расходы видят админы чата.")
+    try:
+        return await asyncio.to_thread(_cost_data, chat_id, admin)
+    except Exception:
+        logger.exception(f"miniapp costs chat={chat_id} uid={user_id}")
+        raise MiniappError(500, "Не удалось загрузить расходы.")
 
 
 def _ma_type_error(s: ChatSetting, value) -> str | None:
@@ -7993,6 +8090,9 @@ class _MiniappDeps:
     async def set_setting(self, user_id: int, chat_id: int, key: str, value) -> dict:
         return await _ma_set_setting(user_id, chat_id, key, value)
 
+    async def chat_costs(self, user_id: int, chat_id: int) -> dict:
+        return await _ma_chat_costs(user_id, chat_id)
+
 
 def build_miniapp():
     """FastAPI-приложение мини-приложения (без запуска) — для сервера и для тестов."""
@@ -8033,9 +8133,17 @@ async def post_shutdown(application):
         _miniapp_server.should_exit = True
 
 
+def _settings_startapp_param(chat_id: int) -> str:
+    """Параметр `startapp` для открытия настроек чата: `chat_n<abs(chat_id)>` («n» = минус группы; только A-Za-z0-9_ — самый строгий
+    из известных наборов символов, как у /start-параметра). Фронтенд разбирает его в `miniapp/index.html` (parseStartParam)."""
+    return f"chat_{'n' if chat_id < 0 else 'p'}{abs(chat_id)}"
+
+
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/settings — мини-приложение. Личка: кнопка web_app. Группа: web_app-кнопки в группах не работают (Bot API:
-    «Available only in private chats between a user and the bot»), поэтому диплинк в личку (/start settings_<chat_id>)."""
+    «Available only in private chats between a user and the bot»), поэтому: при MINIAPP_MAIN_APP=1 — URL-кнопка на Main Mini App
+    (`t.me/<bot>?startapp=chat_n…`, открывается прямо в группе) + запасной диплинк в личку; иначе только диплинк в личку
+    (/start settings_<chat_id>)."""
     msg = update.effective_message
     if not miniapp_enabled():
         await msg.reply_text("Мини-приложение не настроено.")
@@ -8045,8 +8153,13 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Настройки Клодушки:", reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("Открыть настройки", web_app=WebAppInfo(url=f"{MINIAPP_PUBLIC_URL}/"))]]))
     elif chat.type in ("group", "supergroup"):
-        await msg.reply_text("Настройки открываются в личке.", reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Открыть в личке", url=f"https://t.me/{bot_username}?start=settings_{chat.id}")]]))
+        private_btn = InlineKeyboardButton("Открыть в личке", url=f"https://t.me/{bot_username}?start=settings_{chat.id}")
+        if MINIAPP_MAIN_APP and bot_username:
+            await msg.reply_text("Настройки Клодушки:", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Открыть настройки", url=f"https://t.me/{bot_username}?startapp={_settings_startapp_param(chat.id)}")],
+                [private_btn]]))
+        else:
+            await msg.reply_text("Настройки открываются в личке.", reply_markup=InlineKeyboardMarkup([[private_btn]]))
 
 
 async def _start_settings_deeplink(update: Update, arg: str) -> bool:
