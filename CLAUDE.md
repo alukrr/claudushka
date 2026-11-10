@@ -78,7 +78,7 @@
   решения и порядок веток — `docs/claude/roadmap-2026-11.md`
 - Мини-приложение настроек (`miniapp/server.py`, `miniapp/index.html`, `validate_init_data`, `_ma_*`, `/settings`, `MINIAPP_PUBLIC_URL`) — `docs/claude/miniapp.md`; чек-лист стенда — `docs/claude/staging-checklist-miniapp.md`;
   runbook прокси `edge` — `docs/claude/runbook-edge-proxy.md`; ТЗ реестра настроек —
-  `docs/claude/tz-settings-registry.md`; ТЗ мини-приложения — `docs/claude/tz-miniapp.md`; ТЗ v2 (экран «Расходы», открытие из группы через Main Mini App `startapp`, «По месяцам» в `/cost <chat_id>`; `_cost_data`, `_ma_chat_costs`, `MINIAPP_MAIN_APP`) — `docs/claude/tz-miniapp-v2.md`; чек-лист стенда v2 — `docs/claude/staging-checklist-miniapp-v2.md`; ТЗ «недели KW и оценка цены подписки» (`_cost_week_windows`, `_subscription_estimate`, `_paid_seconds`, `db.paid_seconds`, поля `weeks`/`subscription` в `/costs`, `scripts/check_subscription_estimate.py`) — `docs/claude/tz-cost-weeks-subscription.md`, раздел «Оценка цены подписки» в `docs/claude/billing.md`; ТЗ управляющих чата — `docs/claude/tz-chat-managers.md`
+  `docs/claude/tz-settings-registry.md`; ТЗ мини-приложения — `docs/claude/tz-miniapp.md`; ТЗ v2 (экран «Расходы», открытие из группы через Main Mini App `startapp`, «По месяцам» в `/cost <chat_id>`; `_cost_data`, `_ma_chat_costs`, `MINIAPP_MAIN_APP`) — `docs/claude/tz-miniapp-v2.md`; чек-лист стенда v2 — `docs/claude/staging-checklist-miniapp-v2.md`; ТЗ «недели KW и оценка цены подписки» (`_cost_week_windows`, `_subscription_estimate`, `_paid_seconds`, `db.paid_seconds`, поля `weeks`/`subscription` в `/costs`, `scripts/check_subscription_estimate.py`) — `docs/claude/tz-cost-weeks-subscription.md`, раздел «Оценка цены подписки» в `docs/claude/billing.md`; ТЗ управляющих чата — `docs/claude/tz-chat-managers.md`; раздел «Управляющие» в приложении (`_ma_managers_*`, `_manager_assign`, `find_users_by_username`, `/api/chats/{id}/managers`) — `docs/claude/miniapp.md`, ТЗ `docs/claude/tz-miniapp-managers.md`, чек-лист — `docs/claude/staging-checklist-miniapp-managers.md`
 - Параллельная обработка апдейтов (`PerChatUpdateProcessor`, `MAX_CONCURRENT_UPDATES`): ТЗ — `docs/claude/tz-concurrent-updates.md`
 - Атрибуция групповой памяти по uid (метки участников `P1…`): ТЗ — `docs/claude/tz-memory-uid.md`
 - `whatsapp.py` — `.claude/rules/whatsapp.md` (грузится автоматически при чтении файла)
@@ -197,7 +197,7 @@
   через `_dialog_call` (повтор без истории при safety-блоке), пробы скана — настоящий запрос бота через `_model_call`.
   `docs/claude/safety-unblock.md`.
 - Факты и профили участников группы — только по `user_id` (метки `P1…` в запросе извлечения), не по нику: ник меняется и совпадает у разных людей
-  (инцидент 2026-09-28); поиск `user_id` по нику не делать (`docs/claude/memory.md`).
+  (инцидент 2026-09-28); поиск `user_id` по нику не делать (`docs/claude/memory.md`) — единственное исключение: мини-приложение, «Управляющие», явное действие админа с подтверждением найденного человека (`docs/claude/miniapp.md`).
 - Профиль участника: модель только ПРЕДЛАГАЕТ (`profile_proposals`), в `user_profile` пишет админ через
   `db.apply_profile_ops` (бот и dedup TUI — один путь); личка — `chat_id=0`, не NULL; любое новое место, удаляющее
   память человека, обязано чистить и профиль (`db.clear_memory` уже чистит). `docs/claude/profile.md`.
