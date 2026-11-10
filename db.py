@@ -2168,6 +2168,20 @@ def list_chat_managers(chat_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def find_users_by_username(username: str) -> list[dict]:
+    """Люди из НАШЕЙ БД с этим @username: точное совпадение без учёта регистра (Bot API не ищет по нику). Может быть больше одного
+    (ник переходит между людьми, строки users устаревают) — решает вызывающий. Единственное место поиска user_id по нику: мини-приложение,
+    «Управляющие» (явное действие админа + подтверждение найденного человека), docs/claude/miniapp.md."""
+    name = (username or "").strip().lstrip("@")
+    if not name:
+        return []
+    conn = get_conn()
+    rows = conn.execute("SELECT telegram_id, username, full_name FROM users WHERE username IS NOT NULL AND LOWER(username) = LOWER(?) "
+                        "ORDER BY last_active DESC", (name,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def get_ignore(chat_id: int, user_id: int) -> dict | None:
     conn = get_conn()
     row = conn.execute("SELECT level, ignored_until, last_strike_ts FROM chat_ignores WHERE chat_id = ? AND user_id = ?",

@@ -46,6 +46,7 @@ the Mini App» (https://core.telegram.org/bots/webapps#validating-data-received-
   каждый вариант — `{value, label, allowed, reason}` (в группе `restricted` не-админу недоступны); настройка, которую даже смотреть нельзя (автоигнор не-админу) —
   `value: null`, `can_change: false`, `reason`. В личке нет групповых ключей (`scope`).
 - `GET /api/chats/{chat_id}/topup` → `{title, balance, rate, packs: [{stars, usd}], help}` и `POST /api/chats/{chat_id}/topup` с `{"stars": N}` → `{invoice_link}` (экран «Пополнить», Stars — `docs/claude/billing.md` → «Пополнение Stars»). Права: `_ma_topup_access` = `_ma_access(fresh=True)` и `in_target` — своя личка или группа, где человек состоит (платит любой участник); админ бота вне списка и чужая личка — 403. POST перед `createInvoiceLink` гоняет те же `check_star_payment`, что и `pre_checkout` (400 — нет пакета/чат не принимает). **Баланс здесь не зачисляется** — только бот по `successful_payment`; фронтенд по статусу `paid` лишь перечитывает баланс через ~2,5 с. `chat.can_topup` в `/settings` — флаг кнопки «Пополнить баланс ⭐» (экран чата и «Расходы»). Справка — `miniapp/stars_help_ru.md` (текст идёт как `textContent`, без HTML).
+- `GET /api/chats/{chat_id}/managers` → `{chat: {id, title}, can_edit, managers: [{id, name, added_by, added_at}]}`; `POST` с `{"user": "123" | "@name", "confirm": false}` и `DELETE /api/chats/{chat_id}/managers/{user_id}` — раздел «Управляющие» (ниже). Коды: 400 — не группа/неверный ввод/бот; 403 — нет прав; 404 — ник не найден/не управляющий; 409 — уже управляющий, и так админ, не состоит в группе, ник у нескольких людей.
 - `POST /api/chats/{chat_id}/settings/{key}` с `{"value": …}` → `{ok, message, setting}`. Коды: 400 — неверный тип/значение; 401 — подпись; 403 — нет прав
   или чужой чат (текст из `can_change`); 404 — нет ключа; 409 — `apply_setting` отказал (проба модели, чат не известен); 429 — больше 30 запросов/мин на `user.id`.
 - Заголовки на всех ответах: `Content-Security-Policy` (скрипты — свои inline + `https://telegram.org`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`.
@@ -57,6 +58,19 @@ the Mini App» (https://core.telegram.org/bots/webapps#validating-data-received-
 - `is_chat_admin` (в нём же управляющие чата) читается с кэшем 5 минут; **запись проверяет права и членство заново, без кэша**.
 - `usage_ctx` на запись = `(chat_id, "group"|"private", user_id)`: проба модели при смене модели уходит на счёт этого чата, `context=None` (без «печатает…» в чате).
 - Не в приложении: баны, проверка, `/topup`, `/ratelimit`, `/unignore`. Деньги — только ПРОСМОТР расходов (раздел ниже), не изменение.
+
+## Управляющие чата в приложении (`feat/miniapp-managers`)
+ТЗ — `docs/claude/tz-miniapp-managers.md`; сами управляющие — `docs/claude/group-chat.md` → «Управляющие чата». Раздел-карточка «Управляющие» на экране группы (флаг `chat.can_view_managers`):
+список (имя, id, кто и когда добавил), «Убрать», поле «user_id или @username» + «Добавить». Схема БД не менялась (`chat_managers`).
+- **Права те же, что у команд, новых правил нет.** Смотреть — `is_chat_admin` (админы чата, управляющие, админ бота; = кто видит `/managers`) + членство в группе. Назначать и снимать — **только
+  `is_real_chat_admin`** (инвариант: управляющий других не назначает; `can_edit` в ответе). Права читаются **свежо, без кэша 5 минут** — и на просмотр, и на запись.
+- **Логика общая с командой:** `_manager_assign` / `_manager_unassign` (бот нельзя, «и так админ», ответы), их зовут и `cmd_manager`, и `_ma_managers_add|remove`.
+- **По user_id** — назначается сразу; человек должен состоять в группе (`getChatMember` без кэша), иначе 409.
+- **По @username** — Bot API по нику не ищет: только точное совпадение `users.username` без учёта регистра в НАШЕЙ БД (`db.find_users_by_username`). Не найден → 404 с подсказкой
+  («ещё не писал боту… пришлите user_id, команда /id»); найдено несколько → 409 «укажите user_id». Без `confirm` запись НЕ создаётся: ответ `{found: {id, name}}`, экран показывает «Найден: Имя (id)» и
+  назначает после подтверждения — запросом с числовым `user_id` найденного (не с ником: между «нашли» и «подтвердили» ник мог перейти к другому). В `chat_managers` пишется `user_id`.
+- **Единственное исключение из инварианта «поиск `user_id` по нику не делать»** (он про автоматическую атрибуцию памяти и профилей): здесь явное действие админа с подтверждением найденного человека.
+- Только `textContent` (имена пользователей — внешние данные). Выкатка — `docker restart claudushka` (`.env` и compose не менялись; `index.html`/`server.py` монтируются томом `./miniapp`).
 
 ## Расходы (v2, `GET /api/chats/{chat_id}/costs`)
 - Права — только существующие функции, новых правил нет. Группа: `_ma_access` (членство, `allowed_chats`, не `banned`) + `is_chat_admin` (админы чата и управляющие; кэш 5 мин, как у настроек — это чтение) или админ бота (чат из `allowed_chats`). Своя личка — самому человеку; чужая личка — только админ бота. Остальным 403.

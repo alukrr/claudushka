@@ -217,6 +217,7 @@ def test_settings_keys_by_scope(env):
     assert gk == set(bot.SETTINGS) and pk < gk                 # в личке нет групповых
     assert priv["chat"] == {"id": MEMBER, "title": "Личка с ботом", "tier": "paid", "is_group": False, "is_admin": False,
                             "can_view_costs": True,      # v2: флаг кнопки «Расходы» (своя личка)
+                            "can_view_managers": False,  # раздел «Управляющие» — только в группе
                             "can_topup": True}           # stars-topup: кнопка «Пополнить» (свой чат / группа, где состоит)
 
 
