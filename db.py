@@ -1707,6 +1707,80 @@ def credits_sum(kind: str, since_ts: int, until_ts: int, chat_id: int = None) ->
     return round(v, 8)
 
 
+# --- Оценка цены подписки: платные интервалы по журналам (feat/cost-weeks-subscription, docs/claude/billing.md) ---
+# Истории тарифа нет (тариф = f(баланс), баланс не хранится), поэтому «сколько времени чат был в paid» восстанавливается из тех же
+# двух журналов, что и get_balance: ВСЕ строки chat_credits (topup/bonus/writeoff/любой kind: amount складывается как есть, так же
+# делает _BALANCE_SQL) и usage_log billed=1 (минус cost_usd). Событие = (ts, delta, is_spend). Чистые функции без БД — их берёт и
+# scripts/check_subscription_estimate.py (без импорта bot.py). Админский личный чат (always_paid) — всегда paid: у него billed=1
+# без writeoff, баланс может быть отрицательным, но bot.chat_tier для него всегда "paid".
+
+def subscription_events(conn: sqlite3.Connection, chat_id: int, since_ts: int, until_ts: int) -> tuple[float, list[tuple[int, float, bool]]]:
+    """(баланс на since_ts, события [since_ts, until_ts) по возрастанию ts; при равном ts кредиты раньше трат).
+    Баланс на since_ts — сумма всех событий с ts < since_ts одним запросом. Только чтение."""
+    opening = conn.execute(
+        "SELECT COALESCE((SELECT SUM(amount) FROM chat_credits WHERE chat_id = ? AND ts < ?), 0) "
+        "- COALESCE((SELECT SUM(cost_usd) FROM usage_log WHERE chat_id = ? AND billed = 1 AND ts < ?), 0)",
+        (chat_id, since_ts, chat_id, since_ts)).fetchone()[0]
+    events: list[tuple[int, float, bool]] = []
+    for r in conn.execute("SELECT ts, amount FROM chat_credits WHERE chat_id = ? AND ts >= ? AND ts < ?",
+                          (chat_id, since_ts, until_ts)).fetchall():
+        events.append((int(r[0]), float(r[1]), False))
+    for r in conn.execute("SELECT ts, cost_usd FROM usage_log WHERE chat_id = ? AND billed = 1 AND ts >= ? AND ts < ?",
+                          (chat_id, since_ts, until_ts)).fetchall():
+        events.append((int(r[0]), -float(r[1]), True))
+    events.sort(key=lambda e: (e[0], e[2]))
+    return float(opening), events
+
+
+def paid_seconds_from_events(opening: float, events: list[tuple[int, float, bool]], since_ts: int, until_ts: int,
+                             always_paid: bool = False) -> float:
+    """Секунды в [since_ts, until_ts), когда баланс > PAID_MIN_BALANCE. Интервал между соседними моментами событий платный, если
+    баланс в его начале (после ВСЕХ событий с этим ts) выше порога. Чистая функция."""
+    if until_ts <= since_ts:
+        return 0.0
+    if always_paid:
+        return float(until_ts - since_ts)
+    evs = sorted(events, key=lambda e: (e[0], e[2]))
+    bal, cursor, paid, i, n = opening, since_ts, 0.0, 0, len(evs)
+    while i < n and evs[i][0] < until_ts:
+        t = max(evs[i][0], since_ts)
+        if bal > PAID_MIN_BALANCE:
+            paid += t - cursor
+        cursor = t
+        while i < n and max(evs[i][0], since_ts) == t and evs[i][0] < until_ts:
+            bal += evs[i][1]
+            i += 1
+    if bal > PAID_MIN_BALANCE and until_ts > cursor:
+        paid += until_ts - cursor
+    return paid
+
+
+def billed_outside_paid(opening: float, events: list[tuple[int, float, bool]], always_paid: bool = False) -> int:
+    """Сколько трат billed=1 лежат ВНЕ платного интервала: баланс перед тратой (кредиты того же ts уже учтены) <= PAID_MIN_BALANCE.
+    _record_usage ставит billed=1 только в paid, поэтому в норме 0; >0 — гонка параллельных вызовов или дыра в восстановлении."""
+    if always_paid:
+        return 0
+    bal, bad = opening, 0
+    for _ts, delta, is_spend in sorted(events, key=lambda e: (e[0], e[2])):
+        if is_spend and bal <= PAID_MIN_BALANCE:
+            bad += 1
+        bal += delta
+    return bad
+
+
+def paid_seconds(chat_id: int, since_ts: int, until_ts: int, always_paid: bool = False,
+                 conn: sqlite3.Connection | None = None) -> float:
+    """Обёртка над БД: платные секунды чата в [since_ts, until_ts). conn — чужое соединение (скрипт сверки, read-only)."""
+    own = conn is None
+    c = conn or get_conn()
+    try:
+        opening, events = subscription_events(c, chat_id, since_ts, until_ts)
+    finally:
+        if own:
+            c.close()
+    return paid_seconds_from_events(opening, events, since_ts, until_ts, always_paid)
+
+
 # --- Дневные счётчики сообщений непроверенных (ТЗ v0.10, замена daily_messages) ---
 # day — строка даты по BERLIN_TZ, считает bot.py. Считаются только сообщения, на которые
 # бот реально ответил (bump зовётся после успешного ответа модели).

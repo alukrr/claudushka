@@ -206,9 +206,29 @@
     kv(head, "Баланс", money(d.balance));
     if (d.days_left !== null && d.days_left !== undefined) kv(head, "Хватит примерно", "на " + d.days_left + " дн.");
     kv(head, "Темп (последние 7 дней)", money(d.rate_7d_per_day) + " / день");
+    var sub = d.subscription;   // оценка цены подписки по расходу в платном режиме (только платное, видно всем, кто видит расходы)
+    if (sub) {
+      if (sub.enough) {
+        kv(head, "В режиме подписки", "месяц ≈ " + money(sub.month) + ", неделя ≈ " + money(sub.week));
+        head.appendChild(el("div", "hint", "по " + Number(sub.paid_days).toFixed(1) + " дн. платного режима с " + dayLabel(sub.since)));
+      } else {
+        kv(head, "Цена подписки", "мало данных");
+        head.appendChild(el("div", "hint", Number(sub.paid_days).toFixed(1) + " дн. в платном режиме, нужно 7"));
+      }
+    }
 
     var any = d.months.some(function (m) { return m.paid > 0 || (free && m.free > 0); }) || d.by_model.length > 0;
     if (!any) { app.appendChild(el("div", "center", "Расходов пока нет.")); return; }
+
+    if (d.weeks && d.weeks.length) {
+      var wkc = section("По неделям");
+      var maxW = Math.max.apply(null, d.weeks.map(function (w) { return w.paid; }).concat([0.000001]));
+      d.weeks.forEach(function (w) {
+        kv(wkc, "KW " + w.kw + " " + w.iso_year + " · " + dayLabel(w.start) + "–" + dayLabel(w.end) + (w.partial ? " (по сегодня)" : ""),
+           money(w.paid), free ? money(w.free) : null);
+        bar(wkc, w.paid / maxW);
+      });
+    }
 
     var mo = section("По месяцам");
     var maxM = Math.max.apply(null, d.months.map(function (m) { return m.paid; }).concat([0.000001]));
