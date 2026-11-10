@@ -218,7 +218,7 @@ def test_no_credit_without_successful_payment(env):
         async def answer(self, *a, **k):
             pass
     asyncio.run(bot.on_pay_button(SimpleNamespace(callback_query=Q()), SimpleNamespace(bot=B())))
-    assert sent and db.get_balance(USER) == 0 and credits(USER) == []
+    assert sent == [] and db.get_balance(USER) == 0 and credits(USER) == []         # с v2.12.1 callback-кнопка счёт не выставляет
     c = db.get_conn()
     assert c.execute("SELECT COUNT(*) FROM star_payments").fetchone()[0] == 0
     c.close()
@@ -365,15 +365,21 @@ def test_pay_buttons_help_and_topup_for_non_admin(env):
     async def reply(text, **kw):
         sent.update(text=text, **kw)
     msg.reply_text = reply
-    asyncio.run(bot.cmd_pay(upd, SimpleNamespace(args=[])))
+    bot._pay_link_cache.clear()
+    bot._pay_menu.clear()
+
+    class LinkBot:
+        async def create_invoice_link(self, **kw):
+            return f"https://t.me/$L{kw['prices'][0].amount}"
+    asyncio.run(bot.cmd_pay(upd, SimpleNamespace(args=[], bot=LinkBot())))
     rows = sent["reply_markup"].inline_keyboard
-    assert [r[0].callback_data for r in rows] == [f"pay:{n}" for n in bot.STARS_PACKS]
+    assert [r[0].url for r in rows[:len(bot.STARS_PACKS)]] == [f"https://t.me/$L{n}" for n in bot.STARS_PACKS]
     assert str(bot.STARS_PACKS[0]) + " ⭐" in rows[0][0].text
     upd, msg = make_update(USER, USER)
     asyncio.run(bot.cmd_pay(upd, SimpleNamespace(args=["help"])))
     assert "Как купить звёзды" in msg.replies[0] and "**" not in msg.replies[0] and "@PremiumBot" in msg.replies[0]
     upd, msg = make_update(USER, USER)                                          # /topup не-админа ведёт на /pay
-    asyncio.run(bot.cmd_topup(upd, SimpleNamespace(args=[])))
+    asyncio.run(bot.cmd_topup(upd, SimpleNamespace(args=[], bot=LinkBot())))
     assert msg.replies and "Пополнение баланса" in msg.replies[0]
 
 
@@ -384,8 +390,8 @@ def test_invoice_kwargs_limits(env):
     assert bot.STARS_PAYLOAD_RE.match(kw["payload"])
 
 
-def test_pay_button_sends_invoice_and_rejects_unknown_pack(env):
-    sent = []
+def test_old_pay_callback_buttons_do_not_send_invoice(env):
+    sent, answers = [], []
 
     class B:
         async def send_invoice(self, chat_id, **kw):
@@ -395,14 +401,13 @@ def test_pay_button_sends_invoice_and_rejects_unknown_pack(env):
         data = "pay:200"
         message = SimpleNamespace(chat_id=USER)
 
-        async def answer(self, *a, **k):
-            pass
-    asyncio.run(bot.on_pay_button(SimpleNamespace(callback_query=Q()), SimpleNamespace(bot=B())))
-    assert sent and sent[0][0] == USER and sent[0][1]["payload"] == f"topup:{USER}:200" and sent[0][1]["currency"] == "XTR"
-    sent.clear()
-    Q.data = "pay:77"
-    asyncio.run(bot.on_pay_button(SimpleNamespace(callback_query=Q()), SimpleNamespace(bot=B())))
+        async def answer(self, text=None, show_alert=False):
+            answers.append((text, show_alert))
+    for data in ("pay:200", "pay:77"):
+        Q.data = data
+        asyncio.run(bot.on_pay_button(SimpleNamespace(callback_query=Q()), SimpleNamespace(bot=B())))
     assert sent == []
+    assert answers == [("Это меню устарело — отправьте /pay.", True)] * 2
 
 
 def test_terms_paysupport_and_help_texts(env):
