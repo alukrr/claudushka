@@ -349,6 +349,8 @@ def init_db():
     # Migrations for existing databases
     for migration in [
         "ALTER TABLE memory ADD COLUMN context TEXT NOT NULL DEFAULT 'private'",
+        # feat/broadcast: id копии объявления в чате — по нему реплай на объявление опознаётся как «объявление админов», а не «твоё сообщение»
+        "ALTER TABLE broadcast_log ADD COLUMN message_id INTEGER",
         "ALTER TABLE memory ADD COLUMN chat_id INTEGER",
         "ALTER TABLE group_messages ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0",
         # v2.1.0: hidden=1 — строка не уходит ни в один промпт (safety-блок провайдера, docs/claude/safety-unblock.md)
@@ -2428,10 +2430,10 @@ def broadcast_pending(bid: int) -> list[int]:
     return [r["chat_id"] for r in rows]
 
 
-def broadcast_mark(bid: int, chat_id: int, status: str) -> None:
+def broadcast_mark(bid: int, chat_id: int, status: str, message_id: int | None = None) -> None:
     conn = get_conn()
-    conn.execute("UPDATE broadcast_log SET status = ?, ts = ? WHERE broadcast_id = ? AND chat_id = ?",
-                 (status, int(time.time()), bid, chat_id))
+    conn.execute("UPDATE broadcast_log SET status = ?, ts = ?, message_id = COALESCE(?, message_id) WHERE broadcast_id = ? AND chat_id = ?",
+                 (status, int(time.time()), message_id, bid, chat_id))
     conn.commit()
     conn.close()
 
@@ -2449,3 +2451,13 @@ def broadcast_counts(bid: int) -> dict:
     rows = conn.execute("SELECT status, COUNT(*) n FROM broadcast_log WHERE broadcast_id = ? GROUP BY status", (bid,)).fetchall()
     conn.close()
     return {r["status"]: r["n"] for r in rows}
+
+
+def broadcast_note_by_message(chat_id: int, message_id: int) -> str | None:
+    """Пометка объявления, если сообщение message_id в chat_id — копия рассылки (sent), иначе None."""
+    conn = get_conn()
+    row = conn.execute("SELECT b.note FROM broadcast_log l JOIN broadcasts b ON b.id = l.broadcast_id "
+                       "WHERE l.chat_id = ? AND l.message_id = ? AND l.status = 'sent' ORDER BY l.broadcast_id DESC LIMIT 1",
+                       (chat_id, message_id)).fetchone()
+    conn.close()
+    return row["note"] if row else None

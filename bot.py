@@ -4525,31 +4525,39 @@ def _broadcast_note(m) -> str:
             else "документ" if m.document else "голосовое" if m.voice else "")
     body = (m.text or m.caption or "").strip()
     if kind:
-        body = f"[{kind}] {body}".strip()
-    return ("(служебное объявление от администратора бота, не ответ на чьё-то сообщение) " + body)[:BROADCAST_NOTE_MAX]
+        emoji = getattr(m.sticker, "emoji", None) if m.sticker else None
+        body = f"[{kind}{' ' + emoji if isinstance(emoji, str) and emoji else ''}] {body}".strip()
+    return ("(служебное объявление администраторов бота, разослано во все чаты; не твой ответ в диалоге) " + body)[:BROADCAST_NOTE_MAX]
 
 
-async def _broadcast_send_one(bot, src_chat_id: int, src_message_id: int, chat_id: int) -> str:
-    """Одна копия. -> sent | blocked (бот заблокирован/выгнан) | gone (чата нет/мигрировал) | error. Не бросает."""
+def _broadcast_reply_context(chat_id: int, message_id: int) -> str:
+    """reply_context для реплая на копию рассылки: «это объявление админов», а не «твоё собственное сообщение»
+    (иначе модель выдумывает, что это она писала/проверяла). Пустая строка — не рассылка."""
+    note = db.broadcast_note_by_message(chat_id, message_id)
+    return " ".join(note.split())[:BOT_REPLY_QUOTE_CHARS] if note else ""
+
+
+async def _broadcast_send_one(bot, src_chat_id: int, src_message_id: int, chat_id: int) -> tuple[str, int | None]:
+    """Одна копия. -> (sent | blocked (бот заблокирован/выгнан) | gone (чата нет/мигрировал) | error, id копии или None). Не бросает."""
     for _ in range(4):
         try:
-            await bot.copy_message(chat_id=chat_id, from_chat_id=src_chat_id, message_id=src_message_id)
-            return "sent"
+            res = await bot.copy_message(chat_id=chat_id, from_chat_id=src_chat_id, message_id=src_message_id)
+            return "sent", getattr(res, "message_id", None)
         except RetryAfter as e:
             ra = e.retry_after
             await asyncio.sleep((ra.total_seconds() if hasattr(ra, "total_seconds") else float(ra)) + 1)
         except ChatMigrated:
-            return "gone"
+            return "gone", None
         except Forbidden:
-            return "blocked"
+            return "blocked", None
         except BadRequest as e:
             low = str(e).lower()
-            return "gone" if ("chat not found" in low or "group chat was upgraded" in low) else "error"
+            return ("gone" if ("chat not found" in low or "group chat was upgraded" in low) else "error"), None
         except NetworkError:
-            return "error"            # мог дойти — повтор рискует дублем; resume повторит только error-строки
+            return "error", None      # мог дойти — повтор рискует дублем; resume повторит только error-строки
         except TelegramError:
-            return "error"
-    return "error"
+            return "error", None
+    return "error", None
 
 
 async def _broadcast_report(bot, b: dict, started: float, stopped: bool) -> None:
@@ -4576,8 +4584,8 @@ async def _broadcast_worker(bot, bid: int, chat_ids: list) -> None:
             if _broadcast_run.get("stop"):
                 stopped = True
                 break
-            status = await _broadcast_send_one(bot, b["src_chat_id"], b["src_message_id"], cid)
-            db.broadcast_mark(bid, cid, status)
+            status, copy_id = await _broadcast_send_one(bot, b["src_chat_id"], b["src_message_id"], cid)
+            db.broadcast_mark(bid, cid, status, copy_id)
             if status == "sent" and cid < 0:
                 try:
                     db.save_group_message(cid, bot.id, "Клодушка", b["note"], is_bot=True)
@@ -8068,7 +8076,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_context = ""
     if update.message.reply_to_message:
         src = update.message.reply_to_message
-        if src.from_user and src.from_user.id == context_bot_id and src.photo and src.caption:
+        bc_ctx = _broadcast_reply_context(update.effective_chat.id, src.message_id) if (src.from_user and src.from_user.id == context_bot_id) else ""
+        if bc_ctx:
+            # реплай на копию рассылки админа (текст, стикер, фото): без этого стикер не опознаётся, а текст выдаётся за «своё сообщение»
+            reply_context = bc_ctx
+        elif src.from_user and src.from_user.id == context_bot_id and src.photo and src.caption:
             # Реплай на КАРТИНКУ, которую прислал сам бот — обычные сообщения бота и так
             # есть в истории/транскрипте, но фото туда попадает отдельным reply_photo с
             # промптом только в caption, не в тексте. Без этого реплай "а приделай ему

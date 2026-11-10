@@ -40,6 +40,7 @@ class FakeBot:
         if err is not None:
             raise err
         self.copies.append((chat_id, from_chat_id, message_id))
+        return SimpleNamespace(message_id=9000 + len(self.copies))
 
     async def send_message(self, chat_id, text, **kw):
         self.sent.append((chat_id, text))
@@ -374,3 +375,27 @@ def test_test_mode_error_does_not_advise_resume(env):
     bid = db.broadcast_create(ADMIN, ADMIN, 10, "test", [101], "n")
     run_broadcast(fb, bid, [101])
     assert "resume" not in fb.sent[-1][1] and db.broadcast_last_unfinished() is None
+
+
+def test_reply_to_broadcast_copy_is_recognized_as_announcement(env):
+    fb = FakeBot(errors={USER: Forbidden("blocked")})
+    sticker = SimpleNamespace(emoji="😃")
+    note = bot._broadcast_note(src_message(text=None, sticker=sticker))
+    assert "[стикер 😃]" in note and "разослано во все чаты" in note
+    ids = [G_ACTIVE, USER]
+    bid = db.broadcast_create(ADMIN, ADMIN, 10, "active", ids, note)
+    run_broadcast(fb, bid, ids)
+    copy_id = 9001                                                       # id копии в группе (FakeBot отдаёт 9000+n)
+    assert db.broadcast_note_by_message(G_ACTIVE, copy_id) == note
+    ctx = bot._broadcast_reply_context(G_ACTIVE, copy_id)
+    assert "объявление" in ctx and "[стикер 😃]" in ctx and "не твой ответ" in ctx   # модель узнаёт стикер и «чьё» это
+    assert bot._broadcast_reply_context(G_ACTIVE, 123456) == ""                      # обычное сообщение бота — не рассылка
+    assert bot._broadcast_reply_context(USER, copy_id) == ""                         # не тот чат
+    assert bot._broadcast_reply_context(USER, 9002) == ""                            # заблокирован: копии нет
+
+
+def test_handler_uses_broadcast_reply_context_before_own_message_quote():
+    import inspect
+    src = inspect.getsource(bot.handle_message)
+    i, j = src.index("_broadcast_reply_context"), src.index("_bot_reply_quote(reply_text)")
+    assert i < j                                   # объявление проверяется раньше «это твоё собственное сообщение»
