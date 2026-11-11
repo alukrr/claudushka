@@ -316,6 +316,20 @@ SemVer:
 
 Стиль коммитов: `feat:`, `fix:`, `docs:`, `chore:`. Коротко и осмысленно — сообщения видны пользователям в `/update`.
 
+## Agent skills
+
+### Issue tracker
+
+Задачи — GitHub Issues (`alukrr/claudushka`, через `gh`). См. `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Стандартные метки: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. См. `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: один `GLOSSARY.md` и `docs/adr/` в корне (создаются лениво). См. `docs/agents/domain.md`.
+
 ## Открытые задачи
 Вынесено в `docs/claude/open-tasks.md` — незакрытые TODO, не «известные баги» (открытых
 известных багов нет, см. `docs/claude/incidents.md` для закрытых).
