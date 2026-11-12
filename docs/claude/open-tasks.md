@@ -236,8 +236,8 @@
   на сервере (или джоб бота): срок хранения и «сколько последних оставлять всегда» решает Алексей; копии перед мажорными версиями
   (`pre-v*`) — по его решению. До запуска `docs/claude/tz-forget-restore.md` ничего не удалять: копия `claudushka-dedup-20261111-233243.db` — источник восстановления.
 - **`/forget`:** восстановление стёртой памяти сделано (2026-11-12, `scripts/restore_user_memory.py`, `docs/claude/tz-forget-restore.md`); подтверждение, область «только
-  этот чат», `/forget all` и «сувениры» реализованы в ветке `feat/forget-confirm` (`docs/claude/tz-forget-confirm.md`, чек-лист стенда
-  `docs/claude/staging-checklist-forget-confirm.md`) — до стенда и тега не закрыто.
+  этот чат», `/forget all` и «сувениры» реализованы (v2.13.0, смержено в main, стенд пройден 2026-11-12) (`docs/claude/tz-forget-confirm.md`, чек-лист стенда
+  `docs/claude/staging-checklist-forget-confirm.md`).
 
 ## Пополнение Stars (`feat/stars-topup`, v2.10.0) — что осталось после кода
 - **Стенд обязателен до прода** (`docs/claude/staging-checklist-stars-topup.md`): настоящий платёж 1–10 ⭐ тестовому боту из лички, группы и мини-приложения (iOS/Android/Desktop), затем `/refund`.
