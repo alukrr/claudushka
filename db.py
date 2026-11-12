@@ -552,13 +552,13 @@ def conversation_chunk(user_id: int, after_id: int, to_id: int, limit: int) -> l
     return [{"id": r["id"], "role": r["role"], "content": r["content"]} for r in rows]
 
 
-def count_conversation_range(user_id: int, after_id: int, to_id: int) -> int:
-    """Сколько строк треда в (after_id, to_id] — для `dry` первичной обработки."""
+def conversation_lengths(user_id: int, after_id: int, to_id: int) -> list[int]:
+    """Длины (в знаках) реплик треда с id в (after_id, to_id] по ВОЗРАСТАНИЮ id — для точного `dry` первичной обработки (содержимое не читаем)."""
     conn = get_conn()
-    n = conn.execute("SELECT COUNT(*) FROM conversations WHERE user_id = ? AND id > ? AND id <= ?",
-                     (user_id, after_id, to_id)).fetchone()[0]
+    rows = conn.execute("SELECT LENGTH(content) FROM conversations WHERE user_id = ? AND id > ? AND id <= ? ORDER BY id ASC",
+                        (user_id, after_id, to_id)).fetchall()
     conn.close()
-    return n
+    return [r[0] or 0 for r in rows]
 
 
 def usage_label_sum(label: str, chat_id: int, since_ts: int = 0) -> tuple[int, float]:

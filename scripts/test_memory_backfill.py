@@ -41,14 +41,16 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "MEMORY_BACKFILL_PAUSE", 0)
     monkeypatch.setattr(bot, "is_admin", lambda uid: uid == ADMIN)
     monkeypatch.setattr(bot, "chat_tier", lambda cid: "paid")
-    e = SimpleNamespace(calls=[], sent=[], answer=lambda uid, msgs: (["факт"], []), fail=set(), hook=None)
+    e = SimpleNamespace(calls=[], sent=[], answer=lambda uid, msgs: (["факт"], []), fail=set(), hook=None, bad=False)
 
     e.real_raw = bot._extract_private_raw
 
-    def fake_raw(user_id, messages, label="extract_memory"):
+    def fake_raw(user_id, messages, label="extract_memory", diag=None):
         e.calls.append((user_id, [m["content"] for m in messages], label))
         if e.hook:
             e.hook(user_id, messages)
+        if e.bad and diag is not None:
+            diag["bad"] = True
         if user_id in e.fail:
             raise RuntimeError("модель недоступна: секретный-текст-ошибки")
         return e.answer(user_id, messages)
@@ -305,7 +307,133 @@ def test_state_file_written_atomically_via_replace(env, monkeypatch):
     assert not Path(replaced[0][0]).exists()
 
 
+def fill_long(uid, n, size):
+    """n строк по size знаков, у каждой уникальный префикс «#i» — чтобы видеть, что дошло."""
+    for i in range(n):
+        db.save_message(uid, "user" if i % 2 == 0 else "assistant", f"#{i} " + "я" * (size - len(f"#{i} ")))
+
+
+def test_long_chunk_no_row_skipped_mark_on_last_sent(env):
+    fill_long(A, 20, 3000)           # каждая реплика режется до 1500; в 12000 влезает 8 → вызовы 8 + 8 + 4
+    run_worker(env)
+    sizes = [len(m) for _, m, _ in env.calls]
+    assert sizes == [8, 8, 4]
+    seen = [x.split(" ")[0] for _, m, _ in env.calls for x in m]
+    assert seen == [f"#{i}" for i in range(20)]                     # ни одна строка не пропущена, порядок цел
+    for _, m, _ in env.calls:         # то, что реально уйдёт в запрос (обрезку делает _extract_private_raw): ни одна из отправленных строк не теряется
+        clipped = bot.clip_extract_messages([{"role": "user", "content": x} for x in m])
+        assert len(clipped) == len(m)
+        assert all(len(c["content"]) <= bot.MEMORY_EXTRACT_MSG_CHARS for c in clipped)
+        assert sum(len(c["content"]) for c in clipped) <= bot.MEMORY_EXTRACT_TOTAL_CHARS
+    assert marks()[str(A)]["done"] == marks()[str(A)]["to"]
+
+
+def test_mark_after_first_long_call_is_on_last_sent_row(env):
+    fill_long(A, 20, 3000)
+
+    def hook(uid, msgs):
+        bot._backfill_run["stop"] = True
+    env.hook = hook
+    run_worker(env)
+    assert len(env.calls) == 1 and len(env.calls[0][1]) == 8
+    c = db.get_conn()
+    try:
+        ids = [r[0] for r in c.execute("SELECT id FROM conversations WHERE user_id=? ORDER BY id", (A,))]
+    finally:
+        c.close()
+    assert marks()[str(A)]["done"] == ids[7]                         # 8-я строка — последняя отправленная; 9-я пойдёт следующим вызовом
+    env.hook = None; env.calls.clear()
+    run_worker(env)
+    assert env.calls[0][1][0].startswith("#8 ")                      # продолжение — ровно с неотправленной строки
+
+
+def test_single_row_longer_than_limit_does_not_loop(env):
+    db.save_message(A, "user", "я" * 50000)
+    db.save_message(A, "assistant", "ок")
+    run_worker(env)
+    assert [len(m) for _, m, _ in env.calls] == [2]
+    assert len(bot.clip_extract_messages([{"role": "user", "content": env.calls[0][1][0]}])[0]["content"]) == bot.MEMORY_EXTRACT_MSG_CHARS
+    assert marks()[str(A)]["done"] == marks()[str(A)]["to"]
+    env.calls.clear()
+    run_worker(env)
+    assert env.calls == []
+
+
+def test_take_minimum_one_row_and_exact_limit(monkeypatch):
+    assert bot._backfill_take([100000, 5]) == 2                      # каждая строка режется до 1500, потому обе влезают
+    assert bot._backfill_take([1500] * 20) == 8                      # 8 × 1500 = 12000 влезает ровно
+    assert bot._backfill_take([100] * 20) == 20
+    assert bot._backfill_take([]) == 0
+    monkeypatch.setattr(bot, "MEMORY_EXTRACT_TOTAL_CHARS", 1000)     # общий лимит меньше одной строки: минимум одна всё равно уходит
+    assert bot._backfill_take([2000, 5]) == 1
+
+
+def test_plan_calls_equal_real_calls_on_mixed_lengths(env):
+    sizes = [50, 3000, 4000, 200, 9000, 100, 100, 2500, 700, 12000, 40] * 7     # 77 строк разной длины
+    for i, n in enumerate(sizes):
+        db.save_message(A, "user" if i % 2 == 0 else "assistant", "я" * n)
+    fill(B, 45)
+    planned = bot.backfill_plan({"users": {}})
+    run_worker(env)
+    assert planned["calls"] == len(env.calls) and planned["rows"] == 77 + 45
+    assert planned["calls"] > -(-77 // bot.MEMORY_BACKFILL_CHUNK) + -(-45 // bot.MEMORY_BACKFILL_CHUNK)   # дробление длинных кусков видно в оценке
+
+
+def test_dry_reports_exact_calls_for_long_rows(env):
+    fill_long(A, 20, 3000)           # 3 вызова, а не 1
+    replies = []
+
+    async def reply_text(t, **k):
+        replies.append(t)
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN), effective_chat=SimpleNamespace(type="private"),
+                             effective_message=SimpleNamespace(reply_text=reply_text))
+    asyncio.run(bot.cmd_memory_backfill(update, SimpleNamespace(args=["dry"], bot=env.bot)))
+    assert "вызовов 3" in replies[0] and env.calls == []
+
+
+def test_empty_answers_counted_in_report_and_mark_moves(env):
+    fill(A, 40)                      # 2 куска
+    env.bad = True
+    run_worker(env)
+    assert "пустых ответов: 2" in env.sent[-1][1]
+    assert marks()[str(A)]["done"] == marks()[str(A)]["to"]          # отметку двигаем, как раньше
+
+
+def _raw_env(monkeypatch, text, stop="end_turn"):
+    def create(**kw):
+        return SimpleNamespace(model=kw["model"], content=[SimpleNamespace(type="text", text=text)], stop_reason=stop,
+                               usage=SimpleNamespace(input_tokens=10, output_tokens=5, cache_creation_input_tokens=0, cache_read_input_tokens=0))
+    monkeypatch.setattr(bot, "client", SimpleNamespace(messages=SimpleNamespace(create=create)))
+
+
+@pytest.mark.parametrize("text,stop,bad", [
+    ('{"facts": ["a"], "profile_updates": []}', "end_turn", False),
+    ('{"facts": [], "profile_updates": []}', "end_turn", False),      # честное «ничего нового» — не пустой ответ
+    ("извини, не могу", "end_turn", True),                            # не JSON
+    ("", "end_turn", True),                                           # пусто
+    ('{"facts": ["a", "b"', "max_tokens", True),                      # обрезан
+])
+def test_raw_marks_bad_answers(env, monkeypatch, text, stop, bad):
+    monkeypatch.setattr(bot, "_extract_private_raw", env.real_raw)
+    _raw_env(monkeypatch, text, stop)
+    bot.usage_ctx.set((ADMIN, "private", ADMIN))
+    diag = {}
+    bot._extract_private_raw(A, [{"role": "user", "content": "привет"}], "memory_backfill", diag)
+    assert bool(diag.get("bad")) is bad
+
+
+def test_live_extraction_still_keeps_last_messages_when_too_long():
+    # живое извлечение не менялось: при переполнении отбрасываются самые СТАРЫЕ (последние реплики важнее)
+    many = [{"role": "user", "content": f"#{i} " + "я" * 1495} for i in range(10)]
+    out = bot.clip_extract_messages(many)
+    assert out[-1]["content"].startswith("#9 ") and out[0]["content"].startswith("#2 ")
+
+
 def test_help_and_registration():
     src = (Path(__file__).resolve().parent.parent / "bot.py").read_text(encoding="utf-8")
     assert 'CommandHandler("memory_backfill", cmd_memory_backfill)' in src
     assert "/memory_backfill" in bot.ADMIN_HELP and "/memory_backfill" not in bot.USER_HELP
+    lines = bot.ADMIN_HELP.split("\n")
+    i = next(n for n, l in enumerate(lines) if l.lstrip().startswith("/broadcast "))
+    j = next(n for n, l in enumerate(lines) if l.lstrip().startswith("/memory_backfill"))
+    assert j > i + 1 and lines[i + 1].lstrip().startswith("/broadcast test")        # строка не разрывает описание /broadcast
