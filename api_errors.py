@@ -69,10 +69,10 @@ async def _alert_admin_balance(exc: BaseException) -> None:
 
 PROMPT_TOO_LONG_MARKER = "prompt is too long"
 
-# Нейтральная подсказка: /clear чистит историю диалога, /forget — память.
+# Нейтральная подсказка: /clear чистит историю диалога, /forget — память этого чата (в личке полная очистка — /forget all).
 # Вес промпта бывает и там и там (инцидент 2026-07-26 — память), поэтому по умолчанию
 # называем оба. Ветки восстановления подставляют свою, более точную.
-CLEAR_HINT_DEFAULT = "Напиши /clear, а если не поможет — /forget."
+CLEAR_HINT_DEFAULT = "Напиши /clear, а если не поможет — /forget (в личке — /forget all)."
 
 
 def is_prompt_too_long(exc: BaseException) -> bool:

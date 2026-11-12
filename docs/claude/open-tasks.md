@@ -235,8 +235,9 @@
   деплоями) и `data/backups/*.db` (дедуп создаёт копию на каждое применение — до 20 штук за вечер). Никто их не удаляет. Нужен крон
   на сервере (или джоб бота): срок хранения и «сколько последних оставлять всегда» решает Алексей; копии перед мажорными версиями
   (`pre-v*`) — по его решению. До запуска `docs/claude/tz-forget-restore.md` ничего не удалять: копия `claudushka-dedup-20261111-233243.db` — источник восстановления.
-- **`/forget`:** ТЗ восстановления стёртой памяти — `docs/claude/tz-forget-restore.md` (первым); ТЗ подтверждения, области «только
-  этот чат», `/forget all` и «сувениров» — `docs/claude/tz-forget-confirm.md`.
+- **`/forget`:** восстановление стёртой памяти сделано (2026-11-12, `scripts/restore_user_memory.py`, `docs/claude/tz-forget-restore.md`); подтверждение, область «только
+  этот чат», `/forget all` и «сувениры» реализованы (v2.13.0, смержено в main, стенд пройден 2026-11-12) (`docs/claude/tz-forget-confirm.md`, чек-лист стенда
+  `docs/claude/staging-checklist-forget-confirm.md`).
 
 ## Пополнение Stars (`feat/stars-topup`, v2.10.0) — что осталось после кода
 - **Стенд обязателен до прода** (`docs/claude/staging-checklist-stars-topup.md`): настоящий платёж 1–10 ⭐ тестовому боту из лички, группы и мини-приложения (iOS/Android/Desktop), затем `/refund`.

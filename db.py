@@ -996,6 +996,94 @@ def clear_memory(user_id: int, context: str = None):
     clear_profile_data(user_id, context)  # профиль и предложения — часть «памяти» человека (/forget)
 
 
+def _forget_where(context: str | None, chat_id) -> tuple[str, str, tuple]:
+    """Условия области /forget для memory и для профиля (user_profile / profile_proposals). Первый `?` — user_id.
+
+    context=None — «всё везде». 'private' — личные факты (chat_id IS NULL) и личный профиль (chat_id=0, не NULL: см.
+    `profile_chat_id`). 'group' — этот чат."""
+    if context is None:
+        return "", "", ()
+    if context == "private":
+        return " AND context = 'private' AND chat_id IS NULL", " AND context = 'private' AND chat_id = 0", ()
+    if context == "group" and chat_id is not None:
+        return (" AND context = 'group' AND chat_id = ?", " AND context = 'group' AND chat_id = ?", (int(chat_id),))
+    raise ValueError(f"forget: неизвестная область {context!r}/{chat_id!r}")
+
+
+def forget_scope(user_id: int, context: str | None, chat_id=None) -> dict:
+    """Строки области /forget целиком (для предупреждения, файла-копии и выбора «сувениров»): {memory, user_profile,
+    profile_proposals} — списки dict со ВСЕМИ колонками. Только чтение."""
+    mem_w, prof_w, args = _forget_where(context, chat_id)
+    conn = get_conn()
+    try:
+        out = {"memory": [dict(r) for r in conn.execute(
+            f"SELECT * FROM memory WHERE user_id = ?{mem_w} ORDER BY id", (user_id, *args))]}
+        for tbl in ("user_profile", "profile_proposals"):
+            out[tbl] = [dict(r) for r in conn.execute(
+                f"SELECT * FROM {tbl} WHERE user_id = ?{prof_w} ORDER BY rowid", (user_id, *args))]
+    finally:
+        conn.close()
+    return out
+
+
+def forget_apply(user_id: int, context: str | None, chat_id=None, keep_ids=(), clear_thread: bool = False,
+                 snapshot: dict | None = None) -> int:
+    """/forget: ОДНА транзакция — удаляет РОВНО то, что было в снимке `snapshot` (результат `forget_scope`, он же ушёл в
+    файл-копию), кроме фактов `keep_ids`: факты по `id`, поля профиля по ключу и `updated_at`, предложения по `id`. Строки,
+    появившиеся после снимка (между снимком и удалением идёт запрос к модели — секунды), остаются: их нет в копии, значит,
+    стирать их нельзя. `snapshot=None` — снимок берётся тут же, в этой транзакции. Личный тред — по флагу (в копию не пишется).
+    Оставленные строки не меняются (срок жизни medium прежний). Возвращает число удалённых ФАКТОВ.
+    Инвариант «удаляешь память — чисти профиль» соблюдён здесь так же, как в `clear_memory`."""
+    _forget_where(context, chat_id)   # неизвестная область — ValueError до любой записи
+    keep = {int(i) for i in keep_ids}
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            snap = snapshot
+            if snap is None:
+                mem_w, prof_w, args = _forget_where(context, chat_id)
+                snap = {"memory": [dict(r) for r in conn.execute(f"SELECT id FROM memory WHERE user_id = ?{mem_w}", (user_id, *args))],
+                        "user_profile": [dict(r) for r in conn.execute(
+                            f"SELECT * FROM user_profile WHERE user_id = ?{prof_w}", (user_id, *args))],
+                        "profile_proposals": [dict(r) for r in conn.execute(
+                            f"SELECT id FROM profile_proposals WHERE user_id = ?{prof_w}", (user_id, *args))]}
+            ids = [int(r["id"]) for r in snap["memory"] if int(r["id"]) not in keep]
+            n = 0
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                n += conn.execute(f"DELETE FROM memory WHERE user_id = ? AND id IN ({','.join('?' * len(chunk))})",
+                                  (user_id, *chunk)).rowcount
+            for r in snap["user_profile"]:
+                conn.execute("DELETE FROM user_profile WHERE user_id = ? AND context = ? AND chat_id = ? AND field = ? "
+                             "AND updated_at = ?", (user_id, r["context"], r["chat_id"], r["field"], r["updated_at"]))
+            pids = [int(r["id"]) for r in snap["profile_proposals"]]
+            for i in range(0, len(pids), 500):
+                chunk = pids[i:i + 500]
+                conn.execute(f"DELETE FROM profile_proposals WHERE user_id = ? AND id IN ({','.join('?' * len(chunk))})",
+                             (user_id, *chunk))
+            if clear_thread:
+                conn.execute("DELETE FROM conversations WHERE user_id = ?", (user_id,))
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+    return n
+
+
+def forget_group_summary(user_id: int) -> tuple[int, int]:
+    """(живых групповых фактов человека, в скольких чатах) — для предупреждения в личке: они /forget в личке не стирает."""
+    conn = get_conn()
+    try:
+        r = conn.execute("SELECT COUNT(*), COUNT(DISTINCT chat_id) FROM memory WHERE user_id = ? AND context = 'group' "
+                         "AND (expires_at IS NULL OR expires_at > ?)", (user_id, int(time.time()))).fetchone()
+        return r[0], r[1]
+    finally:
+        conn.close()
+
+
 def get_memory_for_private(user_id: int, long_limit: int = None, medium_limit: int = None) -> list[str]:
     """Чтение памяти для ЛИЧКИ (асимметрия секретности).
 
