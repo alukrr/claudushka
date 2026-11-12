@@ -83,7 +83,7 @@ mock-транспортом в venv, тело запроса содержит о
   записи `MODELS` (у других моделей возвращают `{}`; НЕ через `model_meta` — тот фолбэчит на дефолт и выдал бы чужой
   модели параметры Haiku):
   - `aux_params()` — `thinking={"type":"disabled"}` + `output_config={"effort":"low"}` на ВСЕХ служебных вызовах
-    (should_search, rewrite, translate, media_describe, captcha×2, extract_memory, extract_chat_memory, greet_filter,
+    (should_search, rewrite, translate, media_describe, captcha×2, extract_memory, memory_backfill, extract_chat_memory, greet_filter,
     greet) и в `_probe_model`. `disabled` допустим только на low/medium/high (на xhigh/max — 400).
   - `dialog_params(model)` — `thinking={"type":"adaptive"}` + `effort=HAIKU_DIALOG_EFFORT` (env, дефолт `low`;
     допустимы low/medium/high, иначе warning и `low`) на ответах пользователю: диалог (+аварийная обрезка), фото, файл,

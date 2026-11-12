@@ -533,6 +533,43 @@ def get_conversation_rows(user_id: int, limit: int) -> list[dict]:
     return [{"id": r["id"], "role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
 
+def backfill_threads() -> list[dict]:
+    """Личные треды для первичной обработки памяти (docs/claude/tz-private-memory.md, часть 2), только чтение:
+    [{user_id, rows, max_id}] по возрастанию user_id."""
+    conn = get_conn()
+    rows = conn.execute("SELECT user_id, COUNT(*) AS n, MAX(id) AS mx FROM conversations GROUP BY user_id ORDER BY user_id").fetchall()
+    conn.close()
+    return [{"user_id": r["user_id"], "rows": r["n"], "max_id": r["mx"]} for r in rows]
+
+
+def conversation_chunk(user_id: int, after_id: int, to_id: int, limit: int) -> list[dict]:
+    """Строки треда с id в (after_id, to_id] по ВОЗРАСТАНИЮ id, не больше limit (старые → новые). Для первичной обработки памяти."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, role, content FROM conversations WHERE user_id = ? AND id > ? AND id <= ? ORDER BY id ASC LIMIT ?",
+        (user_id, after_id, to_id, limit)).fetchall()
+    conn.close()
+    return [{"id": r["id"], "role": r["role"], "content": r["content"]} for r in rows]
+
+
+def count_conversation_range(user_id: int, after_id: int, to_id: int) -> int:
+    """Сколько строк треда в (after_id, to_id] — для `dry` первичной обработки."""
+    conn = get_conn()
+    n = conn.execute("SELECT COUNT(*) FROM conversations WHERE user_id = ? AND id > ? AND id <= ?",
+                     (user_id, after_id, to_id)).fetchone()[0]
+    conn.close()
+    return n
+
+
+def usage_label_sum(label: str, chat_id: int, since_ts: int = 0) -> tuple[int, float]:
+    """(число строк, сумма cost_usd) usage_log по метке на чат с момента since_ts — расход первичной обработки."""
+    conn = get_conn()
+    n, cost = conn.execute("SELECT COUNT(*), COALESCE(SUM(cost_usd), 0) FROM usage_log WHERE label = ? AND chat_id = ? AND ts >= ?",
+                           (label, chat_id, since_ts)).fetchone()
+    conn.close()
+    return n, float(cost)
+
+
 def clear_conversation(user_id: int):
     conn = get_conn()
     conn.execute("DELETE FROM conversations WHERE user_id = ?", (user_id,))
