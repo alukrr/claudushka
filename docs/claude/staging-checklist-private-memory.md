@@ -8,6 +8,16 @@
 `docker compose -f docker-compose.test.yml up -d --force-recreate claudushka-test` (новых переменных и volume нет). **Бэкап БД стенда** перед началом.
 Нужны: тестовый бот, личка с ним. `<UID>` — id «тестового человека» (узнать `/id`), в репозиторий и коммиты не писать. Прод, dnd и `edge` не трогать.
 
+## Состояние стенда и что уже проверено (2026-11-12, без Telegram)
+Стенд на `origin/fix/private-memory-extract` @ `4fa4669` (`~/claudushka-test`, контейнер `claudushka-test`, пересоздан `--force-recreate`). Бэкап БД стенда до выкатки:
+`~/claudushka-test/data-test/claudushka.db.bak-pre-privmem-1794518440`. Старт без Traceback. Уже сделано и зелёное:
+- тесты `test_private_memory_cadence.py` на Python 3.12 стенда — 14 passed (файл временно клали в `/app/scripts`, потом удалили);
+- **живой вызов модели через пул** на копии БД стенда (копия удалена), вымышленный человек, 5 пар реплик: `n=10`, `due=True`, `extract_memory` → 4 личных факта
+  (`context=private`, `chat_id=NULL`, `tier=long`) только из реплик человека; выдумки бота («живу на Марсе», «бот-математик») и временное («еду в отпуск») не записаны;
+  предложения профиля `city`, `profession` с `chat_id=0`; `usage_log`: `label=extract_memory`, модель Lite, `chat_id` = чат человека.
+Поэтому шаги 3, 4, 9, 11 по сути подтверждены на модели; **остаётся то, что без живого Telegram не проверить:** шаги 1–2, 5–8, 10, 12–14 (настоящий поток сообщений,
+фото, «нарисуй», `/memory`, dedup TUI, `/clear`).
+
 ## Что можно пройти БЕЗ живого Telegram (делает агент)
 | Что | Как | Ожидание |
 |---|---|---|
