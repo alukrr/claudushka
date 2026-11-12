@@ -8,6 +8,40 @@
 ≥ 6 фактов в группе А, ≥ 3 в группе Б, ≥ 2 личных, пара полей профиля в А и в личке, личный тред. Если фактов мало — набрать через `/memory`-цикл
 или вставить строки в БД стенда. Прод, dnd и `edge` не трогать. Только тестовый бот (токен стенда), токен прода не использовать.
 
+## Состояние стенда и что уже проверено (2026-11-12, без Telegram)
+Стенд поднят на `origin/feat/forget-confirm` @ `c08a795` (worktree `~/claudushka-test`, контейнер `claudushka-test`, бот `@claudushka_test_bot`).
+Бэкап БД стенда до выкатки: `~/claudushka-test/data-test/claudushka.db.bak-pre-forget-1794496395`. Прод, dnd и `edge` не трогались.
+Уже сделано и зелёное (на копии БД стенда в `/tmp` контейнера, потом удалено): тесты `test_forget_confirm.py`, `test_restore_user_memory.py`,
+`test_chat_managers.py`, `test_memory_uid.py` на Python 3.12 рантайма стенда — 101 passed; в логе старта 0 Traceback, `memory_purge` пишет
+«удалено файлов-копий /forget …»; **живой вызов модели через пул**: платный чат → `gemini-4-argon`, `billed=1`, free → `gemini-3.1-flash-lite`,
+`billed=0`, `label=forget`, ответ `{"keep": [..]}` разобран, выбраны два смешных факта, «здоровье», «умерла бабушка» и факт-«инъекция» не выбраны,
+файл-копия с правами 600; возврат `--from-json` (10 фактов, повтор 0); чистка файла старше 30 дней. Поэтому шаги 8 и 12 (часть про модель), 20, 21
+повторять не обязательно — достаточно глянуть, что то же самое видно на настоящем боте. **Остаётся то, что без живого Telegram не проверить:**
+шаги 2–6, 9–11, 13–17, 22, 24 (кнопки, права автора, срок, двойное нажатие, тексты, поведение в группах и личке) и 18 (права на каталог).
+
+## Подготовка данных (один раз)
+1. В тестовой группе А (платная: `/topup <chat_id_А> 5` от админа бота) и Б (free, баланс 0) и в личке с ботом напиши по сообщению, чтобы чаты и ты
+   появились в БД стенда. Узнать свой id и id чата — `/id`.
+2. Набить факты и профиль (подставь `<UID>`, `<A>`, `<B>`; запускать на сервере):
+```bash
+docker exec -i claudushka-test python3 - <<'PY'
+import sqlite3, time
+UID, A, B = <UID>, <A>, <B>
+c = sqlite3.connect('/app/data/claudushka.db'); now = int(time.time())
+def fact(text, chat, i): c.execute("INSERT INTO memory (user_id, fact, context, chat_id, created_at, tier, expires_at) VALUES (?,?,?,?,?,'long',NULL)",
+                                   (UID, text, 'group' if chat else 'private', chat, now - i))
+for i in range(7): fact(f"тест А факт {i}: " + ["любит чай", "держит кота по имени Налоговая", "спорит с тостером", "ездит на велосипеде",
+                                                  "читает инструкции как детективы", "носки по цветам радуги", "боится голубей"][i], A, i)
+for i in range(3): fact(f"тест Б факт {i}", B, i)
+for i in range(2): fact(f"тест личный факт {i}", None, i)
+for ctx, chat in (("group", A), ("group", B), ("private", 0)):
+    c.execute("INSERT OR REPLACE INTO user_profile VALUES (?,?,?,?,?,?,?,?)", (UID, ctx, chat, "city", "Казань", "admin", now, UID))
+    c.execute("INSERT INTO profile_proposals (user_id, context, chat_id, field, new_value, created_at) VALUES (?,?,?,?,?,?)", (UID, ctx, chat, "name", "Тест", now))
+c.commit(); print("ok")
+PY
+```
+   Личный тред появится сам, когда ты напишешь боту в личке. Второй участник (для шага 3) — любой другой аккаунт в группе А.
+
 Числа до: `q "SELECT context, chat_id, tier, COUNT(*) FROM memory WHERE user_id=<UID> GROUP BY 1,2,3"`; `q "SELECT chat_id, COUNT(*) FROM user_profile WHERE user_id=<UID> GROUP BY 1"`;
 `q "SELECT COUNT(*) FROM conversations WHERE user_id=<UID>"`. Записать.
 
