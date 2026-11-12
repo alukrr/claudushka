@@ -162,7 +162,9 @@ effort не задаёт; forced `tool_choice` (`any`/`tool`) → 400 — в к�
   Haiku, срабатывает каждые 10 сообщений и не должно платить по цене Sonnet/Opus).
   `cmd_review` — это ОТВЕТ пользователю (уходит в чат), не служебный вызов, поэтому модель
   чата (`get_chat_model`). `daily_chat_review` с ТЗ v0.10 — ОСОЗНАННОЕ исключение: всегда Opus
-  (`DAILY_REVIEW_MODEL_ID`), платная фича paid-групп (`docs/claude/billing.md`). Не хардкодить
+  (`DAILY_REVIEW_MODEL_ID`), платная фича paid-групп (`docs/claude/billing.md`). **Второе осознанное исключение (v2.13.0):** выбор «сувениров»
+  `/forget` (`pick_forget_keepsakes`, `docs/claude/memory.md` → «`/forget`») — в платном чате Argon (`FORGET_PICK_MODEL_ID` рядом с
+  `DAILY_REVIEW_MODEL_ID`, модель чата не учитывается), в free `DEFAULT_MODEL_ID`; `label="forget"`. Не хардкодить
   `MODELS["..."]["id"]` в новых вызовах — служебный вызов берёт `DEFAULT_MODEL_ID`,
   ответ пользователю — `get_chat_model(chat_id)`. Исключение — `_probe_model`: он по
   своей природе обязан тестировать ИМЕННО ту модель, на которую переключаются

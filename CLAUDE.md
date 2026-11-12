@@ -67,7 +67,7 @@
 - Профиль участника (`user_profile`, `profile_proposals`, `_profile_text`, `profile_updates`, `send_profile_digest`,
   `/profile` `/profile_ok` `/profile_no` `/profile_digest`, экран «Профили» в dedup TUI) — `docs/claude/profile.md`
 - Память (`memory`-таблица, `extract_memory`, `extract_all_participants_memory`,
-  `/memory`, `/memory_full`, `/forget`, метки участников `P1…` в групповом извлечении) — `docs/claude/memory.md`; ТЗ — `docs/claude/tz-memory-uid.md`; чек-лист стенда — `docs/claude/staging-checklist-memory-uid.md`; восстановление после `/forget` из копии базы (`scripts/restore_user_memory.py`, сделано 2026-11-12; раздел «Восстановление после `/forget`» в `docs/claude/memory.md`, ТЗ `docs/claude/tz-forget-restore.md`); ТЗ «`/forget` с подтверждением, в пределах чата, `/forget all`» — `docs/claude/tz-forget-confirm.md` (не сделано)
+  `/memory`, `/memory_full`, `/forget` (подтверждение кнопками, `on_forget_button`, `forget_apply`, `pick_forget_keepsakes`, `FORGET_*`), метки участников `P1…` в групповом извлечении) — `docs/claude/memory.md`; ТЗ — `docs/claude/tz-memory-uid.md`; чек-лист стенда — `docs/claude/staging-checklist-memory-uid.md`; восстановление после `/forget` из копии базы (`scripts/restore_user_memory.py`, сделано 2026-11-12; раздел «Восстановление после `/forget`» в `docs/claude/memory.md`, ТЗ `docs/claude/tz-forget-restore.md`); ТЗ «`/forget` с подтверждением, в пределах чата, `/forget all`» — `docs/claude/tz-forget-confirm.md` (реализовано в `feat/forget-confirm`, до стенда и тега не закрыто; чек-лист — `docs/claude/staging-checklist-forget-confirm.md`; раздел «`/forget`» в `docs/claude/memory.md`)
 - Режим разработчика в платной личке (`dev_mode_active`, `handle_dev_message`, `_dev_answer`, `/dev`, `/ws`, `ws_*`, `DEV_*`,
   workspace `data/devspace/`, таблицы `dev_mode`/`dev_messages`) — `docs/claude/dev-mode.md`; ТЗ — `docs/claude/tz-dev-mode.md`;
   чек-лист стенда `feat/dev-mode` — `docs/claude/staging-checklist-dev-mode.md`
@@ -172,8 +172,8 @@
   только `DEFAULT_MODEL_ID` (Lite), ВСЕГДА с `**aux_params()` и `max_tokens=out_tokens(DEFAULT_MODEL_ID, N)` (Lite/Flash
   думают, рассуждения съедят малый лимит и ответ придёт пустым); ответы пользователю — `get_chat_model(chat_id)` с
   `**dialog_params(model)` и `out_tokens(...)`.
-  `MODELS["..."]["id"]` в новых вызовах не хардкодить (единственное сознательное исключение —
-  `daily_chat_review` на Argon, платная фича). `docs/claude/models-and-costs.md`.
+  `MODELS["..."]["id"]` в новых вызовах не хардкодить (сознательные исключения — два:
+  `daily_chat_review` на Argon, платная фича, и выбор «сувениров» `/forget` на Argon в paid-чате, `FORGET_PICK_MODEL_ID`, label `forget`). `docs/claude/models-and-costs.md`.
 - Начало запроса к модели (system) — СТАТИЧНО: изменчивое (время, результаты поиска, reply-контекст)
   только в `service_block` последнего user-turn, не в system, и не в БД. Система собирается через
   `build_system` (блоки с `cache_control`), длина — `system_chars`, не `len`. Окно истории — шагами

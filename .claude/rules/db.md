@@ -10,7 +10,7 @@ paths: ["db.py"]
 ## Таблицы и где искать их семантику
 db.py используется отовсюду, поэтому полная семантика каждой таблицы описана в
 тематическом файле её фичи, а не здесь:
-- `memory` — `docs/claude/memory.md`
+- `memory` — `docs/claude/memory.md`; `/forget` (v2.13.0): `forget_scope(user_id, context, chat_id)` — строки области только на чтение, `forget_apply(user_id, context, chat_id, keep_ids, clear_thread)` — ОДНА транзакция `BEGIN IMMEDIATE` (факты области кроме `keep_ids`, профиль и предложения области, по флагу личный тред; `context=None` — всё везде), `forget_group_summary` (счёт треда — уже существовавшая `count_conversation`); `clear_memory` остаётся (профиль чистит тоже)
 - `user_profile`, `profile_proposals` (профиль участника, `chat_id=0` для лички) — `docs/claude/profile.md`
 - `group_messages` (в т.ч. `is_bot`, `hidden`), `chat_rate_limits` — `docs/claude/group-chat.md`; `hidden=1` и функции
   `hide_group_messages`/`unhide_group_message`/`list_hidden_group_messages` (без текста)/`group_message_ids_with_same_content` —
