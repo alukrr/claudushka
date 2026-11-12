@@ -6,11 +6,13 @@
 
   python3 scripts/restore_user_memory.py --from-db data/backups/<копия>.db --user-id N            # отчёт, ничего не пишет
   sudo python3 scripts/restore_user_memory.py --from-db <копия> --user-id N [--chat-id C] --apply  # записать
+  sudo python3 scripts/restore_user_memory.py --from-json data/forget-backups/<uid>-<unix>.json --user-id N [--apply]   # из копии /forget
 
 Слияние, не замена: из копии добавляются только факты, которых в боевой базе нет по (user_id, context, chat_id, fact),
 и только непросроченные; поля профиля — INSERT OR IGNORE (существующее не перезаписывается). Тексты фактов не печатаются.
 """
 import argparse
+import json
 import sqlite3
 import sys
 import time
@@ -30,6 +32,28 @@ def _open_source(path: Path) -> sqlite3.Connection:
     c = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
     c.row_factory = sqlite3.Row
     return c
+
+
+def _source_from_json(path: Path, user_id: int, dst: sqlite3.Connection) -> sqlite3.Connection:
+    """Файл-копия /forget (data/forget-backups/<uid>-<unix>.json, пишет bot.py `_write_forget_backup`) -> временная база в памяти
+    с теми же таблицами memory и user_profile, дальше правила слияния те же. profile_proposals из файла не возвращаем."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise RestoreError(f"файл-копия не читается: {path} ({type(e).__name__}: {e})") from e
+    if not isinstance(data, dict) or not isinstance(data.get("memory"), list) or not isinstance(data.get("user_profile"), list):
+        raise RestoreError(f"это не файл-копия /forget: {path}")
+    if data.get("user_id") != user_id:
+        raise RestoreError("user_id в файле-копии не совпадает с --user-id")
+    src = sqlite3.connect(":memory:")
+    src.row_factory = sqlite3.Row
+    for t in TABLES:
+        rows = data[t]
+        cols = list(rows[0]) if rows else _cols(dst, t)   # пустая таблица — колонки боевой: схема-проверка не помешает
+        src.execute(f"CREATE TABLE {t} ({', '.join(cols)})")
+        src.executemany(f"INSERT INTO {t} ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                        [tuple(r.get(c) for c in cols) for r in rows])
+    return src
 
 
 def _open_prod_ro(path: Path) -> sqlite3.Connection:
@@ -117,16 +141,19 @@ def _backup(dst_path: Path, backup_dir: Path) -> Path:
     return path
 
 
-def run(from_db: Path, db: Path, user_id: int, chat_id=None, apply: bool = False,
-        backup_dir: Path | None = None, now: int | None = None) -> dict:
+def run(from_db: Path | None, db: Path, user_id: int, chat_id=None, apply: bool = False,
+        backup_dir: Path | None = None, now: int | None = None, from_json: Path | None = None) -> dict:
     now = int(time.time()) if now is None else now
-    for p, name in ((from_db, "копия"), (db, "боевая база")):
+    if (from_db is None) == (from_json is None):
+        raise RestoreError("нужен ровно один источник: --from-db или --from-json")
+    for p, name in ((from_db or from_json, "копия"), (db, "боевая база")):
         if not Path(p).is_file():
             raise RestoreError(f"{name} не найдена: {p}")
-    src = _open_source(Path(from_db))
+    src = None
     try:
         dst = _open_prod_ro(Path(db))
         try:
+            src = _open_source(Path(from_db)) if from_db else _source_from_json(Path(from_json), user_id, dst)
             cols = check_schema(src, dst)
             rep = plan(src, dst, user_id, chat_id, now, cols)
         finally:
@@ -158,7 +185,8 @@ def run(from_db: Path, db: Path, user_id: int, chat_id=None, apply: bool = False
         final["backup"], final["applied"] = rep["backup"], True
         return final
     finally:
-        src.close()
+        if src is not None:
+            src.close()
 
 
 def _ids(ids: list) -> str:
@@ -191,14 +219,16 @@ def print_report(rep: dict, file=None) -> None:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--from-db", required=True, type=Path, help="копия базы, из которой возвращаем")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--from-db", type=Path, help="копия базы, из которой возвращаем")
+    src.add_argument("--from-json", type=Path, help="файл-копия /forget (data/forget-backups/<uid>-<unix>.json)")
     ap.add_argument("--db", type=Path, default=DEFAULT_DB, help="боевая база (по умолчанию data/claudushka.db)")
     ap.add_argument("--user-id", required=True, type=int)
     ap.add_argument("--chat-id", type=int, default=None, help="вернуть только этот чат")
     ap.add_argument("--apply", action="store_true", help="записать (без флага — только отчёт)")
     a = ap.parse_args(argv)
     try:
-        rep = run(a.from_db, a.db, a.user_id, a.chat_id, a.apply)
+        rep = run(a.from_db, a.db, a.user_id, a.chat_id, a.apply, from_json=a.from_json)
     except RestoreError as e:
         print(f"Ошибка: {e}", file=sys.stderr)
         return 1
