@@ -158,7 +158,7 @@ def test_command_in_group_sends_warning_and_deletes_nothing(env):
     fill(U, 6)
     add_profile(U, G1)
     (text, kb), = cmd(U, G1, "supergroup")
-    assert "в этом чате: 6 фактов и профиль" in text and "ТОЧНО СТИРАЕМ" in text
+    assert "в этом чате (фактов: 6), и профиль" in text and "ТОЧНО СТИРАЕМ" in text
     btns = [b for row in kb.inline_keyboard for b in row]
     assert [b.text for b in btns] == ["Да, стереть", "Отмена"]
     assert all(len(b.callback_data.encode()) <= 64 for b in btns)
@@ -172,7 +172,7 @@ def test_command_private_mentions_group_facts(env):
     fill(U, 2, G2)
     db.save_message(U, "user", "привет")
     (text, kb), = cmd(U, U, "private")
-    assert "1 фактов, профиль и нашу переписку" in text and "5 фактов в 2 чатах" in text and "/forget all" in text
+    assert "из лички (фактов: 1), профиль и нашу переписку" in text and "(фактов: 5, чатов: 2)" in text and "/forget all" in text
     assert kb.inline_keyboard[0][0].callback_data.startswith(f"fg:go:c:{U}:")
 
 
@@ -181,7 +181,7 @@ def test_command_all_text_and_group_refusal(env):
     fill(U, 2, G1)
     fill(U, 1, G2)
     (text, kb), = cmd(U, U, "private", ["all"])
-    assert "ВООБЩЕ ВСЁ" in text and "4 фактов в личке и 2 чатах" in text and "ничего" in text
+    assert "ВООБЩЕ ВСЁ" in text and "(фактов: 4, чатов: 2)" in text and "ничего" in text
     assert kb.inline_keyboard[0][0].callback_data.startswith(f"fg:go:a:{U}:")
     (text, kb), = cmd(U, G1, "supergroup", ["all"])
     assert "только в личке" in text and kb is None
@@ -563,3 +563,87 @@ def test_texts_and_registration(env):
     src = Path(bot.__file__).read_text(encoding="utf-8")
     assert 'CallbackQueryHandler(on_forget_button, pattern=r"^fg:")' in src
     assert "/forget all" in bot.USER_HELP
+
+
+# ---- снимок: удаляется только то, что попало в файл-копию ----
+
+def test_forget_apply_deletes_only_snapshot_rows(env):
+    old = fill(U, 3)
+    add_profile(U, G1, "city", "Казань")
+    snap = db.forget_scope(U, "group", G1)
+    late = add_fact(U, "появился после снимка")
+    add_profile(U, G1, "name", "Новое")   # поле, которого в снимке не было
+    c = db.get_conn()
+    c.execute("INSERT INTO profile_proposals (user_id, context, chat_id, field, new_value, created_at) VALUES (?,?,?,?,?,1)",
+              (U, "group", G1, "hobbies", "поздно"))
+    c.commit()
+    c.close()
+    n = db.forget_apply(U, "group", G1, [], False, snap)
+    assert n == 3 and facts(U) == ["появился после снимка"]
+    c = db.get_conn()
+    left = c.execute("SELECT field FROM user_profile WHERE user_id=?", (U,)).fetchall()
+    props = c.execute("SELECT field FROM profile_proposals WHERE user_id=? ORDER BY id", (U,)).fetchall()
+    c.close()
+    assert [r[0] for r in left] == ["name"] and [r[0] for r in props] == ["name", "hobbies"] and late not in old   # add_profile кладёт и предложение
+
+
+def test_fact_added_during_model_call_survives_button(env, model):
+    fill(U, 6)
+
+    async def slow(**kw):
+        add_fact(U, "добавлен пока думала модель")   # между снимком и удалением идёт вызов модели
+        return SimpleNamespace(model=kw["model"], content=[SimpleNamespace(type="text", text='{"keep": [1, 2]}')],
+                               stop_reason="end_turn", usage=SimpleNamespace(input_tokens=1, output_tokens=1))
+    bot.aux_create = slow
+    try:
+        q = press(Q(go("c"), U, G1, "supergroup"))
+    finally:
+        bot.aux_create = None
+    left = facts(U)
+    assert "добавлен пока думала модель" in left and len(left) == 3   # два «сувенира» + новый факт
+    files = list((env.tmp / "fb").glob(f"{U}-*.json"))
+    in_file = [m["fact"] for m in json.loads(files[0].read_text(encoding="utf-8"))["memory"]]
+    assert "добавлен пока думала модель" not in in_file and len(in_file) == 6   # в файле и не было — значит, и стирать нельзя
+    assert q.edits[0].startswith("Почти всё забыла")
+
+
+def test_forget_apply_without_snapshot_takes_one_in_transaction(env):
+    fill(U, 3)
+    fill(U, 2, G2)
+    assert db.forget_apply(U, "group", G1) == 3 and len(facts(U, G2)) == 2
+
+
+# ---- без склонения ----
+
+def test_counts_without_declension(env):
+    add_fact(U, "один", G1)
+    (text, kb), = cmd(U, G1, "supergroup")
+    assert "фактов: 1" in text and "1 фактов" not in text
+    add_fact(U, "личный", chat=None)
+    (text, kb), = cmd(U, U, "private", ["all"])
+    assert "фактов: 2, чатов: 1" in text and " фактов в " not in text and " чатах" not in text
+
+
+# ---- остались только просроченные строки ----
+
+def test_only_expired_rows_means_nothing_to_forget(env, model):
+    add_fact(U, "протух-1", G1, tier="medium", exp=NOW - 100)
+    add_fact(U, "протух-2", G1, tier="medium", exp=NOW - 5)
+    add_fact(U, "другой чат", G2)
+    (text, kb), = cmd(U, G1, "supergroup")
+    assert text == bot.FORGET_NOTHING and kb is None
+    assert facts(U, G1) == [] and facts(U, G2) == ["другой чат"]   # просроченные стёрты молча, чужой чат цел
+    assert not (env.tmp / "fb").exists() and model.model_calls == []
+
+
+def test_only_expired_rows_button_press_says_nothing_to_forget(env, model):
+    add_fact(U, "протух", G1, tier="medium", exp=NOW - 100)
+    q = press(Q(go("c"), U, G1, "supergroup"))
+    assert q.edits == [bot.FORGET_NOTHING] and facts(U, G1) == [] and not (env.tmp / "fb").exists() and model.model_calls == []
+
+
+def test_expired_rows_with_profile_still_get_warning(env):
+    add_fact(U, "протух", G1, tier="medium", exp=NOW - 100)
+    add_profile(U, G1)
+    (text, kb), = cmd(U, G1, "supergroup")
+    assert "фактов: 0" in text and kb is not None and facts(U, G1) == ["протух"]   # есть профиль — это не «нечего забывать»

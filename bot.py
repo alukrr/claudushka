@@ -6702,13 +6702,13 @@ async def cmd_memory_full(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "Я помню о тебе (полный список):", "/memory_full")
 
 
-FORGET_TEXT_GROUP = ("⚠️ СТОП. Сейчас я сотру всё, что помню о тебе в этом чате: {n} фактов и профиль. "
+FORGET_TEXT_GROUP = ("⚠️ СТОП. Сейчас я сотру всё, что помню о тебе в этом чате (фактов: {n}), и профиль. "
                      "Назад дороги не будет. ТОЧНО СТИРАЕМ?")
-FORGET_TEXT_PRIVATE = ("⚠️ СТОП. Сейчас я сотру всё из лички: {n} фактов, профиль и нашу переписку. Назад дороги не будет."
+FORGET_TEXT_PRIVATE = ("⚠️ СТОП. Сейчас я сотру всё из лички (фактов: {n}), профиль и нашу переписку. Назад дороги не будет."
                        "{groups} Стереть вообще всё и везде — /forget all. ТОЧНО СТИРАЕМ?")
-FORGET_TEXT_PRIVATE_GROUPS = (" То, что я узнала о тебе в группах ({m} фактов в {k} чатах), останется, "
+FORGET_TEXT_PRIVATE_GROUPS = (" То, что я узнала о тебе в группах (фактов: {m}, чатов: {k}), останется, "
                               "и здесь я это по-прежнему вижу.")
-FORGET_TEXT_ALL = ("⚠️ СТОП. Сейчас я сотру ВООБЩЕ ВСЁ о тебе: {n} фактов в личке и {k} чатах, профили, переписку. "
+FORGET_TEXT_ALL = ("⚠️ СТОП. Сейчас я сотру ВООБЩЕ ВСЁ о тебе (фактов: {n}, чатов: {k}), профили, переписку. "
                    "На память не оставлю ничего. Назад дороги не будет. ТОЧНО СТИРАЕМ?")
 FORGET_DONE_KEPT = ("Почти всё забыла. Два факта оставила на память — уж больно хороши:\n{facts}\n"
                     "Стереть совсем всё и везде можно в личке: /forget all.")
@@ -6846,7 +6846,9 @@ async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = int(time.time())
     n = sum(1 for f in scope["memory"] if _fact_live(f, now))
     thread = 0 if is_group else await asyncio.to_thread(db.count_conversation, uid)
-    if not (scope["memory"] or scope["user_profile"] or scope["profile_proposals"] or thread):
+    if not (n or scope["user_profile"] or scope["profile_proposals"] or thread):
+        if scope["memory"]:   # остались только просроченные строки — стираем молча, пользователю они не видны
+            await asyncio.to_thread(db.forget_apply, uid, ctx, chat.id if is_group else None, [], False, scope)
         text = FORGET_NOTHING
         if not is_group and kind == "c" and (await asyncio.to_thread(db.forget_group_summary, uid))[0]:
             text += FORGET_NOTHING_HINT
@@ -6922,7 +6924,9 @@ async def on_forget_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         scope = await asyncio.to_thread(db.forget_scope, uid, ctx, scope_chat)
         now = int(time.time())
         thread = 0 if is_group else await asyncio.to_thread(db.count_conversation, uid)
-        if not (scope["memory"] or scope["user_profile"] or scope["profile_proposals"] or thread):
+        if not (any(_fact_live(f, now) for f in scope["memory"]) or scope["user_profile"] or scope["profile_proposals"] or thread):
+            if scope["memory"]:   # только просроченные строки — стираем молча (копия не нужна: пользователь их не видит)
+                await asyncio.to_thread(db.forget_apply, uid, ctx, scope_chat, [], False, scope)
             await _forget_edit(q, FORGET_NOTHING)
             return
         await asyncio.to_thread(_write_forget_backup, uid, kind, ctx, scope_chat, scope)
@@ -6937,7 +6941,7 @@ async def on_forget_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keep = await pick_forget_keepsakes(chat_id, live)
         pick_failed = not keep
     try:
-        deleted = await asyncio.to_thread(db.forget_apply, uid, ctx, scope_chat, [f["id"] for f in keep], not is_group)
+        deleted = await asyncio.to_thread(db.forget_apply, uid, ctx, scope_chat, [f["id"] for f in keep], not is_group, scope)
     except Exception:
         logger.exception(f"forget: удаление не удалось uid={uid} chat={chat_id}")
         await _forget_edit(q, FORGET_FAIL)

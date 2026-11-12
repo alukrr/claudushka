@@ -1026,20 +1026,42 @@ def forget_scope(user_id: int, context: str | None, chat_id=None) -> dict:
     return out
 
 
-def forget_apply(user_id: int, context: str | None, chat_id=None, keep_ids=(), clear_thread: bool = False) -> int:
-    """/forget: ОДНА транзакция — факты области, кроме `keep_ids`, плюс профиль и предложения области (и личный тред при
-    `clear_thread`). Оставленные строки не меняются (срок жизни medium прежний). Возвращает число удалённых ФАКТОВ.
+def forget_apply(user_id: int, context: str | None, chat_id=None, keep_ids=(), clear_thread: bool = False,
+                 snapshot: dict | None = None) -> int:
+    """/forget: ОДНА транзакция — удаляет РОВНО то, что было в снимке `snapshot` (результат `forget_scope`, он же ушёл в
+    файл-копию), кроме фактов `keep_ids`: факты по `id`, поля профиля по ключу и `updated_at`, предложения по `id`. Строки,
+    появившиеся после снимка (между снимком и удалением идёт запрос к модели — секунды), остаются: их нет в копии, значит,
+    стирать их нельзя. `snapshot=None` — снимок берётся тут же, в этой транзакции. Личный тред — по флагу (в копию не пишется).
+    Оставленные строки не меняются (срок жизни medium прежний). Возвращает число удалённых ФАКТОВ.
     Инвариант «удаляешь память — чисти профиль» соблюдён здесь так же, как в `clear_memory`."""
-    mem_w, prof_w, args = _forget_where(context, chat_id)
-    keep = sorted({int(i) for i in keep_ids})
+    _forget_where(context, chat_id)   # неизвестная область — ValueError до любой записи
+    keep = {int(i) for i in keep_ids}
     conn = get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            skip = f" AND id NOT IN ({','.join('?' * len(keep))})" if keep else ""
-            n = conn.execute(f"DELETE FROM memory WHERE user_id = ?{mem_w}{skip}", (user_id, *args, *keep)).rowcount
-            for tbl in ("user_profile", "profile_proposals"):
-                conn.execute(f"DELETE FROM {tbl} WHERE user_id = ?{prof_w}", (user_id, *args))
+            snap = snapshot
+            if snap is None:
+                mem_w, prof_w, args = _forget_where(context, chat_id)
+                snap = {"memory": [dict(r) for r in conn.execute(f"SELECT id FROM memory WHERE user_id = ?{mem_w}", (user_id, *args))],
+                        "user_profile": [dict(r) for r in conn.execute(
+                            f"SELECT * FROM user_profile WHERE user_id = ?{prof_w}", (user_id, *args))],
+                        "profile_proposals": [dict(r) for r in conn.execute(
+                            f"SELECT id FROM profile_proposals WHERE user_id = ?{prof_w}", (user_id, *args))]}
+            ids = [int(r["id"]) for r in snap["memory"] if int(r["id"]) not in keep]
+            n = 0
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                n += conn.execute(f"DELETE FROM memory WHERE user_id = ? AND id IN ({','.join('?' * len(chunk))})",
+                                  (user_id, *chunk)).rowcount
+            for r in snap["user_profile"]:
+                conn.execute("DELETE FROM user_profile WHERE user_id = ? AND context = ? AND chat_id = ? AND field = ? "
+                             "AND updated_at = ?", (user_id, r["context"], r["chat_id"], r["field"], r["updated_at"]))
+            pids = [int(r["id"]) for r in snap["profile_proposals"]]
+            for i in range(0, len(pids), 500):
+                chunk = pids[i:i + 500]
+                conn.execute(f"DELETE FROM profile_proposals WHERE user_id = ? AND id IN ({','.join('?' * len(chunk))})",
+                             (user_id, *chunk))
             if clear_thread:
                 conn.execute("DELETE FROM conversations WHERE user_id = ?", (user_id,))
             conn.commit()
