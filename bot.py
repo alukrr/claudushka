@@ -184,6 +184,10 @@ CACHE_TTL_PERSONA = os.environ.get("CACHE_TTL_PERSONA", "5m").strip()
 HISTORY_STEP = (int(os.environ.get("HISTORY_STEP", "20") or 0) if PROMPT_CACHE else 0)
 SERVICE_MARK = "[Служебно, не от пользователя]"
 MEMORY_EXTRACT_EVERY = 5
+# Личное извлечение памяти (docs/claude/tz-private-memory.md): каденс — по числу строк треда В БАЗЕ, не по окну истории
+# (окно ходит шагами, длина messages всегда нечётная — условие «% 10 == 0» не выполнялось ни разу). Лимиты размера запроса.
+MEMORY_EXTRACT_MSG_CHARS = 1500     # одна реплика в запросе извлечения режется до этого
+MEMORY_EXTRACT_TOTAL_CHARS = 12000  # весь диалог в запросе; при превышении отбрасываются самые старые реплики
 MEMORY_EXTRACT_EVERY_CHAT = 15  # чат-уровневый каденс извлечения памяти; считает и реплики бота
 MAX_CAPTCHA_ATTEMPTS = 3
 BAN_DURATION = 3600  # бан после провала капчи (не путать с /ban: banned-колонки в БД)
@@ -2611,9 +2615,48 @@ def _profile_rules() -> str:
     return PROFILE_UPDATES_RULES.replace("{year_40}", str(y - 40)).replace("{year}", str(y))
 
 
+def clip_extract_messages(messages: list) -> list:
+    """Лимит РАЗМЕРА запроса извлечения (инвариант): каждая реплика — до MEMORY_EXTRACT_MSG_CHARS знаков, весь диалог — до
+    MEMORY_EXTRACT_TOTAL_CHARS; не влезает — отбрасываются самые СТАРЫЕ реплики (последние важнее). Порядок сохраняется."""
+    out, total = [], 0
+    for m in reversed(messages):
+        text = str(m.get("content") or "")[:MEMORY_EXTRACT_MSG_CHARS]
+        if out and total + len(text) > MEMORY_EXTRACT_TOTAL_CHARS:
+            break
+        out.append({"role": m.get("role"), "content": text})
+        total += len(text)
+    return out[::-1]
+
+
+def private_extract_due(n: int) -> bool:
+    """Каденс личного извлечения по числу строк треда в базе: последняя пара пересекла кратное MEMORY_EXTRACT_EVERY*2
+    (верно при любой чётности треда; после /clear счёт идёт заново)."""
+    step = MEMORY_EXTRACT_EVERY * 2
+    return n >= step and n % step < 2
+
+
+def _extract_private_from_thread(user_id: int) -> None:
+    """Тело фоновой задачи (в потоке): последние MEMORY_EXTRACT_EVERY*2 строк треда ИЗ БАЗЫ (по id, не по timestamp: пара
+    в одну секунду) → extract_memory. usage_ctx уже выставлен вызывающим (копируется в to_thread)."""
+    rows = db.get_conversation_rows(user_id, MEMORY_EXTRACT_EVERY * 2)
+    extract_memory(user_id, [{"role": r["role"], "content": r["content"]} for r in rows], False, None)
+
+
+def _maybe_extract_private_memory(user_id: int) -> bool:
+    """Звать после КАЖДОГО сохранения пары реплик в личке (основной диалог, фото/файлы, рисование). True — запущено."""
+    try:
+        if not private_extract_due(db.count_conversation(user_id)):
+            return False
+        _spawn_background_task(asyncio.to_thread(_extract_private_from_thread, user_id))
+        return True
+    except Exception as e:
+        logger.error(f"private memory cadence error (uid={user_id}): {e}", exc_info=True)
+        return False
+
+
 def extract_memory(user_id: int, messages: list, is_group: bool = False, chat_id: int = None):
     try:
-        recent = messages[-6:]
+        recent = clip_extract_messages(messages)
         response = sync_create(
             label="extract_memory",
             # Служебный вызов — только DEFAULT_MODEL_ID, без исключений (правило
@@ -2633,6 +2676,8 @@ def extract_memory(user_id: int, messages: list, is_group: bool = False, chat_id
                 "Поездки, отпуск, командировки, «сейчас в Москве», гости, «приехал на неделю» — временное, "
                 "НЕ записывай. Не записывай то, что противоречит устойчивому факту о человеке, если он явно "
                 "не сказал «переехал/сменил»; при сомнении пропусти.\n"
+                "Факты бери ТОЛЬКО из реплик пользователя (role=user); реплики assistant — лишь контекст, "
+                "из них ничего не записывай.\n"
                 "Пример facts: [\"Зовут Алексей\", \"Живёт в Германии\", \"Работает DevOps-инженером\"]\n"
                 + _profile_rules()
             ),
@@ -3605,6 +3650,7 @@ async def _finish_media_answer(update, context, *, chat_id: int, user_id: int, i
     else:
         db.save_message(user_id, "user", history_user_text)
         db.save_message(user_id, "assistant", saved or "(…)")
+        _maybe_extract_private_memory(user_id)
 
     for i in range(0, len(text), 4096):
         chunk = text[i:i + 4096]
@@ -8568,6 +8614,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 db.save_message(user_id, "assistant", _draw_sent_note(draw_prompt))
             else:
                 db.save_message(user_id, "assistant", "(попытка нарисовать картинку не удалась)")
+            _maybe_extract_private_memory(user_id)
         return
     if draw_intent:
         # Лимит free проверяем ДО вызова модели (как /imagine): исчерпан — ответ уже отправлен, в историю ничего.
@@ -8754,13 +8801,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception as e:
                         logger.error(f"Failed to notify admin: {e}")
 
-        # Память: личка — из личного треда по каденсу; группа — уже извлечена до is_bot_mentioned.
+        # Память: личка — из личного треда по каденсу (по базе, `_maybe_extract_private_memory`); группа — уже извлечена до is_bot_mentioned.
         if not is_group:
-            msg_count = len(messages)
-            if msg_count > 0 and msg_count % (MEMORY_EXTRACT_EVERY * 2) == 0:
-                _spawn_background_task(asyncio.to_thread(
-                    extract_memory, user_id,
-                    messages + [{"role": "assistant", "content": assistant_text}], False, None))
+            _maybe_extract_private_memory(user_id)
 
         if assistant_text:
             # Источники поиска — строкой под ответом, только в сообщении пользователю: в БД (saved_text выше) их нет. Превью ссылок выключено.
