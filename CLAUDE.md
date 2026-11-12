@@ -67,7 +67,7 @@
 - Профиль участника (`user_profile`, `profile_proposals`, `_profile_text`, `profile_updates`, `send_profile_digest`,
   `/profile` `/profile_ok` `/profile_no` `/profile_digest`, экран «Профили» в dedup TUI) — `docs/claude/profile.md`
 - Память (`memory`-таблица, `extract_memory`, `extract_all_participants_memory`,
-  `/memory`, `/memory_full`, `/forget`, метки участников `P1…` в групповом извлечении) — `docs/claude/memory.md`; ТЗ — `docs/claude/tz-memory-uid.md`; чек-лист стенда — `docs/claude/staging-checklist-memory-uid.md`; ТЗ «вернуть память после `/forget`» (`scripts/restore_user_memory.py`) — `docs/claude/tz-forget-restore.md`; ТЗ «`/forget` с подтверждением, в пределах чата, `/forget all`» — `docs/claude/tz-forget-confirm.md` (оба не сделаны)
+  `/memory`, `/memory_full`, `/forget`, метки участников `P1…` в групповом извлечении) — `docs/claude/memory.md`; ТЗ — `docs/claude/tz-memory-uid.md`; чек-лист стенда — `docs/claude/staging-checklist-memory-uid.md`; восстановление после `/forget` из копии базы (`scripts/restore_user_memory.py`, сделано 2026-11-12; раздел «Восстановление после `/forget`» в `docs/claude/memory.md`, ТЗ `docs/claude/tz-forget-restore.md`); ТЗ «`/forget` с подтверждением, в пределах чата, `/forget all`» — `docs/claude/tz-forget-confirm.md` (не сделано)
 - Режим разработчика в платной личке (`dev_mode_active`, `handle_dev_message`, `_dev_answer`, `/dev`, `/ws`, `ws_*`, `DEV_*`,
   workspace `data/devspace/`, таблицы `dev_mode`/`dev_messages`) — `docs/claude/dev-mode.md`; ТЗ — `docs/claude/tz-dev-mode.md`;
   чек-лист стенда `feat/dev-mode` — `docs/claude/staging-checklist-dev-mode.md`
