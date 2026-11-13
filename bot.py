@@ -2729,8 +2729,8 @@ MEMORY_BACKFILL_CHUNK = 20
 MEMORY_BACKFILL_PAUSE = 1.0           # между вызовами, с — бот в это время отвечает людям
 MEMORY_BACKFILL_REPORT_EVERY = 50     # отчёт админу каждые N вызовов
 MEMORY_BACKFILL_MAX_ERRORS = 3        # столько ошибок модели подряд — остановиться
-MEMORY_BACKFILL_EST_SEC = 1.5         # оценка времени одного вызова (без паузы) для `dry`; замер на стенде 2026-11-13: 0.8–1.8 с, среднее ≈ 1.3 с
-MEMORY_BACKFILL_EST_COST = 0.0006     # оценка цены одного вызова (20 строк, Lite), $, пока нет своих строк в usage_log; замер: ≈ $0.0006
+MEMORY_BACKFILL_EST_SEC = 1.2         # оценка времени одного вызова (без паузы) для `dry`; полный прогон на стенде 2026-11-13: 205 вызовов за 426 с ⇒ ≈ 1.1 с + пауза
+MEMORY_BACKFILL_EST_COST = 0.0007     # оценка цены одного вызова (Lite), $, пока нет своих строк в usage_log; полный прогон на стенде: $0.1473 / 205 ≈ $0.00072
 MEMORY_BACKFILL_FILE = DATA_DIR / "memory_backfill.json"
 _backfill_run: dict = {}              # {"task", "stop"} — одна обработка одновременно
 
