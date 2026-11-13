@@ -10,11 +10,13 @@
 Факты хранятся в таблице `memory` (`context` + `chat_id` + `tier` + `expires_at`):
 - `context='private', chat_id=NULL` — сказано боту в личке.
 - `context='group', chat_id=<id>` — узнано в конкретной группе.
+- **Что ещё делает `memory_purge_job`:** отдельными `try` (сбой одного не мешает другим) — просроченные факты, копии `/forget` старше 30 дней,
+  копии базы старше 14 дней (`purge_old_db_backups`: три свежие остаются; `docs/claude/staging.md`, ТЗ `docs/claude/tz-backup-purge.md`).
 - `tier='long'`, `expires_at=NULL` — долгосрочные факты (не протухают).
 - `tier='medium'`, `expires_at=<unix+7d>` — среднесрочные, TTL 7 дней. Автоматически исключаются из выборок после истечения.
 - **Просроченные строки удаляются** (`db.purge_expired_memory()`: `DELETE ... WHERE expires_at IS NOT NULL
   AND expires_at <= now`; long не трогается): раз в сутки в 04:30 Berlin (`memory_purge_job`, имя джоба
-  `memory_purge`) и один раз на старте бота (фоном, `_spawn_background_task`). До v1.4.3 их не удалял никто —
+  `memory_purge`; тем же джобом — копии `/forget` и копии базы, см. ниже) и один раз на старте бота (фоном, `_spawn_background_task`). До v1.4.3 их не удалял никто —
   таблица копила мусор (живой случай 2026-10-18: ~1160 просроченных medium на человека в одном чате, dedup
   слал их модели). Чтения фильтруют `expires_at > now` и раньше, поэтому для бота ничего не меняется;
   `/memory_full` тоже читает через `get_memory` с этим фильтром — просроченного не показывает ни до, ни после.

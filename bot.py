@@ -3286,6 +3286,9 @@ FORGET_PICK_MODEL_ID = MODELS["argon"]["id"]
 FORGET_CONFIRM_TTL = 300             # сколько живут кнопки предупреждения, с
 FORGET_BACKUP_DAYS = 30              # сколько хранится файл-копия стёртых строк
 FORGET_BACKUP_DIR = DATA_DIR / "forget-backups"
+DB_BACKUP_KEEP_DAYS = 14             # копии базы старше — удаляются (purge_old_db_backups, docs/claude/tz-backup-purge.md)
+DB_BACKUP_KEEP_NEWEST = 3            # столько самых свежих копий не трогаем никогда
+DB_BACKUP_DIR = DATA_DIR / "backups"
 FORGET_KEEP = 2                      # сколько фактов оставляем «на память»
 FORGET_KEEP_MIN_FACTS = 5            # меньше живых фактов — стираем всё и модель не зовём
 FORGET_CANDIDATES_MAX = 150          # кандидаты в запросе выбора: не больше штук…
@@ -7103,6 +7106,55 @@ def purge_forget_backups(now: float | None = None) -> int:
     return n
 
 
+def purge_old_db_backups(now: float | None = None, dry_run: bool = False) -> dict:
+    """Удалить старые копии базы (docs/claude/tz-backup-purge.md). Кандидаты — обычные файлы по двум шаблонам:
+    `data/backups/*.db` и `data/claudushka.db.bak-*` (без -wal/-shm, это спутники). Три самые свежие (по mtime, оба шаблона вместе)
+    не трогаем никогда; из остальных удаляем старше DB_BACKUP_KEEP_DAYS суток (ровно 14 — ещё не старше). Спутники `<имя>-wal`/`-shm`
+    уходят вместе с копией. Ошибка на одном файле — warning и дальше. dry_run — ничего не удаляет, результат тот же.
+    Возвращает {"deleted": [имена], "kept": n, "freed_bytes": n}."""
+    now = time.time() if now is None else now
+    pats = ((DB_BACKUP_DIR, "*.db"), (DATA_DIR, "claudushka.db.bak-*"))
+    cands = []
+    for d, pat in pats:
+        try:
+            files = list(Path(d).glob(pat))
+        except OSError as e:
+            logger.warning(f"db_backups: не прочитала {d}: {e}")
+            continue
+        for f in files:
+            if f.name.endswith(("-wal", "-shm")):
+                continue
+            try:
+                if f.is_symlink() or not f.is_file():
+                    continue
+                cands.append((f.stat().st_mtime, f))
+            except OSError as e:
+                logger.warning(f"db_backups: не прочитала {f.name}: {e}")
+    cands.sort(key=lambda t: t[0], reverse=True)
+    deleted, freed = [], 0
+    for mtime, f in cands[DB_BACKUP_KEEP_NEWEST:]:
+        if now - mtime <= DB_BACKUP_KEEP_DAYS * 86400:
+            continue
+        try:
+            size = f.stat().st_size
+            extra = [s for s in (f.with_name(f.name + "-wal"), f.with_name(f.name + "-shm")) if s.is_file() and not s.is_symlink()]
+            if not dry_run:
+                f.unlink()
+                for s in extra:
+                    try:
+                        size += s.stat().st_size
+                        s.unlink()
+                    except OSError as e:
+                        logger.warning(f"db_backups: не удалила {s.name}: {e}")
+            else:
+                size += sum(s.stat().st_size for s in extra)
+            deleted.append(f.name)
+            freed += size
+        except OSError as e:
+            logger.warning(f"db_backups: не удалила {f.name}: {e}")
+    return {"deleted": deleted, "kept": len(cands) - len(deleted), "freed_bytes": freed}
+
+
 def _forget_scope_of(chat_type: str, kind: str) -> tuple[str | None, bool]:
     """(context для db.forget_*, группа ли). kind 'a' — «всё везде» (context=None)."""
     is_group = chat_type in ("group", "supergroup")
@@ -7757,6 +7809,14 @@ async def memory_purge_job(context: ContextTypes.DEFAULT_TYPE = None):
         logger.info(f"memory_purge: удалено файлов-копий /forget старше {FORGET_BACKUP_DAYS} дн.: {n}")
     except Exception:
         logger.exception("memory_purge: не удалось почистить копии /forget")
+    try:
+        r = await asyncio.to_thread(purge_old_db_backups)
+        logger.info(f"memory_purge: копии базы: удалено {len(r['deleted'])}, освобождено {r['freed_bytes'] / 1048576:.1f} МБ, "
+                    f"осталось {r['kept']}")
+        if r["deleted"]:
+            logger.info("memory_purge: удалены копии базы: " + ", ".join(r["deleted"]))
+    except Exception:
+        logger.exception("memory_purge: не удалось почистить копии базы")
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
