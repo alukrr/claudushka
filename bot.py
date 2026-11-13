@@ -2654,57 +2654,291 @@ def _maybe_extract_private_memory(user_id: int) -> bool:
         return False
 
 
+def _extract_private_raw(user_id: int, messages: list, label: str = "extract_memory", diag: dict | None = None) -> tuple[list, list]:
+    """ОДИН вызов модели «факты + предложения профиля» по личному диалогу — общий для живого извлечения (`extract_memory`) и
+    первичной обработки старых тредов (`/memory_backfill`, label `memory_backfill`): промпт один, не копия. Ничего не пишет в базу.
+    Ошибки модели/сети НЕ глотает (вызывающий решает: живое извлечение — в лог, первичная обработка — не двигает отметку).
+    `diag` (необязательный dict): сюда кладётся `bad=True`, если ответ пустой, обрезан по max_tokens или не разобрался как JSON — первичная обработка
+    считает такие куски в отчёте («пустых ответов»). -> (facts: list[str], profile_updates: list)."""
+    recent = clip_extract_messages(messages)
+    response = sync_create(
+        label=label,
+        # Служебный вызов — только DEFAULT_MODEL_ID, без исключений (правило
+        # Алексея, 2026-09-19). Раньше здесь был MODELS["sonnet"]["id"] "осознанно,
+        # аналитическая задача" — решение отменено, срабатывает каждые 10
+        # сообщений в личке и не должно платить по цене Sonnet. См.
+        # docs/claude/models-and-costs.md.
+        model=DEFAULT_MODEL_ID,
+        **aux_params(),
+        # 1024, а не 512: вместе с фактами теперь отдаётся profile_updates (инцидент 2026-08-03 — обрезка JSON).
+        max_tokens=out_tokens(DEFAULT_MODEL_ID, 1024),
+        system=(
+            "Извлеки важные УСТОЙЧИВЫЕ факты о пользователе из диалога. "
+            "Верни JSON-объект: {\"facts\": [строки], \"profile_updates\": [...]}. Если нового нет — пустые массивы.\n"
+            "Место жительства, работа, семейное положение, возраст записывай только когда человек "
+            "прямо говорит о себе как о постоянном («я живу в…», «переехал в…», «устроился в…»). "
+            "Поездки, отпуск, командировки, «сейчас в Москве», гости, «приехал на неделю» — временное, "
+            "НЕ записывай. Не записывай то, что противоречит устойчивому факту о человеке, если он явно "
+            "не сказал «переехал/сменил»; при сомнении пропусти.\n"
+            "Факты бери ТОЛЬКО из реплик пользователя (role=user); реплики assistant — лишь контекст, "
+            "из них ничего не записывай.\n"
+            "Пример facts: [\"Зовут Алексей\", \"Живёт в Германии\", \"Работает DevOps-инженером\"]\n"
+            + _profile_rules()
+        ),
+        messages=[{"role": "user", "content": (
+            f"Текущий профиль: {_profile_prompt_text('private', 0, {'пользователь': user_id}) or '(пусто)'}\n\n"
+            f"Диалог:\n{json.dumps(recent, ensure_ascii=False)}")}],
+    )
+    if api_errors.was_truncated(response):
+        logger.warning(f"Memory extraction: ответ обрезан по max_tokens для {user_id}")
+    text = response_text(response)
+    data = api_errors.parse_json_lenient(text, "{", label=f"memory uid={user_id}")
+    new_facts, updates = [], []
+    unparsed = False
+    if isinstance(data, dict):
+        new_facts = [f for f in (data.get("facts") or []) if isinstance(f, str)]
+        updates = data.get("profile_updates") or []
+    else:  # модель могла вернуть старый формат — голый массив строк
+        legacy = api_errors.parse_json_lenient(text, "[", label=f"memory uid={user_id} (legacy)")
+        unparsed = legacy is None
+        new_facts = [f for f in (legacy or []) if isinstance(f, str)]
+    if diag is not None and (unparsed or not text.strip() or api_errors.was_truncated(response)):
+        diag["bad"] = True
+    return new_facts, (updates if isinstance(updates, list) else [])
+
+
 def extract_memory(user_id: int, messages: list, is_group: bool = False, chat_id: int = None):
     try:
-        recent = clip_extract_messages(messages)
-        response = sync_create(
-            label="extract_memory",
-            # Служебный вызов — только DEFAULT_MODEL_ID, без исключений (правило
-            # Алексея, 2026-09-19). Раньше здесь был MODELS["sonnet"]["id"] "осознанно,
-            # аналитическая задача" — решение отменено, срабатывает каждые 10
-            # сообщений в личке и не должно платить по цене Sonnet. См.
-            # docs/claude/models-and-costs.md.
-            model=DEFAULT_MODEL_ID,
-            **aux_params(),
-            # 1024, а не 512: вместе с фактами теперь отдаётся profile_updates (инцидент 2026-08-03 — обрезка JSON).
-            max_tokens=out_tokens(DEFAULT_MODEL_ID, 1024),
-            system=(
-                "Извлеки важные УСТОЙЧИВЫЕ факты о пользователе из диалога. "
-                "Верни JSON-объект: {\"facts\": [строки], \"profile_updates\": [...]}. Если нового нет — пустые массивы.\n"
-                "Место жительства, работа, семейное положение, возраст записывай только когда человек "
-                "прямо говорит о себе как о постоянном («я живу в…», «переехал в…», «устроился в…»). "
-                "Поездки, отпуск, командировки, «сейчас в Москве», гости, «приехал на неделю» — временное, "
-                "НЕ записывай. Не записывай то, что противоречит устойчивому факту о человеке, если он явно "
-                "не сказал «переехал/сменил»; при сомнении пропусти.\n"
-                "Факты бери ТОЛЬКО из реплик пользователя (role=user); реплики assistant — лишь контекст, "
-                "из них ничего не записывай.\n"
-                "Пример facts: [\"Зовут Алексей\", \"Живёт в Германии\", \"Работает DevOps-инженером\"]\n"
-                + _profile_rules()
-            ),
-            messages=[{"role": "user", "content": (
-                f"Текущий профиль: {_profile_prompt_text('private', 0, {'пользователь': user_id}) or '(пусто)'}\n\n"
-                f"Диалог:\n{json.dumps(recent, ensure_ascii=False)}")}],
-        )
-        if api_errors.was_truncated(response):
-            logger.warning(f"Memory extraction: ответ обрезан по max_tokens для {user_id}")
-        text = response_text(response)
-        data = api_errors.parse_json_lenient(text, "{", label=f"memory uid={user_id}")
-        new_facts, updates = [], []
-        if isinstance(data, dict):
-            new_facts = [f for f in (data.get("facts") or []) if isinstance(f, str)]
-            updates = data.get("profile_updates") or []
-        else:  # модель могла вернуть старый формат — голый массив строк
-            legacy = api_errors.parse_json_lenient(text, "[", label=f"memory uid={user_id} (legacy)")
-            new_facts = [f for f in (legacy or []) if isinstance(f, str)]
+        new_facts, updates = _extract_private_raw(user_id, messages)
         if new_facts:
             context = "group" if is_group else "private"
             db.add_memory_facts(user_id, new_facts, context, chat_id if is_group else None)
             logger.info(f"Memory updated for {user_id} ({context})")
-        if updates and isinstance(updates, list):
+        if updates:
             res = db.add_profile_proposals(user_id, "group" if is_group else "private", chat_id if is_group else None, updates)
             logger.info(f"Profile proposals for {user_id}: {res}")
     except Exception as e:
         logger.error(f"Memory extraction error (uid={user_id}): {e}", exc_info=True)
+
+
+# --- Первичная обработка старых личных тредов (feat/memory-backfill, docs/claude/tz-private-memory.md часть 2) ---
+# Админ бота в личке: `/memory_backfill dry|run|stop`. Каждый личный тред — по возрастанию id кусками MEMORY_BACKFILL_CHUNK строк через
+# ТОТ ЖЕ вызов, что живое извлечение (`_extract_private_raw`, метка `memory_backfill`); вызовы строго по одному с паузой; расход — на личный чат
+# админа (`usage_ctx`), не на пользователей. Отметки «обработано до id» — `data/memory_backfill.json`, переживают рестарт.
+MEMORY_BACKFILL_CHUNK = 20
+MEMORY_BACKFILL_PAUSE = 1.0           # между вызовами, с — бот в это время отвечает людям
+MEMORY_BACKFILL_REPORT_EVERY = 50     # отчёт админу каждые N вызовов
+MEMORY_BACKFILL_MAX_ERRORS = 3        # столько ошибок модели подряд — остановиться
+MEMORY_BACKFILL_EST_SEC = 1.2         # оценка времени одного вызова (без паузы) для `dry`; полный прогон на стенде 2026-11-13: 205 вызовов за 426 с ⇒ ≈ 1.1 с + пауза
+MEMORY_BACKFILL_EST_COST = 0.0007     # оценка цены одного вызова (Lite), $, пока нет своих строк в usage_log; полный прогон на стенде: $0.1473 / 205 ≈ $0.00072
+MEMORY_BACKFILL_FILE = DATA_DIR / "memory_backfill.json"
+_backfill_run: dict = {}              # {"task", "stop"} — одна обработка одновременно
+
+
+def _backfill_active() -> bool:
+    t = _backfill_run.get("task")
+    return t is not None and not t.done()
+
+
+def _backfill_load() -> dict:
+    """{"users": {"<uid>": {"done": id, "to": id}}}. Нет файла/битый файл — пусто (битый — в лог: тогда обработка пойдёт с начала)."""
+    try:
+        data = json.loads(MEMORY_BACKFILL_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("users"), dict):
+            return data
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logger.error("memory_backfill: файл отметок не прочитался, начинаю с пустого", exc_info=True)
+    return {"users": {}}
+
+
+def _backfill_save(state: dict) -> None:
+    """Запись через временный файл и os.replace — рестарт посреди записи не оставляет битый файл."""
+    tmp = MEMORY_BACKFILL_FILE.with_name(MEMORY_BACKFILL_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, MEMORY_BACKFILL_FILE)
+
+
+def _backfill_take(lens: list[int]) -> int:
+    """Сколько строк с НАЧАЛА куска уходит в один вызов: набираем, пока сумма (каждая строка режется до MEMORY_EXTRACT_MSG_CHARS) не больше
+    MEMORY_EXTRACT_TOTAL_CHARS; минимум одна (строка длиннее лимита не зацикливает обработку — режется и проходит). Остаток куска идёт в следующий
+    вызов, отметка ставится на последнюю ОТПРАВЛЕННУЮ строку: ни одна строка треда не пропускается. Эту же функцию использует `backfill_plan`.
+    (Живое извлечение — наоборот, берёт ПОСЛЕДНИЕ реплики, `clip_extract_messages`; там пропуск старых допустим.)"""
+    total = k = 0
+    for n in lens:
+        n = min(n, MEMORY_EXTRACT_MSG_CHARS)
+        if k and total + n > MEMORY_EXTRACT_TOTAL_CHARS:
+            break
+        total += n
+        k += 1
+    return k
+
+
+def _backfill_calls(lens: list[int]) -> int:
+    """Точное число вызовов на тред с длинами строк lens (по порядку id): та же нарезка, что у воркера (кусок MEMORY_BACKFILL_CHUNK → `_backfill_take`)."""
+    i = calls = 0
+    while i < len(lens):
+        i += _backfill_take(lens[i:i + MEMORY_BACKFILL_CHUNK])
+        calls += 1
+    return calls
+
+
+def _backfill_marks(state: dict, thread: dict) -> tuple[int, int]:
+    """(done, to) человека. `to` — максимальный id треда на момент ПЕРВОЙ встречи (дальше живое извлечение личной памяти): диапазон не плывёт
+    при рестарте и повторном run; done >= to — человек обработан, заново не оплачивается."""
+    st = state["users"].get(str(thread["user_id"]))
+    if st:
+        return int(st.get("done", 0)), int(st.get("to", thread["max_id"]))
+    return 0, int(thread["max_id"])
+
+
+def backfill_plan(state: dict) -> dict:
+    """Что осталось обработать: {"people", "rows", "calls", "per_user": [(uid, rows)]} — только чтение, модель не зовём. Треды из <2 строк пропускаются.
+    `calls` — ТОЧНОЕ число вызовов (та же нарезка по размеру, что у воркера: длинные реплики дробят кусок на несколько вызовов)."""
+    per_user, calls = [], 0
+    for th in db.backfill_threads():
+        done, to = _backfill_marks(state, th)
+        lens = db.conversation_lengths(th["user_id"], done, to)
+        if len(lens) >= 2:
+            per_user.append((th["user_id"], len(lens)))
+            calls += _backfill_calls(lens)
+    return {"people": len(per_user), "rows": sum(n for _, n in per_user), "calls": calls, "per_user": per_user}
+
+
+def _backfill_store(user_id: int, facts: list, updates: list, with_profile: bool) -> tuple[int, int]:
+    """Запись результата куска: -> (фактов добавлено, предложений профиля новых). Точные повторы отсекаем по ВСЕМ личным фактам человека
+    (`add_memory_facts` сверяет только с потолком чтения 12+8). Групповые факты, профиль и `conversations` не трогаем."""
+    existing = set(db.get_memory(user_id, "private", None, long_limit=10 ** 9, medium_limit=10 ** 9))
+    fresh = [f for f in dict.fromkeys(f.strip() for f in facts if f and f.strip()) if f not in existing]
+    if fresh:
+        db.add_memory_facts(user_id, fresh, "private", None)
+    new_props = 0
+    if with_profile and updates:
+        new_props = db.add_profile_proposals(user_id, "private", None, updates).get("new", 0)
+    return len(fresh), new_props
+
+
+def _backfill_report_text(stats: dict, head: str, since_ts: int, admin_id: int) -> str:
+    calls, cost = db.usage_label_sum("memory_backfill", admin_id, since_ts)
+    return (f"{head}\nЛюдей обработано: {stats['people']}, кусков: {stats['chunks']}, фактов добавлено: {stats['facts']}, "
+            f"предложений профиля: {stats['proposals']}, пустых ответов: {stats['empty']}, ошибок: {stats['errors']}. Расход: ${cost:.4f} ({calls} вызовов).")
+
+
+async def _backfill_worker(bot, admin_id: int, with_profile: bool) -> None:
+    """Фоновая обработка. Блокирующее (БД, модель) — в asyncio.to_thread; вызовы по одному. Исключений наружу не выпускает."""
+    usage_ctx.set((admin_id, "private", admin_id))   # платит личный чат админа; метка — memory_backfill
+    since = int(time.time())
+    stats = {"people": 0, "chunks": 0, "facts": 0, "proposals": 0, "errors": 0, "empty": 0}
+
+    async def say(text: str) -> None:
+        try:
+            await bot.send_message(chat_id=admin_id, text=text)
+        except Exception:
+            logger.warning("memory_backfill: отчёт админу не ушёл", exc_info=True)
+
+    end = "готово"
+    try:
+        state = await asyncio.to_thread(_backfill_load)
+        threads = await asyncio.to_thread(db.backfill_threads)
+        await say(f"Обработка личных тредов началась: людей в базе {len(threads)}. Остановить — /memory_backfill stop.")
+        consecutive, since_report = 0, 0
+        for th in threads:
+            if _backfill_run.get("stop"):
+                if end == "готово":
+                    end = "остановлено"
+                break
+            uid = th["user_id"]
+            done, to = _backfill_marks(state, th)
+            state["users"][str(uid)] = {"done": done, "to": to}
+            had_work = False
+            while not _backfill_run.get("stop"):
+                rows = await asyncio.to_thread(db.conversation_chunk, uid, done, to, MEMORY_BACKFILL_CHUNK)
+                if len(rows) < 1 or (not had_work and len(rows) < 2 and done == 0):
+                    break
+                had_work = True
+                rows = rows[:_backfill_take([len(r["content"]) for r in rows])]   # влезающее в лимит размера; остаток — в следующий вызов
+                diag: dict = {}
+                try:
+                    facts, updates = await asyncio.to_thread(
+                        _extract_private_raw, uid, [{"role": r["role"], "content": r["content"]} for r in rows], "memory_backfill", diag)
+                    added, props = await asyncio.to_thread(_backfill_store, uid, facts, updates, with_profile)
+                except Exception:
+                    logger.error(f"memory_backfill: ошибка куска (uid={uid}), отметку не двигаю", exc_info=True)
+                    stats["errors"] += 1
+                    consecutive += 1
+                    if consecutive >= MEMORY_BACKFILL_MAX_ERRORS:
+                        end = f"остановлено: {MEMORY_BACKFILL_MAX_ERRORS} ошибки модели подряд"
+                        _backfill_run["stop"] = True
+                    break          # к следующему человеку; этот кусок повторится при следующем run
+                consecutive = 0
+                done = rows[-1]["id"]
+                state["users"][str(uid)]["done"] = done
+                await asyncio.to_thread(_backfill_save, state)
+                stats["chunks"] += 1
+                stats["empty"] += 1 if diag.get("bad") else 0     # ответ пуст/обрезан/не JSON: отметку двигаем, но считаем в отчёте
+                stats["facts"] += added
+                stats["proposals"] += props
+                since_report += 1
+                if since_report >= MEMORY_BACKFILL_REPORT_EVERY:
+                    since_report = 0
+                    await say(await asyncio.to_thread(_backfill_report_text, stats, "Идёт обработка…", since, admin_id))
+                await asyncio.sleep(MEMORY_BACKFILL_PAUSE)
+            if had_work and done >= to:
+                stats["people"] += 1
+        if _backfill_run.get("stop") and end == "готово":
+            end = "остановлено"
+    except Exception:
+        logger.error("memory_backfill: сбой обработки", exc_info=True)
+        end = "остановлено: внутренняя ошибка, подробности в логе"
+    await say(await asyncio.to_thread(_backfill_report_text, stats, f"Обработка личных тредов: {end}.", since, admin_id))
+
+
+async def cmd_memory_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/memory_backfill` (админ бота, ТОЛЬКО личка): без аргументов — справка и состояние; `dry` — сколько людей/реплик/вызовов, ничего не вызывая;
+    `run` — старт в фоне (факты + предложения профиля; `run facts` — только факты); `stop` — остановка после текущего вызова."""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+    msg = update.effective_message
+    if update.effective_chat.type != "private":
+        await msg.reply_text("Эта команда — только в личном чате с ботом.")
+        return
+    arg = context.args[0].lower() if context.args else ""
+    if arg == "stop":
+        if _backfill_active():
+            _backfill_run["stop"] = True
+            await msg.reply_text("Останавливаю: текущий вызов дойдёт, дальше не пойду. Отчёт придёт следом.")
+        else:
+            await msg.reply_text("Сейчас обработки нет.")
+        return
+    if arg == "run":
+        if _backfill_active():
+            await msg.reply_text("Обработка уже идёт — дождись отчёта или /memory_backfill stop.")
+            return
+        with_profile = not (len(context.args) > 1 and context.args[1].lower() == "facts")
+        _backfill_run.clear()   # проверка и запуск без await между ними — второй run не проскочит
+        _backfill_run["stop"] = False
+        _backfill_run["task"] = _spawn_background_task(_backfill_worker(context.bot, user.id, with_profile))
+        await msg.reply_text("Запускаю обработку личных тредов" + ("" if with_profile else " (только факты)")
+                             + ". Отчёты — сюда, остановить — /memory_backfill stop.")
+        return
+    state = await asyncio.to_thread(_backfill_load)
+    plan = await asyncio.to_thread(backfill_plan, state)
+    if arg == "dry":
+        calls = plan["calls"]
+        mins = calls * (MEMORY_BACKFILL_EST_SEC + MEMORY_BACKFILL_PAUSE) / 60
+        n, cost = await asyncio.to_thread(db.usage_label_sum, "memory_backfill", user.id, 0)
+        per_call = (cost / n) if n else MEMORY_BACKFILL_EST_COST
+        await msg.reply_text(f"Пробный прогон (ничего не вызывала): людей {plan['people']}, реплик {plan['rows']}, вызовов {calls}.\n"
+                             f"Оценка: время ≈ {mins:.0f} мин, расход ≈ ${calls * per_call:.2f} на твой личный чат.")
+        return
+    done_people = sum(1 for u in state["users"].values() if int(u.get("done", 0)) >= int(u.get("to", 0)))
+    await msg.reply_text(
+        "Первичная обработка личных тредов: /memory_backfill dry — сколько предстоит, /memory_backfill run — старт (факты + предложения профиля), "
+        "/memory_backfill run facts — только факты, /memory_backfill stop — остановить.\n"
+        f"Сейчас: {'идёт' if _backfill_active() else 'не идёт'}; осталось людей {plan['people']}, реплик {plan['rows']}; "
+        f"уже обработано людей: {done_people}.")
 
 
 def build_memory_participants(transcript: list[dict]) -> dict:
@@ -6265,6 +6499,7 @@ ADMIN_HELP = """\
   /topup <id> <сумма> [коммент] [force] — пополнить баланс ($); отрицательная = корректировка; ID вне базы — только с force.
   /broadcast       — ТОЛЬКО В ЛИЧКЕ: ответом на своё сообщение (текст/стикер/фото) разослать его активным чатам: предпросмотр «в N групп и M личек» + кнопка «Отправить», в конце отчёт.
                      /broadcast test — только админам; /broadcast all — без фильтра активности; /broadcast stop; /broadcast resume — дослать, кому не ушло.
+  /memory_backfill — ТОЛЬКО В ЛИЧКЕ: разовая обработка старых личных тредов в факты памяти: dry — сколько людей/реплик/вызовов и оценка, run — старт в фоне (run facts — без предложений профиля), stop; расход — на твой личный чат.
   /refund [charge_id] — вернуть платёж Stars (без аргумента — последние 10); только если на балансе чата есть эта сумма.
                            От $2 суммарных пополнений (личка) / $5 (группа) чат проверяется автоматически
   /verify <id>             — проверить группу (id с минусом) или пользователя + стартовый бонус
@@ -9336,6 +9571,7 @@ def main():
     app.add_handler(CommandHandler("paysupport", cmd_paysupport))
     app.add_handler(CommandHandler("refund", cmd_refund))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("memory_backfill", cmd_memory_backfill))
     app.add_handler(CallbackQueryHandler(on_broadcast_button, pattern=r"^bc:(go|no):[0-9a-f]+$"))
     app.add_handler(CallbackQueryHandler(on_forget_button, pattern=r"^fg:"))
     app.add_handler(CallbackQueryHandler(on_pay_button, pattern=r"^pay:\d+$"))
