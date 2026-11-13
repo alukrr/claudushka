@@ -244,6 +244,13 @@ d.close()
 "
 ```
 
+**Автоудаление копий (v2.15.0, ТЗ `docs/claude/tz-backup-purge.md`).** Копии базы бот чистит сам: `purge_old_db_backups` в
+`memory_purge_job` (04:30 Berlin и на старте) удаляет копии старше `DB_BACKUP_KEEP_DAYS` = 14 суток по mtime в `data/backups/*.db`
+и `data/claudushka.db.bak-*` (спутники `-wal`/`-shm` — вместе с копией); `DB_BACKUP_KEEP_NEWEST` = 3 самые свежие (оба шаблона вместе)
+не трогаются никогда. Ничего вне этих шаблонов не удаляется (ни `claudushka.db`, ни `forget-backups/`, `dedup_runs/`). **Нужна копия дольше
+14 дней — вынести из `data/`** (например, в `~/backups/`). Dry-run без удаления: `purge_old_db_backups(dry_run=True)` — вернёт список.
+Новые копии перед деплоем делать как ниже; имя `claudushka.db.bak-<дата>` под шаблон подходит.
+
 **Зафиксировать коммит ДО пула** (чтобы было куда откатывать):
 
 ```bash
