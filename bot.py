@@ -2155,6 +2155,16 @@ async def _recognize_video_note(context, video_note) -> tuple[str | None, str | 
     return transcript, description
 
 
+def _video_note_row_text(transcript: str | None, description: str | None) -> str:
+    """Текст строки group_messages для кружочка: «[Кружок] Сказано: …. Видно: …» или голое «[Кружок]»."""
+    parts = []
+    if transcript:
+        parts.append(f"Сказано: {transcript}")
+    if description:
+        parts.append(f"Видно: {description}")
+    return "[Кружок] " + ". ".join(parts) if parts else "[Кружок]"
+
+
 async def _recognize_video(context, video) -> str | None:
     """Короткое Haiku-описание обычного видео (не кружочка) по кадрам, или None."""
     if video.duration and video.duration > MAX_VIDEO_SECONDS:
@@ -3936,6 +3946,13 @@ def is_bot_mentioned(update: Update) -> bool:
         if update.effective_chat.type == "private":
             return True
         # In group — only if bot is mentioned or replied to
+        return False
+    # Голосовое и кружочек: ни текста, ни подписи — как у фото без подписи, единственный сигнал адресации
+    # реплай на сообщение бота (без реплая в группе — по-прежнему не обращение). Видео/GIF не трогаем.
+    if message.voice or message.video_note:
+        if message.reply_to_message and message.reply_to_message.from_user:
+            if message.reply_to_message.from_user.id == context_bot_id:
+                return True
         return False
     text = message.text or message.caption or ""
     if not text and not message.photo and not is_plain_document:
@@ -8580,6 +8597,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     voice_transcript_cache: str | None = None
     video_note_description_cache: str | None = None
     video_description_cache: str | None = None
+    media_gated = False  # True — пассивное распознавание в этой группе выключено (см. ниже)
 
     if is_group and update.message:
         sender = update.effective_user.first_name or "Unknown"
@@ -8647,12 +8665,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 voice_transcript_cache, video_note_description_cache = await _recognize_video_note(
                     context, update.message.video_note
                 )
-                parts = []
-                if voice_transcript_cache:
-                    parts.append(f"Сказано: {voice_transcript_cache}")
-                if video_note_description_cache:
-                    parts.append(f"Видно: {video_note_description_cache}")
-                db.save_group_message(chat_id, user_id, sender, "[Кружок] " + ". ".join(parts) if parts else "[Кружок]")
+                db.save_group_message(chat_id, user_id, sender,
+                                      _video_note_row_text(voice_transcript_cache, video_note_description_cache))
         # Извлечение памяти для всех участников — каждые MEMORY_EXTRACT_EVERY_CHAT сообщений,
         # независимо от того, упомянут бот или нет. Каденс считается по дельте
         # group_messages.id, а не по COUNT(*) — см. db.should_extract_chat_memory.
@@ -8714,15 +8728,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_text:
         if update.message.voice:
             transcript = voice_transcript_cache if is_group else await _recognize_voice(context, update.message.voice)
+            if is_group and media_gated:
+                # Пассивное распознавание выключено (кэш пуст не из-за сбоя), но бот адресован реплаем и все проверки выше
+                # пройдены — платим за распознавание только теперь. Строку group_messages (голое «[Голосовое]»)
+                # дополняем расшифровкой: диалог группы собирает контекст из неё (docs/claude/media.md).
+                transcript = await _recognize_voice(context, update.message.voice)
+                if transcript:
+                    db.update_last_group_message(chat_id, user_id, "[Голосовое]", f"[Голосовое] {transcript}")
             if not transcript:
                 await update.message.reply_text("Не смогла разобрать голосовое — плохое качество или слишком длинное.")
                 return
             user_text = transcript
         elif update.message.video_note:
-            if is_group:
+            if is_group and not media_gated:
                 transcript, description = voice_transcript_cache, video_note_description_cache
             else:
                 transcript, description = await _recognize_video_note(context, update.message.video_note)
+                if is_group and (transcript or description):
+                    # как для голосового: пассивный блок строку не распознавал (media_gated), дополняем её
+                    db.update_last_group_message(chat_id, user_id, "[Кружок]", _video_note_row_text(transcript, description))
             parts = []
             if transcript:
                 parts.append(f"Сказано: {transcript}")
