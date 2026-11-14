@@ -35,6 +35,22 @@ ANTHROPIC_API_KEY`), а НЕ напрямую в Google с отдельным `G
 Telegram на Flash и сам вызов на живом пуле **не проверены** (Gemini в пуле лежал 14.11 с ~15:27 Berlin) — шаг 5 чек-листа
 `docs/claude/staging-checklist-lite-gone.md`. Ниже — история прежних моделей.
 
+**Запасной путь — прямой Google API (v2.16.2, 2026-11-14).** Gemini в пуле лежал часами (429 «Resource has been exhausted» на
+каждый запрос), голос не расшифровывался вовсе. Теперь, если пул не вернул 200 (сеть, 429, 5xx, 404), `_transcribe_audio_gemini`
+зовёт тот же `generateContent` у Google напрямую: `GOOGLE_API_BASE_URL`, ключ `GEMINI_API_KEY` (тот же, что у banana), модель
+`GEMINI_AUDIO_DIRECT_MODEL` = `gemini-3.1-flash-lite` (env переопределяет; в пуле её нет, у Google жива, OGG/Opus принимает —
+проверено с сервера 2026-11-14, ответ за 2 с). Общий код одного провайдера — `_gemini_audio_call`. Правила:
+- 200 с пустым текстом от пула — это «речи нет», запасной путь НЕ зовётся (иначе платим дважды за тишину).
+- После отказа пула `GEMINI_AUDIO_STICKY_SECONDS` (= `FALLBACK_STICKY_SECONDS`, 5 мин) голос идёт сразу в Google, минуя пул
+  (`_audio_pool_down_until`): отказ 429 пул отдаёт только через 8–10 с. Потом снова одна попытка в пул; успех пула сбрасывает окно.
+- Нет `GEMINI_API_KEY` — поведение прежнее (плейсхолдер без транскрипта).
+- Учёт — `_record_gemini_direct_audio_usage`, метка `voice_fallback`, модель `gemini-3.1-flash-lite`; цена — прайс Google без
+  скидки пула (`GEMINI_AUDIO_DIRECT_PRICES`: вход $0.25, аудио-токены входа $0.50, выход $1.50 за 1M; аудио-токены берутся из
+  `promptTokensDetails`). Деньги идут с ключа Google, а не с баланса пула; чату списывается как обычно.
+- В логе: `VOICE FALLBACK gemini-3.8-flash (пул) → gemini-3.1-flash-lite (Google напрямую)` — раз на окно.
+Тесты — `scripts/test_voice_direct_fallback.py`. Это фолбэк ТОЛЬКО голоса; диалог и служебные вызовы по-прежнему уходят на GPT
+пула (`docs/claude/model-fallback.md`).
+
 `GEMINI_AUDIO_MODEL_NAME = "gemini-3.6-flash"` (до 2026-10-28) — **проверено живым запросом 31.08.2026**:
 `gemini-2.5-flash` отдаёт 404 «no longer available to new users», Google сам предлагает
 `gemini-3.6-flash`; и текст, и `audio/wav` inline_data вернули 200 (тогда ещё через прямой
