@@ -1205,6 +1205,23 @@ def save_group_message(chat_id: int, user_id: int, sender_name: str, content: st
     conn.close()
 
 
+def update_last_group_message(chat_id: int, user_id: int, old_content: str, new_content: str) -> bool:
+    """Заменить текст ПОСЛЕДНЕЙ строки человека (is_bot=0) с точно таким содержимым — для голосового/кружочка в группе,
+    где пассивное распознавание выключено: строка сохранена голой, расшифровка появилась позже (docs/claude/media.md).
+    Схему не меняет; True — строка найдена."""
+    conn = get_conn()
+    cur = conn.execute(
+        "UPDATE group_messages SET content = ? WHERE id = ("
+        "SELECT id FROM group_messages WHERE chat_id = ? AND user_id = ? AND is_bot = 0 AND content = ? "
+        "ORDER BY id DESC LIMIT 1)",
+        (new_content, chat_id, user_id, old_content)
+    )
+    conn.commit()
+    changed = cur.rowcount > 0
+    conn.close()
+    return changed
+
+
 def get_group_history(chat_id: int, limit: int = 30, since_ts: int = 0) -> list[str]:
     """since_ts — брать только сообщения не старше этой метки (ежедневный обзор: с полуночи)."""
     conn = get_conn()
