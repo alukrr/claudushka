@@ -77,6 +77,14 @@ def test_service_block_draw_2k():
     assert "[[DRAW 2K" in bot.service_block(draw_intent=True, draw_size="2K")
 
 
+def test_service_block_image_reply():
+    sb = bot.service_block(image_reply=True)
+    assert "ответил на картинку" in sb and "[[DRAW: …]]" in sb and "без маркера" in sb
+    # явная просьба «нарисуй» сильнее: подсказка про реплай не дублируется
+    both = bot.service_block(draw_intent=True, image_reply=True)
+    assert "явно просит нарисовать" in both and "ответил на картинку" not in both
+
+
 def test_service_block_default_clean():
     sb = bot.service_block()
     assert "нарисовать" not in sb and "[[DRAW" not in sb

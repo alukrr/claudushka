@@ -2539,7 +2539,7 @@ def _bot_reply_quote(text: str) -> str:
 
 def service_block(*, reply_context: str = "", search_query: str = "", search_results: str = "",
                   topup_hint: bool = False, draw_intent: bool = False, draw_size: str | None = None,
-                  spontaneous: bool = False, trigger: str = "") -> str:
+                  spontaneous: bool = False, trigger: str = "", image_reply: bool = False) -> str:
     """Изменчивый контекст запроса (время, reply, результаты поиска) — в хвост, в последний
     user-turn, а не в system: иначе он ломает префикс кэша. В БД НЕ сохраняется (в
     conversations/group_messages идёт только текст пользователя). reply_context передавать
@@ -2561,6 +2561,15 @@ def service_block(*, reply_context: str = "", search_query: str = "", search_res
             "Пользователь явно просит нарисовать картинку. Придумай промпт сам — по смыслу просьбы, контексту чата "
             "и цитате, если есть, — не переводи его просьбу дословно. Обязательно добавь маркер "
             f"{marker} (промпт по-английски). Отказаться можно только по правилам безопасности."
+        )
+    elif image_reply:
+        # Реплай на картинку бота без слова «нарисуй» («это не то», «приделай крылья», голосовое): модель обещала
+        # «перерисую» без маркера, и картинка не появлялась (инцидент 2026-11-14, GPT на фолбэке).
+        lines.append(
+            "Пользователь ответил на картинку, которую отправила ты. Если по его словам её надо переделать, исправить "
+            "или нарисовать заново — добавь маркер [[DRAW: …]] (промпт по-английски) прямо в ЭТОМ ответе. Не пиши "
+            "«перерисую» или «сейчас исправлю» без маркера: другого хода у тебя не будет, картинка не появится. "
+            "Если перерисовывать не просят — просто ответь."
         )
     if spontaneous:
         lines.append(
@@ -8822,8 +8831,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Подхватываем контекст реплая ---
     reply_context = ""
+    reply_to_own_image = False
     if update.message.reply_to_message:
         src = update.message.reply_to_message
+        reply_to_own_image = bool(src.from_user and src.from_user.id == context_bot_id and src.photo)
         bc_ctx = _broadcast_reply_context(update.effective_chat.id, src.message_id) if (src.from_user and src.from_user.id == context_bot_id) else ""
         if bc_ctx:
             # реплай на копию рассылки админа (текст, стикер, фото): без этого стикер не опознаётся, а текст выдаётся за «своё сообщение»
@@ -9048,7 +9059,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return mark_cache_tail(with_service_block(base_messages if msgs is None else msgs, service_block(
                 reply_context="" if is_group else reply_context,
                 search_query=sq, search_results=sr, topup_hint=topup_hint,
-                draw_intent=draw_intent, draw_size=intent_size,
+                draw_intent=draw_intent, draw_size=intent_size, image_reply=reply_to_own_image,
             )))
 
         messages = compose(search_query, search_results)
