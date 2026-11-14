@@ -1,6 +1,6 @@
-# Модели per-chat (реестр MODELS; с 2026-10-28 — только Gemini, v2.0.0)
+# Модели per-chat (реестр MODELS: Gemini Flash/Argon и GPT-6 Luna; с 2026-11-14 Luna вместо Flash-Lite, v2.16.0)
 
-Перед правкой `MODELS`, `_set_chat_model`, `/lite /flash /argon`, `/models`, `_track_response`, `calc_llm_cost`, `/cost` —
+Перед правкой `MODELS`, `_set_chat_model`, `/luna /flash /argon`, `/models`, `_track_response`, `calc_llm_cost`, `/cost` —
 читай этот файл. Учёт, тарифы, `/cost` — `docs/claude/billing.md`.
 
 **`MODELS` в bot.py — единственный источник правды.** Команды, цены, гейтинг по ролям, окна контекста, `/models` — оттуда.
@@ -12,7 +12,7 @@ v2.0.0). Всё ниже про Claude (таблица Claude-моделей, Ha
 
 | ключ | id | label | $/MTok in/out (листовая) | cache read | запись | окно | thinking_headroom | роль |
 |---|---|---|---|---|---|---|---|---|
-| `lite` | `gemini-3.1-flash-lite` | Gemini 3.1 Flash-Lite | 0.25 / 1.50 | 0.1× | 1.0× | 1M | 4000 | **free (единственная)**, ВСЕ служебные вызовы (`DEFAULT_MODEL_ID`), описание медиа, выжимки обзора, голос |
+| `luna` | `gpt-6-luna` | GPT-6 Luna (`provider: openai`) | 0.10 / 0.50 | 0.1× | 1.25× (`_GPT_MULTS`) | 872K | 2000 | **free (единственная)**, ВСЕ служебные вызовы (`DEFAULT_MODEL_ID`), описание медиа, выжимки обзора |
 | `flash` | `gemini-3.8-flash` | Gemini 3.8 Flash | 0.75 / 3.75 | 0.1× | 1.0× | 1M | 4000 | дефолт платного чата (`PAID_DEFAULT_MODEL_KEY`) |
 | `argon` | `gemini-4-argon` | Gemini 4 Argon | 2 / 10 | 0.05× | 1.0× | 1M | 4000 | платный выбор, дневной обзор (`DAILY_REVIEW_MODEL_ID`) |
 
@@ -21,27 +21,47 @@ v2.0.0). Всё ниже про Claude (таблица Claude-моделей, Ha
 неявным — `cached_content`; не гарантировано). Gemini 3.8 Flash и Argon **думают всегда**, токены рассуждений входят в
 `usage.output_tokens` — `out_tokens(model, visible)` добавляет запас; без него ответ обрывается.
 
-Роли (решения Алексея 2026-10-28, остальное «предложено»): free — Lite без выбора (`FREE_MODEL_KEYS = ("lite",)`; таблица
+**Luna (GPT) на этой полосе (с 2026-11-14):** `cache_control` пул не режет (200), но `kwargs_for_model` вычищает его всё равно;
+кэш у GPT автоматический, чтение 0.1×, запись 1.25× по таблице пула (тарифицируется ли на `/v1/messages` — не проверено).
+`max_tokens` у GPT пул «принимает и игнорирует» — лимит ответ не обрезает; `thinking_headroom` 2000 ставится по-прежнему
+(при переходе Luna → Flash запас заменяется на 4000, `kwargs_for_model`). Опора на `stop_reason == "max_tokens"` у дефолтной
+модели есть в трёх местах (`api_errors.was_truncated`): извлечение памяти (личное и групповое — только warning в лог) и
+`_finish_review` (обзор идёт на Argon, не на Luna): с Luna эти ветки просто не срабатывают, ломать нечему. Окно Luna 872K
+(у Lite было 1M): лимиты истории и памяти калиброваны под 200k — не поднимать; у GPT вход >272K тарифицируется ×2 (при текущих
+лимитах недостижимо). Картинку на входе Luna принимает (замер 2026-11-14), `/models` показывает её под заголовком «GPT»
+(`model_provider`), не «Gemini».
+
+Роли (решения Алексея 2026-10-28 и 2026-11-14, остальное «предложено»): free — Luna без выбора (`FREE_MODEL_KEYS = ("luna",)`; таблица
 `chat_free_model` больше не читается и не пишется — выбора нет, строки оставлены на диске); платный дефолт — Flash;
 дневной обзор — Argon (нестримовый вывод ≤ 32K, обзор берёт `2200 + 4000`); `restricted` (дорогие, в группе только админам) —
-сейчас ни у одной модели нет; режим разработчика — модель чата. GPT-моделей чата нет (Terra — только для картинок, Шаг 2).
-`get_chat_model`: free → Lite; paid → `chat_models`, а строка не из реестра (старый Claude до миграции) → Flash.
+сейчас ни у одной модели нет; режим разработчика — модель чата. Единственная GPT-модель чата — Luna (Terra — фолбэк Flash и
+рисование, Шаг 2). `get_chat_model`: free → Luna; paid → `chat_models`, а строка не из реестра (старый Claude до миграции,
+убранная Flash-Lite без миграции) → Flash.
 
 Параметры вызова: `aux_params()` и `dialog_params()` возвращают `{}` — ни одна модель пула не принимает `thinking` /
 `output_config` (Gemini → 400; у GPT влияние на `/v1/messages` не доказано). Функции остались единой точкой, чтобы
 не править ~20 вызовов, если управляемая модель вернётся. Служебные вызовы обязаны оборачивать лимит в
-`out_tokens(DEFAULT_MODEL_ID, N)` (иначе Lite/Flash могут обрезать ответ на рассуждениях).
+`out_tokens(DEFAULT_MODEL_ID, N)` (запас Luna 2000; у Flash 4000 — иначе ответ обрезается на рассуждениях).
 
 Команды `/haiku /sonnet /opus /fable` — заглушки `cmd_claude_gone` (подсказка выбрать модель в `/models`), на один релиз;
 подтверждение `/fable` удалено. Миграция БД `no_anthropic_models` (`db._mig_no_anthropic`, `_run_once`, один раз):
-`chat_models` haiku → lite, sonnet → flash, opus/fable → argon; `chat_search_mode` claude → auto; счётчики в лог. Без пути назад.
+`chat_models` haiku → `gemini-3.1-flash-lite` (id заморожен в миграции), sonnet → flash, opus/fable → argon; `chat_search_mode`
+claude → auto; счётчики в лог. Без пути назад. Вторая миграция — `lite_gone` (`db._mig_lite_gone`, 2026-11-14, строго ПОСЛЕ первой):
+`chat_models` с `gemini-3.1-flash-lite` → `gpt-6-luna` (точное сравнение; без неё платный чат, выбравший `/lite`, молча уехал бы на
+Flash — в 7 раз дороже). На проде затрагивает 0 строк, на стенде и в копиях базы — сколько есть; счётчик в лог. SQL-дефолт
+колонки `chat_models.model` — `gpt-6-luna` (только новая база).
+
+Команда `/lite` — заглушка на один релиз `cmd_lite_gone` («Gemini Flash-Lite убрал поставщик. Вместо неё — /luna…»); `/luna` —
+`cmd_luna` → `_set_chat_model(..., "luna")`. Luna — дефолт: пробного запроса перед записью нет (условие по `DEFAULT_MODEL_ID`).
+`gemini-3.1-flash-lite` лежит в `LEGACY_PRICES` (0.25 / 1.50) — подпись и цена старых строк `usage_log` в `/cost`.
 
 Фолбэк — GPT другого провайдера: `docs/claude/model-fallback.md`. Цены GPT (фолбэк, поиск, Terra для картинок) в
 `LEGACY_PRICES`: Luna 0.10/0.50, Terra 1.00/5.00, Sol 2.00/10.00; запись в кэш 1.25× (непроверено на `/v1/messages`).
 
-**Дедуп** (`dedup_memory.py`, `dedup_tui.py`): `MODEL_ALIASES` = lite/flash/argon, дефолт `lite`; `PRICING` — ручная копия `MODELS`
-(общий модуль `models.py` не заводили — решение за Алексеем, п. 3.2 ТЗ; расхождение ловит
-`scripts/test_model_fallback.py::test_dedup_pricing_matches_bot`). GPT-моделей в дедупе нет (GPT-моделей чата нет).
+**Дедуп** (`dedup_memory.py`, `dedup_tui.py`): `MODEL_ALIASES` = luna/flash/argon, дефолт `luna` (запас рассуждений 2000);
+`PRICING` — ручная копия `MODELS` (общий модуль `models.py` не заводили — решение за Алексеем, п. 3.2 ТЗ; расхождение ловит
+`scripts/test_model_fallback.py::test_dedup_pricing_matches_bot`). Вызов дедупа шлёт только `model`/`max_tokens`/`system`/`messages`
+— Luna их принимает (без `thinking`, `output_config`).
 
 ---- ИСТОРИЯ (до 2026-10-28) ---
 
@@ -177,6 +197,7 @@ effort не задаёт; forced `tool_choice` (`any`/`tool`) → 400 — в к�
   с похожей логикой — тогда осмысленно выносить `MODELS` в общий модуль.
 
 ## Gemini как модели чата (v1.9.0, ТЗ `feat/gemini-models`)
+> Историческая секция. С 2026-11-14 `/lite` (Gemini 3.1 Flash-Lite) убрана пулом — вместо неё `/luna` (GPT-6 Luna), см. таблицу вверху файла.
 `MODELS` содержит три записи с `"provider": "gemini"`: `/argon` = `gemini-4-argon` ($2/$10), `/flash` =
 `gemini-3.8-flash` ($0.75/$3.75), `/lite` = `gemini-3.1-flash-lite` ($0.25/$1.50), окно 1M, `thinking_headroom` 4000,
 без `effort`/`restricted`. `model_provider(id)` → `anthropic|gemini|openai` (флаг в записи цены, иначе префикс `gemini*`).
@@ -319,3 +340,37 @@ cache_write_1h, cache_read)` (без наценки; `PRICE_MARKUP` примен
 - Аудио (нативный `generateContent`, 1 с тишины `audio/wav`): `gemini-3.6-flash` — 404 (модели нет), Lite / 2.5
   Flash-Lite / 2.5 Flash — 200, ответ «тишина» (не галлюцинация, в отличие от 3.6-flash в 08.2026). **OGG/Opus из
   Telegram не проверялся** — бенч шлёт WAV.
+
+## Замеры пула 2026-11-14 (ТЗ `docs/claude/tz-lite-gone.md`)
+
+Пул убрал `gemini-3.1-flash-lite`, `gemini-2.5-flash-lite`, `gemini-2.5-flash`, `gemini-3-flash-preview` (404 на всех полосах,
+~13:00 Berlin). В каталоге `GET /v1/models` — 20 моделей: живые Gemini `gemini-3.8-flash`, `gemini-4-argon` и новые
+`gemini-4-hydrogen`, `gemini-4-carbon`; `gemini-3.6-flash` отсутствует по-прежнему; Claude — 403 `model_blocked`. Сырые выводы:
+`docs/claude/bench/2026-11-14-1525.txt` (`/v1/messages`, 3 прогона на точку, картинка и инструменты) и
+`docs/claude/bench/2026-11-14-1531-gemini.txt` (Gemini по обеим полосам). Скрипт — `scripts/bench_pool.py` (под новый каталог).
+
+Прогон 15:25 Berlin, полоса `/v1/messages`, вопрос в характере Клодушки (медиана 3 прогонов):
+
+| Модель | Весь ответ, с | JSON-служебка (max_tokens=300) | Картинка на входе | `cache_control` | Листовая цена in/out |
+|---|---|---|---|---|---|
+| gpt-6-luna | 5.18 | OK, 3.0 с, 66 вых. токенов | да («Красная») | 200 | 0.10 / 0.50 |
+| gpt-5.6-luna | 4.05 | OK, 3.4 с | да | 200 | 0.20 / 1.20 |
+| gpt-6.1-terra | 3.99 | OK, 3.3 с | да | 200 | 1.00 / 5.00 |
+| gpt-5.6-terra | 4.70 | OK, 3.0 с | да | 200 | — |
+| gpt-6.1-sol | 5.39 | OK, 4.4 с | да | 200 | 2.00 / 10.00 |
+| gpt-6-sol / gpt-5.6-sol | 3.15 / 3.27 | OK | да | 200 | — |
+| gpt-6-astra | 5.65 | OK, 3.9 с | да | 200 | — |
+| gemini-3.8-flash | 4.63 (761 вых. токен на ответ) | обрыв без запаса, OK с запасом +4000 (2.4 с) | да (ответ с оговоркой) | **400** | 0.75 / 3.75 |
+| gemini-4-hydrogen | 6.42 (1262 вых.) | пусто без запаса, OK с запасом | пусто | **400** | не измерена |
+| gemini-4-carbon, gemini-4-argon | — | 529 `Overloaded` | — | — | — |
+
+- Luna на `/v1/messages` отвечает за ~5 с (28.10 было 3.0 с — разброс пула по времени суток большой), JSON-служебку отдаёт с
+  первого раза и без запаса, картинку на входе принимает; `reasoning` в ответе не виден. Поэтому служебные вызовы и free
+  переведены на неё (`DEFAULT_MODEL_KEY = "luna"`): Flash думает всегда (~300+ токенов рассуждений на вызов) и на тех же
+  токенах за 14 дней обошёлся бы ≈ $20 против ≈ $1.7 у Luna и $4.42 у Lite (оценки по токенам, не замер).
+- **Не измерено: Carbon, Argon, голос и нативная полоса `generateContent`.** Gemini в пуле лежал (`/v1/messages` — 529,
+  нативная — 503) с ~15:27 Berlin на обоих прогонах; первый прогон успел снять только Flash и Hydrogen. Голос на
+  `gemini-3.8-flash` (OGG/Opus из Telegram) на живом пуле не проверен — шаг стенда `staging-checklist-lite-gone.md`.
+- Аудио принимает только Gemini через нативный `generateContent`; у GPT `input_audio` → 400 на `chat/completions` и
+  `responses`, `/v1/audio/transcriptions` → 404 (проверено 2026-11-14) — запасного провайдера у голоса нет.
+- Hydrogen и Carbon в бот **не добавлены** (решение Алексея 2026-11-14), вопрос — в `open-tasks.md`.

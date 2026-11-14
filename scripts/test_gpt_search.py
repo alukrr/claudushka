@@ -172,7 +172,7 @@ def test_provider_fallback_to_tavily_when_gpt_none(monkeypatch):
 @pytest.mark.parametrize("tier,mode,model,expected", [
     ("paid", "auto", "flash", "gpt"), ("paid", "auto", "argon", "gpt"), ("paid", "gpt", "flash", "gpt"),
     ("paid", "tavily", "flash", "tavily"), ("paid", "claude", "flash", "gpt"),   # «claude» из старой БД → auto
-    ("free", "gpt", "lite", "tavily"), ("free", "auto", "lite", "tavily"),
+    ("free", "gpt", "luna", "tavily"), ("free", "auto", "luna", "tavily"),
 ])
 def test_search_provider_for(monkeypatch, tier, mode, model, expected):
     monkeypatch.setattr(bot, "chat_tier", lambda c: tier)

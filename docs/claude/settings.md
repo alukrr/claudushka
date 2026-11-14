@@ -9,7 +9,7 @@
 
 | Ключ | Команда(ы) | Кто меняет | Free |
 |---|---|---|---|
-| `model` | `/argon /flash /lite` | любой; `restricted` в группе — админ чата/бота | `admin_saves` (проба модели перед записью, кроме Lite и free) |
+| `model` | `/argon /flash /luna` | любой; `restricted` в группе — админ чата/бота | `admin_saves` (проба модели перед записью, кроме Luna и free) |
 | `image_provider` | `/banana /bananapro /gptimage /flare /sunburst` | как `model` (`bananapro` restricted) | `admin_saves` |
 | `persona` | `/classic /business /toxic /flirt /granny` | личка — сам; группа — админ чата/бота | `admin_saves` |
 | `review_persona` | `/review_persona` | админ чата/бота; смотреть — все; только группы | `admin_saves` |
@@ -43,7 +43,7 @@ await apply_setting(key, chat_id, value, *, context=None, probe_chat_id=None) ->
 ```
 Валидация значения (`validate`) → `apply`. Неверное значение или упавшая проба модели → `(False, текст)`, ничего не пишем. Права НЕ проверяет —
 их проверяет `can_change` в команде/мини-приложении ДО вызова. Для `model` проба идёт на чат `probe_chat_id` (в командах — текущий чат,
-как раньше), в free и для Lite пробы нет.
+как раньше), в free и для Luna пробы нет.
 
 ## Как команда использует реестр
 `_parse_target_chat` → `(chat_id, in_target, err)` разбирает только ID (у не-админа не разбирает: отказ «чужой чат» идёт раньше ошибок формата) →

@@ -1,11 +1,12 @@
-# Фолбэк между провайдерами пула: Gemini → GPT (ТЗ no-anthropic, 2026-10-28; до того — Claude → Gemini, ТЗ feat/model-fallback)
+# Фолбэк между провайдерами пула: Gemini → GPT и Luna → Gemini (ТЗ no-anthropic, 2026-10-28; Luna → Flash — ТЗ lite-gone, 2026-11-14; до того — Claude → Gemini, ТЗ feat/model-fallback)
 
 Перед правкой `call_claude` / `sync_create`, `_call_with_fallback`, `should_fallback`, `FALLBACK_*`, `kwargs_for_model`,
 цен GPT в `LEGACY_PRICES` — читай этот файл. Ошибки API вообще — `api-errors.md`.
 
 ## Идея
-Все модели чата — Gemini через пул `router.apitoken.sale` (`/v1/messages`, ключ бота). Если модель недоступна, тот же
-запрос уходит на **GPT из другого провайдера** на той же полосе и с тем же ключом — один сбой пула не роняет обе модели.
+Модели чата — Gemini (Flash, Argon) и GPT-6 Luna через пул `router.apitoken.sale` (`/v1/messages`, ключ бота). Если модель
+недоступна, тот же запрос уходит на **модель из другого провайдера** на той же полосе и с тем же ключом — один сбой пула не
+роняет обе модели (Gemini → GPT, Luna → Gemini).
 Ответ приходит в формате Anthropic, поэтому `response_text`, `_track_response`, групповой транскрипт и история не менялись.
 
 ## История: Claude выключен (2026-10-28)
@@ -20,12 +21,16 @@ Claude-модели на Gemini; v2.0.0 убрал Claude целиком: `CLAUD
 
 | Основная | Фолбэк | Почему |
 |---|---|---|
-| `gemini-3.1-flash-lite` (free, служебные) | `gpt-6-luna` | дешёвая → дешёвая; служебка JSON OK (замер 28.10) |
+| `gpt-6-luna` (free, ВСЕ служебные вызовы) | `gemini-3.8-flash` | другой провайдер; с 2026-11-14 (решение Алексея, Flash-Lite убрана пулом) |
 | `gemini-3.8-flash` (дефолт paid) | `gpt-6.1-terra` | средняя → средняя |
 | `gemini-4-argon` (обзор, дорогая) | `gpt-6.1-sol` | сильная → сильная |
 
-Обратно (GPT → Gemini) не нужно: GPT-моделей чата нет, GPT-модель в `MODELS` не добавлять (решение Алексея 2026-10-28 —
-Terra только для картинок, Шаг 2 ТЗ). **Пары предложены Claude Code, Алексей не подтверждал.**
+Переход всегда **один**: Luna → Flash, дальше цепочка не идёт (если лёг и Flash — `reply_api_error`; Flash → Terra срабатывает
+только когда Flash — основная модель вызова). Пар для Terra и Sol нет. Пара Luna → Flash дороже основной в ~7 раз
+($0.75/$3.75 против $0.10/$0.50) и Flash думает всегда: при `max_tokens = visible + 2000` у Luna `kwargs_for_model` пересобирает
+запас под Flash (`visible + 4000`). Обратного фолбэка Gemini → Luna нет: Terra/Sol остаются парами Flash/Argon, Luna — не вторая
+линия для Gemini. **Пары Flash → Terra и Argon → Sol предложены Claude Code, Алексей не подтверждал; Luna → Flash — решение
+Алексея 2026-11-14.** Прежняя пара `gemini-3.1-flash-lite → gpt-6-luna` убрана вместе с моделью (`fallback_model_for` для неё — None).
 
 | Переменная | Дефолт | Что |
 |---|---|---|
@@ -48,7 +53,7 @@ Terra только для картинок, Шаг 2 ТЗ). **Пары пред�
 - `sync_create` / `aux_create`: SDK-ретраи, затем пара на том же клиенте.
 - `kwargs_for_model(kwargs, model)` — одна функция и для первого вызова, и для фолбэка (на КОПИИ — оригиналы нужны ветке
   обрезки): убирает `thinking`, `output_config`, `tools`, `tool_choice`, **все `cache_control`**; `max_tokens` = видимая часть
-  + `thinking_headroom` целевой модели (Gemini 4000, GPT 2000). Для GPT `cache_control` на `/v1/messages` пул принимает
+  + `thinking_headroom` целевой модели (Gemini 4000, GPT 2000; при Luna → Flash запас 2000 заменяется на 4000). Для GPT `cache_control` на `/v1/messages` пул принимает
   (200, бенч 28.10), но действие не доказано — не шлём; кэш у GPT автоматический.
 
 ## Липкое окно (circuit breaker)

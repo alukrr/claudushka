@@ -25,7 +25,7 @@
   dry-run: читает со снимка во временном файле, sudo НЕ требует. `--apply` пишет в
   боевой файл напрямую — `data/` на сервере root:root, нужен `sudo` (для llm — `sudo -E`,
   прокинуть `ANTHROPIC_API_KEY`). `--model` принимает короткие имена
-  (`haiku`/`sonnet`/`opus`/`fable`, а также `argon` = gemini-4-argon, `flash` = gemini-3.8-flash и `lite` = gemini-3.1-flash-lite (те же имена, что команды бота) —
+  (`haiku`/`sonnet`/`opus`/`fable`, а также `argon` = gemini-4-argon, `flash` = gemini-3.8-flash и `luna` = gpt-6-luna (те же имена, что команды бота) —
   Gemini через пул, ВЫБОР ВРУЧНУЮ, не автофолбэк: дедуп меняет память, смена модели посреди прогона дала бы смесь;
   у Gemini `max_tokens` + запас 4000 на рассуждения, без thinking/output_config/cache_control, оценка цены
   приблизительная — `THINKING_EST`; реестр `MODEL_ALIASES` дублирует `MODELS` из bot.py,
@@ -218,7 +218,7 @@
   (п. 2.5). Ветка `feat/terra-image`.
 - **Риск:** пул может закрыть и `/v1/messages` (как закрыл Claude). Отказ полосы фолбэк не спасёт — все модели и фолбэк на ней.
   Тогда нужен собственный транспорт (OpenAI/Gemini-совместимый) за теми же обёртками — отдельное ТЗ.
-- **Проверить на стенде:** OGG/Opus из Telegram на `gemini-3.1-flash-lite` (голос), `cache_read_input_tokens` у GPT на
+- **Проверить на стенде:** OGG/Opus из Telegram на `gemini-3.8-flash` (голос), `cache_read_input_tokens` у GPT на
   `/v1/messages`, качество дневного обзора на Argon, `thinking_headroom` GPT (2000 — не замерено), пары фолбэка (предложены).
 - **Цена поиска GPT** (`GPT_SEARCH_PRICE = 0.0`) и цена GPT Image (плоские $0.02 против токенной тарификации пула) — замерить по балансу пула.
 - **Общий модуль `models.py`** для бота и дедупа не заводили (п. 3.2 ТЗ, вопрос Алексею): `PRICING` в `dedup_memory.py` — копия,
@@ -261,3 +261,9 @@ PTB обрабатывает апдейты по очереди (`concurrent_upd
 генерация картинки) задерживает ответы ВСЕМ чатам. Частный случай — `Retry-After: 866` — закрыт потолком `SDK_RETRY_WAIT_CAP`
 (v2.5.1, `docs/claude/api-errors.md`). Общее решение (`concurrent_updates=True` + блокировка per-chat, чтобы не ломать порядок
 реплик и запись в `group_messages`/`conversations`) — отдельная ветка со стендом, не делали: поведенческое изменение, решение Алексея.
+
+- **Gemini в пуле после 2026-11-14** (`fix/lite-gone`): повторить замер `scripts/bench_pool.py --lanes messages,native`, когда пул стабилизируется
+  (14.11 с ~15:27 Berlin Gemini отвечал 529/503): не измерены Carbon, Argon, нативная полоса и голос на `gemini-3.8-flash` (OGG/Opus из Telegram).
+  Решить по `gemini-4-hydrogen` и `gemini-4-carbon` (в бот не добавлены, решение Алексея 2026-11-14). У голоса запасного провайдера нет — аудио принимает
+  только Gemini; если нужен запас — искать другой источник (отдельный сервис расшифровки), в пуле его нет. Проверить на стенде, тарифицируется ли запись кэша
+  Luna на `/v1/messages` (1.25× по таблице пула) и приходит ли `cache_read_input_tokens`. ТЗ — `docs/claude/tz-lite-gone.md`.
