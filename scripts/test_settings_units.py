@@ -96,7 +96,7 @@ def test_can_change_group_only():
 
 def test_can_change_model_free_and_restricted():
     assert cc("model", "argon", tier="free")[1].startswith("Gemini 4 Argon — доступно в платном режиме")
-    assert "я и так на" in cc("model", "lite", tier="free")[1]
+    assert "я и так на" in cc("model", "luna", tier="free")[1]
     assert cc("model", "argon", tier="free", bot_admin=True)[0]            # админ бота сохраняет (с пометкой в команде)
     assert cc("model", "argon", tier="free", chat_admin=True)[0] is False  # админ чата — нет
     ok, why = cc("image_provider", "bananapro")
@@ -201,9 +201,9 @@ def test_apply_model_probe(tmpdb, monkeypatch):
     monkeypatch.setattr(bot, "_probe_model", fake_probe)
     ok, _ = run(bot.apply_setting("model", GROUP, "argon", context=None, probe_chat_id=777))
     assert ok and probes == [(777, "gemini-4-argon")] and db.get_chat_model_db(GROUP) == "gemini-4-argon"
-    # Lite — без пробы
+    # Luna (дефолт) — без пробы
     probes.clear()
-    ok, _ = run(bot.apply_setting("model", GROUP, "lite", context=None, probe_chat_id=777))
+    ok, _ = run(bot.apply_setting("model", GROUP, "luna", context=None, probe_chat_id=777))
     assert ok and probes == []
 
 
@@ -246,6 +246,6 @@ def test_get_shapes(tmpdb):
 
 def test_get_free_notes(tmpdb, monkeypatch):
     monkeypatch.setattr(bot, "chat_tier", lambda cid: "free")
-    assert bot.SETTINGS["model"].get(GROUP)["note"] == "бесплатный режим — всегда Lite"
-    assert bot.SETTINGS["model"].get(GROUP)["value"] == "lite"
+    assert bot.SETTINGS["model"].get(GROUP)["note"] == "бесплатный режим — всегда Luna"
+    assert bot.SETTINGS["model"].get(GROUP)["value"] == "luna"
     assert "активность не работает" in bot.SETTINGS["activity"].get(GROUP)["note"]

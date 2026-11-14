@@ -236,7 +236,7 @@ def test_settings_describe_rights_and_choices(env):
 def test_settings_free_note_and_denial(env):
     env.tiers[MEMBER] = "free"
     s = {x["key"]: x for x in env.client.get(f"/api/chats/{MEMBER}/settings", headers=auth(MEMBER)).json()["settings"]}
-    assert "Lite" in s["model"]["note"] and s["model"]["can_change"] is False and s["model"]["reason"]
+    assert "Luna" in s["model"]["note"] and s["model"]["can_change"] is False and s["model"]["reason"]
 
 
 # ---- POST settings ----

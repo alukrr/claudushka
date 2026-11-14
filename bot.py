@@ -118,12 +118,14 @@ else:
     logger.error("SDK без _calculate_retry_timeout — потолок Retry-After не стоит (docs/claude/api-errors.md); проверить после обновления anthropic")
 
 # --- Фолбэк между провайдерами пула (docs/claude/model-fallback.md, ТЗ no-anthropic) ---
-# С 2026-10-28 пул не отдаёт модели Anthropic; все модели чата — Gemini, фолбэк — GPT из ДРУГОГО провайдера (один сбой
-# пула не должен ронять обе): lite → gpt-6-luna, flash → gpt-6.1-terra, argon → gpt-6.1-sol. Та же полоса /v1/messages и
-# тот же ключ. FALLBACK_ENABLED=0 — откат без правки кода. Обратного фолбэка (GPT → Gemini) нет: GPT-моделей чата нет.
+# С 2026-10-28 пул не отдаёт модели Anthropic; фолбэк — модель из ДРУГОГО провайдера (один сбой пула не должен ронять
+# обе): flash → gpt-6.1-terra, argon → gpt-6.1-sol. С 2026-11-14 (Flash-Lite убрана пулом) служебные вызовы и free — на
+# gpt-6-luna, её пара — gemini-3.8-flash (GPT → Gemini). Переход один: Luna → Flash, дальше цепочка не идёт (Flash → Terra
+# срабатывает только когда Flash — основная модель вызова). Та же полоса /v1/messages и тот же ключ.
+# FALLBACK_ENABLED=0 — откат без правки кода.
 FALLBACK_ENABLED = os.environ.get("FALLBACK_ENABLED", "1").strip() != "0"
 FALLBACK_PAIRS = {
-    "gemini-3.1-flash-lite": "gpt-6-luna",
+    "gpt-6-luna": "gemini-3.8-flash",
     "gemini-3.8-flash": "gpt-6.1-terra",
     "gemini-4-argon": "gpt-6.1-sol",
 }
@@ -263,6 +265,7 @@ captcha_state: dict[str, dict] = {}
 # DEFAULT_CACHE_MULTS. thinking_headroom — сколько токенов добавить к max_tokens под рассуждения (см. out_tokens):
 # Gemini 3.8 Flash и Argon думают ВСЕГДА (не выключить), рассуждения идут в вывод — без запаса ответ обрывается.
 # "restricted" — дорогая модель: в группе её переключают только админы чата и бота (сейчас ни у одной нет).
+_GPT_MULTS = {"cache_write_5m_mult": 1.25, "cache_write_1h_mult": 1.25}   # GPT через пул: запись кэша по таблице пула
 MODELS = {
     "argon":  {"id": "gemini-4-argon",            "label": "Gemini 4 Argon", "provider": "gemini",
                "in": 2.0,  "out": 10.0, "cache_read_mult": 0.05,
@@ -272,19 +275,19 @@ MODELS = {
                "in": 0.75, "out": 3.75, "cache_read_mult": 0.1,
                "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0, "context": 1_000_000,
                "thinking_headroom": 4000},
-    "lite":   {"id": "gemini-3.1-flash-lite",     "label": "Gemini 3.1 Flash-Lite", "provider": "gemini",
-               "in": 0.25, "out": 1.50, "cache_read_mult": 0.1,
-               "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0, "context": 1_000_000,
-               "thinking_headroom": 4000},
+    # Luna — служебные вызовы и free (с 2026-11-14, вместо убранной пулом Flash-Lite). GPT через /v1/messages: кэш
+    # автоматический, запись 1.25x по таблице пула (тарифицируется ли — не проверено), max_tokens пул «принимает и игнорирует».
+    "luna":   {"id": "gpt-6-luna",                "label": "GPT-6 Luna", "provider": "openai",
+               "in": 0.10, "out": 0.50, "cache_read_mult": 0.1,
+               **_GPT_MULTS, "context": 872_000, "thinking_headroom": 2000},
 }
-DEFAULT_MODEL_KEY = "lite"
+DEFAULT_MODEL_KEY = "luna"
 DEFAULT_MODEL_ID = MODELS[DEFAULT_MODEL_KEY]["id"]
 
 # Модели, которых нет в выборе пользователя, но которые встречаются в ответах API, фолбэке или в истории usage_log —
 # для цены и подписи в /cost. Claude-строки (до 2026-10-28) нужны подписям старых строк usage_log; Haiku 5.5 со
 # ступенчатой ценой >100k в новых расчётах ступень не использует (расчёт на Claude больше не идёт).
 _CLAUDE_MULTS = {"cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0}
-_GPT_MULTS = {"cache_write_5m_mult": 1.25, "cache_write_1h_mult": 1.25}
 LEGACY_PRICES = {
     "claude-haiku-5-5":  {"label": "Haiku 5.5",  "in": 0.10, "out": 0.50, "cache_read_mult": 0.1, **_CLAUDE_MULTS},
     "claude-sonnet-5-5": {"label": "Sonnet 5.5", "in": 2.0, "out": 10.0, "cache_read_mult": 0.05, **_CLAUDE_MULTS},
@@ -296,12 +299,14 @@ LEGACY_PRICES = {
     "claude-opus-4-8": {"label": "Opus 4.8", "in": 5.0, "out": 25.0, "cache_read_mult": 0.1, **_CLAUDE_MULTS},
     "gemini-2.5-flash-lite": {"label": "Gemini 2.5 Flash-Lite", "provider": "gemini", "in": 0.10, "out": 0.40,
                               "cache_read_mult": 0.1, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0},
+    # Убрана пулом 2026-11-14: только подписи и цены старых строк usage_log (/cost).
+    "gemini-3.1-flash-lite": {"label": "Gemini 3.1 Flash-Lite", "provider": "gemini", "in": 0.25, "out": 1.50,
+                              "cache_read_mult": 0.1, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0},
     # GPT через пул: фолбэк Gemini-моделей (FALLBACK_PAIRS) и поиск (gpt-6-luna, /v1/responses, label=gpt_search).
+    # gpt-6-luna с 2026-11-14 — в MODELS (выбираемая, дефолт), здесь её нет.
     # Листовые цены со страницы пула 2026-10-28. Выход включает reasoning, поэтому у фолбэк-моделей запас
     # thinking_headroom (кэш у GPT автоматический; запись 1.25x — по таблице пула, тарифицируется ли она на
     # /v1/messages — не проверено). Terra ещё и рисует (/v1/responses + image_generation, Шаг 2 ТЗ).
-    "gpt-6-luna":    {"label": "GPT-6 Luna", "provider": "openai", "in": 0.10, "out": 0.50,
-                      "cache_read_mult": 0.1, "thinking_headroom": 2000, **_GPT_MULTS},
     "gpt-6.1-terra": {"label": "GPT-6.1 Terra", "provider": "openai", "in": 1.00, "out": 5.00,
                       "cache_read_mult": 0.05, "thinking_headroom": 2000, **_GPT_MULTS},
     "gpt-6.1-sol":   {"label": "GPT-6.1 Sol", "provider": "openai", "in": 2.00, "out": 10.00,
@@ -638,8 +643,8 @@ _last_fallback_alert = 0.0
 
 
 def fallback_model_for(model_id: str) -> str | None:
-    """Модель фолбэка (FALLBACK_PAIRS: Gemini → GPT) или None: фолбэк выключен / у модели пары нет (GPT-модели,
-    неизвестные строки). Только один переход."""
+    """Модель фолбэка (FALLBACK_PAIRS: Luna → Flash, Flash → Terra, Argon → Sol) или None: фолбэк выключен / у модели пары
+    нет (Terra, Sol, неизвестные строки). Только один переход."""
     if not model_id or not FALLBACK_ENABLED:
         return None
     return FALLBACK_PAIRS.get(model_id)
@@ -728,7 +733,7 @@ async def check_fallback_models() -> None:
 
 
 async def _call_with_fallback(kwargs: dict, make_fn, *, label: str, keepalive, fallback: bool = True):
-    """Вызов модели с переходом на пару из FALLBACK_PAIRS. make_fn(kw) → функция без аргументов для call_with_retry.
+    """Вызов модели с переходом на пару из FALLBACK_PAIRS (Luna → Flash, Flash → Terra, Argon → Sol). make_fn(kw) → функция без аргументов для call_with_retry.
     Возвращает (response, фактически запрошенная модель)."""
     model = kwargs.get("model", "")
     fb = fallback_model_for(model) if fallback else None
@@ -943,11 +948,11 @@ PAID_DEFAULT_MODEL_KEY = "flash"    # модель платного чата, к
 FREE_IMAGE_PROVIDER = "gpt"         # единственный провайдер картинок в free
 
 
-FREE_MODEL_KEYS = ("lite",)   # модели, доступные в free: только Gemini Flash-Lite (выбора нет)
+FREE_MODEL_KEYS = ("luna",)   # модели, доступные в free: только GPT-6 Luna (выбора нет)
 
 
 def get_chat_model(chat_id: int) -> str:
-    """Эффективная модель чата: free → всегда Lite (выбора нет); запись chat_models НЕ трогаем — при возврате в paid
+    """Эффективная модель чата: free → всегда Luna (выбора нет); запись chat_models НЕ трогаем — при возврате в paid
     прошлый выбор восстанавливается. paid → выбор чата, иначе Flash; строка не из реестра → тоже Flash."""
     if chat_tier(chat_id) == "free":
         return DEFAULT_MODEL_ID
@@ -1059,7 +1064,7 @@ def persona_review_style(chat_id: int) -> str:
 
 
 TIER_FREE_MSG = (
-    "Баланс закончился, я перешла в бесплатный режим: Lite, картинки через GPT "
+    "Баланс закончился, я перешла в бесплатный режим: Luna, картинки через GPT "
     "(лимит в сутки). Баланс — /cost"
 )
 
@@ -1575,9 +1580,13 @@ def image_price_text(key: str) -> str:
 # именем — GPT Image 2 (см. IMAGE_PROVIDERS ниже), это не то же самое, что «банан через
 # пул», а второй независимый провайдер.
 # 2026-10-28: gemini-3.6-flash пропала из каталога пула, расшифровка отвечала 404 → gemini-3.1-flash-lite (по докам пула
-# аудио inline принимают все текстовые модели Gemini). GEMINI_AUDIO_MODEL в .env — смена без правки кода
-# (нужен --force-recreate). OGG/Opus из Telegram на Lite — проверить на первом же голосовом в проде.
-GEMINI_AUDIO_MODEL_NAME = os.environ.get("GEMINI_AUDIO_MODEL", "").strip() or "gemini-3.1-flash-lite"
+# аудио inline принимают все текстовые модели Gemini). 2026-11-14: пул убрал и Flash-Lite — голос на gemini-3.8-flash.
+# Аудио в пуле принимает ТОЛЬКО Gemini через нативный generateContent: у GPT `input_audio` → 400, /v1/audio/transcriptions →
+# 404 (проверено 2026-11-14), поэтому запасного провайдера у голоса нет. Flash думает всегда — части ответа с "thought": true
+# в текст не берём (_audio_text_from_parts), рассуждения тарифицируются как выход (_record_gemini_usage).
+# GEMINI_AUDIO_MODEL в .env — смена без правки кода (нужен --force-recreate). OGG/Opus из Telegram на Flash — проверить на
+# первом же голосовом (стенд, docs/claude/staging-checklist-lite-gone.md).
+GEMINI_AUDIO_MODEL_NAME = os.environ.get("GEMINI_AUDIO_MODEL", "").strip() or "gemini-3.8-flash"
 # POOL_BASE_URL — общий пул api.apitoken.sale, не только для Gemini: с добавлением
 # GPT Image 2 через него же идёт и OpenAI-совместимый /v1/images/generations.
 POOL_BASE_URL = "https://router.apitoken.sale"
@@ -1707,6 +1716,11 @@ def _record_gemini_usage(meta: dict, model: str, label: str) -> None:
         logger.exception(f"usage_log: не удалось записать {label}")
 
 
+def _audio_text_from_parts(parts: list) -> str:
+    """Текст расшифровки из parts ответа generateContent: части с "thought": true (рассуждения Flash) пропускаются."""
+    return "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
+
+
 async def _transcribe_audio_gemini(audio_bytes: bytes, mime_type: str) -> str | None:
     """Расшифровывает речь из голосового/видео через Gemini на пуле api.apitoken.sale
     (тот же ANTHROPIC_API_KEY, что и Claude — не GEMINI_API_KEY). None — при любой
@@ -1742,7 +1756,7 @@ async def _transcribe_audio_gemini(audio_bytes: bytes, mime_type: str) -> str | 
             try:
                 data = resp.json()
                 parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-                text = "".join(p.get("text", "") for p in parts).strip()
+                text = _audio_text_from_parts(parts)
             except Exception as e:
                 logger.warning(f"Gemini audio: unparseable response: {e}")
                 return None
@@ -3277,10 +3291,10 @@ async def handle_captcha(update: Update, user: dict) -> bool:
 
 # --- Daily review ---
 
-DAILY_REVIEW_MODEL_ID = MODELS["argon"]["id"]  # осознанное исключение из «служебное — Lite»: платная фича
+DAILY_REVIEW_MODEL_ID = MODELS["argon"]["id"]  # осознанное исключение из «служебное — Luna»: платная фича
 
 # --- /forget: подтверждение, область, «сувениры» (docs/claude/memory.md → «/forget», ТЗ docs/claude/tz-forget-confirm.md) ---
-# Выбор «сувениров» на Argon в платном чате — ВТОРОЕ осознанное исключение из «служебное — только Lite» (первое — обзор выше);
+# Выбор «сувениров» на Argon в платном чате — ВТОРОЕ осознанное исключение из «служебное — только Luna» (первое — обзор выше);
 # модель чата (/flash) не учитывается. Free — DEFAULT_MODEL_ID.
 FORGET_PICK_MODEL_ID = MODELS["argon"]["id"]
 FORGET_CONFIRM_TTL = 300             # сколько живут кнопки предупреждения, с
@@ -4100,7 +4114,7 @@ _ACTIVITY_SYSTEM = (
 
 
 def _json_flag(text: str, key: str, label: str) -> bool:
-    """Булев флаг из JSON-ответа Lite; мусор, пусто, не-bool → False (сомнение = нет)."""
+    """Булев флаг из JSON-ответа Luna; мусор, пусто, не-bool → False (сомнение = нет)."""
     if not text:
         return False
     data = api_errors.parse_json_lenient(text, "{", label=label)
@@ -4108,7 +4122,7 @@ def _json_flag(text: str, key: str, label: str) -> bool:
 
 
 def _json_verdict(text: str, key: str, label: str) -> tuple[bool, str]:
-    """(флаг, reason) из JSON-ответа Lite; мусор/пусто/не-bool → (False, ""). reason — строка до 200 знаков."""
+    """(флаг, reason) из JSON-ответа Luna; мусор/пусто/не-bool → (False, ""). reason — строка до 200 знаков."""
     if not text:
         return False, ""
     data = api_errors.parse_json_lenient(text, "{", label=label)
@@ -4119,13 +4133,13 @@ def _json_verdict(text: str, key: str, label: str) -> tuple[bool, str]:
 
 
 def _abuse_skip_prefixes() -> tuple:
-    """Служебные строки бота, которых нет во входе Lite: пометка паузы подсказывала бы модели «человек плохой»,
+    """Служебные строки бота, которых нет во входе Luna: пометка паузы подсказывала бы модели «человек плохой»,
     остальные — не реплики. Префиксы из констант, не хардкод."""
     return (f"({PAUSE_NOTE_LABEL}:", f"({DRAW_SENT_LABEL}", f"({REVIEW_SENT_LABEL}")
 
 
 def build_abuse_input(rows: list[dict]) -> str:
-    """[{"is_bot","text"}] → текст для Lite: каждая реплика ≤ ABUSE_ITEM_CHARS, всего ≤ ABUSE_TOTAL_CHARS (старые отбрасываем)."""
+    """[{"is_bot","text"}] → текст для Luna: каждая реплика ≤ ABUSE_ITEM_CHARS, всего ≤ ABUSE_TOTAL_CHARS (старые отбрасываем)."""
     lines = [f"{'Бот' if r['is_bot'] else 'Человек'}: {_clip(r['text'], ABUSE_ITEM_CHARS).replace(chr(10), ' ')}" for r in rows]
     while lines and sum(len(x) + 1 for x in lines) > ABUSE_TOTAL_CHARS:
         lines.pop(0)
@@ -4140,7 +4154,7 @@ def build_abuse_payload(context_rows: list[dict], current: str) -> str:
 
 
 async def _abuse_check_task(message, chat_id: int, user_id: int, name: str) -> None:
-    """Фоновая проверка на травлю (Lite, label=abuse_check). Ответ на сообщение уже ушёл; проступок применяется после."""
+    """Фоновая проверка на травлю (Luna, label=abuse_check). Ответ на сообщение уже ушёл; проступок применяется после."""
     usage_ctx.set((chat_id, "group", user_id))
     try:
         prev = db.get_ignore(chat_id, user_id)
@@ -4199,7 +4213,7 @@ def build_activity_input(entries: list[dict]) -> str:
 
 
 async def _activity_task(message, context, chat_id: int, user_id: int) -> None:
-    """Фон: Lite решает «вставлять реплику?» → модель чата пишет её → отправка. Ошибки — только в лог."""
+    """Фон: Luna решает «вставлять реплику?» → модель чата пишет её → отправка. Ошибки — только в лог."""
     usage_ctx.set((chat_id, "group", user_id))
     try:
         entries = db.get_group_transcript(chat_id, ACTIVITY_TRANSCRIPT_LINES)
@@ -5814,7 +5828,7 @@ def _in_choices(key_choices: Callable[[], list], error: str) -> Callable[[Any], 
 # --- get: действующее значение, сохранённое, пояснение ---
 def _get_model(chat_id: int) -> dict:
     stored = db.get_chat_model_db(chat_id)
-    note = "бесплатный режим — всегда Lite" if chat_tier(chat_id) == "free" else ""
+    note = "бесплатный режим — всегда Luna" if chat_tier(chat_id) == "free" else ""
     return {"value": _model_key(get_chat_model(chat_id)), "stored": None if stored is None else _model_key(stored), "note": note}
 
 
@@ -5861,7 +5875,7 @@ def _get_autoignore(chat_id: int) -> dict:
 # --- apply: запись с побочными эффектами → (успех, текст ошибки) ---
 async def _apply_model(chat_id, value, *, context=None, probe_chat_id=None):
     meta = MODELS[value]
-    # Lite — дефолт, проба ему не нужна (возврат на него не должен падать); в free (пишет только админ) пробы нет.
+    # Luna — дефолт, проба ей не нужна (возврат на него не должен падать); в free (пишет только админ) пробы нет.
     if chat_tier(chat_id) != "free" and meta["id"] != DEFAULT_MODEL_ID:
         try:
             await _probe_model(context, probe_chat_id if probe_chat_id is not None else chat_id, meta["id"])
@@ -6103,8 +6117,8 @@ def _parse_target_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: 
 async def _set_chat_model(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str):
     """Переключение модели чата. key — ключ реестра MODELS, не API-строка.
 
-    Права — can_change("model"): всё, кроме Lite, — «админ ИЛИ платный режим»; restricted в группе — ещё и только админы
-    чата/бота. В free выбора нет (get_chat_model всегда отдаёт Lite) и запись chat_models меняет только админ бота —
+    Права — can_change("model"): всё, кроме Luna, — «админ ИЛИ платный режим»; restricted в группе — ещё и только админы
+    чата/бота. В free выбора нет (get_chat_model всегда отдаёт Luna) и запись chat_models меняет только админ бота —
     прошлый платный выбор дождётся возвращения в paid. Запись и проба модели — apply_setting."""
     meta = MODELS[key]
     chat_id, in_target, err = _parse_target_chat(update, context, key)
@@ -6132,7 +6146,7 @@ async def cmd_claude_gone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/haiku /sonnet /opus /fable — заглушка на один релиз: пул закрыл модели Anthropic (2026-10-28)."""
     await update.effective_message.reply_text(
         "Модели Claude мне больше недоступны — их закрыл поставщик. Выбери другую в /models: "
-        "/argon, /flash или /lite.")
+        "/argon, /flash или /luna.")
 
 
 async def cmd_argon(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6143,8 +6157,14 @@ async def cmd_flash(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _set_chat_model(update, context, "flash")
 
 
-async def cmd_lite(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _set_chat_model(update, context, "lite")
+async def cmd_luna(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _set_chat_model(update, context, "luna")
+
+
+async def cmd_lite_gone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/lite — заглушка на один релиз: пул убрал Gemini Flash-Lite (2026-11-14), её место заняла Luna."""
+    await update.effective_message.reply_text(
+        "Gemini Flash-Lite убрал поставщик. Вместо неё — /luna (GPT-6 Luna), остальные модели — в /models.")
 
 
 SEARCH_PROVIDER_LABELS = {"gpt": "GPT", "tavily": "Tavily"}
@@ -6216,8 +6236,15 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tier = chat_tier(chat_id)
     _, label = _chat_display(update, chat_id)
     lines = [f"Модель для {label}: {model_meta(current)['label']}", f"Режим: {_tier_label(chat_id)}"]
-    lines += ["", "Gemini (явного кэша промпта нет; неявный срабатывает не всегда):"]
+    # Заголовок — по провайдеру модели (model_provider): Luna (GPT) не должна оказаться под «Gemini».
+    group_titles = {"gemini": "Gemini (явного кэша промпта нет; неявный срабатывает не всегда):",
+                    "openai": "GPT (кэш промпта автоматический):"}
+    shown_provider = None
     for key, meta in MODELS.items():
+        prov = model_provider(meta["id"])
+        if prov != shown_provider:
+            shown_provider = prov
+            lines += ["", group_titles.get(prov, prov)]
         mark = "▸" if meta["id"] == current else " "
         window = f"{meta['context'] // 1000}k" if meta["context"] < 1_000_000 else "1M"
         tail = "  (платный режим)" if tier == "free" and key not in FREE_MODEL_KEYS else ""
@@ -6239,7 +6266,7 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("Nano Banana — 2K по запросу («нарисуй 2к …», /imagine 2k …), приходит документом. Подробнее — /imagemodels.")
     lines.append("(админы) — в группе переключают только админы чата и бота.")
     if tier == "free":
-        lines.append("В бесплатном режиме работает только Lite; остальные модели — после пополнения баланса (/cost).")
+        lines.append("В бесплатном режиме работает только Luna; остальные модели — после пополнения баланса (/cost).")
         saved = db.get_chat_model_db(chat_id)
         if saved and saved != DEFAULT_MODEL_ID:
             lines.append(f"Прошлый выбор ({model_meta(saved)['label']}) вернётся в платном режиме.")
@@ -6471,9 +6498,9 @@ USER_HELP = """\
   /imagine <q>   — генерация изображения (/imagine 2k <q> — в 2K, документом)
                    или «нарисуй "…"» — дословно; без кавычек Клодушка сама придумает картинку
   /models        — модели, режим (платный/бесплатный) и что сейчас у чата
-  /lite          — Gemini 3.1 Flash-Lite (единственная модель бесплатного режима; кэша промпта нет)
-  /flash         — Gemini 3.8 Flash (платный режим, дефолт)
-  /argon         — Gemini 4 Argon (платный режим, самая сильная)
+  /luna          — GPT-6 Luna (единственная модель бесплатного режима)
+  /flash         — Gemini 3.8 Flash (платный режим, дефолт; кэша промпта нет)
+  /argon         — Gemini 4 Argon (платный режим, самая сильная; кэша промпта нет)
   /searchmode    — откуда брать данные для поиска: auto|gpt|tavily (платный режим; без аргумента — текущий)
   /imagemodels   — какой провайдер картинок сейчас у чата
   /banana        — рисовать через Nano Banana 2.1 (платный режим)
@@ -6518,15 +6545,16 @@ ADMIN_HELP = """\
 
 Модели (без аргумента — текущий чат; с chat_id — любой, только админу):
   /models [chat_id]        — список моделей, цены, окно; ▸ = текущая
-  /lite [chat_id]          — Gemini 3.1 Flash-Lite — $0.25/$1.50, окно 1M (единственная модель бесплатного режима)
+  /luna [chat_id]          — GPT-6 Luna — $0.10/$0.50, окно 872K (единственная модель бесплатного режима и всех служебных вызовов)
   /flash [chat_id]         — Gemini 3.8 Flash — $0.75/$3.75, окно 1M (дефолт платного режима)
   /argon [chat_id]         — Gemini 4 Argon — $2/$10, окно 1M (платный режим; модель дневного обзора)
   chat_id — число с минусом, например: /flash -1001109809707
-  Gemini-модели без кэша промпта: вход каждый раз по полной цене. Если модель чата упала, ответ даёт GPT из другого
-  провайдера (lite → GPT-6 Luna, flash → GPT-6.1 Terra, argon → GPT-6.1 Sol), в /cost такие строки с меткой *_fallback.
-  Всё, кроме Lite, — админу или чату в платном режиме. Выбор постоянный (chat_models), в бесплатном режиме
-  не применяется (там всегда Lite), но и не стирается. Перед записью — пробный запрос (кроме Lite).
-  /haiku /sonnet /opus /fable больше нет (пул закрыл Claude) — отвечают подсказкой выбрать другую модель.
+  Gemini-модели без кэша промпта: вход каждый раз по полной цене. Если модель чата упала, ответ даёт модель другого
+  провайдера (luna → Gemini 3.8 Flash, flash → GPT-6.1 Terra, argon → GPT-6.1 Sol), в /cost такие строки с меткой *_fallback.
+  Всё, кроме Luna, — админу или чату в платном режиме. Выбор постоянный (chat_models), в бесплатном режиме
+  не применяется (там всегда Luna), но и не стирается. Перед записью — пробный запрос (кроме Luna).
+  /haiku /sonnet /opus /fable больше нет (пул закрыл Claude), /lite тоже (пул убрал Flash-Lite 2026-11-14) — отвечают
+  подсказкой выбрать другую модель.
 
 Поиск (без аргумента — текущий режим чата; chat_id вторым аргументом — любой чат, только админу):
   /searchmode [auto|gpt|tavily] [chat_id] — auto = поиск GPT при любой модели.
@@ -7051,7 +7079,7 @@ def parse_forget_keep(data, n: int) -> list[int]:
 
 async def pick_forget_keepsakes(chat_id: int, facts: list) -> list:
     """Две самые смешные записи из области стирания (список dict строк memory) или [] — сбой модели стиранию не мешает.
-    Платный чат — Argon, free — Lite; вызов через aux_create (фолбэк не отключаем), расход — label="forget" на счёт чата
+    Платный чат — Argon, free — Luna; вызов через aux_create (фолбэк не отключаем), расход — label="forget" на счёт чата
     (usage_ctx поставил gate_update и для нажатия кнопки)."""
     try:
         cands = forget_candidates(facts, int(time.time()))
@@ -9648,7 +9676,8 @@ def main():
     app.add_handler(CommandHandler(["haiku", "sonnet", "opus", "fable"], cmd_claude_gone))
     app.add_handler(CommandHandler("argon", cmd_argon))
     app.add_handler(CommandHandler("flash", cmd_flash))
-    app.add_handler(CommandHandler("lite", cmd_lite))
+    app.add_handler(CommandHandler("luna", cmd_luna))
+    app.add_handler(CommandHandler("lite", cmd_lite_gone))
     app.add_handler(CommandHandler("models", cmd_models))
     app.add_handler(CommandHandler("searchmode", cmd_searchmode))
     app.add_handler(CommandHandler("dev", cmd_dev))

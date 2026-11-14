@@ -1,4 +1,4 @@
-"""Юнит-тесты фолбэка Gemini → GPT (ТЗ no-anthropic, docs/claude/model-fallback.md).
+"""Юнит-тесты фолбэка между провайдерами пула (ТЗ no-anthropic и lite-gone, docs/claude/model-fallback.md).
 
 Без сети: клиент подменён. Запуск из корня репозитория:
     TELEGRAM_BOT_TOKEN=x ANTHROPIC_API_KEY=x python -m pytest scripts/test_model_fallback.py -q
@@ -66,8 +66,8 @@ def test_should_fallback_midstream_error():
     assert api_errors.should_fallback(exc) is True
 
 
-FLASH, LITE, ARGON = (bot.MODELS[k]["id"] for k in ("flash", "lite", "argon"))
-TERRA, LUNA, SOL = "gpt-6.1-terra", "gpt-6-luna", "gpt-6.1-sol"
+FLASH, LUNA, ARGON = (bot.MODELS[k]["id"] for k in ("flash", "luna", "argon"))
+TERRA, SOL = "gpt-6.1-terra", "gpt-6.1-sol"
 
 
 def test_fallback_kwargs_strips_and_copies():
@@ -84,12 +84,24 @@ def test_fallback_kwargs_strips_and_copies():
 
 
 def test_fallback_pairs():
-    assert bot.fallback_model_for(LITE) == LUNA and bot.fallback_model_for(FLASH) == TERRA
-    assert bot.fallback_model_for(ARGON) == SOL
-    assert bot.fallback_model_for(LUNA) is None and bot.fallback_model_for("claude-haiku-5-5") is None
-    for gem, gpt in bot.FALLBACK_PAIRS.items():                  # пара — другой провайдер и с ценой
-        assert bot.model_provider(gem) == "gemini" and bot.model_provider(gpt) == "openai"
-        assert bot.price_meta(gpt) is not None and bot.price_meta(gem) is not None
+    assert bot.fallback_model_for("gpt-6-luna") == "gemini-3.8-flash" and bot.fallback_model_for(LUNA) == FLASH
+    assert bot.fallback_model_for(FLASH) == TERRA and bot.fallback_model_for(ARGON) == SOL
+    assert bot.fallback_model_for(TERRA) is None and bot.fallback_model_for(SOL) is None
+    assert bot.fallback_model_for("gemini-3.1-flash-lite") is None   # убрана пулом 2026-11-14
+    assert bot.fallback_model_for("claude-haiku-5-5") is None
+    for src, dst in bot.FALLBACK_PAIRS.items():                  # пара — ДРУГОЙ провайдер и с ценой
+        assert bot.model_provider(src) != bot.model_provider(dst)
+        assert bot.price_meta(dst) is not None and bot.price_meta(src) is not None
+    assert (bot.model_provider(LUNA), bot.model_provider(FLASH)) == ("openai", "gemini")
+
+
+def test_luna_to_flash_headroom_is_4000():
+    """Переход Luna → Flash: запас на рассуждения заменяется запасом Flash (4000 вместо 2000)."""
+    assert bot._headroom(LUNA) == 2000 and bot._headroom(FLASH) == 4000
+    kw = dict(model=LUNA, max_tokens=bot.out_tokens(LUNA, 100), system="s", messages=[])
+    assert kw["max_tokens"] == 2100
+    assert bot.kwargs_for_model(kw, FLASH)["max_tokens"] == 100 + 4000
+    assert bot.kwargs_for_model(kw, FLASH)["model"] == FLASH
 
 
 @pytest.fixture(autouse=True)
@@ -107,20 +119,22 @@ def clean(monkeypatch):
 
 
 class FakeMessages:
-    """Gemini-модели падают с primary_exc (если задан), GPT отвечает."""
-    def __init__(self, primary_exc=None):
+    """Модели из `fail` (по умолчанию — все Gemini) падают с primary_exc (если задан), остальные отвечают."""
+    def __init__(self, primary_exc=None, fail=None):
         self.calls = []
         self.primary_exc = primary_exc
+        self.fail = fail
 
     def create(self, **kw):
         self.calls.append(kw)
-        if kw["model"].startswith("gemini") and self.primary_exc:
+        failing = kw["model"] in self.fail if self.fail is not None else kw["model"].startswith("gemini")
+        if failing and self.primary_exc:
             raise self.primary_exc
         return ok_response(kw["model"])
 
 
-def use_fake(monkeypatch, primary_exc=None):
-    fake = FakeMessages(primary_exc)
+def use_fake(monkeypatch, primary_exc=None, fail=None):
+    fake = FakeMessages(primary_exc, fail)
     c = SimpleNamespace(messages=fake)
     monkeypatch.setattr(bot, "client", c)
     monkeypatch.setattr(bot, "client_noretry", c)
@@ -149,11 +163,29 @@ def test_5xx_falls_back_one_retry_then_gpt(monkeypatch, clean):
     assert clean == [TERRA]                         # учёт по фактической модели
 
 
-@pytest.mark.parametrize("model,target", [(LITE, LUNA), (FLASH, TERRA), (ARGON, SOL)])
+@pytest.mark.parametrize("model,target", [(LUNA, FLASH), (FLASH, TERRA), (ARGON, SOL)])
 def test_each_model_goes_to_its_pair(monkeypatch, model, target):
-    fake = use_fake(monkeypatch, make_exc(500))
+    fake = use_fake(monkeypatch, make_exc(500), fail={model})
     run(dialog(model))
     assert fake.calls[-1]["model"] == target
+
+
+def test_luna_down_answers_via_flash_with_flash_headroom(monkeypatch, clean):
+    fake = use_fake(monkeypatch, make_exc(404), fail={LUNA})
+    r = run(bot.call_claude(None, None, label="t", model=LUNA, max_tokens=bot.out_tokens(LUNA, 50), system="s",
+                            messages=[{"role": "user", "content": "hi"}]))
+    assert api_errors.response_text(r) == "ok"
+    assert fake.calls[-1]["model"] == FLASH and fake.calls[-1]["max_tokens"] == 50 + 4000
+    assert clean == [FLASH]
+    assert bot._sticky_fallback(LUNA) == FLASH and bot._sticky_fallback(FLASH) is None
+
+
+def test_luna_to_flash_is_a_single_hop(monkeypatch):
+    """Luna и Flash лежат вместе: цепочки Luna → Flash → Terra нет, ошибка уходит наверх (reply_api_error)."""
+    fake = use_fake(monkeypatch, make_exc(500), fail={LUNA, FLASH})
+    with pytest.raises(anthropic.APIStatusError):
+        run(dialog(LUNA))
+    assert {c["model"] for c in fake.calls} == {LUNA, FLASH}
 
 
 def test_sticky_window_then_return(monkeypatch):
@@ -201,14 +233,15 @@ def test_probe_never_falls_back(monkeypatch):
 
 
 def test_sync_create_fallback(monkeypatch, clean):
-    fake = use_fake(monkeypatch, make_exc(500))
-    r = bot.sync_create(label="x", model=bot.DEFAULT_MODEL_ID, max_tokens=30 + 4000, system="s",
+    assert bot.DEFAULT_MODEL_ID == LUNA            # служебные вызовы — Luna; её пара — Flash
+    fake = use_fake(monkeypatch, make_exc(500), fail={LUNA})
+    r = bot.sync_create(label="x", model=bot.DEFAULT_MODEL_ID, max_tokens=30 + 2000, system="s",
                         messages=[{"role": "user", "content": "x"}], thinking={"type": "disabled"},
                         output_config={"effort": "low"})
     assert api_errors.response_text(r) == "ok"
-    assert fake.calls[-1]["model"] == LUNA and "thinking" not in fake.calls[-1]
-    assert fake.calls[-1]["max_tokens"] == 30 + bot._headroom(LUNA)
-    assert clean == [LUNA]
+    assert fake.calls[-1]["model"] == FLASH and "thinking" not in fake.calls[-1]
+    assert fake.calls[-1]["max_tokens"] == 30 + bot._headroom(FLASH) == 4030
+    assert clean == [FLASH]
 
 
 def test_prices_present():

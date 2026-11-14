@@ -30,8 +30,8 @@ data/dedup_runs/, калибровка оценок — data/dedup_calibration.j
                  формулировке (например "Поделился фото" / "Поделился фото в чате" /
                  "Отправил фото в чат" -> один факт). Один вызов модели на группу
                  (user_id, context, chat_id, tier) — СТОИТ ДЕНЕГ, задаётся --model
-                 (короткое имя lite / flash / argon — Gemini 3.1 Flash-Lite, 3.8 Flash, 4 Argon через пул,
-                 те же имена, что команды бота; дефолт lite, либо полная API-строка; выбор вручную, не
+                 (короткое имя luna / flash / argon — GPT-6 Luna, Gemini 3.8 Flash, 4 Argon через пул,
+                 те же имена, что команды бота; дефолт luna, либо полная API-строка; выбор вручную, не
                  автофолбэк; оценка цены приблизительна: рассуждения идут в вывод). Старые записи группы удаляются, вместо
                  них вставляется объединённый список с tier и (для medium)
                  максимальным expires_at среди объединяемых записей. Нужен пакет
@@ -101,11 +101,11 @@ from typing import Iterator, Literal
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "claudushka.db"
 
-# Короткие имена — как в реестре MODELS в bot.py, чтобы не помнить точные API-строки. Только Gemini через пул
-# (тот же Anthropic Messages API и ключ); с 2026-10-28 Claude пул не отдаёт. Не автофолбэк, а выбор вручную: дедуп
+# Короткие имена — как в реестре MODELS в bot.py, чтобы не помнить точные API-строки. Только модели пула (Gemini и
+# GPT-6 Luna; тот же Anthropic Messages API и ключ); с 2026-10-28 Claude пул не отдаёт, с 2026-11-14 нет и Flash-Lite. Не автофолбэк, а выбор вручную: дедуп
 # меняет память, молчаливая смена модели посреди прогона дала бы смесь результатов двух моделей.
 MODEL_ALIASES = {
-    "lite": "gemini-3.1-flash-lite",
+    "luna": "gpt-6-luna",
     "flash": "gemini-3.8-flash",
     "argon": "gemini-4-argon",
 }
@@ -116,7 +116,7 @@ MODEL_ALIASES = {
 PRICING = {
     "gemini-4-argon": (2.0, 10.0, 0.05, 1.0, 1.0),
     "gemini-3.8-flash": (0.75, 3.75, 0.1, 1.0, 1.0),
-    "gemini-3.1-flash-lite": (0.25, 1.50, 0.1, 1.0, 1.0),
+    "gpt-6-luna": (0.10, 0.50, 0.1, 1.25, 1.25),
 }
 
 # Gemini думает ВСЕГДА (thinking не выключить, output_config пул отклоняет 400) и токены рассуждения идут в вывод.
@@ -124,8 +124,9 @@ PRICING = {
 # Оценка стоимости ПРИБЛИЗИТЕЛЬНАЯ: THINKING_EST — ~480 токенов на короткий ответ (замер 2026-10-24),
 # а входят ли они в usage.output_tokens Anthropic-полосы — не проверено (docs/claude/model-fallback.md).
 # Лимит нестримового вывода argon — 32K (доки пула): MAX_OUT_TOKENS + запас = 12192, в лимит укладываемся.
-THINKING_HEADROOM = {"gemini-4-argon": 4000, "gemini-3.8-flash": 4000, "gemini-3.1-flash-lite": 4000}
-THINKING_EST = {"gemini-4-argon": 500, "gemini-3.8-flash": 500, "gemini-3.1-flash-lite": 500}
+# Luna (GPT, пул «принимает и игнорирует» max_tokens) — запас 2000 как в bot.py; thinking/output_config вызов не шлёт никому.
+THINKING_HEADROOM = {"gemini-4-argon": 4000, "gemini-3.8-flash": 4000, "gpt-6-luna": 2000}
+THINKING_EST = {"gemini-4-argon": 500, "gemini-3.8-flash": 500, "gpt-6-luna": 500}
 
 
 def request_cost(model, inp, out, cw_5m, cw_1h, cr):
@@ -951,7 +952,7 @@ def fmt_dur(sec: float) -> str:
 
 
 def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
-              model="gemini-3.1-flash-lite", limit_groups=None, verbose=False, force_retry=False):
+              model="gpt-6-luna", limit_groups=None, verbose=False, force_retry=False):
     """CLI-обёртка над run_llm: печатает прогресс, при apply пишет каждую группу сразу."""
     try:
         client = make_client()
@@ -1073,8 +1074,8 @@ def main():
     p.add_argument("--chat-id", type=int, default=None)
     p.add_argument("--tier", choices=["long", "medium"], default=None)
     p.add_argument("--limit-groups", type=int, default=None, help="только для --mode llm")
-    p.add_argument("--model", default="lite",
-                    help="только для --mode llm — короткое имя (haiku/sonnet/opus/fable, "
+    p.add_argument("--model", default="luna",
+                    help="только для --mode llm — короткое имя (luna/flash/argon, "
                          "как в bot.py) или полная API-строка")
     p.add_argument("--fact", default=None,
                     help="только для --mode delete — текст факта на удаление (точное "

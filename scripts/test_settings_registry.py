@@ -61,7 +61,7 @@ def _variants():
     return [
         ("model:argon", "model", "argon", [("plain", []), ("foreign", [f]), ("unknown", [u]), ("badid", ["abc"])]),
         ("model:flash", "model", "flash", [("plain", []), ("foreign", [f])]),
-        ("model:lite", "model", "lite", [("plain", []), ("foreign", [f])]),
+        ("model:luna", "model", "luna", [("plain", []), ("foreign", [f])]),
         ("image:bananapro", "image", "bananapro", [("plain", []), ("foreign", [f]), ("unknown", [u]), ("badid", ["abc"])]),
         ("image:gpt", "image", "gpt", [("plain", []), ("foreign", [f])]),
         ("image:banana", "image", "banana", [("plain", []), ("foreign", [f])]),
@@ -85,7 +85,7 @@ def _variants():
 
 
 def _probe_modes(cmd: str, variant: str):
-    return ("ok", "fail") if cmd.startswith("model:") and cmd != "model:lite" and variant == "plain" else ("ok",)
+    return ("ok", "fail") if cmd.startswith("model:") and cmd != "model:luna" and variant == "plain" else ("ok",)
 
 
 def all_cases():

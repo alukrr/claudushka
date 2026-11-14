@@ -19,8 +19,9 @@ db.py используется отовсюду, поэтому полная с�
 - `chat_models` — `docs/claude/models-and-costs.md`
 - `chat_image_provider` — `docs/claude/images.md`
 - `chat_search_mode` (`auto|gpt|tavily`; `claude` мигрирован в `auto`) — `docs/claude/models-and-costs.md`, `docs/claude/native-search.md`.
-  `chat_free_model` с v2.0.0 не читается и не создаётся (в free единственная модель — Lite); в старых БД таблица осталась, не трогать
+  `chat_free_model` с v2.0.0 не читается и не создаётся (в free единственная модель — Luna); в старых БД таблица осталась, не трогать
 - Миграция `no_anthropic_models` (`_mig_no_anthropic`, `_run_once`): `chat_models` Claude → Gemini, id заморожены в db.py — `docs/claude/models-and-costs.md`
+- Миграция `lite_gone` (`_mig_lite_gone`, `_run_once`, 2026-11-14): `chat_models` `gemini-3.1-flash-lite` → `gpt-6-luna`, точное сравнение, счётчик в лог; строго ПОСЛЕ `no_anthropic_models` (тот пишет id Flash-Lite бывшим Haiku). SQL-дефолт `chat_models.model` — `gpt-6-luna`. `docs/claude/tz-lite-gone.md`
 - `chat_persona` (режим характера чата, личка — `user_id`) — `docs/claude/personas.md`
 - `chat_ignores` (автоигнор: `chat_id, user_id, level, ignored_until, last_strike_ts`) и колонки `allowed_chats.activity_percent` (дефолт 0), `allowed_chats.autoignore_enabled` (дефолт 1) — `docs/claude/group-chat.md`
 - `chat_managers` (управляющие чата: `chat_id, user_id, added_by, added_at`, PK `(chat_id, user_id)`; права админа ЭТОГО чата без админки в Telegram) — `docs/claude/group-chat.md` → «Управляющие чата»

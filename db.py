@@ -70,6 +70,14 @@ def _mig_no_anthropic(conn: sqlite3.Connection) -> None:
     logger.info(f"no_anthropic: chat_search_mode claude -> auto: {n}")
 
 
+def _mig_lite_gone(conn: sqlite3.Connection) -> None:
+    """2026-11-14 (ТЗ lite-gone): пул убрал gemini-3.1-flash-lite — выбор «/lite» в chat_models переезжает на gpt-6-luna
+    (без миграции get_chat_model молча отдал бы такому чату Flash, в 7 раз дороже). Точное сравнение; идентификаторы заморожены
+    на момент миграции. Обратного пути нет. Счётчик — в лог."""
+    n = conn.execute("UPDATE chat_models SET model = 'gpt-6-luna' WHERE model = 'gemini-3.1-flash-lite'").rowcount
+    logger.info(f"lite_gone: chat_models gemini-3.1-flash-lite -> gpt-6-luna: {n}")
+
+
 def _mig_defaults(conn: sqlite3.Connection) -> None:
     """Старые глобальные дефолты (haiku / gpt) писались явными строками — без их удаления
     платные чаты остались бы на Haiku/GPT вместо нового дефолта Sonnet/banana."""
@@ -202,7 +210,7 @@ def init_db():
 
         CREATE TABLE IF NOT EXISTS chat_models (
             chat_id INTEGER PRIMARY KEY,
-            model TEXT NOT NULL DEFAULT 'gemini-3.1-flash-lite'
+            model TEXT NOT NULL DEFAULT 'gpt-6-luna'
         );
 
         CREATE TABLE IF NOT EXISTS chat_search_mode (
@@ -404,6 +412,7 @@ def init_db():
     _run_once(conn, "billing_starter_bonus", _mig_starter_bonus)
     _run_once(conn, "user_profile_v1", _mig_profile)
     _run_once(conn, "no_anthropic_models", _mig_no_anthropic)
+    _run_once(conn, "lite_gone", _mig_lite_gone)   # строго ПОСЛЕ no_anthropic: тот пишет id Flash-Lite для бывших Haiku
     # куда переехали нерешённые предложения старого дайджеста (для ответа /profile_ok со старым номером)
     conn.execute("CREATE TABLE IF NOT EXISTS profile_digest_moves (old_id INTEGER PRIMARY KEY, new_id INTEGER NOT NULL)")
     # daily_usage нужна только за сегодня; строки старше недели — мусор.
@@ -1507,7 +1516,7 @@ def set_chat_review_enabled(chat_id: int, enabled: bool) -> bool:
 
 def get_chat_model_db(chat_id: int, default: str | None = None) -> str | None:
     """Сохранённый выбор модели или default, если строки нет. Эффективную модель с учётом
-    тарифа (free → Lite) решает bot.get_chat_model — здесь только хранилище."""
+    тарифа (free → Luna) решает bot.get_chat_model — здесь только хранилище."""
     conn = get_conn()
     row = conn.execute("SELECT model FROM chat_models WHERE chat_id = ?", (chat_id,)).fetchone()
     conn.close()

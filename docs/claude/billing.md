@@ -1,4 +1,4 @@
-> **С 2026-10-28 (v2.0.0)**: free-режим — только Gemini 3.1 Flash-Lite (выбора нет, `chat_free_model` не используется);
+> **С 2026-11-14 (v2.16.0)**: free-режим — только GPT-6 Luna (`gpt-6-luna`, $0.10/$0.50; выбора нет, `chat_free_model` не используется); до 2026-11-14 это была Gemini 3.1 Flash-Lite, убранная пулом. Старые строки `usage_log` с `gemini-3.1-flash-lite` подписаны через `LEGACY_PRICES`, не пересчитываются; голос (`label=voice`) — `gemini-3.8-flash`;
 > подтверждение `/fable` удалено, «дорогих» (`restricted`) моделей сейчас нет; нативный поиск Anthropic (`native_search`) не
 > считается — остался `gpt_search` (токены) и `kind=search/gpt` (цена вызова пока 0.0). Голос пишется в `usage_log` с
 > `label="voice"` (`_record_gemini_usage`). Старые Claude-строки `usage_log` читаются по `LEGACY_PRICES`. Текст ниже про Haiku/
@@ -36,8 +36,8 @@
   `model`: для LLM — API-строка ФАКТИЧЕСКОЙ модели из `response.model` (с 2026-09-23, см.
   `docs/claude/models-and-costs.md` → «Учёт токенов»), для картинок — ключ провайдера (`gpt`/`banana`), для
   поиска — `tavily` (бесплатный режим) или `anthropic` (нативный `web_search` в платном, `label=native_search`, `docs/claude/native-search.md`). `label`: `dialog` (ответ на реплику: диалог/фото/файл), `should_search`,
-  `search`, `image`, `draw_translate`, `extract_memory`, `memory_backfill` (разовая обработка старых личных тредов, Lite; платит ЛИЧНЫЙ ЧАТ АДМИНА, `docs/claude/memory.md`), `extract_chat_memory`,
-  `media_describe`, `abuse_check` (Lite: проверка на травлю при каждом обращении к боту в группе, платит чат), `activity_check` (Lite: «вставлять ли реплику», только при выпавшем шансе), `activity` (спонтанная реплика модели чата), `daily_review`, `forget` (выбор «сувениров» `/forget`: Argon в paid, Lite в free; платит чат, где нажали кнопку), `greet`, `greet_filter`, `captcha_*`, `/review`, `/search`,
+  `search`, `image`, `draw_translate`, `extract_memory`, `memory_backfill` (разовая обработка старых личных тредов, Luna; платит ЛИЧНЫЙ ЧАТ АДМИНА, `docs/claude/memory.md`), `extract_chat_memory`,
+  `media_describe`, `abuse_check` (Luna: проверка на травлю при каждом обращении к боту в группе, платит чат), `activity_check` (Luna: «вставлять ли реплику», только при выпавшем шансе), `activity` (спонтанная реплика модели чата), `daily_review`, `forget` (выбор «сувениров» `/forget`: Argon в paid, Lite в free; платит чат, где нажали кнопку), `greet`, `greet_filter`, `captcha_*`, `/review`, `/search`,
   `проверка` (пробный запрос `_probe_model`) и т.д. `thinking` — токены thinking, входят в
   `output` (с 2026-09-23, старые строки 0). Индексы `(chat_id, ts)`, `(ts)` и покрывающие `usage_log(chat_id, billed, cost_usd)`, `chat_credits(chat_id, amount)` — баланс считается полным SUM по чату (не хранится), индекс не даёт читать таблицу.
 - `chat_credits` — `bonus` / `topup` / `adjust` / `writeoff`.

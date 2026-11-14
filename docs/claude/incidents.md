@@ -9,6 +9,26 @@
 `daily_chat_review`, дубль `run_daily` в `main()`, инвертированные
 `cmd_whitelist_on` / `cmd_captcha_on` (теперь ставят `True`).
 
+## 2026-11-14 — пул убрал Gemini Flash-Lite: служебка шла через 404, голос не работал (`fix/lite-gone`, v2.16.0)
+
+- **Симптом:** в логе прода `MODEL NOT FOUND: пул не знает 'gemini-3.1-flash-lite' (404)` на каждый служебный вызов, уведомления админам раз в 30 минут,
+  в `/cost` — строки с меткой `*_fallback` на `gpt-6-luna`; голосовые не расшифровываются (`Gemini audio non-retryable error: HTTP 404`).
+- **Причина:** около 13:00 Berlin пул `router.apitoken.sale` убрал `gemini-3.1-flash-lite`, `gemini-2.5-flash-lite`, `gemini-2.5-flash`,
+  `gemini-3-flash-preview` (404 на всех полосах; живые — `gemini-3.8-flash`, `gemini-4-argon`, новые `gemini-4-hydrogen`, `gemini-4-carbon`).
+  `DEFAULT_MODEL_ID` указывал на Flash-Lite: это бесплатный режим и ВСЕ служебные вызовы. `GEMINI_AUDIO_MODEL_NAME` — та же модель.
+- **Как держался фолбэк:** `should_fallback` считает 404 поводом переключиться → пара Lite → `gpt-6-luna` отвечала, липкое окно 5 минут, затем снова 404
+  и снова фолбэк (лишний вызов раз в окно). Деньги и ответы не страдали (Luna дешевле Lite), страдали лог и уведомления; метка расхода `*_fallback`
+  скрывала от `/cost`, что «основная» модель мертва. Голос фолбэка не имеет: аудио в пуле принимает только Gemini через нативный `generateContent`
+  (у GPT `input_audio` → 400 на `chat/completions` и `responses`, `/v1/audio/transcriptions` → 404 — проверено 2026-11-14).
+- **Как нашли:** лог и замер `scripts/bench_pool.py` 14.11 (`docs/claude/bench/2026-11-14-1525.txt`): каталог `GET /v1/models` — 20 моделей, Lite среди них нет. Gemini в пуле
+  с ~15:27 Berlin отвечал 529/503 — Carbon, Argon, голос и нативную полосу замерить не удалось (`docs/claude/models-and-costs.md` → «Замеры пула 2026-11-14»).
+- **Решение Алексея:** Luna вместо Lite везде (служебка и free), пара Luna → `gemini-3.8-flash`, голос на `gemini-3.8-flash`, `/lite` — заглушка, `/luna` — новая команда;
+  Hydrogen и Carbon пока не добавлять. Миграция `lite_gone` переводит `chat_models` с Lite на Luna (иначе платный чат с `/lite` молча уехал бы на Flash, в 7 раз дороже).
+  ТЗ — `docs/claude/tz-lite-gone.md`.
+- **Урок:** модель из `MODELS`, на которой висят служебные вызовы и free, нельзя оставлять без запасного пути: каталог пула меняется без предупреждения
+  (дважды за 17 дней). `check_fallback_models` предупреждает на старте, но только про каталог; фолбэк прячет мёртвую основную модель — смотреть `MODEL NOT FOUND`
+  в логе и метки `*_fallback` в `/cost`. У голоса запасного провайдера нет и не будет, пока аудио принимает один Gemini.
+
 ## 2026-11-12 — личная память не извлекалась никогда (`fix/private-memory-extract`, v2.13.1)
 
 - **Симптом:** в dedup TUI не видно личек; в проде `memory` — 4308 строк, все `context='group'`, строк `context='private'` нет ни в одной копии базы с 2026-07-26.

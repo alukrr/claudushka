@@ -1,4 +1,4 @@
-> **С 2026-10-28 (v2.0.0)** `DAILY_REVIEW_MODEL_ID` = `gemini-4-argon` (было Opus 5.5), выжимки ветки B — Lite (`DEFAULT_MODEL_ID`).
+> **С 2026-10-28 (v2.0.0)** `DAILY_REVIEW_MODEL_ID` = `gemini-4-argon` (было Opus 5.5), выжимки ветки B — Luna (`DEFAULT_MODEL_ID`).
 > «Opus»/«Haiku» ниже — история. Нестримовый вывод Argon ≤ 32K: обзор просит `out_tokens(.., 2200)` = 6200, запас большой.
 > Стенд: сравнить качество обзора Argon на реальном чате перед выкаткой (чек-лист `staging-checklist-no-anthropic.md`).
 

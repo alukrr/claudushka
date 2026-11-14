@@ -25,10 +25,15 @@ ANTHROPIC_API_KEY`), а НЕ напрямую в Google с отдельным `G
 авторизации (вместо `?key=` в URL) для этой функции больше не актуален общий класс бага
 «ключ в тексте сетевого исключения requests» — секрета в URL просто нет.
 
-**С 2026-10-28 модель — `gemini-3.1-flash-lite`** (env `GEMINI_AUDIO_MODEL` переопределяет): `gemini-3.6-flash`
-исчезла из каталога пула, расшифровка голоса/кружочков отвечала 404. По докам пула аудио inline принимают все
-текстовые модели Gemini (в доках — `audio/wav`; бот шлёт `audio/ogg` из Telegram — на Lite
-**не проверялся**, проверить на первом голосовом после деплоя). Ниже — история прежней модели.
+**С 2026-11-14 модель — `gemini-3.8-flash`** (env `GEMINI_AUDIO_MODEL` переопределяет, нужен `--force-recreate`): пул убрал
+`gemini-3.1-flash-lite` (404; до того с 2026-10-28 голос шёл на ней, после пропажи `gemini-3.6-flash`), расшифровка голоса/кружочков
+снова отвечала `Gemini audio non-retryable error: HTTP 404`. **Аудио в пуле принимает только Gemini, нативный `generateContent`:**
+у GPT `input_audio` → 400 на `chat/completions` и `responses`, `/v1/audio/transcriptions` → 404 (проверено 2026-11-14), поэтому
+у голоса нет запасного провайдера — при падении Gemini транскрипта нет (плейсхолдер, как раньше при любой ошибке). Flash думает
+всегда: части ответа с `"thought": true` в расшифровку НЕ берутся (`_audio_text_from_parts`), рассуждения тарифицируются как
+выход (`_record_gemini_usage`: `thoughtsTokenCount` → `out`, цена по id модели из `MODELS`, метка `voice`). `audio/ogg` из
+Telegram на Flash и сам вызов на живом пуле **не проверены** (Gemini в пуле лежал 14.11 с ~15:27 Berlin) — шаг 5 чек-листа
+`docs/claude/staging-checklist-lite-gone.md`. Ниже — история прежних моделей.
 
 `GEMINI_AUDIO_MODEL_NAME = "gemini-3.6-flash"` (до 2026-10-28) — **проверено живым запросом 31.08.2026**:
 `gemini-2.5-flash` отдаёт 404 «no longer available to new users», Google сам предлагает

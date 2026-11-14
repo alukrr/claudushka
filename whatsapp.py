@@ -42,7 +42,7 @@ WHATSAPP_API_URL = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_NUMBER_ID}
 # бота (paid-дефолт и служебная). Gemini не принимает thinking/output_config и думает всегда (3.8 Flash) — к max_tokens
 # добавляется WA_HEADROOM. Сервис на паузе, НЕ проверялся на стенде (docs/claude/tz-no-anthropic.md, п. 1.10).
 WA_MODEL = "gemini-3.8-flash"
-WA_AUX_MODEL = "gemini-3.1-flash-lite"
+WA_AUX_MODEL = "gpt-6-luna"   # 2026-11-14: Flash-Lite убрана пулом (WhatsApp на паузе, константа без проверки)
 WA_AUX_PARAMS = {}
 WA_HEADROOM = 4000
 
