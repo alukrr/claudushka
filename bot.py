@@ -1582,11 +1582,21 @@ def image_price_text(key: str) -> str:
 # 2026-10-28: gemini-3.6-flash пропала из каталога пула, расшифровка отвечала 404 → gemini-3.1-flash-lite (по докам пула
 # аудио inline принимают все текстовые модели Gemini). 2026-11-14: пул убрал и Flash-Lite — голос на gemini-3.8-flash.
 # Аудио в пуле принимает ТОЛЬКО Gemini через нативный generateContent: у GPT `input_audio` → 400, /v1/audio/transcriptions →
-# 404 (проверено 2026-11-14), поэтому запасного провайдера у голоса нет. Flash думает всегда — части ответа с "thought": true
+# 404 (проверено 2026-11-14), поэтому запасного провайдера у голоса В ПУЛЕ нет (запасной — прямой Google, ниже). Flash думает всегда — части ответа с "thought": true
 # в текст не берём (_audio_text_from_parts), рассуждения тарифицируются как выход (_record_gemini_usage).
 # GEMINI_AUDIO_MODEL в .env — смена без правки кода (нужен --force-recreate). OGG/Opus из Telegram на Flash — проверить на
 # первом же голосовом (стенд, docs/claude/staging-checklist-lite-gone.md).
 GEMINI_AUDIO_MODEL_NAME = os.environ.get("GEMINI_AUDIO_MODEL", "").strip() or "gemini-3.8-flash"
+# Запасной путь голоса (2026-11-14, Gemini в пуле лежал часами с 429): прямой Google API с GEMINI_API_KEY (тот же ключ, что у
+# banana), модель gemini-3.1-flash-lite — в пуле её нет, у Google жива, OGG/Opus принимает (проверено с сервера 2026-11-14).
+# Включается, только если пул не вернул 200 (сеть, 429, 5xx, 404); 200 с пустым текстом — «речи нет», запасной путь не зовём.
+# Цена — прайс Google без скидки пула, аудио на входе дороже текста (ai.google.dev/pricing, сверено 2026-11-14), $ за 1M.
+# После отказа пула голос GEMINI_AUDIO_STICKY_SECONDS идёт сразу в Google: отказ 429 пул отдаёт только через 8–10 с.
+GOOGLE_API_BASE_URL = "https://generativelanguage.googleapis.com"
+GEMINI_AUDIO_DIRECT_MODEL = os.environ.get("GEMINI_AUDIO_DIRECT_MODEL", "").strip() or "gemini-3.1-flash-lite"
+GEMINI_AUDIO_DIRECT_PRICES = {"gemini-3.1-flash-lite": {"in": 0.25, "audio_in": 0.50, "out": 1.50}}
+GEMINI_AUDIO_STICKY_SECONDS = FALLBACK_STICKY_SECONDS
+_audio_pool_down_until = 0.0   # monotonic; состояние провайдера, не чата — гонка между чатами безвредна (лишний вызов пула)
 # POOL_BASE_URL — общий пул api.apitoken.sale, не только для Gemini: с добавлением
 # GPT Image 2 через него же идёт и OpenAI-совместимый /v1/images/generations.
 POOL_BASE_URL = "https://router.apitoken.sale"
@@ -1731,8 +1741,8 @@ async def _transcribe_audio_gemini(audio_bytes: bytes, mime_type: str) -> str | 
     query-параметром — в URL секрета нет, текст сетевого исключения requests безопасно
     попадает в лог как есть.
     """
+    global _audio_pool_down_until
     import base64
-    url = f"{POOL_BASE_URL}/v1beta/models/{GEMINI_AUDIO_MODEL_NAME}:generateContent"
     payload = {
         "contents": [{
             "parts": [
@@ -1741,13 +1751,33 @@ async def _transcribe_audio_gemini(audio_bytes: bytes, mime_type: str) -> str | 
             ]
         }],
     }
-    headers = {"x-goog-api-key": ANTHROPIC_API_KEY}
+    direct = bool(GEMINI_API_KEY)
+    if not (direct and _audio_pool_down_until > time.monotonic()):
+        ok, text = await _gemini_audio_call(POOL_BASE_URL, ANTHROPIC_API_KEY, GEMINI_AUDIO_MODEL_NAME, payload, "Gemini audio")
+        if ok:
+            _audio_pool_down_until = 0.0
+            return text
+        if not direct:
+            return None
+        _audio_pool_down_until = time.monotonic() + GEMINI_AUDIO_STICKY_SECONDS
+        logger.warning(f"VOICE FALLBACK {GEMINI_AUDIO_MODEL_NAME} (пул) → {GEMINI_AUDIO_DIRECT_MODEL} (Google напрямую), "
+                       f"ближайшие {GEMINI_AUDIO_STICKY_SECONDS // 60} мин голос идёт сразу в Google")
+    _, text = await _gemini_audio_call(GOOGLE_API_BASE_URL, GEMINI_API_KEY, GEMINI_AUDIO_DIRECT_MODEL, payload,
+                                       "Google audio (запасной)", direct=True)
+    return text
 
+
+async def _gemini_audio_call(base_url: str, api_key: str, model: str, payload: dict, tag: str,
+                             direct: bool = False) -> tuple[bool, str | None]:
+    """Один провайдер расшифровки (пул или прямой Google): (ответил ли 200 с разборчивым JSON, текст или None).
+    Ключ — заголовком, в URL секрета нет. Учёт: пул — `voice` по цене модели, прямой Google — `voice_fallback` по прайсу Google."""
+    url = f"{base_url}/v1beta/models/{model}:generateContent"
+    headers = {"x-goog-api-key": api_key}
     for attempt in range(1, GEMINI_MAX_RETRIES + 1):
         try:
             resp = await asyncio.to_thread(http_requests.post, url, json=payload, headers=headers, timeout=GEMINI_TIMEOUT)
         except Exception as e:
-            logger.warning(f"Gemini audio request failed (attempt {attempt}/{GEMINI_MAX_RETRIES}): {e}")
+            logger.warning(f"{tag} request failed (attempt {attempt}/{GEMINI_MAX_RETRIES}): {e}")
             if attempt < GEMINI_MAX_RETRIES:
                 await asyncio.sleep(GEMINI_RETRY_DELAY)
             continue
@@ -1758,19 +1788,39 @@ async def _transcribe_audio_gemini(audio_bytes: bytes, mime_type: str) -> str | 
                 parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
                 text = _audio_text_from_parts(parts)
             except Exception as e:
-                logger.warning(f"Gemini audio: unparseable response: {e}")
-                return None
-            _record_gemini_usage(data.get("usageMetadata") or {}, GEMINI_AUDIO_MODEL_NAME, "voice")
-            return text[:GEMINI_AUDIO_TRANSCRIPT_MAX_CHARS] if text else None
+                logger.warning(f"{tag}: unparseable response: {e}")
+                return False, None
+            meta = data.get("usageMetadata") or {}
+            if direct:
+                _record_gemini_direct_audio_usage(meta, model)
+            else:
+                _record_gemini_usage(meta, model, "voice")
+            return True, (text[:GEMINI_AUDIO_TRANSCRIPT_MAX_CHARS] if text else None)
 
         if resp.status_code in (429, 500, 502, 503, 504) and attempt < GEMINI_MAX_RETRIES:
             await asyncio.sleep(GEMINI_RETRY_DELAY)
             continue
 
-        logger.warning(f"Gemini audio non-retryable error: HTTP {resp.status_code}")
-        return None
+        logger.warning(f"{tag} non-retryable error: HTTP {resp.status_code}")
+        return False, None
 
-    return None
+    return False, None
+
+
+def _record_gemini_direct_audio_usage(meta: dict, model: str) -> None:
+    """Учёт расшифровки через прямой Google API (метка `voice_fallback`): цена Google без скидки пула, аудио-токены входа
+    (promptTokensDetails, modality AUDIO) — по `audio_in`, остальной вход — по `in`, рассуждения — как выход."""
+    try:
+        price = GEMINI_AUDIO_DIRECT_PRICES.get(model) or GEMINI_AUDIO_DIRECT_PRICES["gemini-3.1-flash-lite"]
+        inp = meta.get("promptTokenCount") or 0
+        audio = sum((d.get("tokenCount") or 0) for d in (meta.get("promptTokensDetails") or []) if d.get("modality") == "AUDIO")
+        audio = min(audio, inp)
+        thoughts = meta.get("thoughtsTokenCount") or 0
+        out = (meta.get("candidatesTokenCount") or 0) + thoughts
+        cost = ((inp - audio) * price["in"] + audio * price["audio_in"] + out * price["out"]) / 1_000_000
+        _record_usage("llm", model, "voice_fallback", cost, inp, out, 0, 0, thinking=thoughts)
+    except Exception:
+        logger.exception("usage_log: не удалось записать voice_fallback")
 
 
 async def _try_gpt_image(prompt: str, model_id: str, label: str) -> tuple[bytes | None, str | None, str | None]:

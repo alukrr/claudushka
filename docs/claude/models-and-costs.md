@@ -372,5 +372,7 @@ cache_write_1h, cache_read)` (без наценки; `PRICE_MARKUP` примен
   нативная — 503) с ~15:27 Berlin на обоих прогонах; первый прогон успел снять только Flash и Hydrogen. Голос на
   `gemini-3.8-flash` (OGG/Opus из Telegram) на живом пуле не проверен — шаг стенда `staging-checklist-lite-gone.md`.
 - Аудио принимает только Gemini через нативный `generateContent`; у GPT `input_audio` → 400 на `chat/completions` и
-  `responses`, `/v1/audio/transcriptions` → 404 (проверено 2026-11-14) — запасного провайдера у голоса нет.
+  `responses`, `/v1/audio/transcriptions` → 404 (проверено 2026-11-14) — запасного провайдера у голоса в пуле нет. С v2.16.2 запасной — прямой Google API
+  (`gemini-3.1-flash-lite`, ключ `GEMINI_API_KEY`, метка `voice_fallback`, прайс Google $0.25 / аудио $0.50 / выход $1.50) —
+  `docs/claude/media.md`.
 - Hydrogen и Carbon в бот **не добавлены** (решение Алексея 2026-11-14), вопрос — в `open-tasks.md`.
