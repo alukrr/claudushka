@@ -24,11 +24,13 @@ KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 BEARER = {"Authorization": f"Bearer {KEY}"}
 GOOG = {"x-goog-api-key": KEY}
 
-GPT = ["gpt-6-luna", "gpt-5.6-luna", "gpt-6.1-terra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-astra"]
-GEMINI = ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-3-flash-preview",
-          "gemini-3.8-flash", "gemini-4-argon"]
+GPT = ["gpt-6-luna", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-6.1-terra", "gpt-5.6-sol", "gpt-6.1-sol", "gpt-6-sol",
+       "gpt-6-astra"]
+# 2026-11-14: пул убрал gemini-3.1-flash-lite / 2.5-flash-lite / 2.5-flash / 3-flash-preview, добавил Hydrogen и Carbon.
+GEMINI = ["gemini-3.8-flash", "gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon"]
+GEMINI_GONE = ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-3-flash-preview"]
 CLAUDE = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"]   # только проверка «живы ли»
-EXTRA_IDS = ["gemini-3.6-flash"]     # GEMINI_AUDIO_MODEL_NAME — голос/видео; только наличие в каталоге
+EXTRA_IDS = ["gemini-3.6-flash"] + GEMINI_GONE     # GEMINI_AUDIO_MODEL_NAME — голос/видео; только наличие в каталоге
 
 SYSTEM = ("Ты Клодушка — ироничная, остроумная участница дружеского чата. Отвечай по-русски, коротко, "
           "с лёгкой иронией, обращайся по имени.")
@@ -270,7 +272,7 @@ def bench(model, lane):
                 ok = False
             rec["aux"] = {"json_ok": ok, "time": round(aux["total"], 2), "out": aux.get("out"),
                           "reasoning": aux.get("reasoning"), "empty": not txt, "sample": short(aux.get("text"), 120)}
-        if model.startswith("gemini-3") and "lite" not in model:
+        if model.startswith("gemini"):
             aux2 = fn(model, AUX_SYSTEM, AUX_USER, max_tokens=AUX_MAX + 4000, stream=False)
             t2 = (aux2.get("text") or "").strip().strip("`").removeprefix("json").strip()
             try:
@@ -319,6 +321,12 @@ for m in CLAUDE:
     print(f"  {m:24} {r.get('err') or 'ОТВЕЧАЕТ: ' + short(r.get('text'), 40)} ({r['total']:.1f}s)", flush=True)
     RESULTS.append({"model": m, "lane": "messages", "alive_check": r.get("err") or "ok"})
 
+print("\n== Убранные Gemini: жив ли (1 вызов, /v1/messages)")
+for m in GEMINI_GONE:
+    r = lane_messages(m, SYSTEM, "Скажи «ок».", max_tokens=200, stream=False)
+    print(f"  {m:24} {r.get('err') or 'ОТВЕЧАЕТ: ' + short(r.get('text'), 40)} ({r['total']:.1f}s)", flush=True)
+    RESULTS.append({"model": m, "lane": "messages", "alive_check": r.get("err") or "ok"})
+
 print("\n== Текст в характере, служебный JSON, картинка на входе, инструменты")
 for m in GPT + GEMINI:
     if A.only and A.only not in m:
@@ -333,7 +341,7 @@ def _wav(sec=1, rate=16000):
     return (b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16)
             + b"data" + struct.pack("<I", len(data)) + data)
 WAV = base64.b64encode(_wav()).decode()
-for m in ("gemini-3.6-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-2.5-flash"):
+for m in GEMINI + ["gemini-3.1-flash-lite"]:
     t0 = time.monotonic()
     try:
         r = requests.post(f"{BASE}/v1beta/models/{m}:generateContent", headers=GOOG, timeout=60, json={

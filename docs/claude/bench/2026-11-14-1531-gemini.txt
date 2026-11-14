@@ -1,0 +1,53 @@
+base=https://router.apitoken.sale key_len=56 runs=3 images=False lanes=['messages', 'native']
+
+== каталог GET /v1/models
+HTTP 200, всего 20; claude в каталоге: []
+  gpt-6-luna               есть
+  gpt-5.6-luna             есть
+  gpt-5.6-terra            есть
+  gpt-6.1-terra            есть
+  gpt-5.6-sol              есть
+  gpt-6.1-sol              есть
+  gpt-6-sol                есть
+  gpt-6-astra              есть
+  gemini-3.8-flash         есть
+  gemini-4-hydrogen        есть
+  gemini-4-carbon          есть
+  gemini-4-argon           есть
+  gemini-3.6-flash         НЕТ
+  gemini-3.1-flash-lite    НЕТ
+  gemini-2.5-flash-lite    НЕТ
+  gemini-2.5-flash         НЕТ
+  gemini-3-flash-preview   НЕТ
+
+== Claude: жив ли (1 вызов, /v1/messages)
+  claude-haiku-5-5         HTTP 403: {'error': {'details': {'error_code': 'model_blocked', 'param': 'model'}, 'message': "Model 'claude-haiku-5-5' is blocked for this account.", 'type': 'permission_error'}, 'request_id': '3170a25c-15aa-4… (0.3s)
+  claude-sonnet-5-5        HTTP 403: {'error': {'details': {'error_code': 'model_blocked', 'param': 'model'}, 'message': "Model 'claude-sonnet-5-5' is blocked for this account.", 'type': 'permission_error'}, 'request_id': '7bbe75a8-d05d-… (0.1s)
+  claude-opus-5-5          HTTP 403: {'error': {'details': {'error_code': 'model_blocked', 'param': 'model'}, 'message': "Model 'claude-opus-5-5' is blocked for this account.", 'type': 'permission_error'}, 'request_id': '64aaa982-dd47-43… (0.1s)
+
+== Убранные Gemini: жив ли (1 вызов, /v1/messages)
+  gemini-3.1-flash-lite    HTTP 404: {'error': {'message': 'The model `gemini-3.1-flash-lite` does not exist or you do not have access to it.', 'type': 'not_found_error'}, 'request_id': 'req_8c2ad76a73234e538c94a71395f95194', 'type': 'er… (0.1s)
+  gemini-2.5-flash-lite    HTTP 404: {'error': {'message': 'The model `gemini-2.5-flash-lite` does not exist or you do not have access to it.', 'type': 'not_found_error'}, 'request_id': 'req_3e9a2669459041d0a8dfb772c74f66da', 'type': 'er… (0.1s)
+  gemini-2.5-flash         HTTP 404: {'error': {'message': 'The model `gemini-2.5-flash` does not exist or you do not have access to it.', 'type': 'not_found_error'}, 'request_id': 'req_1c85d02893ef43e38afeeb12cb72ae5a', 'type': 'error'} (0.1s)
+  gemini-3-flash-preview   HTTP 404: {'error': {'message': 'The model `gemini-3-flash-preview` does not exist or you do not have access to it.', 'type': 'not_found_error'}, 'request_id': 'req_0401445231294fcf8b9343bdf5766d37', 'type': 'e… (0.1s)
+
+== Текст в характере, служебный JSON, картинка на входе, инструменты
+  gemini-3.8-flash         messages  ✗ HTTP 529: {'error': {'message': 'Overloaded', 'type': 'overloaded_error'}, 'type': 'error'}
+  gemini-3.8-flash         native    ✗ HTTP 503: {"error":{"code":503,"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2s"}],"message":"The service is currently unavailable. Please retry shortly.","status":"UNAVAILABLE"}}
+  gemini-4-hydrogen        messages  ✗ HTTP 529: {'error': {'message': 'Overloaded', 'type': 'overloaded_error'}, 'type': 'error'}
+  gemini-4-hydrogen        native    ✗ HTTP 503: {"error":{"code":503,"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2s"}],"message":"The service is currently unavailable. Please retry shortly.","status":"UNAVAILABLE"}}
+  gemini-4-carbon          messages  ✗ HTTP 529: {'error': {'message': 'Overloaded', 'type': 'overloaded_error'}, 'type': 'error'}
+  gemini-4-carbon          native    ✗ HTTP 503: {"error":{"code":503,"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2s"}],"message":"The service is currently unavailable. Please retry shortly.","status":"UNAVAILABLE"}}
+  gemini-4-argon           messages  ✗ HTTP 529: {'error': {'message': 'Overloaded', 'type': 'overloaded_error'}, 'type': 'error'}
+  gemini-4-argon           native    ✗ HTTP 503: {"error":{"code":503,"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2s"}],"message":"The service is currently unavailable. Please retry shortly.","status":"UNAVAILABLE"}}
+
+== Голос: нативный generateContent, 1 с тишины audio/wav inline (проверяем только, что модель принимает аудио)
+  gemini-3.8-flash         HTTP 503 8.6s {"error":{"code":503,"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2s"}],"message":"The s…
+  gemini-4-hydrogen        HTTP 503 8.6s {"error":{"code":503,"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2s"}],"message":"The s…
+  gemini-4-carbon          HTTP 503 8.6s {"error":{"code":503,"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2s"}],"message":"The s…
+  gemini-4-argon           HTTP 503 8.6s {"error":{"code":503,"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2s"}],"message":"The s…
+  gemini-3.1-flash-lite    HTTP 404 0.6s {"error":{"code":404,"message":"models/gemini-3.1-flash-lite is not found for API version v1beta, or is not supported fo…
+
+BENCH_JSON_BEGIN
+[{"model": "claude-haiku-5-5", "lane": "messages", "alive_check": "HTTP 403: {'error': {'details': {'error_code': 'model_blocked', 'param': 'model'}, 'message': \"Model 'claude-haiku-5-5' is blocked for this account.\", 'type': 'permission_error'}, 'request_id': '3170a25c-15aa-4…"}, {"model": "claude-sonnet-5-5", "lane": "messages", "alive_check": "HTTP 403: {'error': {'details': {'error_code': 'model_blocked', 'param': 'model'}, 'message': \"Model 'claude-sonnet-5-5' is blocked for this account.\", 'type': 'permission_error'}, 'request_id': '7bbe75a8-d05d-…"}, {"model": "claude-opus-5-5", "lane": "messages", "alive_check": "HTTP 403: {'error': {'details': {'error_code': 'model_blocked', 'param': 'model'}, 'message': \"Model 'claude-opus-5-5' is blocked for this account.\", 'type': 'permission_error'}, 'request_id': '64aaa982-dd47-43…"}, {"model": "gemini-3.1-flash-lite", "lane": "messages", "alive_check": "HTTP 404: {'error': {'message': 'The model `gemini-3.1-flash-lite` does not exist or you do not have access to it.', 'type': 'not_found_error'}, 'request_id': 'req_8c2ad76a73234e538c94a71395f95194', 'type': 'er…"}, {"model": "gemini-2.5-flash-lite", "lane": "messages", "alive_check": "HTTP 404: {'error': {'message': 'The model `gemini-2.5-flash-lite` does not exist or you do not have access to it.', 'type': 'not_found_error'}, 'request_id': 'req_3e9a2669459041d0a8dfb772c74f66da', 'type': 'er…"}, {"model": "gemini-2.5-flash", "lane": "messages", "alive_check": "HTTP 404: {'error': {'message': 'The model `gemini-2.5-flash` does not exist or you do not have access to it.', 'type': 'not_found_error'}, 'request_id': 'req_1c85d02893ef43e38afeeb12cb72ae5a', 'type': 'error'}"}, {"model": "gemini-3-flash-preview", "lane": "messages", "alive_check": "HTTP 404: {'error': {'message': 'The model `gemini-3-flash-preview` does not exist or you do not have access to it.', 'type': 'not_found_error'}, 'request_id': 'req_0401445231294fcf8b9343bdf5766d37', 'type': 'e…"}, {"model": "gemini-3.8-flash", "lane": "messages", "err": "HTTP 529: {'error': {'message': 'Overloaded', 'type': 'overloaded_error'}, 'type': 'error'}", "err_time": 8.12}, {"model": "gemini-3.8-flash", "lane": "native", "err": "HTTP 503: {\"error\":{\"code\":503,\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"2s\"}],\"message\":\"The service is currently unavailable. Please retry shortly.\",\"status\":\"UNAVAILABLE\"}}", "err_time": 8.55}, {"model": "gemini-4-hydrogen", "lane": "messages", "err": "HTTP 529: {'error': {'message': 'Overloaded', 'type': 'overloaded_error'}, 'type': 'error'}", "err_time": 8.34}, {"model": "gemini-4-hydrogen", "lane": "native", "err": "HTTP 503: {\"error\":{\"code\":503,\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"2s\"}],\"message\":\"The service is currently unavailable. Please retry shortly.\",\"status\":\"UNAVAILABLE\"}}", "err_time": 8.36}, {"model": "gemini-4-carbon", "lane": "messages", "err": "HTTP 529: {'error': {'message': 'Overloaded', 'type': 'overloaded_error'}, 'type': 'error'}", "err_time": 8.37}, {"model": "gemini-4-carbon", "lane": "native", "err": "HTTP 503: {\"error\":{\"code\":503,\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"2s\"}],\"message\":\"The service is currently unavailable. Please retry shortly.\",\"status\":\"UNAVAILABLE\"}}", "err_time": 8.35}, {"model": "gemini-4-argon", "lane": "messages", "err": "HTTP 529: {'error': {'message': 'Overloaded', 'type': 'overloaded_error'}, 'type': 'error'}", "err_time": 8.35}, {"model": "gemini-4-argon", "lane": "native", "err": "HTTP 503: {\"error\":{\"code\":503,\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"2s\"}],\"message\":\"The service is currently unavailable. Please retry shortly.\",\"status\":\"UNAVAILABLE\"}}", "err_time": 8.36}, {"audio_model": "gemini-3.8-flash", "status": 503}, {"audio_model": "gemini-4-hydrogen", "status": 503}, {"audio_model": "gemini-4-carbon", "status": 503}, {"audio_model": "gemini-4-argon", "status": 503}, {"audio_model": "gemini-3.1-flash-lite", "status": 404}]
+BENCH_JSON_END
