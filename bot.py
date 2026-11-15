@@ -128,6 +128,10 @@ FALLBACK_PAIRS = {
     "gpt-6-luna": "gemini-3.8-flash",
     "gemini-3.8-flash": "gpt-6.1-terra",
     "gemini-4-argon": "gpt-6.1-sol",
+    # Нативная полоса Google → та же модель через пул (другой поставщик, тот же характер). Дальше цепочка не идёт.
+    "google-direct/gemini-4-argon": "gemini-4-argon",
+    "google-direct/gemini-3.8-flash": "gemini-3.8-flash",
+    "google-direct/gemini-3.1-flash-lite": "gemini-3.8-flash",   # Lite в пуле нет
 }
 # После сбоя модели X следующие N секунд запросы на X сразу идут на её пару (без попытки и ожидания).
 FALLBACK_STICKY_SECONDS = int(os.environ.get("FALLBACK_STICKY_SECONDS", "300") or 300)
@@ -266,6 +270,13 @@ captcha_state: dict[str, dict] = {}
 # Gemini 3.8 Flash и Argon думают ВСЕГДА (не выключить), рассуждения идут в вывод — без запаса ответ обрывается.
 # "restricted" — дорогая модель: в группе её переключают только админы чата и бота (сейчас ни у одной нет).
 _GPT_MULTS = {"cache_write_5m_mult": 1.25, "cache_write_1h_mult": 1.25}   # GPT через пул: запись кэша по таблице пула
+GOOGLE_NATIVE_MARKUP = 1.10   # нативные модели Google: прайс Google +10%
+
+
+def _gprice(google_list_price: float) -> float:
+    return round(google_list_price * GOOGLE_NATIVE_MARKUP, 6)
+
+
 MODELS = {
     "argon":  {"id": "gemini-4-argon",            "label": "Gemini 4 Argon", "provider": "gemini",
                "in": 2.0,  "out": 10.0, "cache_read_mult": 0.05,
@@ -280,6 +291,26 @@ MODELS = {
     "luna":   {"id": "gpt-6-luna",                "label": "GPT-6 Luna", "provider": "openai",
                "in": 0.10, "out": 0.50, "cache_read_mult": 0.1,
                **_GPT_MULTS, "context": 872_000, "thinking_headroom": 2000},
+    # Нативная полоса Google (feat/google-native, 2026-11-15): те же модели напрямую через generativelanguage.googleapis.com
+    # по GEMINI_API_KEY, мимо пула — google_native_create. id с префиксом `google-direct/` (chat_models, usage_log, response.model);
+    # api_model — строка для API Google. Цена — прайс Google × GOOGLE_NATIVE_MARKUP (решение Алексея: +10%); у Google цены
+    # со сроком — price_steps [(дата Berlin «с какого дня», in, out)], читать через effective_price. Кэш — только неявный
+    # (cachedContentTokenCount), доля от входа как в прайсе. Только paid; пара фолбэка — та же модель через пул.
+    "argon_g": {"id": "google-direct/gemini-4-argon", "api_model": "gemini-4-argon", "native": True,
+                "label": "Gemini 4 Argon (Google)", "provider": "gemini",
+                "in": _gprice(2.0), "out": _gprice(10.0), "price_steps": [("2026-12-01", _gprice(4.0), _gprice(20.0))],
+                "cache_read_mult": 0.05, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0,
+                "context": 1_000_000, "thinking_headroom": 4000},
+    "flash_g": {"id": "google-direct/gemini-3.8-flash", "api_model": "gemini-3.8-flash", "native": True,
+                "label": "Gemini 3.8 Flash (Google)", "provider": "gemini",
+                "in": _gprice(0.75), "out": _gprice(3.75), "price_steps": [("2027-01-01", _gprice(1.5), _gprice(7.5))],
+                "cache_read_mult": 0.1, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0,
+                "context": 1_000_000, "thinking_headroom": 4000},
+    "lite":    {"id": "google-direct/gemini-3.1-flash-lite", "api_model": "gemini-3.1-flash-lite", "native": True,
+                "label": "Gemini 3.1 Flash-Lite (Google)", "provider": "gemini",
+                "in": _gprice(0.25), "out": _gprice(1.5),
+                "cache_read_mult": 0.1, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0,
+                "context": 1_000_000, "thinking_headroom": 1000},
 }
 DEFAULT_MODEL_KEY = "luna"
 DEFAULT_MODEL_ID = MODELS[DEFAULT_MODEL_KEY]["id"]
@@ -370,6 +401,22 @@ def price_meta(model_id: str | None) -> dict | None:
     return _PRICES_BY_ID.get(model_id or "")
 
 
+def effective_price(meta: dict, now: datetime | None = None) -> tuple[float, float]:
+    """(in, out) на дату: базовые meta["in"]/["out"] или последняя наступившая ступень price_steps (у Google цены со сроком:
+    Argon дорожает 2026-12-01, Flash — 2027-01-01). Дата — по Берлину. Цена в usage_log замораживается при записи."""
+    price = (meta["in"], meta["out"])
+    day = (now or datetime.now(BERLIN_TZ)).strftime("%Y-%m-%d")
+    for since, p_in, p_out in meta.get("price_steps") or ():
+        if day >= since:
+            price = (p_in, p_out)
+    return price
+
+
+def is_native_model(model_id: str | None) -> bool:
+    """Модель нативной полосы Google (id `google-direct/…`, флаг native в MODELS) — вызов идёт мимо пула."""
+    return bool((_MODELS_BY_ID.get(model_id or "") or {}).get("native"))
+
+
 # Про кэш в формуле: пул этого ключа кеширует любой достаточно большой вход, не только
 # системные промпты (найдено 2026-08-31 при разборе dedup_memory.py). usage.input_tokens
 # при этом почти пустой, реальный вес — в cache_creation_input_tokens/cache_read_input_tokens
@@ -387,7 +434,7 @@ def calc_llm_cost(model: str, inp: int, out: int, cache_write_5m: int = 0,
     """
     meta = price_meta(model) or MODELS[DEFAULT_MODEL_KEY]
     mult = lambda k: meta.get(k, DEFAULT_CACHE_MULTS[k])
-    price_in, price_out = meta["in"], meta["out"]
+    price_in, price_out = effective_price(meta)
     return (
         (inp / 1_000_000 * price_in)
         + (cache_write_5m / 1_000_000 * price_in * mult("cache_write_5m_mult"))
@@ -636,6 +683,141 @@ async def reply_expandable(reply_fn, body: str, header: str = "") -> None:
             await reply_fn(plain)
 
 
+# --- Нативная полоса Google (feat/google-native, docs/claude/models-and-costs.md → «Нативная полоса Google») ---
+# Модели MODELS с native=True зовутся напрямую у Google (generateContent, GEMINI_API_KEY), а не через /v1/messages пула.
+# Вход и выход — в форме Anthropic SDK: google_native_create принимает те же kwargs, что client.messages.create, и
+# возвращает объект с content/usage/model/stop_reason — обёртки (call_claude/sync_create), response_text, учёт и
+# классификация ошибок (api_errors) работают без правок. Ошибки — настоящие исключения SDK (anthropic.*Error).
+GOOGLE_NATIVE_TIMEOUT = 180          # Argon думает долго: 33 с на короткую реплику (замер 2026-11-15)
+GOOGLE_NATIVE_RETRY_DELAY = 2
+_GOOGLE_SAFETY_FINISH = ("SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "RECITATION", "IMAGE_SAFETY")
+
+
+def _google_parts(content) -> list[dict]:
+    """Блоки содержимого Anthropic (строка или список text/image) → parts Google. Пустой текст и неизвестные блоки пропускаются."""
+    if isinstance(content, str):
+        return [{"text": content}] if content.strip() else []
+    parts = []
+    for block in content or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text" and (block.get("text") or "").strip():
+            parts.append({"text": block["text"]})
+        elif block.get("type") == "image" and (block.get("source") or {}).get("type") == "base64":
+            src = block["source"]
+            parts.append({"inline_data": {"mime_type": src.get("media_type") or "image/jpeg", "data": src.get("data") or ""}})
+    return parts
+
+
+def google_native_payload(kwargs: dict) -> dict:
+    """kwargs messages.create → тело generateContent. Соседние реплики одной роли склеиваются (Google ждёт чередование),
+    system (строка или блоки) → systemInstruction. thinking/tools/cache_control сюда не доходят (kwargs_for_model)."""
+    contents: list[dict] = []
+    for msg in kwargs.get("messages") or []:
+        role = "model" if msg.get("role") == "assistant" else "user"
+        parts = _google_parts(msg.get("content"))
+        if not parts:
+            continue
+        if contents and contents[-1]["role"] == role:
+            contents[-1]["parts"].extend(parts)
+        else:
+            contents.append({"role": role, "parts": parts})
+    payload: dict = {"contents": contents}
+    system = kwargs.get("system")
+    sys_parts = _google_parts(system) if system else []
+    if sys_parts:
+        payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(p["text"] for p in sys_parts if "text" in p)}]}
+    gen: dict = {}
+    if kwargs.get("max_tokens"):
+        gen["maxOutputTokens"] = int(kwargs["max_tokens"])
+    if kwargs.get("temperature") is not None:
+        gen["temperature"] = kwargs["temperature"]
+    if kwargs.get("stop_sequences"):
+        gen["stopSequences"] = list(kwargs["stop_sequences"])[:5]
+    if gen:
+        payload["generationConfig"] = gen
+    return payload
+
+
+def _google_status_error(status: int, message: str, url: str):
+    """Исключение SDK нужного класса (RateLimitError, BadRequestError, …) для ответа Google — чтобы ретраи, фолбэк и
+    тексты пользователю (api_errors) работали как на полосе пула."""
+    import httpx2
+    body = {"error": {"message": message, "type": "google_native"}}
+    resp = httpx2.Response(status, request=httpx2.Request("POST", url), json=body)
+    return client._make_status_error(f"Error code: {status} - {body}", body=body, response=resp)
+
+
+def google_native_response(data: dict, model_id: str, url: str = ""):
+    """Ответ generateContent → объект в форме ответа SDK. Блок фильтром Google (promptFeedback.blockReason или
+    finishReason из _GOOGLE_SAFETY_FINISH без текста) → 400 с маркером SAFETY_BLOCK_MARKER: дальше штатное
+    самовосстановление (_dialog_call, docs/claude/safety-unblock.md). Части с thought=true в текст не идут."""
+    cand = (data.get("candidates") or [{}])[0]
+    finish = cand.get("finishReason") or ""
+    text = "".join(p.get("text", "") for p in (cand.get("content") or {}).get("parts") or [] if not p.get("thought"))
+    block = (data.get("promptFeedback") or {}).get("blockReason")
+    if block or (not text.strip() and finish in _GOOGLE_SAFETY_FINISH):
+        raise _google_status_error(400, f"{api_errors.SAFETY_BLOCK_MARKER} (Google: {block or finish})", url)
+    meta = data.get("usageMetadata") or {}
+    cached = meta.get("cachedContentTokenCount") or 0
+    thoughts = meta.get("thoughtsTokenCount") or 0
+    usage = SimpleNamespace(
+        input_tokens=max(0, (meta.get("promptTokenCount") or 0) - cached),
+        output_tokens=(meta.get("candidatesTokenCount") or 0) + thoughts,
+        cache_creation_input_tokens=0, cache_read_input_tokens=cached, cache_creation=None,
+        output_tokens_details=SimpleNamespace(thinking_tokens=thoughts))
+    return SimpleNamespace(
+        id=data.get("responseId"), type="message", role="assistant", model=model_id,
+        content=[SimpleNamespace(type="text", text=text)] if text else [],
+        stop_reason="max_tokens" if finish == "MAX_TOKENS" else "end_turn", stop_sequence=None, usage=usage)
+
+
+def google_native_create(*, retries: int = 0, **kwargs):
+    """messages.create для нативной модели Google. СИНХРОННАЯ — звать только из потока (как client.messages.create).
+    retries — повторы на 429/5xx/сеть внутри вызова (служебный путь sync_create; у call_claude ретраи свои)."""
+    model_id = kwargs.get("model", "")
+    meta = _MODELS_BY_ID.get(model_id) or {}
+    url = f"{GOOGLE_API_BASE_URL}/v1beta/models/{meta.get('api_model') or model_id.split('/', 1)[-1]}:generateContent"
+    import httpx2
+    if not GEMINI_API_KEY:
+        raise _google_status_error(401, "GEMINI_API_KEY не задан — нативная полоса Google недоступна", url)
+    payload = google_native_payload(kwargs)
+    timeout = kwargs.get("timeout") or GOOGLE_NATIVE_TIMEOUT
+    for attempt in range(retries + 1):
+        last = attempt == retries
+        try:
+            resp = http_requests.post(url, json=payload, headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=timeout)
+        except http_requests.Timeout:
+            if last:
+                raise anthropic.APITimeoutError(request=httpx2.Request("POST", url))
+            time.sleep(GOOGLE_NATIVE_RETRY_DELAY)
+            continue
+        except Exception:
+            if last:
+                raise anthropic.APIConnectionError(request=httpx2.Request("POST", url))
+            time.sleep(GOOGLE_NATIVE_RETRY_DELAY)
+            continue
+        if resp.status_code == 200:
+            return google_native_response(resp.json(), model_id, url)
+        if resp.status_code in (429, 500, 502, 503, 504) and not last:
+            time.sleep(GOOGLE_NATIVE_RETRY_DELAY)
+            continue
+        try:
+            message = str((resp.json().get("error") or {}).get("message") or "")[:500]
+        except Exception:
+            message = (resp.text or "")[:500]
+        if resp.status_code == 400 and "token count" in message.lower() and "exceed" in message.lower():
+            message = f"{api_errors.PROMPT_TOO_LONG_MARKER}: {message}"   # лечится обрезкой истории, как на пуле
+        raise _google_status_error(resp.status_code, message, url)
+
+
+def _messages_create(sdk_client, kwargs: dict):
+    """Единственное место, где уходит вызов модели: нативная модель Google → google_native_create, остальные → SDK пула."""
+    if is_native_model(kwargs.get("model")):
+        return google_native_create(retries=0 if sdk_client is client_noretry else 1, **kwargs)
+    return sdk_client.messages.create(**kwargs)
+
+
 # --- Фолбэк между провайдерами (docs/claude/model-fallback.md) ---
 
 _fallback_until: dict[str, float] = {}   # id основной модели → monotonic-время конца «липкого» окна
@@ -706,7 +888,7 @@ def _enter_fallback(model: str, fb_model: str, exc: BaseException, label: str) -
 
 
 def catalog_ids(payload: dict) -> set[str]:
-    """Id моделей из GET /v1/models пула без префикса провайдера (`google/…`, `openai/…`): в запросе и в
+    """Id моделей из GET /v1/models пула без префикса провайдера (`google-direct/…`, `openai/…`): в запросе и в
     `response.model` — голая строка."""
     return {m.get("id", "").split("/", 1)[-1] for m in payload.get("data", [])}
 
@@ -726,7 +908,7 @@ async def check_fallback_models() -> None:
         logger.warning(f"fallback: каталог моделей пула не получен ({type(e).__name__}) — проверка пропущена")
         return
     for m in dict.fromkeys([meta["id"] for meta in MODELS.values()] + list(FALLBACK_PAIRS.values())):
-        if m not in ids:
+        if m not in ids and not is_native_model(m):
             logger.warning(f"models: {m!r} нет в каталоге пула /v1/models — запросы к ней могут не пройти")
         if price_meta(m) is None:
             logger.warning(f"models: у {m!r} нет цены (MODELS/LEGACY_PRICES) — usage_log посчитает по цене дефолтной модели")
@@ -781,7 +963,7 @@ async def call_claude(context, chat_id: int | None, *, label: str, usage_label: 
         keepalive = functools.partial(_keep_chat_action, context.bot, chat_id, "typing")
 
     response, used = await _call_with_fallback(
-        kwargs, lambda kw: functools.partial(client_noretry.messages.create, **kw),
+        kwargs, lambda kw: functools.partial(_messages_create, client_noretry, kw),
         label=label, keepalive=keepalive, fallback=fallback)
     _track_response(used, response, _usage_label(usage_label or label.split()[0], used, kwargs.get("model", "")))
     return response
@@ -811,16 +993,16 @@ def sync_create(**kwargs):
     kwargs = kwargs_for_model(kwargs, model)
     if fb and _sticky_fallback(model):
         used = fb
-        response = client.messages.create(**kwargs_for_model(kwargs, fb))
+        response = _messages_create(client, kwargs_for_model(kwargs, fb))
     else:
         try:
-            response = client.messages.create(**kwargs)   # SDK-ретраи отработали, дальше — фолбэк
+            response = _messages_create(client, kwargs)   # SDK-ретраи отработали, дальше — фолбэк
         except Exception as exc:
             if not (fb and api_errors.should_fallback(exc)):
                 raise
             _enter_fallback(model, fb, exc, label)
             used = fb
-            response = client.messages.create(**kwargs_for_model(kwargs, fb))
+            response = _messages_create(client, kwargs_for_model(kwargs, fb))
     _track_response(used, response, label + "_fallback" if used != model else label)
     return response
 
@@ -6008,14 +6190,16 @@ def _t_model_free(value, chat_id):
     meta = MODELS[value]
     if value in FREE_MODEL_KEYS:
         return f"В бесплатном режиме я и так на {meta['label']} — другой модели тут нет. Баланс — /cost."
+    p_in, p_out = effective_price(meta)
     return (f"{meta['label']} — доступно в платном режиме "
-            f"(${meta['in']:g}/${meta['out']:g} за миллион токенов). "
+            f"(${p_in:g}/${p_out:g} за миллион токенов). "
             f"Баланс — /cost, пополнить — {ADMIN_CONTACT}.")
 
 
 def _t_model_restricted(value, chat_id):
     meta = MODELS[value]
-    return (f"{meta['label']} дорогая (${meta['in']:g}/${meta['out']:g} за MTok) — "
+    p_in, p_out = effective_price(meta)
+    return (f"{meta['label']} дорогая (${p_in:g}/${p_out:g} за MTok) — "
             f"переключать её могут {_ADMINS_ONLY}.")
 
 
@@ -6222,7 +6406,7 @@ async def cmd_claude_gone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/haiku /sonnet /opus /fable — заглушка на один релиз: пул закрыл модели Anthropic (2026-10-28)."""
     await update.effective_message.reply_text(
         "Модели Claude мне больше недоступны — их закрыл поставщик. Выбери другую в /models: "
-        "/argon, /flash или /luna.")
+        "/argon, /flash, /luna или модели напрямую у Google — /argon_g, /flash_g, /lite.")
 
 
 async def cmd_argon(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6237,10 +6421,17 @@ async def cmd_luna(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _set_chat_model(update, context, "luna")
 
 
-async def cmd_lite_gone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/lite — заглушка на один релиз: пул убрал Gemini Flash-Lite (2026-11-14), её место заняла Luna."""
-    await update.effective_message.reply_text(
-        "Gemini Flash-Lite убрал поставщик. Вместо неё — /luna (GPT-6 Luna), остальные модели — в /models.")
+async def cmd_argon_g(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _set_chat_model(update, context, "argon_g")
+
+
+async def cmd_flash_g(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _set_chat_model(update, context, "flash_g")
+
+
+async def cmd_lite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/lite — снова модель: Gemini 3.1 Flash-Lite напрямую у Google (пул её убрал 2026-11-14)."""
+    await _set_chat_model(update, context, "lite")
 
 
 SEARCH_PROVIDER_LABELS = {"gpt": "GPT", "tavily": "Tavily"}
@@ -6313,11 +6504,12 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, label = _chat_display(update, chat_id)
     lines = [f"Модель для {label}: {model_meta(current)['label']}", f"Режим: {_tier_label(chat_id)}"]
     # Заголовок — по провайдеру модели (model_provider): Luna (GPT) не должна оказаться под «Gemini».
-    group_titles = {"gemini": "Gemini (явного кэша промпта нет; неявный срабатывает не всегда):",
-                    "openai": "GPT (кэш промпта автоматический):"}
+    group_titles = {"gemini": "Gemini через пул (явного кэша промпта нет; неявный срабатывает не всегда):",
+                    "openai": "GPT (кэш промпта автоматический):",
+                    "google": "Gemini напрямую у Google (без запасной GPT: при сбое — та же модель через пул):"}
     shown_provider = None
     for key, meta in MODELS.items():
-        prov = model_provider(meta["id"])
+        prov = "google" if meta.get("native") else model_provider(meta["id"])
         if prov != shown_provider:
             shown_provider = prov
             lines += ["", group_titles.get(prov, prov)]
@@ -6326,8 +6518,12 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tail = "  (платный режим)" if tier == "free" and key not in FREE_MODEL_KEYS else ""
         if meta.get("restricted"):
             tail += "  (админы)"
+        p_in, p_out = effective_price(meta)
+        for since, s_in, s_out in meta.get("price_steps") or ():
+            if (p_in, p_out) != (s_in, s_out):
+                tail += f"  (с {since[8:10]}.{since[5:7]}.{since[:4]} — ${s_in:g}/${s_out:g})"
         lines.append(
-            f"{mark} /{key:6} {meta['label']:22} ${meta['in']:g}/${meta['out']:g} за MTok, окно {window}{tail}"
+            f"{mark} /{key:7} {meta['label']:30} ${p_in:g}/${p_out:g} за MTok, окно {window}{tail}"
         )
     lines += ["", "Цены — прайс провайдера за миллион токенов (вход/выход).", _search_status_line(chat_id)]
     # Генерация картинок — те же провайдеры, что в /imagemodels, но компактно и с ценами за картинку.
@@ -6577,6 +6773,7 @@ USER_HELP = """\
   /luna          — GPT-6 Luna (единственная модель бесплатного режима)
   /flash         — Gemini 3.8 Flash (платный режим, дефолт; кэша промпта нет)
   /argon         — Gemini 4 Argon (платный режим, самая сильная; кэша промпта нет)
+  /argon_g /flash_g /lite — те же Argon и Flash и Gemini 3.1 Flash-Lite напрямую у Google (платный режим; цены — в /models)
   /searchmode    — откуда брать данные для поиска: auto|gpt|tavily (платный режим; без аргумента — текущий)
   /imagemodels   — какой провайдер картинок сейчас у чата
   /banana        — рисовать через Nano Banana 2.1 (платный режим)
@@ -6624,13 +6821,16 @@ ADMIN_HELP = """\
   /luna [chat_id]          — GPT-6 Luna — $0.10/$0.50, окно 872K (единственная модель бесплатного режима и всех служебных вызовов)
   /flash [chat_id]         — Gemini 3.8 Flash — $0.75/$3.75, окно 1M (дефолт платного режима)
   /argon [chat_id]         — Gemini 4 Argon — $2/$10, окно 1M (платный режим; модель дневного обзора)
+  /argon_g [chat_id]       — Gemini 4 Argon напрямую у Google — прайс Google +10% ($2.2/$11, с 01.12.2026 $4.4/$22)
+  /flash_g [chat_id]       — Gemini 3.8 Flash напрямую у Google — $0.825/$4.125 (с 01.01.2027 $1.65/$8.25)
+  /lite [chat_id]          — Gemini 3.1 Flash-Lite напрямую у Google — $0.275/$1.65
+                             нативные: ключ GEMINI_API_KEY, мимо пула; при сбое Google — та же модель через пул (Lite → Flash)
   chat_id — число с минусом, например: /flash -1001109809707
   Gemini-модели без кэша промпта: вход каждый раз по полной цене. Если модель чата упала, ответ даёт модель другого
   провайдера (luna → Gemini 3.8 Flash, flash → GPT-6.1 Terra, argon → GPT-6.1 Sol), в /cost такие строки с меткой *_fallback.
   Всё, кроме Luna, — админу или чату в платном режиме. Выбор постоянный (chat_models), в бесплатном режиме
   не применяется (там всегда Luna), но и не стирается. Перед записью — пробный запрос (кроме Luna).
-  /haiku /sonnet /opus /fable больше нет (пул закрыл Claude), /lite тоже (пул убрал Flash-Lite 2026-11-14) — отвечают
-  подсказкой выбрать другую модель.
+  /haiku /sonnet /opus /fable больше нет (пул закрыл Claude) — отвечают подсказкой выбрать другую модель.
 
 Поиск (без аргумента — текущий режим чата; chat_id вторым аргументом — любой чат, только админу):
   /searchmode [auto|gpt|tavily] [chat_id] — auto = поиск GPT при любой модели.
@@ -9762,7 +9962,9 @@ def main():
     app.add_handler(CommandHandler("argon", cmd_argon))
     app.add_handler(CommandHandler("flash", cmd_flash))
     app.add_handler(CommandHandler("luna", cmd_luna))
-    app.add_handler(CommandHandler("lite", cmd_lite_gone))
+    app.add_handler(CommandHandler("lite", cmd_lite))
+    app.add_handler(CommandHandler("argon_g", cmd_argon_g))
+    app.add_handler(CommandHandler("flash_g", cmd_flash_g))
     app.add_handler(CommandHandler("models", cmd_models))
     app.add_handler(CommandHandler("searchmode", cmd_searchmode))
     app.add_handler(CommandHandler("dev", cmd_dev))

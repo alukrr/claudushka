@@ -41,6 +41,10 @@ Claude-модели на Gemini; v2.0.0 убрал Claude целиком: `CLAUD
 `check_fallback_models` (фон, только warning) сверяет `MODELS` и пары с `GET /v1/models` и с таблицей цен.
 **Наличие в каталоге работу не гарантирует**: `gemini-3.6/3.7-flash` были в каталоге, а апстрим отвечал 404.
 
+**Нативная полоса Google (v2.17.0).** Модели `google-direct/…` (`/argon_g`, `/flash_g`, `/lite`) при сбое Google уходят на ТУ ЖЕ модель
+через пул (Lite → Flash пула), не на GPT; дальше цепочка не идёт. Фолбэка на нативные нет. Вызов любой модели — через
+`_messages_create` (нативная → `google_native_create`, иначе SDK пула). `docs/claude/models-and-costs.md` → «Нативная полоса Google».
+
 ## Когда переключаемся — `api_errors.should_fallback(exc)`
 Да: 5xx/529, 429, обрыв/таймаут, ошибка посреди стрима, **404** (модель неизвестна — громкий `MODEL NOT FOUND`),
 401/403 с признаками апстрима (`UPSTREAM_MARKERS`). Нет: **402** (баланс общий, `_alert_admin_balance`),

@@ -30,7 +30,7 @@ def run(coro):
 
 
 def test_registry_has_no_claude():
-    assert set(bot.MODELS) == {"argon", "flash", "luna"}
+    assert set(bot.MODELS) == {"argon", "flash", "luna", "argon_g", "flash_g", "lite"}
     for key, provider, price, headroom in (("argon", "gemini", (2.0, 10.0), 4000), ("flash", "gemini", (0.75, 3.75), 4000),
                                            ("luna", "openai", (0.10, 0.50), 2000)):
         m = bot.MODELS[key]
@@ -141,21 +141,22 @@ def test_set_model_paid_writes(monkeypatch):
 def test_claude_commands_are_stubs():
     upd, m = make_update()
     run(bot.cmd_claude_gone(upd, None))
-    assert "/argon" in m.sent[0] and "Claude" in m.sent[0] and "/luna" in m.sent[0] and "/lite" not in m.sent[0]
+    assert "/argon" in m.sent[0] and "Claude" in m.sent[0] and "/luna" in m.sent[0] and "/argon_g" in m.sent[0]
 
 
-def test_lite_command_is_stub_and_luna_command_switches(monkeypatch):
+def test_lite_is_native_model_again_and_luna_command_switches(monkeypatch):
     upd, m = make_update()
-    run(bot.cmd_lite_gone(upd, None))
-    assert "Flash-Lite убрал поставщик" in m.sent[0] and "/luna" in m.sent[0] and "/models" in m.sent[0]
-    assert not hasattr(bot, "cmd_lite")
+    assert not hasattr(bot, "cmd_lite_gone")
     seen = []
 
     async def fake_set(update, context, key):
         seen.append(key)
     monkeypatch.setattr(bot, "_set_chat_model", fake_set)
     run(bot.cmd_luna(upd, None))
-    assert seen == ["luna"]
+    run(bot.cmd_lite(upd, None))
+    run(bot.cmd_argon_g(upd, None))
+    run(bot.cmd_flash_g(upd, None))
+    assert seen == ["luna", "lite", "argon_g", "flash_g"]
 
 
 def test_luna_needs_no_probe_in_paid_chat(monkeypatch):
@@ -180,16 +181,16 @@ def test_models_listing_groups_by_provider(monkeypatch):
     upd, m = make_update()
     run(bot.cmd_models(upd, SimpleNamespace(args=[], bot=None)))
     text = m.sent[0]
-    assert text.index("Gemini (") < text.index("/argon") < text.index("/flash") < text.index("GPT (") < text.index("/luna")
+    assert (text.index("Gemini через пул") < text.index("/argon ") < text.index("/flash ") < text.index("GPT (")
+            < text.index("/luna") < text.index("Gemini напрямую у Google") < text.index("/argon_g") < text.index("/lite"))
     assert "▸ /luna" in text and "$0.1/$0.5" in text and "872k" in text
-    assert "только Luna" in text and "Lite" not in text
-    assert "/lite" not in text
+    assert "только Luna" in text
 
 
 def test_help_mentions_luna_not_lite():
     for text in (bot.USER_HELP, bot.ADMIN_HELP):
         assert "/luna" in text and "GPT-6 Luna" in text
-        assert not re.search(r"^\s*/lite", text, re.M)          # в списках команд /lite нет (в ADMIN_HELP — только упоминание заглушки)
+        assert "/argon_g" in text and "/flash_g" in text and "/lite" in text   # нативная полоса Google
     assert "luna → Gemini 3.8 Flash" in bot.ADMIN_HELP
     assert "Luna" in bot.TIER_FREE_MSG and "Lite" not in bot.TIER_FREE_MSG
 
