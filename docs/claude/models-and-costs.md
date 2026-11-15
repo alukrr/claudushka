@@ -51,7 +51,8 @@ claude → auto; счётчики в лог. Без пути назад. Вто�
 Flash — в 7 раз дороже). На проде затрагивает 0 строк, на стенде и в копиях базы — сколько есть; счётчик в лог. SQL-дефолт
 колонки `chat_models.model` — `gpt-6-luna` (только новая база).
 
-Команда `/lite` — заглушка на один релиз `cmd_lite_gone` («Gemini Flash-Lite убрал поставщик. Вместо неё — /luna…»); `/luna` —
+Команда `/lite` была заглушкой `cmd_lite_gone` в v2.16.x; с v2.17.0 это снова модель — Flash-Lite напрямую у Google
+(`cmd_lite`, раздел «Нативная полоса Google» в конце файла); `/luna` —
 `cmd_luna` → `_set_chat_model(..., "luna")`. Luna — дефолт: пробного запроса перед записью нет (условие по `DEFAULT_MODEL_ID`).
 `gemini-3.1-flash-lite` лежит в `LEGACY_PRICES` (0.25 / 1.50) — подпись и цена старых строк `usage_log` в `/cost`.
 
@@ -376,3 +377,40 @@ cache_write_1h, cache_read)` (без наценки; `PRICE_MARKUP` примен
   (`gemini-3.1-flash-lite`, ключ `GEMINI_API_KEY`, метка `voice_fallback`, прайс Google $0.25 / аудио $0.50 / выход $1.50) —
   `docs/claude/media.md`.
 - Hydrogen и Carbon в бот **не добавлены** (решение Алексея 2026-11-14), вопрос — в `open-tasks.md`.
+
+## Нативная полоса Google (v2.17.0, `feat/google-native`, 2026-11-15)
+
+Зачем: когда Gemini в пуле лежит, платные чаты отвечают через GPT-фолбэк (Sol/Terra) — по оценке Алексея, не дотягивает по
+юмору и звучит «как ChatGPT». Поэтому те же модели можно выбрать напрямую у Google, мимо пула.
+
+| Команда (ключ `MODELS`) | id (в `chat_models`, `usage_log`, `response.model`) | Модель у Google | Цена в боте, $/MTok |
+|---|---|---|---|
+| `/argon_g` | `google-direct/gemini-4-argon` | `gemini-4-argon` | 2.2 / 11 (с 2026-12-01 — 4.4 / 22) |
+| `/flash_g` | `google-direct/gemini-3.8-flash` | `gemini-3.8-flash` | 0.825 / 4.125 (с 2027-01-01 — 1.65 / 8.25) |
+| `/lite` | `google-direct/gemini-3.1-flash-lite` | `gemini-3.1-flash-lite` | 0.275 / 1.65 |
+
+- **Цена = прайс Google × `GOOGLE_NATIVE_MARKUP` (1.10)**, решение Алексея. Прайс сверен на странице Google 2026-11-15; у Argon и
+  Flash он со сроком (акционная цена до 30.11 / 31.12, потом вдвое) — ступени в поле `price_steps`, читать ТОЛЬКО через
+  `effective_price(meta)` (дата по Берлину; `calc_llm_cost` и `/models` уже через неё). До подорожания прайс Google равен
+  листовой цене пула в `MODELS`. Кэш у Google только неявный: `cachedContentTokenCount` → `cache_read`, доля — как в прайсе
+  (Argon 5%, Flash и Lite 10%). Ступень >200k токенов у Google для этих моделей не заявлена.
+- **Только платный режим** (free — всегда Luna), права — общий `can_change("model")`; перед записью — обычная проба `_probe_model`.
+- **Вызов**: `_messages_create(sdk_client, kwargs)` — единственное место, где уходит запрос модели. Нативная модель
+  (`is_native_model`, флаг `native` в `MODELS`) → `google_native_create`, остальные → SDK пула. Адаптер переводит kwargs
+  `messages.create` в `generateContent` (`google_native_payload`: system-блоки → `systemInstruction`, соседние реплики одной роли
+  склеиваются, картинки → `inline_data`) и возвращает объект в форме ответа SDK (`google_native_response`: `content`, `usage`,
+  `model` = id с префиксом `google-direct/`, `stop_reason`). Поэтому обёртки, `response_text`, учёт (`_track_response`) и разбор ошибок
+  не менялись. Ошибки Google превращаются в настоящие исключения SDK (`client._make_status_error`): 429/5xx/сеть — ретрай и
+  фолбэк, 400 — нет; «token count exceeds» → маркер `prompt is too long` (лечится обрезкой истории).
+- **Safety-блок**: `promptFeedback.blockReason` или `finishReason` SAFETY/PROHIBITED_CONTENT/… без текста → 400 с маркером
+  `blocked by provider safety policy` → штатное самовосстановление (`docs/claude/safety-unblock.md`). `safetySettings` не
+  задаём — действуют умолчания Google.
+- **Фолбэк ОТ нативных** — та же модель через пул (`FALLBACK_PAIRS`: `google-direct/gemini-4-argon` → `gemini-4-argon`,
+  `google-direct/gemini-3.8-flash` → `gemini-3.8-flash`, `google-direct/gemini-3.1-flash-lite` → `gemini-3.8-flash`), один переход, GPT в
+  цепочке нет. Фолбэка НА нативные нет (решение Алексея). Если лежат и Google, и Gemini пула — пользователь получит ошибку.
+- **Ключ и деньги**: `GEMINI_API_KEY` (тот же, что у banana и запасного голоса); расход идёт со счёта Google, не с баланса пула.
+  Лимиты запросов ключа Google (RPM/TPM) не проверялись.
+- **Не через нативную полосу**: служебные вызовы (Luna), дневной обзор и «сувениры» `/forget` (Argon пула), поиск (GPT пула).
+- **Замер 2026-11-15** (адаптер из ветки, контейнер прода, system ~2.5k токенов + картинка): Lite 1.2 с, Flash 4.8 с, Argon 10 с;
+  короткая проба без system на Argon — 33 с. Таймаут `GOOGLE_NATIVE_TIMEOUT` = 180 с.
+- Тесты — `scripts/test_google_native.py`.

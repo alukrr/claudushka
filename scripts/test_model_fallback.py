@@ -90,6 +90,9 @@ def test_fallback_pairs():
     assert bot.fallback_model_for("gemini-3.1-flash-lite") is None   # убрана пулом 2026-11-14
     assert bot.fallback_model_for("claude-haiku-5-5") is None
     for src, dst in bot.FALLBACK_PAIRS.items():                  # пара — ДРУГОЙ провайдер и с ценой
+        if bot.is_native_model(src):                             # нативная полоса Google → та же модель через пул (другой поставщик)
+            assert not bot.is_native_model(dst)
+            continue
         assert bot.model_provider(src) != bot.model_provider(dst)
         assert bot.price_meta(dst) is not None and bot.price_meta(src) is not None
     assert (bot.model_provider(LUNA), bot.model_provider(FLASH)) == ("openai", "gemini")
@@ -256,8 +259,9 @@ def test_prices_present():
 def test_dedup_pricing_matches_bot():
     """dedup_memory.PRICING — ручная копия MODELS из bot.py (общего модуля нет): расхождение цен/запаса — падение."""
     import dedup_memory as dm
-    assert set(dm.MODEL_ALIASES.values()) == {m["id"] for m in bot.MODELS.values()}
-    for m in bot.MODELS.values():
+    pool_models = [m for m in bot.MODELS.values() if not m.get("native")]   # дедуп ходит только в пул, нативных Google в нём нет
+    assert set(dm.MODEL_ALIASES.values()) == {m["id"] for m in pool_models}
+    for m in pool_models:
         assert dm.PRICING[m["id"]] == (m["in"], m["out"], m["cache_read_mult"], m["cache_write_5m_mult"],
                                        m["cache_write_1h_mult"]), m["id"]
         assert dm.THINKING_HEADROOM[m["id"]] == m["thinking_headroom"]
