@@ -44,7 +44,8 @@ def test_registry_has_no_claude():
     assert bot.DEFAULT_MODEL_KEY == "luna" and bot.DEFAULT_MODEL_ID == LUNA
     assert bot.MODELS[bot.PAID_DEFAULT_MODEL_KEY]["id"] == FLASH
     assert bot.FREE_MODEL_KEYS == ("luna",)
-    assert bot.DAILY_REVIEW_MODEL_ID == ARGON
+    assert bot.DAILY_REVIEW_MODEL_ID == "google-direct/gemini-4-argon"      # обзор — Argon напрямую у Google (2026-11-15)
+    assert bot.FALLBACK_PAIRS[bot.DAILY_REVIEW_MODEL_ID] == ARGON
     assert bot.model_provider("claude-opus-5-5") == "anthropic" and bot.model_provider(LITE_OLD) == "gemini"
     assert not {FLASH, ARGON, LUNA} & bot.LEGACY_PRICES.keys()   # одна цена на строку
 

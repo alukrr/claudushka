@@ -3542,7 +3542,10 @@ async def handle_captcha(update: Update, user: dict) -> bool:
 
 # --- Daily review ---
 
-DAILY_REVIEW_MODEL_ID = MODELS["argon"]["id"]  # осознанное исключение из «служебное — Luna»: платная фича
+# Осознанное исключение из «служебное — Luna»: платная фича. С 2026-11-15 — Argon НАПРЯМУЮ у Google (нативная полоса): пока
+# Gemini в пуле лежал, обзор писал GPT-фолбэк Sol — «скучно» (Алексей). Пара фолбэка — Argon пула, GPT в цепочке нет:
+# лежат оба — обзора в этот день нет (в логе ошибка). Цена чату — нативная (прайс Google +10%).
+DAILY_REVIEW_MODEL_ID = MODELS["argon_g"]["id"]
 
 # --- /forget: подтверждение, область, «сувениры» (docs/claude/memory.md → «/forget», ТЗ docs/claude/tz-forget-confirm.md) ---
 # Выбор «сувениров» на Argon в платном чате — ВТОРОЕ осознанное исключение из «служебное — только Luna» (первое — обзор выше);
@@ -6820,8 +6823,8 @@ ADMIN_HELP = """\
   /models [chat_id]        — список моделей, цены, окно; ▸ = текущая
   /luna [chat_id]          — GPT-6 Luna — $0.10/$0.50, окно 872K (единственная модель бесплатного режима и всех служебных вызовов)
   /flash [chat_id]         — Gemini 3.8 Flash — $0.75/$3.75, окно 1M (дефолт платного режима)
-  /argon [chat_id]         — Gemini 4 Argon — $2/$10, окно 1M (платный режим; модель дневного обзора)
-  /argon_g [chat_id]       — Gemini 4 Argon напрямую у Google — прайс Google +10% ($2.2/$11, с 01.12.2026 $4.4/$22)
+  /argon [chat_id]         — Gemini 4 Argon — $2/$10, окно 1M (платный режим)
+  /argon_g [chat_id]       — Gemini 4 Argon напрямую у Google — прайс Google +10% ($2.2/$11, с 01.12.2026 $4.4/$22); модель дневного обзора
   /flash_g [chat_id]       — Gemini 3.8 Flash напрямую у Google — $0.825/$4.125 (с 01.01.2027 $1.65/$8.25)
   /lite [chat_id]          — Gemini 3.1 Flash-Lite напрямую у Google — $0.275/$1.65
                              нативные: ключ GEMINI_API_KEY, мимо пула; при сбое Google — та же модель через пул (Lite → Flash)

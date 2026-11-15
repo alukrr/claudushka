@@ -180,7 +180,7 @@
   нужен при переходе на Flash); ответы пользователю — `get_chat_model(chat_id)` с
   `**dialog_params(model)` и `out_tokens(...)`.
   `MODELS["..."]["id"]` в новых вызовах не хардкодить (сознательные исключения — два:
-  `daily_chat_review` на Argon, платная фича, и выбор «сувениров» `/forget` на Argon в paid-чате, `FORGET_PICK_MODEL_ID`, label `forget`). `docs/claude/models-and-costs.md`.
+  `daily_chat_review` на Argon напрямую у Google (`DAILY_REVIEW_MODEL_ID`), платная фича, и выбор «сувениров» `/forget` на Argon в paid-чате, `FORGET_PICK_MODEL_ID`, label `forget`). `docs/claude/models-and-costs.md`.
 - Начало запроса к модели (system) — СТАТИЧНО: изменчивое (время, результаты поиска, reply-контекст)
   только в `service_block` последнего user-turn, не в system, и не в БД. Система собирается через
   `build_system` (блоки с `cache_control`), длина — `system_chars`, не `len`. Окно истории — шагами
