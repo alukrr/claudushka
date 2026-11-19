@@ -117,21 +117,26 @@ if callable(_sdk_retry_timeout):
 else:
     logger.error("SDK без _calculate_retry_timeout — потолок Retry-After не стоит (docs/claude/api-errors.md); проверить после обновления anthropic")
 
-# --- Фолбэк между провайдерами пула (docs/claude/model-fallback.md, ТЗ no-anthropic) ---
-# С 2026-10-28 пул не отдаёт модели Anthropic; фолбэк — модель из ДРУГОГО провайдера (один сбой пула не должен ронять
-# обе): flash → gpt-6.1-terra, argon → gpt-6.1-sol. С 2026-11-14 (Flash-Lite убрана пулом) служебные вызовы и free — на
-# gpt-6-luna, её пара — gemini-3.8-flash (GPT → Gemini). Переход один: Luna → Flash, дальше цепочка не идёт (Flash → Terra
-# срабатывает только когда Flash — основная модель вызова). Та же полоса /v1/messages и тот же ключ.
-# FALLBACK_ENABLED=0 — откат без правки кода.
+# --- Фолбэк между провайдерами (docs/claude/model-fallback.md) ---
+# С 2026-11-19 (пул отключил Gemini: 400 «Gemini models are currently unavailable», решение Алексея) Gemini пула и Luna
+# уходят на Gemini НАПРЯМУЮ у Google (нативная полоса, GEMINI_API_KEY), не на GPT: тот же характер, другой поставщик.
+# Нативные модели при сбое Google — на ту же модель пула. Переход ОДИН, дальше цепочка не идёт.
+# Без GEMINI_API_KEY — прежние пары на GPT пула (FALLBACK_PAIRS_NO_GOOGLE). FALLBACK_ENABLED=0 — откат без правки кода.
 FALLBACK_ENABLED = os.environ.get("FALLBACK_ENABLED", "1").strip() != "0"
 FALLBACK_PAIRS = {
-    "gpt-6-luna": "gemini-3.8-flash",
-    "gemini-3.8-flash": "gpt-6.1-terra",
-    "gemini-4-argon": "gpt-6.1-sol",
-    # Нативная полоса Google → та же модель через пул (другой поставщик, тот же характер). Дальше цепочка не идёт.
+    "gpt-6-luna": "google-direct/gemini-3.8-flash",
+    "gemini-3.8-flash": "google-direct/gemini-3.8-flash",
+    "gemini-4-argon": "google-direct/gemini-4-argon",
+    # Нативная полоса Google → та же модель через пул (другой поставщик, тот же характер).
     "google-direct/gemini-4-argon": "gemini-4-argon",
     "google-direct/gemini-3.8-flash": "gemini-3.8-flash",
     "google-direct/gemini-3.1-flash-lite": "gemini-3.8-flash",   # Lite в пуле нет
+}
+# Пары, если ключа Google нет (стенд без GEMINI_API_KEY): как до 2026-11-19 — Gemini → GPT пула, Luna → Flash пула.
+FALLBACK_PAIRS_NO_GOOGLE = {
+    "gpt-6-luna": "gemini-3.8-flash",
+    "gemini-3.8-flash": "gpt-6.1-terra",
+    "gemini-4-argon": "gpt-6.1-sol",
 }
 # После сбоя модели X следующие N секунд запросы на X сразу идут на её пару (без попытки и ожидания).
 FALLBACK_STICKY_SECONDS = int(os.environ.get("FALLBACK_STICKY_SECONDS", "300") or 300)
@@ -825,11 +830,15 @@ _last_fallback_alert = 0.0
 
 
 def fallback_model_for(model_id: str) -> str | None:
-    """Модель фолбэка (FALLBACK_PAIRS: Luna → Flash, Flash → Terra, Argon → Sol) или None: фолбэк выключен / у модели пары
-    нет (Terra, Sol, неизвестные строки). Только один переход."""
+    """Модель фолбэка (FALLBACK_PAIRS: Luna/Flash → Flash у Google, Argon → Argon у Google, нативные → та же модель пула)
+    или None: фолбэк выключен / у модели пары нет (Terra, Sol, неизвестные строки). Только один переход.
+    Нет GEMINI_API_KEY — пара на нативную недоступна, берём FALLBACK_PAIRS_NO_GOOGLE (GPT пула)."""
     if not model_id or not FALLBACK_ENABLED:
         return None
-    return FALLBACK_PAIRS.get(model_id)
+    fb = FALLBACK_PAIRS.get(model_id)
+    if fb and is_native_model(fb) and not GEMINI_API_KEY:
+        return FALLBACK_PAIRS_NO_GOOGLE.get(model_id)
+    return fb
 
 
 def _sticky_fallback(model_id: str) -> str | None:
@@ -915,7 +924,7 @@ async def check_fallback_models() -> None:
 
 
 async def _call_with_fallback(kwargs: dict, make_fn, *, label: str, keepalive, fallback: bool = True):
-    """Вызов модели с переходом на пару из FALLBACK_PAIRS (Luna → Flash, Flash → Terra, Argon → Sol). make_fn(kw) → функция без аргументов для call_with_retry.
+    """Вызов модели с переходом на пару из FALLBACK_PAIRS (Gemini пула и Luna → Gemini у Google, нативные → пул). make_fn(kw) → функция без аргументов для call_with_retry.
     Возвращает (response, фактически запрошенная модель)."""
     model = kwargs.get("model", "")
     fb = fallback_model_for(model) if fallback else None
@@ -6829,8 +6838,8 @@ ADMIN_HELP = """\
   /lite [chat_id]          — Gemini 3.1 Flash-Lite напрямую у Google — $0.275/$1.65
                              нативные: ключ GEMINI_API_KEY, мимо пула; при сбое Google — та же модель через пул (Lite → Flash)
   chat_id — число с минусом, например: /flash -1001109809707
-  Gemini-модели без кэша промпта: вход каждый раз по полной цене. Если модель чата упала, ответ даёт модель другого
-  провайдера (luna → Gemini 3.8 Flash, flash → GPT-6.1 Terra, argon → GPT-6.1 Sol), в /cost такие строки с меткой *_fallback.
+  Gemini-модели без кэша промпта: вход каждый раз по полной цене. Если модель чата упала, ответ даёт другой поставщик
+  (luna и flash → Flash у Google, argon → Argon у Google; без GEMINI_API_KEY — GPT пула), в /cost такие строки с меткой *_fallback.
   Всё, кроме Luna, — админу или чату в платном режиме. Выбор постоянный (chat_models), в бесплатном режиме
   не применяется (там всегда Luna), но и не стирается. Перед записью — пробный запрос (кроме Luna).
   /haiku /sonnet /opus /fable больше нет (пул закрыл Claude) — отвечают подсказкой выбрать другую модель.

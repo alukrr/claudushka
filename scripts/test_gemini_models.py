@@ -192,7 +192,7 @@ def test_help_mentions_luna_not_lite():
     for text in (bot.USER_HELP, bot.ADMIN_HELP):
         assert "/luna" in text and "GPT-6 Luna" in text
         assert "/argon_g" in text and "/flash_g" in text and "/lite" in text   # нативная полоса Google
-    assert "luna → Gemini 3.8 Flash" in bot.ADMIN_HELP
+    assert "luna и flash → Flash у Google" in bot.ADMIN_HELP   # фолбэк на нативную полосу (2026-11-19)
     assert "Luna" in bot.TIER_FREE_MSG and "Lite" not in bot.TIER_FREE_MSG
 
 

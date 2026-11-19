@@ -158,14 +158,31 @@ UPSTREAM_MARKERS = ("subscription", "upstream", "no available", "overloaded", "c
                     "model_blocked")   # 403 model_blocked — пул закрыл модель для аккаунта (Claude, 2026-10-28)
 
 
+# 400 «модель у пула выключена» (2026-11-19: «Gemini models are currently unavailable on this service. Retrying will not
+# help; do not retry this request and use another model.»). Это не баг запроса — другой поставщик ответит.
+MODEL_UNAVAILABLE_MARKERS = ("currently unavailable", "use another model")
+
+
+def is_model_unavailable(exc: BaseException) -> bool:
+    """400/422, которым пул говорит «эта модель у нас выключена, бери другую» (не ошибка нашего запроса)."""
+    status = getattr(exc, "status_code", None) or 0
+    if not (isinstance(exc, anthropic.BadRequestError) or status in (400, 422)):
+        return False
+    text = f"{exc} {getattr(exc, 'body', '')}".lower()
+    return any(m in text for m in MODEL_UNAVAILABLE_MARKERS)
+
+
 def should_fallback(exc: BaseException) -> bool:
-    """Claude недоступен — пора отвечать Gemini (docs/claude/model-fallback.md).
+    """Модель недоступна — пора отвечать её парой (docs/claude/model-fallback.md).
 
     Переключаем: 5xx/529, 429, обрыв/таймаут, ошибка посреди стрима, 404 (модель не знает пул),
-    401/403/404 с признаками апстрима. НЕ переключаем: 402 (баланс общий, Gemini тоже не пройдёт),
-    400/422 (баг запроса, в т.ч. prompt is too long — его лечит обрезка), 401/403 без признаков (ключ)."""
+    401/403/404 с признаками апстрима, 400 «модель выключена, бери другую» (MODEL_UNAVAILABLE_MARKERS).
+    НЕ переключаем: 402 (баланс общий), прочие 400/422 (баг запроса, в т.ч. prompt is too long — его лечит обрезка),
+    401/403 без признаков (ключ)."""
     if is_insufficient_balance(exc):
         return False
+    if is_model_unavailable(exc):
+        return True
     status = getattr(exc, "status_code", None) or 0
     if isinstance(exc, anthropic.BadRequestError) or status in (400, 422):
         return False
