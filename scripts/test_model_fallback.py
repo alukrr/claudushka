@@ -296,11 +296,16 @@ def test_prices_present():
 def test_dedup_pricing_matches_bot():
     """dedup_memory.PRICING — ручная копия MODELS из bot.py (общего модуля нет): расхождение цен/запаса — падение."""
     import dedup_memory as dm
-    pool_models = [m for m in bot.MODELS.values() if not m.get("native")]   # дедуп ходит только в пул, нативных Google в нём нет
+    pool_models = [m for m in bot.MODELS.values() if not m.get("native")]   # MODEL_ALIASES (и TUI) — только пул
     assert set(dm.MODEL_ALIASES.values()) == {m["id"] for m in pool_models}
-    for m in pool_models:
-        assert dm.PRICING[m["id"]] == (m["in"], m["out"], m["cache_read_mult"], m["cache_write_5m_mult"],
-                                       m["cache_write_1h_mult"]), m["id"]
+    # Нативные — NATIVE_ALIASES / NATIVE_FALLBACK (фолбэк дедупа на ту же модель у Google), цена — базовая из MODELS
+    native = [bot.MODELS[k] for k in dm.NATIVE_ALIASES]
+    assert set(dm.NATIVE_ALIASES.values()) == {m["id"] for m in native} == set(dm.NATIVE_FALLBACK.values())
+    for pool_id, nat_id in dm.NATIVE_FALLBACK.items():
+        assert bot.FALLBACK_PAIRS[pool_id] == nat_id                      # та же пара, что у бота
+    for m in pool_models + native:
+        assert dm.PRICING[m["id"]] == pytest.approx((m["in"], m["out"], m["cache_read_mult"], m["cache_write_5m_mult"],
+                                                     m["cache_write_1h_mult"])), m["id"]
         assert dm.THINKING_HEADROOM[m["id"]] == m["thinking_headroom"]
 
 

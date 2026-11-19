@@ -31,8 +31,10 @@ data/dedup_runs/, калибровка оценок — data/dedup_calibration.j
                  "Отправил фото в чат" -> один факт). Один вызов модели на группу
                  (user_id, context, chat_id, tier) — СТОИТ ДЕНЕГ, задаётся --model
                  (короткое имя luna / flash / argon / neon — GPT-6 Luna, Gemini 3.8 Flash, 4 Argon, 4 Neon через пул,
-                 те же имена, что команды бота; дефолт luna, либо полная API-строка; выбор вручную, не
-                 автофолбэк; оценка цены приблизительна: рассуждения идут в вывод). Старые записи группы удаляются, вместо
+                 flash_g / argon_g / neon_g — те же Gemini напрямую у Google (GEMINI_API_KEY, только в контейнере);
+                 те же имена, что команды бота; дефолт luna, либо полная API-строка; выбор вручную. Если пул не
+                 отвечает на Gemini — та же модель у Google до конца прогона (Luna без фолбэка);
+                 оценка цены приблизительна: рассуждения идут в вывод). Старые записи группы удаляются, вместо
                  них вставляется объединённый список с tier и (для medium)
                  максимальным expires_at среди объединяемых записей. Нужен пакет
                  anthropic и ANTHROPIC_API_KEY — на голом хосте их обычно нет
@@ -102,13 +104,28 @@ from typing import Iterator, Literal
 DB_PATH = Path(__file__).resolve().parent / "data" / "claudushka.db"
 
 # Короткие имена — как в реестре MODELS в bot.py, чтобы не помнить точные API-строки. Только модели пула (Gemini и
-# GPT-6 Luna; тот же Anthropic Messages API и ключ); с 2026-10-28 Claude пул не отдаёт, с 2026-11-14 нет и Flash-Lite. Не автофолбэк, а выбор вручную: дедуп
-# меняет память, молчаливая смена модели посреди прогона дала бы смесь результатов двух моделей.
+# GPT-6 Luna; тот же Anthropic Messages API и ключ); с 2026-10-28 Claude пул не отдаёт, с 2026-11-14 нет и Flash-Lite. Выбор вручную: дедуп
+# меняет память, молчаливая смена модели посреди прогона дала бы смесь результатов двух моделей — поэтому фолбэк
+# (NATIVE_FALLBACK ниже) только на ТУ ЖЕ модель у другого поставщика.
 MODEL_ALIASES = {
     "luna": "gpt-6-luna",
     "flash": "gemini-3.8-flash",
     "argon": "gemini-4-argon",
     "neon": "gemini-4-neon",
+}
+# Нативная полоса Google (те же имена, что команды бота): мимо пула, по GEMINI_API_KEY, через адаптер bot.google_native_create.
+NATIVE_ALIASES = {
+    "flash_g": "google-direct/gemini-3.8-flash",
+    "argon_g": "google-direct/gemini-4-argon",
+    "neon_g": "google-direct/gemini-4-neon",
+}
+# Фолбэк (2026-11-19, пул выключил Gemini — 400 «currently unavailable»): Gemini пула при сбое → ТА ЖЕ модель у Google,
+# до конца прогона (липко: пул лежит долго, не тратим вызов на каждую группу). Модель та же — смеси результатов двух
+# моделей нет. Luna — без фолбэка (другой модели в дедупе не подменяем). Без GEMINI_API_KEY — ошибка как раньше.
+NATIVE_FALLBACK = {
+    "gemini-3.8-flash": "google-direct/gemini-3.8-flash",
+    "gemini-4-argon": "google-direct/gemini-4-argon",
+    "gemini-4-neon": "google-direct/gemini-4-neon",
 }
 
 # $/MTok in,out + множители кэша — дубль MODELS из bot.py (листовые цены пула), менять синхронно: расхождение ловит
@@ -119,6 +136,11 @@ PRICING = {
     "gemini-4-neon": (3.0, 15.0, 0.05, 1.0, 1.0),
     "gemini-3.8-flash": (0.75, 3.75, 0.1, 1.0, 1.0),
     "gpt-6-luna": (0.10, 0.50, 0.1, 1.25, 1.25),
+    # Нативные — базовая цена MODELS бота (прайс Google ×1.10), БЕЗ ступеней price_steps: оценка дедупа приблизительна
+    # (Argon у Google дорожает вдвое с 2026-12-01 — здесь не учтено).
+    "google-direct/gemini-3.8-flash": (0.825, 4.125, 0.1, 1.0, 1.0),
+    "google-direct/gemini-4-argon": (2.2, 11.0, 0.05, 1.0, 1.0),
+    "google-direct/gemini-4-neon": (3.3, 16.5, 0.05, 1.0, 1.0),
 }
 
 # Gemini думает ВСЕГДА (thinking не выключить, output_config пул отклоняет 400) и токены рассуждения идут в вывод.
@@ -129,6 +151,37 @@ PRICING = {
 # Luna (GPT, пул «принимает и игнорирует» max_tokens) — запас 2000 как в bot.py; thinking/output_config вызов не шлёт никому.
 THINKING_HEADROOM = {"gemini-4-argon": 4000, "gemini-4-neon": 4000, "gemini-3.8-flash": 4000, "gpt-6-luna": 2000}
 THINKING_EST = {"gemini-4-argon": 500, "gemini-4-neon": 500, "gemini-3.8-flash": 500, "gpt-6-luna": 500}
+for _pool, _native in NATIVE_FALLBACK.items():   # нативная — та же модель, тот же запас
+    THINKING_HEADROOM[_native], THINKING_EST[_native] = THINKING_HEADROOM[_pool], THINKING_EST[_pool]
+
+
+def is_native(model: str) -> bool:
+    return model.startswith("google-direct/")
+
+
+def _native_create(**kwargs):
+    """Вызов нативной модели Google. Адаптер generateContent ↔ ответ формы SDK живёт в bot.py (google_native_create) —
+    импорт ленивый: нужен только при нативной модели/фолбэке и работает только там, где bot.py импортируется (контейнер)."""
+    import bot
+    return bot.google_native_create(retries=1, **kwargs)
+
+
+def create_with_fallback(client, model: str, state: dict, **kwargs):
+    """(ответ, фактическая модель). state — общий на прогон: после первого перехода на Google весь остаток прогона
+    идёт сразу туда (state["fallback"]). Фолбэк — только NATIVE_FALLBACK и только по api_errors.should_fallback."""
+    used = state.get("fallback") or model
+    if is_native(used):
+        return _native_create(model=used, **kwargs), used
+    try:
+        return client.messages.create(model=used, **kwargs), used
+    except Exception as e:
+        import api_errors
+        fb = NATIVE_FALLBACK.get(used)
+        if not fb or not os.environ.get("GEMINI_API_KEY") or not api_errors.should_fallback(e):
+            raise
+        state["fallback"] = fb
+        state["reason"] = f"{type(e).__name__} {getattr(e, 'status_code', '')}".strip()
+        return _native_create(model=fb, **kwargs), fb
 
 
 def request_cost(model, inp, out, cw_5m, cw_1h, cr):
@@ -313,6 +366,8 @@ class GroupResult:
     # calls — всего вызовов модели (куски + слияния). Токены/стоимость/секунды — суммы по всем вызовам.
     chunks: int = 0
     calls: int = 1
+    # Модель, которая фактически ответила (последний вызов группы); отличается от запрошенной — сработал фолбэк на Google.
+    model_used: str = ""
 
     @property
     def edited(self) -> bool:
@@ -402,7 +457,8 @@ def _usage_numbers(resp):
     return in_tok, cw_5m, cw_1h, cache_read, out_tok
 
 
-def run_llm(groups, model, client, stop_event=None, calib: dict | None = None) -> Iterator[GroupResult]:
+def run_llm(groups, model, client, stop_event=None, calib: dict | None = None,
+            state: dict | None = None) -> Iterator[GroupResult]:
     """Прогон: читает снимок (groups), зовёт API, НИЧЕГО не пишет и не печатает.
 
     stop_event проверяется между группами (и не прерывает идущую группу — часть вызовов уже оплачена);
@@ -410,8 +466,10 @@ def run_llm(groups, model, client, stop_event=None, calib: dict | None = None) -
     на куски (plan_chunks), результаты кусков сливаются повторным вызовом, при необходимости — ещё
     проход, до MAX_CHUNK_LEVELS. Обрезан/упал любой вызов -> вся группа не применяется.
     calib — запись калибровки модели (для оценки размера кусков), None — дефолты.
+    state — общий словарь прогона для фолбэка на Google (create_with_fallback); None — свой на этот вызов.
     """
     import api_errors  # общий с bot.py/whatsapp.py: response_text / parse_json_lenient / was_truncated
+    state = {} if state is None else state
     for g in groups:
         if stop_event is not None and stop_event.is_set():
             return
@@ -423,17 +481,18 @@ def run_llm(groups, model, client, stop_event=None, calib: dict | None = None) -
         def call(facts):
             """Один вызов модели -> (status, merged). Токены и деньги копятся в res."""
             nonlocal cost_unknown
-            resp = client.messages.create(
-                model=model,
+            resp, used = create_with_fallback(
+                client, model, state,
                 max_tokens=MAX_OUT_TOKENS + THINKING_HEADROOM.get(model, 0),
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": json.dumps(facts, ensure_ascii=False)}],
             )
+            res.model_used = used
             res.calls += 1
             i, w5, w1, cr, o = _usage_numbers(resp)
             res.in_tok, res.cw_5m, res.cw_1h, res.cache_read, res.out_tok = (
                 res.in_tok + i, res.cw_5m + w5, res.cw_1h + w1, res.cache_read + cr, res.out_tok + o)
-            c = request_cost(model, i, o, w5, w1, cr)
+            c = request_cost(used, i, o, w5, w1, cr)
             if c is None:
                 cost_unknown = True
             else:
@@ -992,10 +1051,16 @@ def dedup_llm(conn, user_id=None, chat_id=None, tier=None, apply=False,
     total_cost = 0.0
     truncated_groups = errors = 0
     started = time.monotonic()
-    for i, res in enumerate(run_llm(candidates, model, client, calib=calib), 1):
+    state: dict = {}
+    announced = False
+    for i, res in enumerate(run_llm(candidates, model, client, calib=calib, state=state), 1):
         results.append(res)
         k = res.key
         tag = f"[{i}/{n}] user={k.user_id} chat={k.chat_id} tier={k.tier}"
+        if state.get("fallback") and not announced:
+            announced = True
+            print(f"[llm] пул не ответил на {model} ({state.get('reason')}) — до конца прогона та же модель напрямую "
+                  f"у Google: {state['fallback']}", flush=True)
         total_before += len(res.facts_before)
         total_after += len(res.facts_after) if res.applicable else len(res.facts_before)
         totals["in_tok"] += res.in_tok
@@ -1077,8 +1142,8 @@ def main():
     p.add_argument("--tier", choices=["long", "medium"], default=None)
     p.add_argument("--limit-groups", type=int, default=None, help="только для --mode llm")
     p.add_argument("--model", default="luna",
-                    help="только для --mode llm — короткое имя (luna/flash/argon/neon, "
-                         "как в bot.py) или полная API-строка")
+                    help="только для --mode llm — короткое имя (luna/flash/argon/neon через пул, "
+                         "flash_g/argon_g/neon_g напрямую у Google, как в bot.py) или полная API-строка")
     p.add_argument("--fact", default=None,
                     help="только для --mode delete — текст факта на удаление (точное "
                          "совпадение, если не передан --like)")
@@ -1095,7 +1160,7 @@ def main():
                     help="показать сами факты (exact: какой дубль какому id соответствует; "
                          "llm: полный список 'было'/'стало' по каждой группе), не только счётчики")
     args = p.parse_args()
-    args.model = MODEL_ALIASES.get(args.model, args.model)
+    args.model = MODEL_ALIASES.get(args.model) or NATIVE_ALIASES.get(args.model) or args.model
     global INCLUDE_EXPIRED
     INCLUDE_EXPIRED = args.include_expired
 
