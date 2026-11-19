@@ -229,6 +229,20 @@ def test_three_errors_in_a_row_abort(env):
     assert "секретный-текст" not in bot._dedup_auto_report_text(st, "x", 0, 0)   # сырой текст исключения в отчёт не идёт
 
 
+def test_http_402_aborts_at_once_with_clear_reason(env):
+    for u in (U1, U2, U3):
+        ins(u, 12)
+    msg = "Error code: 402 - {'error': {'message': 'Your prepayment credits are depleted.', 'type': 'google_native'}}"
+    r = httpx.Response(402, request=httpx.Request("POST", "http://x"), json={})
+    env.raise_for = lambda facts: anthropic.APIStatusError(msg, response=r, body=None)
+    st = go(env)
+    assert st["errors"] == 1 and len(env.calls) == 1 and st["left"] == 2 and states() == {}   # не три попытки, а сразу стоп
+    assert "402" in st["abort"] and "кончились деньги" in st["abort"]
+    text = bot._dedup_auto_report_text(st, "Итог", 0.0, 1)
+    assert "HTTP 402" in text and "prepayment" not in text                                   # код — да, сырой текст — нет
+    assert bot._dedup_http_code("RuntimeError: x") is None and bot._dedup_http_code(None) is None
+
+
 def test_model_called_via_sync_create_with_label_and_no_native(env):
     ins(U1, 20)
     go(env)

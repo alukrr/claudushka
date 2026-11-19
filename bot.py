@@ -3338,6 +3338,12 @@ def _dedup_where(k, names) -> str:
     return f"«{names[0][k.chat_id]}»" if names and k.chat_id in names[0] else f"чат {k.chat_id}"
 
 
+def _dedup_http_code(err: str | None) -> int | None:
+    """HTTP-код из текста ошибки SDK («Error code: 402 - {...}»); сам текст в отчёт не идёт (инвариант «сырой текст исключения не показываем»)."""
+    m = re.search(r"Error code: (\d{3})", err or "")
+    return int(m.group(1)) if m else None
+
+
 def _dedup_key_text(k, names=None) -> str:
     return f"{_dedup_who(k.user_id, names)} · {_dedup_where(k, names)} · {k.tier}"
 
@@ -3450,7 +3456,14 @@ def _dedup_auto_run_sync(budget: float, stop_event) -> dict:
                 stats["errors"] += 1
                 consecutive += 1
                 logger.warning(f"dedup_auto: ошибка набора {_dedup_key_text(k, names)}: {res.error}")   # текст исключения — только в лог
-                stats["error_list"].append(f"{_dedup_key_text(k, names)}: {(res.error or 'ошибка').split(':')[0]}")
+                code = _dedup_http_code(res.error)
+                stats["error_list"].append(f"{_dedup_key_text(k, names)}: " + (f"HTTP {code}" if code else (res.error or 'ошибка').split(':')[0]))
+                if code == 402:
+                    # Кончились деньги у провайдера (баланс пула или кредиты Google): повторять бессмысленно и каждый вызов — впустую.
+                    stats["abort"] = ("провайдер ответил 402 — на счёте кончились деньги (кредиты Google AI Studio или баланс пула). "
+                                      "Пополни счёт и запусти заново; применённое останется, остальные наборы без отметок")
+                    stats["left"] = len(plan) - i - 1
+                    break
                 if consecutive >= DEDUP_AUTO_MAX_ERRORS:
                     stats["abort"] = f"остановлено: {DEDUP_AUTO_MAX_ERRORS} ошибки модели подряд"
                     stats["left"] = len(plan) - i - 1
