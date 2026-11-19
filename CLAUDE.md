@@ -44,7 +44,8 @@
   `run_daily`, `BERLIN_TZ`, `_review_window`, `build_review_log`, `split_review_sessions`, `prepare_review_input`, `REVIEW_*`, `_review_history_text`, `GROUP_MESSAGES_KEEP`) — `docs/claude/daily-review.md`; ТЗ «характер обзора отдельно» — `docs/claude/tz-review-persona.md`; чек-лист стенда — `docs/claude/staging-checklist-review-persona.md`; ТЗ «весь день + блоки тем» — `docs/claude/tz-daily-review-topics.md`; чек-лист стенда — `docs/claude/staging-checklist-review-topics.md`
 - Модели и цены (`MODELS` = Gemini Flash/Argon + GPT-6 Luna через пул и нативная полоса Google `/argon_g /flash_g /lite` (`google_native_create`, `_messages_create`, `is_native_model`, `effective_price`/`price_steps`, `GOOGLE_NATIVE_MARKUP`), `/argon /flash /luna`, заглушки `/haiku /sonnet /opus /fable`, `/models`, `calc_llm_cost`, миграции `no_anthropic_models` и `lite_gone`) —
   `docs/claude/models-and-costs.md`; ТЗ «Flash-Lite убрана, служебка и free на Luna» — `docs/claude/tz-lite-gone.md` (замеры пула 14.11 — `docs/claude/bench/2026-11-14-*.txt`);
-  чек-лист стенда `fix/lite-gone` — `docs/claude/staging-checklist-lite-gone.md`
+  чек-лист стенда `fix/lite-gone` — `docs/claude/staging-checklist-lite-gone.md`; ТЗ «Gemini 4 Neon — `/neon` (пул) и `/neon_g` (Google)» —
+  `docs/claude/tz-neon.md` (не сделано, ветка `feat/neon`), чек-лист стенда — `docs/claude/staging-checklist-neon.md`
 - Prompt caching (`build_system`, `service_block`, `mark_cache_tail`, `pick_history_window`,
   `PROMPT_CACHE`, `HISTORY_STEP`, `CACHE_TTL_PERSONA`) — `docs/claude/prompt-cache.md`
 - Поиск (`sources_line`, провайдеры gpt/tavily, `/searchmode`, `chat_search_mode`, `search_provider_for`, `_gpt_web_search`, `SEARCH_PROVIDER_FREE`, `SEARCH_GPT_*`;
