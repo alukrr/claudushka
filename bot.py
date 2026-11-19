@@ -3316,27 +3316,90 @@ def _dedup_auto_plan() -> list[dict]:
     return plan
 
 
-def _dedup_key_text(k) -> str:
-    return f"{k.user_id} · {'личка' if k.chat_id is None else f'чат {k.chat_id}'} · {k.tier}"
+def _dedup_auto_names() -> tuple[dict, dict]:
+    """({chat_id: название}, {user_id: «Имя (@ник)»}) для читаемого отчёта (`dedup_memory.load_directory`). Синхронно, из потока. Нет данных — пусто."""
+    conn = db.get_conn()
+    try:
+        return _dm().load_directory(conn)
+    except Exception:
+        logger.warning("dedup_auto: справочник имён не прочитался", exc_info=True)
+        return {}, {}
+    finally:
+        conn.close()
+
+
+def _dedup_who(uid: int, names) -> str:
+    return (names[1].get(uid) if names else None) or f"id {uid}"
+
+
+def _dedup_where(k, names) -> str:
+    if k.chat_id is None:
+        return "личка"
+    return f"«{names[0][k.chat_id]}»" if names and k.chat_id in names[0] else f"чат {k.chat_id}"
+
+
+def _dedup_key_text(k, names=None) -> str:
+    return f"{_dedup_who(k.user_id, names)} · {_dedup_where(k, names)} · {k.tier}"
+
+
+def _n(x: int) -> str:
+    return f"{x:,}".replace(",", " ")
+
+
+def _facts_word(n: int) -> str:
+    return f"{_n(n)} {_dm().ru_plural(n, 'факт', 'факта', 'фактов')}"
 
 
 def _dedup_est_cost(plan: list[dict]) -> float:
     return sum((p["est"].cost or 0.0) for p in plan)
 
 
-def _dedup_auto_estimate_text(plan: list[dict], head: str) -> str:
-    """Оценка «что и почём» без вызова модели (режим estimate и `/dedup_auto estimate`)."""
+def _dedup_fits_budget(plan: list[dict], budget: float) -> int:
+    """Сколько наборов из плана (по порядку) влезет в потолок по ОЦЕНКЕ цены — так же, как проверяет сам прогон."""
+    spent = 0.0
+    for i, p in enumerate(plan):
+        c = p["est"].cost or 0.0
+        if spent + c > budget and spent > 0:
+            return i
+        spent += c
+    return len(plan)
+
+
+def _dedup_auto_estimate_text(plan: list[dict], head: str, names=None) -> str:
+    """Оценка «что и почём» без вызова модели (режим estimate и `/dedup_auto estimate`). names — `_dedup_auto_names()`: с ним вместо id —
+    имена людей и названия чатов."""
+    dm = _dm()
     if not plan:
-        return f"{head}\nГрупп к проверке нет: новых фактов набралось меньше порога."
+        return f"{head}\n\nНаборов к проверке нет: новых фактов набралось меньше порога."
     facts = sum(len(p["group"].facts) for p in plan)
     first = sum(1 for p in plan if p["first"])
     est = _dedup_est_cost(plan)
-    lines = [head,
-             f"Групп к проверке: {len(plan)} (из них впервые: {first}), фактов в них: {facts}.",
-             f"Оценка цены прогона ≈ ${est:.2f} (по прайсу и калибровке, без вызова модели); потолок прогона ${DEDUP_AUTO_MAX_USD:.2f}."
-             + (" Часть групп не влезет — перейдёт на следующую неделю." if est > DEDUP_AUTO_MAX_USD else "")]
-    top = sorted(plan, key=lambda p: -len(p["group"].facts))[:5]
-    lines.append("Самые большие: " + "; ".join(f"{_dedup_key_text(p['group'].key)} — {len(p['group'].facts)} ф., новых {p['new']}" for p in top))
+    lines = [head, "",
+             f"К проверке: {_n(len(plan))} {dm.ru_plural(len(plan), 'набор', 'набора', 'наборов')} фактов (человек × чат × тип), {_facts_word(facts)}"
+             + (" — все впервые." if first == len(plan) else f", впервые: {_n(first)}."),
+             f"Оценка цены: ≈ ${est:.2f} · потолок прогона ${DEDUP_AUTO_MAX_USD:.2f}."]
+    if est > DEDUP_AUTO_MAX_USD:
+        fit = _dedup_fits_budget(plan, DEDUP_AUTO_MAX_USD)
+        lines.append(f"⚠️ Всё не влезет: в потолок войдёт примерно {_n(fit)} из {_n(len(plan))}, остальное — на следующей неделе. "
+                     "(Оценка консервативна — реальная цена обычно ниже.)")
+    by_chat: dict = {}
+    for p in plan:
+        k = p["group"].key
+        row = by_chat.setdefault(k.chat_id, [0, 0, 0.0])
+        row[0] += 1
+        row[1] += len(p["group"].facts)
+        row[2] += p["est"].cost or 0.0
+    lines += ["", "По чатам:"]
+    ranked = sorted(by_chat.items(), key=lambda kv: -kv[1][1])
+    for chat_id, (n, f, c) in ranked[:6]:
+        label = "Личные факты" if chat_id is None else f"«{names[0][chat_id]}»" if names and chat_id in names[0] else f"чат {chat_id}"
+        lines.append(f"• {label} — {_n(n)} {dm.ru_plural(n, 'набор', 'набора', 'наборов')}, {_facts_word(f)}, ≈ ${c:.2f}")
+    if len(ranked) > 6:
+        lines.append(f"• …и ещё {len(ranked) - 6} {dm.ru_plural(len(ranked) - 6, 'чат', 'чата', 'чатов')}")
+    lines += ["", "Самые большие наборы:"]
+    for n, p in enumerate(sorted(plan, key=lambda p: -len(p["group"].facts))[:5], 1):
+        lines.append(f"{n}. {_dedup_key_text(p['group'].key, names)} — {_facts_word(len(p['group'].facts))}"
+                     + (f", новых {_n(p['new'])}" if not p["first"] else "") + f" (≈ ${p['est'].cost or 0:.2f})")
     return "\n".join(lines)
 
 
@@ -3347,11 +3410,12 @@ def _dedup_auto_run_sync(budget: float, stop_event) -> dict:
     dm = _dm()
     stats = {"due": 0, "processed": 0, "left": 0, "applied": 0, "unchanged": 0, "truncated": 0, "empty": 0, "errors": 0,
              "guard": [], "apply_skipped": [], "error_list": [], "facts_before": 0, "facts_after": 0,
-             "spent_est": 0.0, "backup": None, "run_file": None, "abort": None, "stopped": False}
+             "spent_est": 0.0, "names": None, "backup": None, "run_file": None, "abort": None, "stopped": False}
     plan = _dedup_auto_plan()
     stats["due"] = len(plan)
     if not plan:
         return stats
+    names = stats["names"] = _dedup_auto_names()
     try:
         stats["backup"] = dm.backup_db().name       # до первого платного вызова; не создался — прогон отменяется
     except dm.BackupError as e:
@@ -3385,8 +3449,8 @@ def _dedup_auto_run_sync(budget: float, stop_event) -> dict:
             if res.status == "error":
                 stats["errors"] += 1
                 consecutive += 1
-                logger.warning(f"dedup_auto: ошибка группы {_dedup_key_text(k)}: {res.error}")   # текст исключения — только в лог
-                stats["error_list"].append(f"{_dedup_key_text(k)}: {(res.error or 'ошибка').split(':')[0]}")
+                logger.warning(f"dedup_auto: ошибка набора {_dedup_key_text(k, names)}: {res.error}")   # текст исключения — только в лог
+                stats["error_list"].append(f"{_dedup_key_text(k, names)}: {(res.error or 'ошибка').split(':')[0]}")
                 if consecutive >= DEDUP_AUTO_MAX_ERRORS:
                     stats["abort"] = f"остановлено: {DEDUP_AUTO_MAX_ERRORS} ошибки модели подряд"
                     stats["left"] = len(plan) - i - 1
@@ -3403,7 +3467,7 @@ def _dedup_auto_run_sync(budget: float, stop_event) -> dict:
                 else:
                     rep = dm.apply_results(conn, [res])
                     if not rep.applied:
-                        stats["apply_skipped"].append(f"{_dedup_key_text(k)}: {rep.skipped[0][1] if rep.skipped else '?'}")
+                        stats["apply_skipped"].append(f"{_dedup_key_text(k, names)}: {rep.skipped[0][1] if rep.skipped else '?'}")
                         continue                        # строки снимка изменились (бот писал во время прогона) — отметки нет
                     status = "applied"
                     stats["facts_before"] += n_before
@@ -3429,22 +3493,32 @@ def _dedup_auto_run_sync(budget: float, stop_event) -> dict:
 
 
 def _dedup_auto_report_text(stats: dict, head: str, cost: float, calls: int) -> str:
-    lines = [head]
+    names = stats.get("names")
+    dm = _dm()
+    lines = [head, ""]
     if stats.get("abort"):
-        lines.append(f"⚠️ {stats['abort']}")
-    lines.append(f"Групп к проверке: {stats['due']}, обработано: {stats['processed']}, ждут следующей недели (бюджет/остановка): {stats['left']}.")
-    lines.append(f"Применено: {stats['applied']} (фактов {stats['facts_before']} → {stats['facts_after']}), без изменений: {stats['unchanged']}, "
-                 f"обрезано: {stats['truncated']}, пустой ответ: {stats['empty']}, ошибок: {stats['errors']}.")
+        lines += [f"⚠️ {stats['abort']}", ""]
+    lines.append(f"Наборов фактов: к проверке {_n(stats['due'])}, обработано {_n(stats['processed'])}"
+                 + (f", ждут следующей недели {_n(stats['left'])} (бюджет или остановка)." if stats["left"] else "."))
+    lines.append(f"✅ Применено: {_n(stats['applied'])} — фактов {_n(stats['facts_before'])} → {_n(stats['facts_after'])}"
+                 + (f" (−{_n(stats['facts_before'] - stats['facts_after'])})" if stats["facts_before"] > stats["facts_after"] else ""))
+    other = [f"без изменений {_n(stats['unchanged'])}", f"обрезано {_n(stats['truncated'])}", f"пустой ответ {_n(stats['empty'])}",
+             f"ошибок {_n(stats['errors'])}"]
+    lines.append("Остальное: " + ", ".join(other) + ".")
     if stats["guard"]:
-        lines.append(f"Страховка (стало < {DEDUP_AUTO_MIN_KEEP:.0%}, НЕ применено): " + "; ".join(
-            f"{_dedup_key_text(k)} {b}→{a}" for k, b, a in stats["guard"][:15]))
+        lines += ["", f"🛡 Страховка (стало меньше {DEDUP_AUTO_MIN_KEEP:.0%}) — НЕ применено:"]
+        lines += [f"• {_dedup_key_text(k, names)}: {b} → {a}" for k, b, a in stats["guard"][:15]]
+        if len(stats["guard"]) > 15:
+            lines.append(f"• …и ещё {len(stats['guard']) - 15}")
     if stats["apply_skipped"]:
-        lines.append("Не применено (база изменилась): " + "; ".join(stats["apply_skipped"][:10]))
+        lines += ["", "Не применено (база изменилась во время прогона):"] + [f"• {x}" for x in stats["apply_skipped"][:10]]
     if stats["error_list"]:
-        lines.append("Ошибки: " + "; ".join(stats["error_list"][:5]))
-    lines.append(f"Потрачено: ${cost:.4f} ({calls} вызовов, метка memory_dedup, личный чат админа)."
-                 + (f" Бэкап: {stats['backup']}." if stats.get("backup") else "")
-                 + (f" Журнал: {stats['run_file']}." if stats.get("run_file") else ""))
+        lines += ["", "Ошибки:"] + [f"• {x}" for x in stats["error_list"][:5]]
+    lines += ["", f"Потрачено: ${cost:.4f} · {calls} {dm.ru_plural(calls, 'вызов', 'вызова', 'вызовов')} модели (метка memory_dedup, личный чат админа)."]
+    if stats.get("backup"):
+        lines.append(f"Бэкап: {stats['backup']}")
+    if stats.get("run_file"):
+        lines.append(f"Журнал: {stats['run_file']}")
     return "\n".join(lines)
 
 
@@ -3513,7 +3587,8 @@ async def dedup_auto_job(context: ContextTypes.DEFAULT_TYPE):
             return
         if mode == "estimate":
             plan = await asyncio.to_thread(_dedup_auto_plan)
-            await _dedup_auto_send(context.bot, sorted(ADMIN_IDS), _dedup_auto_estimate_text(plan, "Автодедуп памяти (режим estimate, модель не вызывалась):"))
+            names = await asyncio.to_thread(_dedup_auto_names)
+            await _dedup_auto_send(context.bot, sorted(ADMIN_IDS), _dedup_auto_estimate_text(plan, "Автодедуп памяти — недельная оценка (режим estimate).\nМодель не вызывалась, отметки не пишу.", names))
             return
         if not _dedup_auto_start(context.bot, min(ADMIN_IDS), sorted(ADMIN_IDS), "Автодедуп памяти (недельный)"):
             logger.warning("dedup_auto: прогон уже идёт, недельный запуск пропущен")
@@ -3561,7 +3636,8 @@ async def cmd_dedup_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if arg == "estimate":
         plan = await asyncio.to_thread(_dedup_auto_plan)
-        for part in split_lines_for_telegram(_dedup_auto_estimate_text(plan, "Оценка автодедупа (модель не вызывалась, отметки не пишу):")):
+        names = await asyncio.to_thread(_dedup_auto_names)
+        for part in split_lines_for_telegram(_dedup_auto_estimate_text(plan, "Автодедуп памяти — оценка.\nМодель не вызывалась, отметки не пишу.", names)):
             await msg.reply_text(part)
         return
     if arg == "run":
@@ -3570,9 +3646,10 @@ async def cmd_dedup_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         plan = await asyncio.to_thread(_dedup_auto_plan)
         if not plan:
-            await msg.reply_text("Групп к проверке нет — гнать нечего.")
+            await msg.reply_text("Наборов к проверке нет — гнать нечего.")
             return
-        text = _dedup_auto_estimate_text(plan, "Прогнать автодедуп сейчас (apply: факты в базе будут заменены слитыми, перед этим — бэкап)?")
+        names = await asyncio.to_thread(_dedup_auto_names)
+        text = _dedup_auto_estimate_text(plan, "Прогнать автодедуп сейчас?\nФакты в базе будут заменены слитыми, перед этим — бэкап.", names) + "\n\nЗапустить?"
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("Запустить", callback_data="da:go"),
                                     InlineKeyboardButton("Отмена", callback_data="da:no")]])
         await msg.reply_text(text, reply_markup=kb)

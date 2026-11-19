@@ -307,8 +307,35 @@ def test_estimate_mode_job_no_model_no_state(env):
     job_ctx = SimpleNamespace(bot=env.bot)
     run(bot.dedup_auto_job(job_ctx))             # файла нет → estimate
     assert env.calls == [] and states() == {} and count(U1) == 20
-    assert len(env.sent) == 1 and env.sent[0][0] == ADMIN and "estimate" in env.sent[0][1] and "Групп к проверке: 1" in env.sent[0][1]
+    assert len(env.sent) == 1 and env.sent[0][0] == ADMIN and "estimate" in env.sent[0][1] and "1 набор фактов" in env.sent[0][1]
     assert not dm.BACKUPS_DIR.exists() or not list(dm.BACKUPS_DIR.glob("*.db"))   # estimate бэкапов не делает
+
+
+def test_estimate_text_uses_chat_and_user_names(env):
+    conn = db.get_conn()
+    conn.execute("INSERT INTO allowed_chats (chat_id, name) VALUES (?, ?)", (-100777, "Котики и кодеры"))
+    conn.execute("UPDATE users SET username = ?, full_name = ? WHERE telegram_id = ?", ("ivan", "Иван Петров", U1))
+    conn.commit()
+    conn.close()
+    ins(U1, 15, ctx="group", chat_id=-100777)
+    ins(U2, 12, ctx="group", chat_id=-100888)        # чата нет в allowed_chats — остаётся id
+    ins(U3, 10)
+    names = bot._dedup_auto_names()
+    text = bot._dedup_auto_estimate_text(bot._dedup_auto_plan(), "Шапка", names)
+    assert "«Котики и кодеры»" in text and "Иван Петров (@ivan)" in text and "чат -100888" in text
+    assert "Личные факты" in text and "3 набора фактов" in text and "37 фактов" in text and "все впервые" in text
+    assert "Всё не влезет" not in text and "Самые большие наборы:" in text and "По чатам:" in text
+    assert text.splitlines()[0] == "Шапка"
+
+
+def test_estimate_text_budget_warning_and_numbers(env, monkeypatch):
+    monkeypatch.setattr(bot, "DEDUP_AUTO_MAX_USD", 0.0000001)
+    for u in (U1, U2, U3):
+        ins(u, 1200)
+    plan = bot._dedup_auto_plan()
+    text = bot._dedup_auto_estimate_text(plan, "x")
+    assert "Всё не влезет" in text and "3 из 3" not in text and "3 600 фактов" in text   # разделитель тысяч
+    assert bot._dedup_fits_budget(plan, 0.0000001) == 1                                   # хотя бы один набор идёт, как в прогоне
 
 
 def test_off_mode_job_does_nothing(env):
@@ -335,7 +362,7 @@ def test_apply_mode_job_runs_and_reports(env):
     run(main())
     assert count(U1) == 10 and len(env.sent) == 1
     text = env.sent[0][1]
-    assert "готово" in text and "Применено: 1" in text and "20 → 10" in text and "Бэкап:" in text
+    assert "готово" in text and "Применено: 1" in text and "фактов 20 → 10" in text and "Бэкап:" in text
     assert bot._dedup_auto_load()["last"]["applied"] == 1
 
 
@@ -397,7 +424,7 @@ def test_command_estimate_and_run_confirm_do_not_call_model(env):
     ins(U1, 20)
     u, c, sent = _upd(ADMIN, args=["estimate"])
     run(bot.cmd_dedup_auto(u, c))
-    assert "Групп к проверке: 1" in sent[0][0] and env.calls == [] and states() == {}
+    assert "1 набор фактов" in sent[0][0] and env.calls == [] and states() == {}
     u, c, sent = _upd(ADMIN, args=["run"])
     run(bot.cmd_dedup_auto(u, c))
     assert "reply_markup" in sent[0][1] and env.calls == [] and count(U1) == 20
