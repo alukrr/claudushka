@@ -87,7 +87,7 @@ def test_fallback_pairs_native_to_pool():
     assert bot.FALLBACK_PAIRS[ARGON_G] == "gemini-4-argon"
     assert bot.FALLBACK_PAIRS[FLASH_G] == "gemini-3.8-flash"
     assert bot.FALLBACK_PAIRS[LITE] == "gemini-3.8-flash"
-    assert not any(v.startswith("google-direct/") for v in bot.FALLBACK_PAIRS.values())   # фолбэка НА нативные нет
+    assert bot.FALLBACK_PAIRS["gemini-4-argon"] == ARGON_G and bot.FALLBACK_PAIRS["gemini-3.8-flash"] == FLASH_G   # пул → Google (2026-11-19)
 
 
 def test_payload_conversion():

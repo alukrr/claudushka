@@ -141,7 +141,8 @@ GPT Image 2.5 Flare или Sunburst без дневного лимита, еже
 
 С 2026-10-28 пул не отдаёт модели Anthropic: `/haiku` `/sonnet` `/opus` `/fable` остались заглушками
 (подсказка выбрать модель в `/models`). `/lite` с v2.17.0 снова модель — Gemini 3.1 Flash-Lite напрямую у Google (пул её убрал 2026-11-14). Если модель
-чата упала, ответ даёт модель другого провайдера (Luna → Gemini 3.8 Flash, Flash → Terra, Argon → Sol); в `/cost` такие строки с меткой
+чата упала, ответ даёт другой поставщик: Luna и Flash → Gemini 3.8 Flash напрямую у Google, Argon → Argon у Google, модели
+`/argon_g` `/flash_g` `/lite` → та же модель через пул; в `/cost` такие строки с меткой
 `*_fallback`. Голосовые расшифровывает Gemini 3.8 Flash; если пул не отвечает — Gemini 3.1 Flash-Lite напрямую через Google
 (метка `voice_fallback`).
 

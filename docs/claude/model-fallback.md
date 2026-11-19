@@ -17,20 +17,27 @@ Claude-модели на Gemini; v2.0.0 убрал Claude целиком: `CLAUD
 `UPSTREAM_MARKERS` (безвредно). Переезд — `docs/claude/tz-no-anthropic.md`.
 
 ## Пары и конфиг
-`FALLBACK_PAIRS` (bot.py, константа):
+`FALLBACK_PAIRS` (bot.py, константа). **С 2026-11-19 (решение Алексея) Gemini пула и Luna уходят на Gemini напрямую у Google,
+не на GPT** — пул выключил Gemini целиком (400 «Gemini models are currently unavailable… use another model», инцидент
+2026-11-19 в `incidents.md`), а GPT-фолбэк, по оценке Алексея, «звучит как ChatGPT».
 
 | Основная | Фолбэк | Почему |
 |---|---|---|
-| `gpt-6-luna` (free, ВСЕ служебные вызовы) | `gemini-3.8-flash` | другой провайдер; с 2026-11-14 (решение Алексея, Flash-Lite убрана пулом) |
-| `gemini-3.8-flash` (дефолт paid) | `gpt-6.1-terra` | средняя → средняя |
-| `gemini-4-argon` (обзор, дорогая) | `gpt-6.1-sol` | сильная → сильная |
+| `gpt-6-luna` (free, ВСЕ служебные вызовы) | `google-direct/gemini-3.8-flash` | другой провайдер; до 2026-11-19 — Flash пула |
+| `gemini-3.8-flash` (дефолт paid) | `google-direct/gemini-3.8-flash` | та же модель у другого поставщика; до 2026-11-19 — `gpt-6.1-terra` |
+| `gemini-4-argon` | `google-direct/gemini-4-argon` | та же модель; до 2026-11-19 — `gpt-6.1-sol` |
+| `google-direct/gemini-4-argon` / `…3.8-flash` | та же модель пула | v2.17.0 |
+| `google-direct/gemini-3.1-flash-lite` | `gemini-3.8-flash` (пул) | Lite в пуле нет |
 
-Переход всегда **один**: Luna → Flash, дальше цепочка не идёт (если лёг и Flash — `reply_api_error`; Flash → Terra срабатывает
-только когда Flash — основная модель вызова). Пар для Terra и Sol нет. Пара Luna → Flash дороже основной в ~7 раз
-($0.75/$3.75 против $0.10/$0.50) и Flash думает всегда: при `max_tokens = visible + 2000` у Luna `kwargs_for_model` пересобирает
-запас под Flash (`visible + 4000`). Обратного фолбэка Gemini → Luna нет: Terra/Sol остаются парами Flash/Argon, Luna — не вторая
-линия для Gemini. **Пары Flash → Terra и Argon → Sol предложены Claude Code, Алексей не подтверждал; Luna → Flash — решение
-Алексея 2026-11-14.** Прежняя пара `gemini-3.1-flash-lite → gpt-6-luna` убрана вместе с моделью (`fallback_model_for` для неё — None).
+**Без `GEMINI_API_KEY`** (стенд без ключа) пара на нативную недоступна — `fallback_model_for` берёт `FALLBACK_PAIRS_NO_GOOGLE`
+(прежние пары: Luna → Flash пула, Flash → Terra, Argon → Sol). Ключ проверяется в момент вызова, не при старте.
+
+Переход всегда **один**: Luna → Flash у Google, дальше цепочка не идёт (если лёг и Flash у Google — `reply_api_error`; Flash
+Google → Flash пула срабатывает только когда нативная — основная модель вызова). Пар для Terra и Sol нет. Пара Luna → Flash
+дороже основной ×8 ($0.825/$4.125 против $0.10/$0.50; с 2027-01-01 Google вдвое дороже) и Flash думает всегда: при
+`max_tokens = visible + 2000` у Luna `kwargs_for_model` пересобирает запас под Flash (`visible + 4000`). Расход фолбэка на
+нативную идёт со счёта Google (`GEMINI_API_KEY`), не с баланса пула; лимиты ключа Google (RPM/TPM) не проверялись — если пул
+лежит долго, на Google уходят ВСЕ служебные вызовы при сбое Luna и все платные чаты на Gemini пула.
 
 | Переменная | Дефолт | Что |
 |---|---|---|
@@ -42,13 +49,16 @@ Claude-модели на Gemini; v2.0.0 убрал Claude целиком: `CLAUD
 **Наличие в каталоге работу не гарантирует**: `gemini-3.6/3.7-flash` были в каталоге, а апстрим отвечал 404.
 
 **Нативная полоса Google (v2.17.0).** Модели `google-direct/…` (`/argon_g`, `/flash_g`, `/lite`) при сбое Google уходят на ТУ ЖЕ модель
-через пул (Lite → Flash пула), не на GPT; дальше цепочка не идёт. Фолбэка на нативные нет. Вызов любой модели — через
+через пул (Lite → Flash пула), не на GPT; дальше цепочка не идёт. С 2026-11-19 есть и обратный путь — пул → нативные (см.
+таблицу выше). Вызов любой модели — через
 `_messages_create` (нативная → `google_native_create`, иначе SDK пула). `docs/claude/models-and-costs.md` → «Нативная полоса Google».
 
 ## Когда переключаемся — `api_errors.should_fallback(exc)`
 Да: 5xx/529, 429, обрыв/таймаут, ошибка посреди стрима, **404** (модель неизвестна — громкий `MODEL NOT FOUND`),
-401/403 с признаками апстрима (`UPSTREAM_MARKERS`). Нет: **402** (баланс общий, `_alert_admin_balance`),
-**400/422 включая `prompt is too long`** (лечит ветка обрезки), 401/403 без признаков (ключ).
+401/403 с признаками апстрима (`UPSTREAM_MARKERS`), **400/422 «модель выключена, бери другую»** (`is_model_unavailable`,
+`MODEL_UNAVAILABLE_MARKERS`: «currently unavailable», «use another model» — с 2026-11-19; повтора на основной нет, 400 не
+ретраится, сразу пара и липкое окно). Нет: **402** (баланс общий, `_alert_admin_balance`), **прочие 400/422 включая
+`prompt is too long`** (лечит ветка обрезки), 401/403 без признаков (ключ).
 
 ## Где — одна точка, а не по месту
 - `call_claude` → `_call_with_fallback`: на основной модели **одна** повторная попытка (`FALLBACK_PRIMARY_DELAYS = (2,)`),

@@ -55,6 +55,8 @@ def ok_response(model: str):
     (make_exc(400, "prompt is too long: 300000 tokens"), False),
     (make_exc(400, "bad param"), False),
     (make_exc(422, "unprocessable"), False),
+    (make_exc(400, "Gemini models are currently unavailable on this service. Retrying will not help; do not retry "
+                   "this request and use another model."), True),     # пул выключил Gemini, 2026-11-19
 ])
 def test_should_fallback(exc, expected):
     assert api_errors.should_fallback(exc) is expected
@@ -67,7 +69,9 @@ def test_should_fallback_midstream_error():
 
 
 FLASH, LUNA, ARGON = (bot.MODELS[k]["id"] for k in ("flash", "luna", "argon"))
+FLASH_G, ARGON_G = (bot.MODELS[k]["id"] for k in ("flash_g", "argon_g"))
 TERRA, SOL = "gpt-6.1-terra", "gpt-6.1-sol"
+UNAVAILABLE = "Gemini models are currently unavailable on this service. Retrying will not help; use another model."
 
 
 def test_fallback_kwargs_strips_and_copies():
@@ -84,33 +88,43 @@ def test_fallback_kwargs_strips_and_copies():
 
 
 def test_fallback_pairs():
-    assert bot.fallback_model_for("gpt-6-luna") == "gemini-3.8-flash" and bot.fallback_model_for(LUNA) == FLASH
-    assert bot.fallback_model_for(FLASH) == TERRA and bot.fallback_model_for(ARGON) == SOL
+    """С 2026-11-19 Gemini пула и Luna → Gemini напрямую у Google, не GPT (решение Алексея)."""
+    assert bot.fallback_model_for(LUNA) == FLASH_G
+    assert bot.fallback_model_for(FLASH) == FLASH_G and bot.fallback_model_for(ARGON) == ARGON_G
+    assert bot.fallback_model_for(FLASH_G) == FLASH and bot.fallback_model_for(ARGON_G) == ARGON
+    assert not any(bot.model_provider(v) == "openai" for v in bot.FALLBACK_PAIRS.values())   # GPT в парах нет
     assert bot.fallback_model_for(TERRA) is None and bot.fallback_model_for(SOL) is None
     assert bot.fallback_model_for("gemini-3.1-flash-lite") is None   # убрана пулом 2026-11-14
     assert bot.fallback_model_for("claude-haiku-5-5") is None
-    for src, dst in bot.FALLBACK_PAIRS.items():                  # пара — ДРУГОЙ провайдер и с ценой
-        if bot.is_native_model(src):                             # нативная полоса Google → та же модель через пул (другой поставщик)
-            assert not bot.is_native_model(dst)
-            continue
-        assert bot.model_provider(src) != bot.model_provider(dst)
+    for src, dst in bot.FALLBACK_PAIRS.items():                  # пара — ДРУГОЙ поставщик (пул <-> Google) и с ценой
+        assert bot.is_native_model(src) != bot.is_native_model(dst)
         assert bot.price_meta(dst) is not None and bot.price_meta(src) is not None
-    assert (bot.model_provider(LUNA), bot.model_provider(FLASH)) == ("openai", "gemini")
+
+
+def test_no_google_key_falls_back_to_gpt(monkeypatch):
+    """Без GEMINI_API_KEY нативная полоса недоступна — прежние пары на GPT пула."""
+    monkeypatch.setattr(bot, "GEMINI_API_KEY", "")
+    assert bot.fallback_model_for(LUNA) == FLASH
+    assert bot.fallback_model_for(FLASH) == TERRA and bot.fallback_model_for(ARGON) == SOL
+    assert bot.fallback_model_for(ARGON_G) == ARGON                # нативная → пул: ключ не нужен
+    for dst in bot.FALLBACK_PAIRS_NO_GOOGLE.values():
+        assert bot.price_meta(dst) is not None and not bot.is_native_model(dst)
 
 
 def test_luna_to_flash_headroom_is_4000():
-    """Переход Luna → Flash: запас на рассуждения заменяется запасом Flash (4000 вместо 2000)."""
-    assert bot._headroom(LUNA) == 2000 and bot._headroom(FLASH) == 4000
+    """Переход Luna → Flash (Google): запас на рассуждения заменяется запасом Flash (4000 вместо 2000)."""
+    assert bot._headroom(LUNA) == 2000 and bot._headroom(FLASH) == 4000 and bot._headroom(FLASH_G) == 4000
     kw = dict(model=LUNA, max_tokens=bot.out_tokens(LUNA, 100), system="s", messages=[])
     assert kw["max_tokens"] == 2100
-    assert bot.kwargs_for_model(kw, FLASH)["max_tokens"] == 100 + 4000
-    assert bot.kwargs_for_model(kw, FLASH)["model"] == FLASH
+    assert bot.kwargs_for_model(kw, FLASH_G)["max_tokens"] == 100 + 4000
+    assert bot.kwargs_for_model(kw, FLASH_G)["model"] == FLASH_G
 
 
 @pytest.fixture(autouse=True)
 def clean(monkeypatch):
     bot._fallback_until.clear()
     monkeypatch.setattr(bot, "FALLBACK_ENABLED", True)
+    monkeypatch.setattr(bot, "GEMINI_API_KEY", "test-key")
     monkeypatch.setattr(bot, "_last_fallback_alert", 0.0)
     monkeypatch.setattr(bot, "_fire", lambda coro: coro.close())
     async def no_sleep(*a, **k):
@@ -122,7 +136,7 @@ def clean(monkeypatch):
 
 
 class FakeMessages:
-    """Модели из `fail` (по умолчанию — все Gemini) падают с primary_exc (если задан), остальные отвечают."""
+    """Модели из `fail` (по умолчанию — все Gemini пула) падают с primary_exc (если задан), остальные отвечают."""
     def __init__(self, primary_exc=None, fail=None):
         self.calls = []
         self.primary_exc = primary_exc
@@ -141,6 +155,7 @@ def use_fake(monkeypatch, primary_exc=None, fail=None):
     c = SimpleNamespace(messages=fake)
     monkeypatch.setattr(bot, "client", c)
     monkeypatch.setattr(bot, "client_noretry", c)
+    monkeypatch.setattr(bot, "google_native_create", lambda retries=0, **kw: fake.create(**kw))   # нативная полоса — тот же фейк
     return fake
 
 
@@ -159,14 +174,32 @@ def test_normal_path_no_fallback(monkeypatch, clean):
     assert [c["model"] for c in fake.calls] == [FLASH] and clean == [FLASH]
 
 
-def test_5xx_falls_back_one_retry_then_gpt(monkeypatch, clean):
+def test_5xx_falls_back_one_retry_then_google(monkeypatch, clean):
     fake = use_fake(monkeypatch, make_exc(529))
     run(dialog(FLASH))
-    assert [c["model"] for c in fake.calls] == [FLASH] * 2 + [TERRA]
-    assert clean == [TERRA]                         # учёт по фактической модели
+    assert [c["model"] for c in fake.calls] == [FLASH] * 2 + [FLASH_G]
+    assert clean == [FLASH_G]                       # учёт по фактической модели
 
 
-@pytest.mark.parametrize("model,target", [(LUNA, FLASH), (FLASH, TERRA), (ARGON, SOL)])
+@pytest.mark.parametrize("model", [FLASH, ARGON])
+def test_pool_gemini_off_400_goes_to_google_without_retry(monkeypatch, clean, model):
+    """2026-11-19: пул отвечает 400 «Gemini currently unavailable» — без повтора сразу Google, окно липнет."""
+    fake = use_fake(monkeypatch, make_exc(400, UNAVAILABLE), fail={FLASH, ARGON})
+    r = run(dialog(model))
+    assert api_errors.response_text(r) == "ok"
+    target = {FLASH: FLASH_G, ARGON: ARGON_G}[model]
+    assert [c["model"] for c in fake.calls] == [model, target]
+    assert clean == [target] and bot._sticky_fallback(model) == target
+
+
+def test_pool_gemini_off_400_sync_create(monkeypatch, clean):
+    fake = use_fake(monkeypatch, make_exc(400, UNAVAILABLE), fail={FLASH})
+    r = bot.sync_create(label="x", model=FLASH, max_tokens=4030, system="s", messages=[{"role": "user", "content": "x"}])
+    assert api_errors.response_text(r) == "ok" and fake.calls[-1]["model"] == FLASH_G and clean == [FLASH_G]
+
+
+@pytest.mark.parametrize("model,target", [(LUNA, FLASH_G), (FLASH, FLASH_G), (ARGON, ARGON_G),
+                                          (FLASH_G, FLASH), (ARGON_G, ARGON)])
 def test_each_model_goes_to_its_pair(monkeypatch, model, target):
     fake = use_fake(monkeypatch, make_exc(500), fail={model})
     run(dialog(model))
@@ -178,17 +211,17 @@ def test_luna_down_answers_via_flash_with_flash_headroom(monkeypatch, clean):
     r = run(bot.call_claude(None, None, label="t", model=LUNA, max_tokens=bot.out_tokens(LUNA, 50), system="s",
                             messages=[{"role": "user", "content": "hi"}]))
     assert api_errors.response_text(r) == "ok"
-    assert fake.calls[-1]["model"] == FLASH and fake.calls[-1]["max_tokens"] == 50 + 4000
-    assert clean == [FLASH]
-    assert bot._sticky_fallback(LUNA) == FLASH and bot._sticky_fallback(FLASH) is None
+    assert fake.calls[-1]["model"] == FLASH_G and fake.calls[-1]["max_tokens"] == 50 + 4000
+    assert clean == [FLASH_G]
+    assert bot._sticky_fallback(LUNA) == FLASH_G and bot._sticky_fallback(FLASH) is None
 
 
 def test_luna_to_flash_is_a_single_hop(monkeypatch):
-    """Luna и Flash лежат вместе: цепочки Luna → Flash → Terra нет, ошибка уходит наверх (reply_api_error)."""
-    fake = use_fake(monkeypatch, make_exc(500), fail={LUNA, FLASH})
+    """Luna и Flash у Google лежат вместе: цепочки Luna → Flash_g → Flash пула нет, ошибка уходит наверх."""
+    fake = use_fake(monkeypatch, make_exc(500), fail={LUNA, FLASH_G})
     with pytest.raises(anthropic.APIStatusError):
         run(dialog(LUNA))
-    assert {c["model"] for c in fake.calls} == {LUNA, FLASH}
+    assert {c["model"] for c in fake.calls} == {LUNA, FLASH_G}
 
 
 def test_sticky_window_then_return(monkeypatch):
@@ -196,7 +229,7 @@ def test_sticky_window_then_return(monkeypatch):
     run(dialog(FLASH))
     fake.calls.clear()
     run(dialog(FLASH))                               # окно открыто: основную модель не трогаем вообще
-    assert [c["model"] for c in fake.calls] == [TERRA]
+    assert [c["model"] for c in fake.calls] == [FLASH_G]
     bot._fallback_until[FLASH] = time.monotonic() - 1   # окно истекло
     fake.calls.clear()
     fake.primary_exc = None
@@ -242,13 +275,13 @@ def test_sync_create_fallback(monkeypatch, clean):
                         messages=[{"role": "user", "content": "x"}], thinking={"type": "disabled"},
                         output_config={"effort": "low"})
     assert api_errors.response_text(r) == "ok"
-    assert fake.calls[-1]["model"] == FLASH and "thinking" not in fake.calls[-1]
-    assert fake.calls[-1]["max_tokens"] == 30 + bot._headroom(FLASH) == 4030
-    assert clean == [FLASH]
+    assert fake.calls[-1]["model"] == FLASH_G and "thinking" not in fake.calls[-1]
+    assert fake.calls[-1]["max_tokens"] == 30 + bot._headroom(FLASH_G) == 4030
+    assert clean == [FLASH_G]
 
 
 def test_prices_present():
-    for m in list(bot.FALLBACK_PAIRS) + list(bot.FALLBACK_PAIRS.values()):
+    for m in list(bot.FALLBACK_PAIRS) + list(bot.FALLBACK_PAIRS.values()) + list(bot.FALLBACK_PAIRS_NO_GOOGLE.values()):
         assert bot.price_meta(m) is not None
     assert bot._billed_model(TERRA, SimpleNamespace(model=TERRA)) == TERRA
     # старые Claude-строки usage_log по-прежнему имеют подпись
@@ -272,5 +305,5 @@ def test_catalog_ids_strips_any_provider_prefix():
                         {"id": "gemini-4-argon"}, {"id": "openai/gpt-6-luna"}]}
     ids = bot.catalog_ids(payload)
     assert ids == {"gpt-6.1-terra", "gemini-3.8-flash", "gemini-4-argon", "gpt-6-luna"}
-    assert set(bot.FALLBACK_PAIRS.values()) - {"gpt-6.1-sol"} <= ids
+    assert {v for v in bot.FALLBACK_PAIRS.values() if not bot.is_native_model(v)} <= ids
     assert bot.catalog_ids({}) == set()

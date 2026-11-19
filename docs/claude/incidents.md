@@ -9,6 +9,21 @@
 `daily_chat_review`, дубль `run_daily` в `main()`, инвертированные
 `cmd_whitelist_on` / `cmd_captcha_on` (теперь ставят `True`).
 
+## 2026-11-19 — пул выключил Gemini (400), фолбэк не срабатывал (`fix/pool-gemini-off`, v2.17.1)
+
+- **Как нашли**: при проверке новой модели Gemini 4 Neon. Каталог `GET /v1/models` пула Gemini показывает, но ЛЮБОЙ запрос к
+  `gemini-4-neon`/`gemini-4-argon`/`gemini-3.8-flash` на `/v1/messages` — за 0.4 с **400** `invalid_request_error`: «Gemini models
+  are currently unavailable on this service. Retrying will not help; do not retry this request and use another model.» Тот же
+  ключ Google напрямую отвечал нормально.
+- **Чем грозило**: `should_fallback` считал любой 400 багом запроса и пару не включал → каждый ответ в чатах на Flash/Argon пула
+  (7 записей `chat_models` + все платные без записи — дефолт Flash пула) и служебка при сбое Luna (её пара — Flash пула)
+  кончались `reply_api_error`. Жалоб не было: в `usage_log` Gemini пула последний раз ~44 ч назад, такие чаты молчали.
+- **Починка**: 400/422 с «currently unavailable» / «use another model» — повод для фолбэка (`api_errors.is_model_unavailable`);
+  пары Gemini пула и Luna — на Gemini напрямую у Google, не на GPT (решение Алексея; без `GEMINI_API_KEY` — прежние GPT-пары),
+  `docs/claude/model-fallback.md`.
+- **Урок**: «модель выключена» пул может отдать любым кодом (403 `model_blocked` у Claude 2026-10-28, 404 у Flash-Lite
+  2026-11-14, теперь 400) — признаки по тексту, не только по статусу.
+
 ## 2026-11-14 — «перерисую» без картинки в ответ на реплай к картинке бота (`fix/redraw-reply`, v2.16.3)
 
 - **Симптом**: Алексей голосовым ответил на картинку бота «это не то, а колбаска» — Клодушка написала «перерисую более
