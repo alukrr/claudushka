@@ -3230,6 +3230,377 @@ async def cmd_memory_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"уже обработано людей: {done_people}.")
 
 
+# --- Автоматическая дедупликация памяти (docs/claude/memory.md → «Автоматическая дедупликация», ТЗ docs/claude/tz-dedup-auto.md) ---
+# Раз в неделю (понедельник 05:07 Berlin) бот сам сливает перефразированные факты через ЯДРО `dedup_memory.py` (run_llm / apply_results / backup_db /
+# estimate_group / finish_run) — своей логики слияния здесь нет. Модель — только через sync_create (учёт `usage_log`, метка `memory_dedup`, фолбэк бота),
+# собственный фолбэк дедупа выключен (`state["no_fallback"]`: его `_native_create` делает `import bot`, а бот запущен как __main__). Проверяются только группы,
+# где появилось новое (`db.dedup_due_groups`, таблица `memory_dedup_state`). Режим — `data/dedup_auto.json`: off | estimate (дефолт) | apply.
+DEDUP_AUTO_WEEKDAY = 1                         # PTB 22.8: 0 = воскресенье, 1 = понедельник
+DEDUP_AUTO_TIME = dt_time(5, 7, tzinfo=BERLIN_TZ)   # после чистки памяти 04:30
+DEDUP_AUTO_MODEL_ID = MODELS["flash"]["id"]    # сознательное исключение «служебка — Luna» (третье): Flash, метка memory_dedup
+DEDUP_AUTO_MIN_FACTS = 10                      # группа меньше — не проверяем
+DEDUP_AUTO_MIN_NEW = 5                         # «есть новое»: новых фактов с прошлой проверки >= max(MIN_NEW, NEW_RATIO × фактов после неё)
+DEDUP_AUTO_NEW_RATIO = 0.2
+DEDUP_AUTO_MAX_USD = 2.0                       # потолок прогона; остаток групп — в следующий раз
+DEDUP_AUTO_MIN_KEEP = 0.1                      # страховка: «стало» < 10% от «было» — группу не применяем
+DEDUP_AUTO_MAX_ERRORS = 3                      # столько ошибок модели подряд — прогон останавливается
+DEDUP_AUTO_FILE = DATA_DIR / "dedup_auto.json"
+DEDUP_AUTO_MODES = ("off", "estimate", "apply")
+_dedup_auto_run: dict = {}                     # {"task", "stop_event"} — один прогон одновременно
+
+
+def _dm():
+    """Ленивый импорт ядра дедупа: `docker-compose.yml` монтирует `dedup_memory.py`, но бот не должен падать на старте,
+    если релиз выкатили `/update` без `--force-recreate` (файла в контейнере нет) — тогда ошибка только у самой задачи."""
+    import dedup_memory
+    return dedup_memory
+
+
+def _dedup_auto_active() -> bool:
+    t = _dedup_auto_run.get("task")
+    return t is not None and not t.done()
+
+
+def _dedup_auto_load() -> dict:
+    """{"mode": off|estimate|apply, "last": {...}|None}. Нет файла/битый/неизвестный режим → estimate."""
+    data = {"mode": "estimate", "last": None}
+    try:
+        raw = json.loads(DEDUP_AUTO_FILE.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            if raw.get("mode") in DEDUP_AUTO_MODES:
+                data["mode"] = raw["mode"]
+            if isinstance(raw.get("last"), dict):
+                data["last"] = raw["last"]
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logger.error("dedup_auto: файл режима не прочитался, беру estimate", exc_info=True)
+    return data
+
+
+def _dedup_auto_save(data: dict) -> None:
+    tmp = DEDUP_AUTO_FILE.with_name(DEDUP_AUTO_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, DEDUP_AUTO_FILE)
+
+
+class _DedupClientShim:
+    """«Клиент» для `dedup_memory.run_llm`: `messages.create(**kw)` → `sync_create` бота (учёт, метка memory_dedup, фолбэк бота)."""
+    class _Messages:
+        @staticmethod
+        def create(**kw):
+            return sync_create(label="memory_dedup", **aux_params(kw.get("model")), **kw)
+    messages = _Messages()
+
+
+def _dedup_auto_plan() -> list[dict]:
+    """Группы к проверке (синхронно, ТОЛЬКО из потока): [{"group", "new", "first", "est"}] по числу новых по убыванию. Модель не зовёт."""
+    dm = _dm()
+    due = db.dedup_due_groups(DEDUP_AUTO_MIN_FACTS, DEDUP_AUTO_MIN_NEW, DEDUP_AUTO_NEW_RATIO)
+    if not due:
+        return []
+    meta = {k: (n, first) for k, n, first in due}
+    conn = db.get_conn()
+    try:
+        groups = dm.load_groups(conn, min_facts=DEDUP_AUTO_MIN_FACTS)
+    finally:
+        conn.close()
+    calib = dm.load_calibration().get(DEDUP_AUTO_MODEL_ID)
+    plan = []
+    for g in groups:
+        k = (g.key.user_id, g.key.context, g.key.chat_id, g.key.tier)
+        if k in meta:
+            plan.append({"group": g, "new": meta[k][0], "first": meta[k][1],
+                         "est": dm.estimate_group(g.facts, DEDUP_AUTO_MODEL_ID, calib)})
+    plan.sort(key=lambda p: (-p["new"], p["group"].key.user_id, p["group"].key.context, p["group"].key.chat_id or 0, p["group"].key.tier))
+    return plan
+
+
+def _dedup_key_text(k) -> str:
+    return f"{k.user_id} · {'личка' if k.chat_id is None else f'чат {k.chat_id}'} · {k.tier}"
+
+
+def _dedup_est_cost(plan: list[dict]) -> float:
+    return sum((p["est"].cost or 0.0) for p in plan)
+
+
+def _dedup_auto_estimate_text(plan: list[dict], head: str) -> str:
+    """Оценка «что и почём» без вызова модели (режим estimate и `/dedup_auto estimate`)."""
+    if not plan:
+        return f"{head}\nГрупп к проверке нет: новых фактов набралось меньше порога."
+    facts = sum(len(p["group"].facts) for p in plan)
+    first = sum(1 for p in plan if p["first"])
+    est = _dedup_est_cost(plan)
+    lines = [head,
+             f"Групп к проверке: {len(plan)} (из них впервые: {first}), фактов в них: {facts}.",
+             f"Оценка цены прогона ≈ ${est:.2f} (по прайсу и калибровке, без вызова модели); потолок прогона ${DEDUP_AUTO_MAX_USD:.2f}."
+             + (" Часть групп не влезет — перейдёт на следующую неделю." if est > DEDUP_AUTO_MAX_USD else "")]
+    top = sorted(plan, key=lambda p: -len(p["group"].facts))[:5]
+    lines.append("Самые большие: " + "; ".join(f"{_dedup_key_text(p['group'].key)} — {len(p['group'].facts)} ф., новых {p['new']}" for p in top))
+    return "\n".join(lines)
+
+
+def _dedup_auto_run_sync(budget: float, stop_event) -> dict:
+    """Один прогон: план → бэкап → по группе: модель (run_llm) → страховка → apply_results → отметка в memory_dedup_state.
+    Синхронно, ТОЛЬКО из потока (usage_ctx копируется в поток из вызывающей корутины). Исключений при ошибке модели не выпускает:
+    группа с error отметки не получает (повторится в следующий раз). -> словарь итогов для отчёта."""
+    dm = _dm()
+    stats = {"due": 0, "processed": 0, "left": 0, "applied": 0, "unchanged": 0, "truncated": 0, "empty": 0, "errors": 0,
+             "guard": [], "apply_skipped": [], "error_list": [], "facts_before": 0, "facts_after": 0,
+             "spent_est": 0.0, "backup": None, "run_file": None, "abort": None, "stopped": False}
+    plan = _dedup_auto_plan()
+    stats["due"] = len(plan)
+    if not plan:
+        return stats
+    try:
+        stats["backup"] = dm.backup_db().name       # до первого платного вызова; не создался — прогон отменяется
+    except dm.BackupError as e:
+        stats["abort"] = str(e)
+        return stats
+    calib = dm.load_calibration().get(DEDUP_AUTO_MODEL_ID)
+    client, dstate = _DedupClientShim(), {"no_fallback": True}
+    results, spent, consecutive = [], 0.0, 0
+    conn = db.get_conn()
+    try:
+        for i, p in enumerate(plan):
+            if stop_event.is_set():
+                stats["stopped"], stats["left"] = True, len(plan) - i
+                break
+            est = p["est"].cost or 0.0
+            if spent + est > budget:
+                if spent > 0:
+                    stats["left"] = len(plan) - i       # бюджет кончился: остальные ждут следующей недели, отметки не трогаем
+                    break
+                stats["left"] += 1                      # одна эта группа дороже всего бюджета — пропускаем, остальные идут
+                continue
+            g = p["group"]
+            got = list(dm.run_llm([g], DEDUP_AUTO_MODEL_ID, client, None, calib, dstate))
+            if not got:
+                continue
+            res = got[0]
+            results.append(res)
+            spent += res.cost or 0.0
+            stats["processed"] += 1
+            k, n_before = g.key, len(res.facts_before)
+            if res.status == "error":
+                stats["errors"] += 1
+                consecutive += 1
+                logger.warning(f"dedup_auto: ошибка группы {_dedup_key_text(k)}: {res.error}")   # текст исключения — только в лог
+                stats["error_list"].append(f"{_dedup_key_text(k)}: {(res.error or 'ошибка').split(':')[0]}")
+                if consecutive >= DEDUP_AUTO_MAX_ERRORS:
+                    stats["abort"] = f"остановлено: {DEDUP_AUTO_MAX_ERRORS} ошибки модели подряд"
+                    stats["left"] = len(plan) - i - 1
+                    break
+                continue                                # отметку не пишем: повторит в следующий раз
+            consecutive = 0
+            status, after = res.status, len(res.facts_after)
+            if status == "ok":
+                if after < DEDUP_AUTO_MIN_KEEP * n_before:
+                    status = "guard"                    # «съела всё»: не применяем, показываем в отчёте
+                    stats["guard"].append((k, n_before, after))
+                elif after >= n_before:
+                    status = "unchanged"
+                else:
+                    rep = dm.apply_results(conn, [res])
+                    if not rep.applied:
+                        stats["apply_skipped"].append(f"{_dedup_key_text(k)}: {rep.skipped[0][1] if rep.skipped else '?'}")
+                        continue                        # строки снимка изменились (бот писал во время прогона) — отметки нет
+                    status = "applied"
+                    stats["facts_before"] += n_before
+                    stats["facts_after"] += after
+            # checked_at — ПОСЛЕ записи: apply_results ставит слитым фактам created_at = now (<= этого момента), иначе они
+            # сами стали бы «новыми» и группа гонялась бы каждую неделю.
+            db.dedup_state_put(k.user_id, k.context, k.chat_id, k.tier, int(time.time()), n_before,
+                               after if status == "applied" else n_before, status, res.cost)
+            if status in ("unchanged", "truncated", "empty"):
+                stats[status] += 1
+            elif status == "applied":
+                stats["applied"] += 1
+    finally:
+        conn.close()
+        stats["spent_est"] = spent
+        try:
+            if results:
+                path, _ = dm.finish_run(DEDUP_AUTO_MODEL_ID, results)
+                stats["run_file"] = path.name if path else None
+        except Exception:
+            logger.error("dedup_auto: журнал прогона/калибровка не записались", exc_info=True)
+    return stats
+
+
+def _dedup_auto_report_text(stats: dict, head: str, cost: float, calls: int) -> str:
+    lines = [head]
+    if stats.get("abort"):
+        lines.append(f"⚠️ {stats['abort']}")
+    lines.append(f"Групп к проверке: {stats['due']}, обработано: {stats['processed']}, ждут следующей недели (бюджет/остановка): {stats['left']}.")
+    lines.append(f"Применено: {stats['applied']} (фактов {stats['facts_before']} → {stats['facts_after']}), без изменений: {stats['unchanged']}, "
+                 f"обрезано: {stats['truncated']}, пустой ответ: {stats['empty']}, ошибок: {stats['errors']}.")
+    if stats["guard"]:
+        lines.append(f"Страховка (стало < {DEDUP_AUTO_MIN_KEEP:.0%}, НЕ применено): " + "; ".join(
+            f"{_dedup_key_text(k)} {b}→{a}" for k, b, a in stats["guard"][:15]))
+    if stats["apply_skipped"]:
+        lines.append("Не применено (база изменилась): " + "; ".join(stats["apply_skipped"][:10]))
+    if stats["error_list"]:
+        lines.append("Ошибки: " + "; ".join(stats["error_list"][:5]))
+    lines.append(f"Потрачено: ${cost:.4f} ({calls} вызовов, метка memory_dedup, личный чат админа)."
+                 + (f" Бэкап: {stats['backup']}." if stats.get("backup") else "")
+                 + (f" Журнал: {stats['run_file']}." if stats.get("run_file") else ""))
+    return "\n".join(lines)
+
+
+async def _dedup_auto_send(bot, chat_ids, text: str) -> None:
+    for cid in chat_ids:
+        for part in split_lines_for_telegram(text):
+            try:
+                await bot.send_message(chat_id=cid, text=part)
+            except Exception:
+                logger.warning(f"dedup_auto: отчёт {cid} не ушёл", exc_info=True)
+                break
+
+
+def _dedup_auto_last(mode: str, stats: dict, cost: float, end: str) -> dict:
+    return {"ts": int(time.time()), "mode": mode, "end": end, "due": stats["due"], "processed": stats["processed"],
+            "applied": stats["applied"], "unchanged": stats["unchanged"], "guard": len(stats["guard"]),
+            "truncated": stats["truncated"], "errors": stats["errors"], "left": stats["left"],
+            "facts_before": stats["facts_before"], "facts_after": stats["facts_after"], "cost": round(cost, 4)}
+
+
+async def _dedup_auto_worker(bot, admin_id: int, recipients, head: str) -> None:
+    """Фоновый прогон. Блокирующее (SQLite, модель) — в asyncio.to_thread; usage_ctx ставится ДО to_thread (контекст копируется в поток).
+    Исключений наружу не выпускает; итог — одним сообщением получателям."""
+    usage_ctx.set((admin_id, "private", admin_id))
+    since = int(time.time())
+    stats = None
+    try:
+        stats = await asyncio.to_thread(_dedup_auto_run_sync, DEDUP_AUTO_MAX_USD, _dedup_auto_run["stop_event"])
+        calls, cost = await asyncio.to_thread(db.usage_label_sum, "memory_dedup", admin_id, since)
+        end = "прервано" if stats["stopped"] else "остановлено" if stats["abort"] else "готово"
+        data = await asyncio.to_thread(_dedup_auto_load)
+        data["last"] = _dedup_auto_last("apply", stats, cost, end)
+        await asyncio.to_thread(_dedup_auto_save, data)
+        text = _dedup_auto_report_text(stats, f"{head}: {end}.", cost, calls)
+    except Exception:
+        logger.error("dedup_auto: сбой прогона", exc_info=True)
+        text = f"{head}: остановлено, внутренняя ошибка — подробности в логе."
+    await _dedup_auto_send(bot, recipients, text)
+
+
+def _dedup_auto_start(bot, admin_id: int, recipients, head: str) -> bool:
+    """Запуск прогона. Проверка и запуск — без await между ними (второй запуск не проскочит). False — уже идёт."""
+    if _dedup_auto_active():
+        return False
+    import threading
+    _dedup_auto_run.clear()
+    _dedup_auto_run["stop_event"] = threading.Event()
+    _dedup_auto_run["task"] = _spawn_background_task(_dedup_auto_worker(bot, admin_id, recipients, head))
+    return True
+
+
+async def dedup_auto_job(context: ContextTypes.DEFAULT_TYPE):
+    """Недельная задача (понедельник 05:07 Berlin). off — ничего; estimate — отчёт «что и почём» без модели; apply — прогон."""
+    try:
+        data = await asyncio.to_thread(_dedup_auto_load)
+        mode = data["mode"]
+        if mode == "off":
+            logger.info("dedup_auto: режим off, пропуск")
+            return
+        if mode == "estimate":
+            plan = await asyncio.to_thread(_dedup_auto_plan)
+            await _dedup_auto_send(context.bot, sorted(ADMIN_IDS), _dedup_auto_estimate_text(plan, "Автодедуп памяти (режим estimate, модель не вызывалась):"))
+            return
+        if not _dedup_auto_start(context.bot, min(ADMIN_IDS), sorted(ADMIN_IDS), "Автодедуп памяти (недельный)"):
+            logger.warning("dedup_auto: прогон уже идёт, недельный запуск пропущен")
+    except Exception:
+        logger.exception("dedup_auto: недельная задача упала")
+
+
+def _dedup_auto_next_text(context) -> str:
+    try:
+        jobs = context.job_queue.get_jobs_by_name("dedup_auto")
+        if jobs and jobs[0].next_t:
+            return jobs[0].next_t.astimezone(BERLIN_TZ).strftime("%d.%m.%Y %H:%M Berlin")
+    except Exception:
+        pass
+    return "понедельник 05:07 Berlin"
+
+
+async def cmd_dedup_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/dedup_auto` (админ бота, ТОЛЬКО личка): без аргументов — режим, следующий прогон, итог прошлого; `estimate` — оценка сейчас (без модели);
+    `run` — прогнать сейчас (подтверждение кнопкой); `stop`; `on` / `off` / `estimate-only` — режим недельной задачи."""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+    msg = update.effective_message
+    if update.effective_chat.type != "private":
+        await msg.reply_text("Эта команда — только в личном чате с ботом.")
+        return
+    arg = context.args[0].lower() if context.args else ""
+    if arg in ("on", "off", "estimate-only"):
+        mode = {"on": "apply", "off": "off", "estimate-only": "estimate"}[arg]
+        data = await asyncio.to_thread(_dedup_auto_load)
+        data["mode"] = mode
+        await asyncio.to_thread(_dedup_auto_save, data)
+        await msg.reply_text({"apply": "Автодедуп включён: по понедельникам сам сливает факты (apply).",
+                              "off": "Автодедуп выключен.",
+                              "estimate": "Автодедуп в режиме estimate: по понедельникам только отчёт «что и почём», факты не трогаю."}[mode])
+        return
+    if arg == "stop":
+        ev = _dedup_auto_run.get("stop_event")
+        if _dedup_auto_active() and ev is not None:
+            ev.set()
+            await msg.reply_text("Останавливаю: текущая группа дойдёт, дальше не пойду. Отчёт придёт следом.")
+        else:
+            await msg.reply_text("Сейчас прогона нет.")
+        return
+    if arg == "estimate":
+        plan = await asyncio.to_thread(_dedup_auto_plan)
+        for part in split_lines_for_telegram(_dedup_auto_estimate_text(plan, "Оценка автодедупа (модель не вызывалась, отметки не пишу):")):
+            await msg.reply_text(part)
+        return
+    if arg == "run":
+        if _dedup_auto_active():
+            await msg.reply_text("Прогон уже идёт — дождись отчёта или /dedup_auto stop.")
+            return
+        plan = await asyncio.to_thread(_dedup_auto_plan)
+        if not plan:
+            await msg.reply_text("Групп к проверке нет — гнать нечего.")
+            return
+        text = _dedup_auto_estimate_text(plan, "Прогнать автодедуп сейчас (apply: факты в базе будут заменены слитыми, перед этим — бэкап)?")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Запустить", callback_data="da:go"),
+                                    InlineKeyboardButton("Отмена", callback_data="da:no")]])
+        await msg.reply_text(text, reply_markup=kb)
+        return
+    data = await asyncio.to_thread(_dedup_auto_load)
+    last = data["last"]
+    last_txt = "ещё не было."
+    if last:
+        when = datetime.fromtimestamp(last["ts"], BERLIN_TZ).strftime("%d.%m.%Y %H:%M")
+        last_txt = (f"{when}, {last.get('end', '?')}: групп {last['due']}, применено {last['applied']}, без изменений {last['unchanged']}, "
+                    f"страховка {last['guard']}, ошибок {last['errors']}, ждут {last['left']}; фактов {last['facts_before']} → {last['facts_after']}; ${last['cost']}.")
+    await msg.reply_text(
+        f"Автодедуп памяти. Режим: {data['mode']} (off — выключен, estimate — только отчёт, apply — сам сливает). "
+        f"Сейчас: {'идёт прогон' if _dedup_auto_active() else 'не идёт'}. Следующий запуск: {_dedup_auto_next_text(context)}.\n"
+        f"Прошлый итог: {last_txt}\n"
+        "/dedup_auto estimate — оценка сейчас, /dedup_auto run — прогнать сейчас, /dedup_auto on | estimate-only | off — режим, /dedup_auto stop — остановить.")
+
+
+async def on_dedup_auto_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки подтверждения `/dedup_auto run`: только админ бота и только личка."""
+    q = update.callback_query
+    if not is_admin(q.from_user.id) or not q.message or q.message.chat.type != "private":
+        await q.answer()
+        return
+    if q.data == "da:no":
+        await q.answer("Отменено")
+        await q.edit_message_text("Автодедуп: запуск отменён.")
+        return
+    if not _dedup_auto_start(context.bot, q.from_user.id, [q.from_user.id], "Автодедуп памяти (ручной запуск)"):
+        await q.answer("Прогон уже идёт.", show_alert=True)
+        return
+    await q.answer("Запускаю")
+    await q.edit_message_text("Автодедуп запущен. Отчёт придёт сюда; остановить — /dedup_auto stop.")
+
+
 def build_memory_participants(transcript: list[dict]) -> dict:
     """Метки участников для группового извлечения памяти (docs/claude/tz-memory-uid.md): человек = user_id, а не ник.
     Берутся только реплики людей (is_bot=0) с user_id; метки P1, P2… в порядке первого появления.
@@ -6839,6 +7210,7 @@ ADMIN_HELP = """\
   /broadcast       — ТОЛЬКО В ЛИЧКЕ: ответом на своё сообщение (текст/стикер/фото) разослать его активным чатам: предпросмотр «в N групп и M личек» + кнопка «Отправить», в конце отчёт.
                      /broadcast test — только админам; /broadcast all — без фильтра активности; /broadcast stop; /broadcast resume — дослать, кому не ушло.
   /memory_backfill — ТОЛЬКО В ЛИЧКЕ: разовая обработка старых личных тредов в факты памяти: dry — сколько людей/реплик/вызовов и оценка, run — старт в фоне (run facts — без предложений профиля), stop; расход — на твой личный чат.
+  /dedup_auto — ТОЛЬКО В ЛИЧКЕ: автодедуп памяти (раз в неделю, пн 05:07 Berlin): без аргумента — режим и итог прошлого, estimate — оценка без модели, run — прогнать сейчас (кнопка), on | estimate-only | off — режим, stop; расход — на твой личный чат.
   /refund [charge_id] — вернуть платёж Stars (без аргумента — последние 10); только если на балансе чата есть эта сумма.
                            От $2 суммарных пополнений (личка) / $5 (группа) чат проверяется автоматически
   /verify <id>             — проверить группу (id с минусом) или пользователя + стартовый бонус
@@ -9983,8 +10355,10 @@ def main():
     app.add_handler(CommandHandler("refund", cmd_refund))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("memory_backfill", cmd_memory_backfill))
+    app.add_handler(CommandHandler("dedup_auto", cmd_dedup_auto))
     app.add_handler(CallbackQueryHandler(on_broadcast_button, pattern=r"^bc:(go|no):[0-9a-f]+$"))
     app.add_handler(CallbackQueryHandler(on_forget_button, pattern=r"^fg:"))
+    app.add_handler(CallbackQueryHandler(on_dedup_auto_button, pattern=r"^da:(go|no)$"))
     app.add_handler(CallbackQueryHandler(on_pay_button, pattern=r"^pay:\d+$"))
     app.add_handler(PreCheckoutQueryHandler(on_pre_checkout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_successful_payment))
@@ -10065,6 +10439,13 @@ def main():
         name="profile_digest"
     )
     logger.info("Profile digest scheduled on Sundays at 19:00 Berlin time")
+    app.job_queue.run_daily(
+        dedup_auto_job,
+        time=DEDUP_AUTO_TIME,
+        days=(DEDUP_AUTO_WEEKDAY,),  # PTB 22.8: 0 = воскресенье, 1 = понедельник
+        name="dedup_auto"
+    )
+    logger.info("Dedup auto scheduled on Mondays at 05:07 Berlin time")
     logger.info("Клодушка started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

@@ -2,7 +2,7 @@
 
 > План на ноябрь 2026 и какие пункты отсюда взяты в работу — `docs/claude/roadmap-2026-11.md`.
 
-- **Гигиена памяти**: дедуп фактов (`UNIQUE(user_id, context, chat_id, fact)` +
+- **Гигиена памяти** (автоматический еженедельный дедуп с v2.19.0 — `docs/claude/memory.md` → «Автоматическая дедупликация», `/dedup_auto`): дедуп фактов (`UNIQUE(user_id, context, chat_id, fact)` +
   `INSERT OR IGNORE`; индекс не создастся, пока в таблице есть дубликаты) и разовая
   чистка просроченных (`DELETE FROM memory WHERE expires_at IS NOT NULL AND expires_at <= now`,
   ~380k символов балласта). На размер промпта не влияет — просроченные и так фильтруются,
@@ -32,7 +32,7 @@
   до конца прогона (CLI печатает одну строку, в журнале прогона — `model_used`), Luna без фолбэка, без `GEMINI_API_KEY`
   — ошибка как раньше. Нативные можно выбрать и сразу: `--model flash_g|argon_g|neon_g` (`NATIVE_ALIASES`, только CLI;
   TUI показывает только пул, но фолбэк в нём тот же). Адаптер — `bot.google_native_create`, ленивый `import bot` (работает
-  в контейнере). Цены нативных в `PRICING` — базовые из `MODELS` бота, без ступеней по датам;
+  в контейнере; из процесса бота (`/dedup_auto`) этот фолбэк ВЫКЛЮЧЕН — `state["no_fallback"]`, фолбэк делает `sync_create` бота). Цены нативных в `PRICING` — базовые из `MODELS` бота, без ступеней по датам;
   у Gemini `max_tokens` + запас 4000 на рассуждения, без thinking/output_config/cache_control, оценка цены
   приблизительная — `THINKING_EST`; реестр `MODEL_ALIASES` дублирует `MODELS` из bot.py,
   см. `docs/claude/models-and-costs.md`) или полную API-строку. По завершении llm-режима

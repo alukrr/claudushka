@@ -170,6 +170,10 @@ def create_with_fallback(client, model: str, state: dict, **kwargs):
     """(ответ, фактическая модель). state — общий на прогон: после первого перехода на Google весь остаток прогона
     идёт сразу туда (state["fallback"]). Фолбэк — только NATIVE_FALLBACK и только по api_errors.should_fallback."""
     used = state.get("fallback") or model
+    if state.get("no_fallback"):
+        # Вызов из процесса бота (bot.py, /dedup_auto): фолбэк делает sync_create бота, а _native_create делает `import bot` —
+        # внутри работающего бота (он запущен как __main__) это выполнило бы bot.py второй раз. Ошибка уходит наверх как есть.
+        return client.messages.create(model=used, **kwargs), used
     if is_native(used):
         return _native_create(model=used, **kwargs), used
     try:
