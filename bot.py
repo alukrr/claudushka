@@ -3242,7 +3242,8 @@ DEDUP_AUTO_MIN_FACTS = 10                      # группа меньше — �
 DEDUP_AUTO_MIN_NEW = 5                         # «есть новое»: новых фактов с прошлой проверки >= max(MIN_NEW, NEW_RATIO × фактов после неё)
 DEDUP_AUTO_NEW_RATIO = 0.2
 DEDUP_AUTO_MAX_USD = 2.0                       # потолок прогона; остаток групп — в следующий раз
-DEDUP_AUTO_MIN_KEEP = 0.1                      # страховка: «стало» < 10% от «было» — группу не применяем
+DEDUP_AUTO_MIN_KEEP = 0.1                      # страховка: «стало» < 10% от «было» И < DEDUP_AUTO_MIN_KEEP_ABS фактов — набор не применяем
+DEDUP_AUTO_MIN_KEEP_ABS = 20                   # ...но если осталось >= 20 фактов, сжатие честное (стенд 2026-11-19: 3452 → 32 — плотный профиль)
 DEDUP_AUTO_MAX_ERRORS = 3                      # столько ошибок модели подряд — прогон останавливается
 DEDUP_AUTO_FILE = DATA_DIR / "dedup_auto.json"
 DEDUP_AUTO_MODES = ("off", "estimate", "apply")
@@ -3472,7 +3473,7 @@ def _dedup_auto_run_sync(budget: float, stop_event) -> dict:
             consecutive = 0
             status, after = res.status, len(res.facts_after)
             if status == "ok":
-                if after < DEDUP_AUTO_MIN_KEEP * n_before:
+                if after < DEDUP_AUTO_MIN_KEEP * n_before and after < DEDUP_AUTO_MIN_KEEP_ABS:
                     status = "guard"                    # «съела всё»: не применяем, показываем в отчёте
                     stats["guard"].append((k, n_before, after))
                 elif after >= n_before:
@@ -3519,7 +3520,7 @@ def _dedup_auto_report_text(stats: dict, head: str, cost: float, calls: int) -> 
              f"ошибок {_n(stats['errors'])}"]
     lines.append("Остальное: " + ", ".join(other) + ".")
     if stats["guard"]:
-        lines += ["", f"🛡 Страховка (стало меньше {DEDUP_AUTO_MIN_KEEP:.0%}) — НЕ применено:"]
+        lines += ["", f"🛡 Страховка (стало меньше {DEDUP_AUTO_MIN_KEEP:.0%} и меньше {DEDUP_AUTO_MIN_KEEP_ABS} фактов) — НЕ применено:"]
         lines += [f"• {_dedup_key_text(k, names)}: {b} → {a}" for k, b, a in stats["guard"][:15]]
         if len(stats["guard"]) > 15:
             lines.append(f"• …и ещё {len(stats['guard']) - 15}")

@@ -209,6 +209,19 @@ def test_guard_not_applied_and_reported(env):
     assert "Страховка" in bot._dedup_auto_report_text(st, "Итог", 0.1, 1)
 
 
+def test_guard_allows_big_honest_compression(env):
+    """Стенд 2026-11-19: 3452 → 32 — плотный профиль. Меньше 10%, но осталось >= 20 фактов → применяется; 5 из 100 (<20) — страховка."""
+    ins(U1, 300)
+    env.answer = lambda facts: facts[:25]        # 25/300 = 8% < 10%, но 25 >= 20
+    st = go(env)
+    assert st["applied"] == 1 and st["guard"] == [] and count(U1) == 25
+    ins(U2, 100)
+    env.answer = lambda facts: facts[:5]         # 5% и 5 < 20
+    st = go(env)
+    assert st["applied"] == 0 and [(k.user_id, b, a) for k, b, a in st["guard"]] == [(U2, 100, 5)] and count(U2) == 100
+    assert bot.DEDUP_AUTO_MIN_KEEP == 0.1 and bot.DEDUP_AUTO_MIN_KEEP_ABS == 20
+
+
 def test_budget_stops_and_leaves_rest_untouched(env):
     ins(U1, 30)
     ins(U2, 20)
