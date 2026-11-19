@@ -3465,6 +3465,13 @@ def _dedup_auto_last(mode: str, stats: dict, cost: float, end: str) -> dict:
             "facts_before": stats["facts_before"], "facts_after": stats["facts_after"], "cost": round(cost, 4)}
 
 
+def _dedup_auto_spent(admin_id: int, since_ts: int) -> tuple[int, float]:
+    """(вызовов, $) за прогон из usage_log: метка `memory_dedup` И `memory_dedup_fallback` (sync_create дописывает суффикс при фолбэке бота)."""
+    n1, c1 = db.usage_label_sum("memory_dedup", admin_id, since_ts)
+    n2, c2 = db.usage_label_sum("memory_dedup_fallback", admin_id, since_ts)
+    return n1 + n2, c1 + c2
+
+
 async def _dedup_auto_worker(bot, admin_id: int, recipients, head: str) -> None:
     """Фоновый прогон. Блокирующее (SQLite, модель) — в asyncio.to_thread; usage_ctx ставится ДО to_thread (контекст копируется в поток).
     Исключений наружу не выпускает; итог — одним сообщением получателям."""
@@ -3473,7 +3480,7 @@ async def _dedup_auto_worker(bot, admin_id: int, recipients, head: str) -> None:
     stats = None
     try:
         stats = await asyncio.to_thread(_dedup_auto_run_sync, DEDUP_AUTO_MAX_USD, _dedup_auto_run["stop_event"])
-        calls, cost = await asyncio.to_thread(db.usage_label_sum, "memory_dedup", admin_id, since)
+        calls, cost = await asyncio.to_thread(_dedup_auto_spent, admin_id, since)
         end = "прервано" if stats["stopped"] else "остановлено" if stats["abort"] else "готово"
         data = await asyncio.to_thread(_dedup_auto_load)
         data["last"] = _dedup_auto_last("apply", stats, cost, end)

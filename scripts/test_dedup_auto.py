@@ -318,6 +318,13 @@ def test_off_mode_job_does_nothing(env):
     assert env.sent == [] and env.calls == []
 
 
+def test_report_cost_counts_fallback_label(env, monkeypatch):
+    """Найдено на стенде 2026-11-19: при фолбэке бота метка — memory_dedup_fallback, отчёт показывал $0.0000 (0 вызовов)."""
+    rows = {"memory_dedup": (1, 0.01), "memory_dedup_fallback": (2, 0.03)}
+    monkeypatch.setattr(db, "usage_label_sum", lambda label, chat_id, since=0: rows[label])
+    assert bot._dedup_auto_spent(ADMIN, 0) == (3, pytest.approx(0.04))
+
+
 def test_apply_mode_job_runs_and_reports(env):
     ins(U1, 20)
     bot._dedup_auto_save({"mode": "apply", "last": None})
