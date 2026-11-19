@@ -291,7 +291,7 @@ MODELS = {
                "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0, "context": 1_000_000,
                "thinking_headroom": 4000},
     # Neon (2026-11-19): листовая цена пула $3/$15 — ЭМПИРИЧЕСКАЯ (каталог пула 1.20/6.00 = ×0.4 к прайсу Google 3/15, как у
-    # Argon 0.80/4.00 к 2/10); на странице пула Neon не найден — сверить, когда появится прайс (решение Алексея).
+    # Argon 0.80/4.00 к 2/10); на странице пула Neon не найден — оценка Claude Code, не сверено со страницей пула; сверить, когда пул вернёт Gemini.
     "neon":   {"id": "gemini-4-neon",             "label": "Gemini 4 Neon", "provider": "gemini",
                "in": 3.0,  "out": 15.0, "cache_read_mult": 0.05,
                "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0, "context": 1_000_000,
