@@ -96,6 +96,8 @@ def test_fallback_pairs():
     assert bot.fallback_model_for(TERRA) is None and bot.fallback_model_for(SOL) is None
     assert bot.fallback_model_for("gemini-3.1-flash-lite") is None   # убрана пулом 2026-11-14
     assert bot.fallback_model_for("claude-haiku-5-5") is None
+    NEON, NEON_G = bot.MODELS["neon"]["id"], bot.MODELS["neon_g"]["id"]
+    assert bot.fallback_model_for(NEON) == NEON_G and bot.fallback_model_for(NEON_G) == NEON
     for src, dst in bot.FALLBACK_PAIRS.items():                  # пара — ДРУГОЙ поставщик (пул <-> Google) и с ценой
         assert bot.is_native_model(src) != bot.is_native_model(dst)
         assert bot.price_meta(dst) is not None and bot.price_meta(src) is not None
@@ -107,6 +109,8 @@ def test_no_google_key_falls_back_to_gpt(monkeypatch):
     assert bot.fallback_model_for(LUNA) == FLASH
     assert bot.fallback_model_for(FLASH) == TERRA and bot.fallback_model_for(ARGON) == SOL
     assert bot.fallback_model_for(ARGON_G) == ARGON                # нативная → пул: ключ не нужен
+    assert bot.fallback_model_for(bot.MODELS["neon"]["id"]) == SOL
+    assert bot.fallback_model_for(bot.MODELS["neon_g"]["id"]) == bot.MODELS["neon"]["id"]
     for dst in bot.FALLBACK_PAIRS_NO_GOOGLE.values():
         assert bot.price_meta(dst) is not None and not bot.is_native_model(dst)
 
@@ -302,8 +306,8 @@ def test_dedup_pricing_matches_bot():
 
 def test_catalog_ids_strips_any_provider_prefix():
     payload = {"data": [{"id": "openai/gpt-6.1-terra"}, {"id": "google/gemini-3.8-flash"},
-                        {"id": "gemini-4-argon"}, {"id": "openai/gpt-6-luna"}]}
+                        {"id": "gemini-4-argon"}, {"id": "google/gemini-4-neon"}, {"id": "openai/gpt-6-luna"}]}
     ids = bot.catalog_ids(payload)
-    assert ids == {"gpt-6.1-terra", "gemini-3.8-flash", "gemini-4-argon", "gpt-6-luna"}
+    assert ids == {"gpt-6.1-terra", "gemini-3.8-flash", "gemini-4-argon", "gemini-4-neon", "gpt-6-luna"}
     assert {v for v in bot.FALLBACK_PAIRS.values() if not bot.is_native_model(v)} <= ids
     assert bot.catalog_ids({}) == set()

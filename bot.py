@@ -127,8 +127,10 @@ FALLBACK_PAIRS = {
     "gpt-6-luna": "google-direct/gemini-3.8-flash",
     "gemini-3.8-flash": "google-direct/gemini-3.8-flash",
     "gemini-4-argon": "google-direct/gemini-4-argon",
+    "gemini-4-neon": "google-direct/gemini-4-neon",
     # Нативная полоса Google → та же модель через пул (другой поставщик, тот же характер).
     "google-direct/gemini-4-argon": "gemini-4-argon",
+    "google-direct/gemini-4-neon": "gemini-4-neon",
     "google-direct/gemini-3.8-flash": "gemini-3.8-flash",
     "google-direct/gemini-3.1-flash-lite": "gemini-3.8-flash",   # Lite в пуле нет
 }
@@ -137,6 +139,7 @@ FALLBACK_PAIRS_NO_GOOGLE = {
     "gpt-6-luna": "gemini-3.8-flash",
     "gemini-3.8-flash": "gpt-6.1-terra",
     "gemini-4-argon": "gpt-6.1-sol",
+    "gemini-4-neon": "gpt-6.1-sol",
 }
 # После сбоя модели X следующие N секунд запросы на X сразу идут на её пару (без попытки и ожидания).
 FALLBACK_STICKY_SECONDS = int(os.environ.get("FALLBACK_STICKY_SECONDS", "300") or 300)
@@ -287,6 +290,12 @@ MODELS = {
                "in": 2.0,  "out": 10.0, "cache_read_mult": 0.05,
                "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0, "context": 1_000_000,
                "thinking_headroom": 4000},
+    # Neon (2026-11-19): листовая цена пула $3/$15 — ЭМПИРИЧЕСКАЯ (каталог пула 1.20/6.00 = ×0.4 к прайсу Google 3/15, как у
+    # Argon 0.80/4.00 к 2/10); на странице пула Neon не найден — оценка Claude Code, не сверено со страницей пула; сверить, когда пул вернёт Gemini.
+    "neon":   {"id": "gemini-4-neon",             "label": "Gemini 4 Neon", "provider": "gemini",
+               "in": 3.0,  "out": 15.0, "cache_read_mult": 0.05,
+               "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0, "context": 1_000_000,
+               "thinking_headroom": 4000},
     "flash":  {"id": "gemini-3.8-flash",          "label": "Gemini 3.8 Flash", "provider": "gemini",
                "in": 0.75, "out": 3.75, "cache_read_mult": 0.1,
                "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0, "context": 1_000_000,
@@ -306,6 +315,12 @@ MODELS = {
                 "in": _gprice(2.0), "out": _gprice(10.0), "price_steps": [("2026-12-01", _gprice(4.0), _gprice(20.0))],
                 "cache_read_mult": 0.05, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0,
                 "context": 1_000_000, "thinking_headroom": 4000},
+    # Neon у Google: $3/$15, кэш 0.15 (5%), акции и ступени >200k нет (aistudio.google.com/docs/pricing, сверка 2026-11-19).
+    "neon_g": {"id": "google-direct/gemini-4-neon", "api_model": "gemini-4-neon", "native": True,
+               "label": "Gemini 4 Neon (Google)", "provider": "gemini",
+               "in": _gprice(3.0), "out": _gprice(15.0),
+               "cache_read_mult": 0.05, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0,
+               "context": 1_000_000, "thinking_headroom": 4000},
     "flash_g": {"id": "google-direct/gemini-3.8-flash", "api_model": "gemini-3.8-flash", "native": True,
                 "label": "Gemini 3.8 Flash (Google)", "provider": "gemini",
                 "in": _gprice(0.75), "out": _gprice(3.75), "price_steps": [("2027-01-01", _gprice(1.5), _gprice(7.5))],
@@ -6418,11 +6433,15 @@ async def cmd_claude_gone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/haiku /sonnet /opus /fable — заглушка на один релиз: пул закрыл модели Anthropic (2026-10-28)."""
     await update.effective_message.reply_text(
         "Модели Claude мне больше недоступны — их закрыл поставщик. Выбери другую в /models: "
-        "/argon, /flash, /luna или модели напрямую у Google — /argon_g, /flash_g, /lite.")
+        "/argon, /neon, /flash, /luna или модели напрямую у Google — /argon_g, /neon_g, /flash_g, /lite.")
 
 
 async def cmd_argon(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _set_chat_model(update, context, "argon")
+
+
+async def cmd_neon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _set_chat_model(update, context, "neon")
 
 
 async def cmd_flash(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6435,6 +6454,10 @@ async def cmd_luna(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_argon_g(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _set_chat_model(update, context, "argon_g")
+
+
+async def cmd_neon_g(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _set_chat_model(update, context, "neon_g")
 
 
 async def cmd_flash_g(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6785,7 +6808,8 @@ USER_HELP = """\
   /luna          — GPT-6 Luna (единственная модель бесплатного режима)
   /flash         — Gemini 3.8 Flash (платный режим, дефолт; кэша промпта нет)
   /argon         — Gemini 4 Argon (платный режим, самая сильная; кэша промпта нет)
-  /argon_g /flash_g /lite — те же Argon и Flash и Gemini 3.1 Flash-Lite напрямую у Google (платный режим; цены — в /models)
+  /neon          — Gemini 4 Neon (платный режим, для кода и сложных рассуждений; кэша промпта нет)
+  /argon_g /neon_g /flash_g /lite — те же Argon, Neon и Flash и Gemini 3.1 Flash-Lite напрямую у Google (платный режим; цены — в /models)
   /searchmode    — откуда брать данные для поиска: auto|gpt|tavily (платный режим; без аргумента — текущий)
   /imagemodels   — какой провайдер картинок сейчас у чата
   /banana        — рисовать через Nano Banana 2.1 (платный режим)
@@ -6833,13 +6857,15 @@ ADMIN_HELP = """\
   /luna [chat_id]          — GPT-6 Luna — $0.10/$0.50, окно 872K (единственная модель бесплатного режима и всех служебных вызовов)
   /flash [chat_id]         — Gemini 3.8 Flash — $0.75/$3.75, окно 1M (дефолт платного режима)
   /argon [chat_id]         — Gemini 4 Argon — $2/$10, окно 1M (платный режим)
+  /neon [chat_id]          — Gemini 4 Neon — $3/$15, окно 1M (платный режим)
   /argon_g [chat_id]       — Gemini 4 Argon напрямую у Google — прайс Google +10% ($2.2/$11, с 01.12.2026 $4.4/$22); модель дневного обзора
+  /neon_g [chat_id]        — Gemini 4 Neon напрямую у Google — прайс Google +10%: $3.3/$16.5
   /flash_g [chat_id]       — Gemini 3.8 Flash напрямую у Google — $0.825/$4.125 (с 01.01.2027 $1.65/$8.25)
   /lite [chat_id]          — Gemini 3.1 Flash-Lite напрямую у Google — $0.275/$1.65
                              нативные: ключ GEMINI_API_KEY, мимо пула; при сбое Google — та же модель через пул (Lite → Flash)
   chat_id — число с минусом, например: /flash -1001109809707
   Gemini-модели без кэша промпта: вход каждый раз по полной цене. Если модель чата упала, ответ даёт другой поставщик
-  (luna и flash → Flash у Google, argon → Argon у Google; без GEMINI_API_KEY — GPT пула), в /cost такие строки с меткой *_fallback.
+  (luna и flash → Flash у Google, argon → Argon, neon → Neon у Google; без GEMINI_API_KEY — GPT пула), в /cost такие строки с меткой *_fallback.
   Всё, кроме Luna, — админу или чату в платном режиме. Выбор постоянный (chat_models), в бесплатном режиме
   не применяется (там всегда Luna), но и не стирается. Перед записью — пробный запрос (кроме Luna).
   /haiku /sonnet /opus /fable больше нет (пул закрыл Claude) — отвечают подсказкой выбрать другую модель.
@@ -9972,10 +9998,12 @@ def main():
     app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler(["haiku", "sonnet", "opus", "fable"], cmd_claude_gone))
     app.add_handler(CommandHandler("argon", cmd_argon))
+    app.add_handler(CommandHandler("neon", cmd_neon))
     app.add_handler(CommandHandler("flash", cmd_flash))
     app.add_handler(CommandHandler("luna", cmd_luna))
     app.add_handler(CommandHandler("lite", cmd_lite))
     app.add_handler(CommandHandler("argon_g", cmd_argon_g))
+    app.add_handler(CommandHandler("neon_g", cmd_neon_g))
     app.add_handler(CommandHandler("flash_g", cmd_flash_g))
     app.add_handler(CommandHandler("models", cmd_models))
     app.add_handler(CommandHandler("searchmode", cmd_searchmode))

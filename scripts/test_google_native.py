@@ -73,6 +73,14 @@ def test_registry_and_prices():
     assert not any(k in bot.FREE_MODEL_KEYS for k in ("argon_g", "flash_g", "lite"))
 
 
+def test_neon_g_native_and_price():
+    n = bot.MODELS["neon_g"]
+    assert n["id"] == "google-direct/gemini-4-neon" and n["api_model"] == "gemini-4-neon" and bot.is_native_model(n["id"])
+    assert (n["in"], n["out"]) == pytest.approx((3.3, 16.5))                      # прайс Google 3/15 +10%
+    assert "price_steps" not in n and bot.effective_price(n) == pytest.approx((3.3, 16.5))
+    assert "neon_g" not in bot.FREE_MODEL_KEYS and "neon" not in bot.FREE_MODEL_KEYS
+
+
 def test_price_steps_by_date():
     a, f = bot.MODELS["argon_g"], bot.MODELS["flash_g"]
     tz = bot.BERLIN_TZ

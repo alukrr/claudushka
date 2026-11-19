@@ -27,6 +27,7 @@ Claude-модели на Gemini; v2.0.0 убрал Claude целиком: `CLAUD
 | `gemini-3.8-flash` (дефолт paid) | `google-direct/gemini-3.8-flash` | та же модель у другого поставщика; до 2026-11-19 — `gpt-6.1-terra` |
 | `gemini-4-argon` | `google-direct/gemini-4-argon` | та же модель; до 2026-11-19 — `gpt-6.1-sol` |
 | `google-direct/gemini-4-argon` / `…3.8-flash` | та же модель пула | v2.17.0 |
+| `gemini-4-neon` ↔ `google-direct/gemini-4-neon` | друг на друга (v2.18.0); без `GEMINI_API_KEY` пул-Neon → `gpt-6.1-sol` | v2.18.0 |
 | `google-direct/gemini-3.1-flash-lite` | `gemini-3.8-flash` (пул) | Lite в пуле нет |
 
 **Без `GEMINI_API_KEY`** (стенд без ключа) пара на нативную недоступна — `fallback_model_for` берёт `FALLBACK_PAIRS_NO_GOOGLE`

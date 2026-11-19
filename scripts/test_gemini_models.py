@@ -30,8 +30,8 @@ def run(coro):
 
 
 def test_registry_has_no_claude():
-    assert set(bot.MODELS) == {"argon", "flash", "luna", "argon_g", "flash_g", "lite"}
-    for key, provider, price, headroom in (("argon", "gemini", (2.0, 10.0), 4000), ("flash", "gemini", (0.75, 3.75), 4000),
+    assert set(bot.MODELS) == {"argon", "neon", "flash", "luna", "argon_g", "neon_g", "flash_g", "lite"}
+    for key, provider, price, headroom in (("argon", "gemini", (2.0, 10.0), 4000), ("neon", "gemini", (3.0, 15.0), 4000), ("flash", "gemini", (0.75, 3.75), 4000),
                                            ("luna", "openai", (0.10, 0.50), 2000)):
         m = bot.MODELS[key]
         assert m["provider"] == provider and (m["in"], m["out"]) == price
@@ -157,7 +157,9 @@ def test_lite_is_native_model_again_and_luna_command_switches(monkeypatch):
     run(bot.cmd_lite(upd, None))
     run(bot.cmd_argon_g(upd, None))
     run(bot.cmd_flash_g(upd, None))
-    assert seen == ["luna", "lite", "argon_g", "flash_g"]
+    run(bot.cmd_neon(upd, None))
+    run(bot.cmd_neon_g(upd, None))
+    assert seen == ["luna", "lite", "argon_g", "flash_g", "neon", "neon_g"]
 
 
 def test_luna_needs_no_probe_in_paid_chat(monkeypatch):
@@ -182,8 +184,8 @@ def test_models_listing_groups_by_provider(monkeypatch):
     upd, m = make_update()
     run(bot.cmd_models(upd, SimpleNamespace(args=[], bot=None)))
     text = m.sent[0]
-    assert (text.index("Gemini через пул") < text.index("/argon ") < text.index("/flash ") < text.index("GPT (")
-            < text.index("/luna") < text.index("Gemini напрямую у Google") < text.index("/argon_g") < text.index("/lite"))
+    assert (text.index("Gemini через пул") < text.index("/argon ") < text.index("/neon ") < text.index("/flash ") < text.index("GPT (")
+            < text.index("/luna") < text.index("Gemini напрямую у Google") < text.index("/argon_g") < text.index("/neon_g") < text.index("/lite"))
     assert "▸ /luna" in text and "$0.1/$0.5" in text and "872k" in text
     assert "только Luna" in text
 
@@ -192,6 +194,7 @@ def test_help_mentions_luna_not_lite():
     for text in (bot.USER_HELP, bot.ADMIN_HELP):
         assert "/luna" in text and "GPT-6 Luna" in text
         assert "/argon_g" in text and "/flash_g" in text and "/lite" in text   # нативная полоса Google
+        assert "/neon" in text and "/neon_g" in text
     assert "luna и flash → Flash у Google" in bot.ADMIN_HELP   # фолбэк на нативную полосу (2026-11-19)
     assert "Luna" in bot.TIER_FREE_MSG and "Lite" not in bot.TIER_FREE_MSG
 
