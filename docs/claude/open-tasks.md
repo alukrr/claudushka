@@ -26,7 +26,13 @@
   боевой файл напрямую — `data/` на сервере root:root, нужен `sudo` (для llm — `sudo -E`,
   прокинуть `ANTHROPIC_API_KEY`). `--model` принимает короткие имена
   (`haiku`/`sonnet`/`opus`/`fable`, а также `argon` = gemini-4-argon, `flash` = gemini-3.8-flash и `luna` = gpt-6-luna (те же имена, что команды бота) —
-  Gemini через пул, ВЫБОР ВРУЧНУЮ, не автофолбэк: дедуп меняет память, смена модели посреди прогона дала бы смесь;
+  Gemini через пул, ВЫБОР ВРУЧНУЮ: дедуп меняет память, смена модели посреди прогона дала бы смесь. Поэтому фолбэк
+  (с 2026-11-19, `NATIVE_FALLBACK`, `create_with_fallback`) — только на ТУ ЖЕ модель напрямую у Google: при сбое пула
+  (`api_errors.should_fallback`, в т.ч. 400 «Gemini currently unavailable») Flash/Argon/Neon пула → `google-direct/…`
+  до конца прогона (CLI печатает одну строку, в журнале прогона — `model_used`), Luna без фолбэка, без `GEMINI_API_KEY`
+  — ошибка как раньше. Нативные можно выбрать и сразу: `--model flash_g|argon_g|neon_g` (`NATIVE_ALIASES`, только CLI;
+  TUI показывает только пул, но фолбэк в нём тот же). Адаптер — `bot.google_native_create`, ленивый `import bot` (работает
+  в контейнере). Цены нативных в `PRICING` — базовые из `MODELS` бота, без ступеней по датам;
   у Gemini `max_tokens` + запас 4000 на рассуждения, без thinking/output_config/cache_control, оценка цены
   приблизительная — `THINKING_EST`; реестр `MODEL_ALIASES` дублирует `MODELS` из bot.py,
   см. `docs/claude/models-and-costs.md`) или полную API-строку. По завершении llm-режима
