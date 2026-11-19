@@ -30,7 +30,7 @@ data/dedup_runs/, калибровка оценок — data/dedup_calibration.j
                  формулировке (например "Поделился фото" / "Поделился фото в чате" /
                  "Отправил фото в чат" -> один факт). Один вызов модели на группу
                  (user_id, context, chat_id, tier) — СТОИТ ДЕНЕГ, задаётся --model
-                 (короткое имя luna / flash / argon — GPT-6 Luna, Gemini 3.8 Flash, 4 Argon через пул,
+                 (короткое имя luna / flash / argon / neon — GPT-6 Luna, Gemini 3.8 Flash, 4 Argon, 4 Neon через пул,
                  те же имена, что команды бота; дефолт luna, либо полная API-строка; выбор вручную, не
                  автофолбэк; оценка цены приблизительна: рассуждения идут в вывод). Старые записи группы удаляются, вместо
                  них вставляется объединённый список с tier и (для medium)
@@ -108,6 +108,7 @@ MODEL_ALIASES = {
     "luna": "gpt-6-luna",
     "flash": "gemini-3.8-flash",
     "argon": "gemini-4-argon",
+    "neon": "gemini-4-neon",
 }
 
 # $/MTok in,out + множители кэша — дубль MODELS из bot.py (листовые цены пула), менять синхронно: расхождение ловит
@@ -115,6 +116,7 @@ MODEL_ALIASES = {
 # Кортеж: (in, out, cache_read_mult, cache_write_5m_mult, cache_write_1h_mult).
 PRICING = {
     "gemini-4-argon": (2.0, 10.0, 0.05, 1.0, 1.0),
+    "gemini-4-neon": (3.0, 15.0, 0.05, 1.0, 1.0),
     "gemini-3.8-flash": (0.75, 3.75, 0.1, 1.0, 1.0),
     "gpt-6-luna": (0.10, 0.50, 0.1, 1.25, 1.25),
 }
@@ -125,8 +127,8 @@ PRICING = {
 # а входят ли они в usage.output_tokens Anthropic-полосы — не проверено (docs/claude/model-fallback.md).
 # Лимит нестримового вывода argon — 32K (доки пула): MAX_OUT_TOKENS + запас = 12192, в лимит укладываемся.
 # Luna (GPT, пул «принимает и игнорирует» max_tokens) — запас 2000 как в bot.py; thinking/output_config вызов не шлёт никому.
-THINKING_HEADROOM = {"gemini-4-argon": 4000, "gemini-3.8-flash": 4000, "gpt-6-luna": 2000}
-THINKING_EST = {"gemini-4-argon": 500, "gemini-3.8-flash": 500, "gpt-6-luna": 500}
+THINKING_HEADROOM = {"gemini-4-argon": 4000, "gemini-4-neon": 4000, "gemini-3.8-flash": 4000, "gpt-6-luna": 2000}
+THINKING_EST = {"gemini-4-argon": 500, "gemini-4-neon": 500, "gemini-3.8-flash": 500, "gpt-6-luna": 500}
 
 
 def request_cost(model, inp, out, cw_5m, cw_1h, cr):
@@ -1075,7 +1077,7 @@ def main():
     p.add_argument("--tier", choices=["long", "medium"], default=None)
     p.add_argument("--limit-groups", type=int, default=None, help="только для --mode llm")
     p.add_argument("--model", default="luna",
-                    help="только для --mode llm — короткое имя (luna/flash/argon, "
+                    help="только для --mode llm — короткое имя (luna/flash/argon/neon, "
                          "как в bot.py) или полная API-строка")
     p.add_argument("--fact", default=None,
                     help="только для --mode delete — текст факта на удаление (точное "

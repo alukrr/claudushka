@@ -80,8 +80,8 @@ GPT Image 2.5 Flare или Sunburst без дневного лимита, еже
 | `/dev` | Режим разработчика (личка, платный режим): включить и статус; `/dev off` — выключить, `/dev reset` — очистить тред режима |
 | `/ws` | Файлы режима разработчика: список; `/ws get <имя>`, `/ws rm <имя>`, `/ws clear yes` |
 | `/luna` | GPT-6 Luna (единственная модель бесплатного режима) |
-| `/flash` `/argon` | Gemini 3.8 Flash (дефолт платного режима) / Gemini 4 Argon (платный режим) |
-| `/flash_g` `/argon_g` `/lite` | Те же Flash и Argon и Gemini 3.1 Flash-Lite напрямую у Google, мимо пула (платный режим; цены — в `/models`) |
+| `/flash` `/argon` `/neon` | Gemini 3.8 Flash (дефолт платного режима) / Gemini 4 Argon / Gemini 4 Neon (платный режим) |
+| `/flash_g` `/argon_g` `/neon_g` `/lite` | Те же Flash, Argon и Neon и Gemini 3.1 Flash-Lite напрямую у Google, мимо пула (платный режим; цены — в `/models`) |
 | `/imagemodels` | Какой провайдер картинок сейчас у чата |
 | `/banana` | Рисовать через Nano Banana 2.1 (платный режим) |
 | `/bananapro` | Рисовать через Nano Banana Pro (платный режим, сразу 2K; в группе — только админы чата и бота) |
@@ -135,14 +135,16 @@ GPT Image 2.5 Flare или Sunburst без дневного лимита, еже
 | `/luna [chat_id]` | GPT-6 Luna — $0.10/$0.50 за MTok, окно 872K (единственная модель бесплатного режима, на ней же идут служебные вызовы) |
 | `/flash [chat_id]` | Gemini 3.8 Flash — $0.75/$3.75, окно 1M (дефолт платного режима) |
 | `/argon [chat_id]` | Gemini 4 Argon — $2/$10, окно 1M (платный режим) |
+| `/neon [chat_id]` | Gemini 4 Neon — $3/$15, окно 1M (платный режим; цена пула пока оценочная) |
 | `/argon_g [chat_id]` | Gemini 4 Argon напрямую у Google — прайс Google +10%: $2.2/$11 (с 01.12.2026 — $4.4/$22); модель дневного обзора |
+| `/neon_g [chat_id]` | Gemini 4 Neon напрямую у Google — прайс Google +10%: $3.3/$16.5 |
 | `/flash_g [chat_id]` | Gemini 3.8 Flash напрямую у Google — $0.825/$4.125 (с 01.01.2027 — $1.65/$8.25) |
 | `/lite [chat_id]` | Gemini 3.1 Flash-Lite напрямую у Google — $0.275/$1.65 |
 
 С 2026-10-28 пул не отдаёт модели Anthropic: `/haiku` `/sonnet` `/opus` `/fable` остались заглушками
 (подсказка выбрать модель в `/models`). `/lite` с v2.17.0 снова модель — Gemini 3.1 Flash-Lite напрямую у Google (пул её убрал 2026-11-14). Если модель
-чата упала, ответ даёт другой поставщик: Luna и Flash → Gemini 3.8 Flash напрямую у Google, Argon → Argon у Google, модели
-`/argon_g` `/flash_g` `/lite` → та же модель через пул; в `/cost` такие строки с меткой
+чата упала, ответ даёт другой поставщик: Luna и Flash → Gemini 3.8 Flash напрямую у Google, Argon → Argon и Neon → Neon у Google, модели
+`/argon_g` `/neon_g` `/flash_g` `/lite` → та же модель через пул; в `/cost` такие строки с меткой
 `*_fallback`. Голосовые расшифровывает Gemini 3.8 Flash; если пул не отвечает — Gemini 3.1 Flash-Lite напрямую через Google
 (метка `voice_fallback`).
 
