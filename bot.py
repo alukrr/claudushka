@@ -3430,7 +3430,9 @@ def _dedup_auto_run_sync(budget: float, stop_event) -> dict:
         return stats
     calib = dm.load_calibration().get(DEDUP_AUTO_MODEL_ID)
     client, dstate = _DedupClientShim(), {"no_fallback": True}
-    results, spent, consecutive = [], 0.0, 0
+    results, spent, acc, consecutive = [], 0.0, 0.0, 0
+    ctx = usage_ctx.get()
+    pay_chat, since_ts = (ctx[0] if ctx else None), int(time.time())
     conn = db.get_conn()
     try:
         for i, p in enumerate(plan):
@@ -3450,7 +3452,11 @@ def _dedup_auto_run_sync(budget: float, stop_event) -> dict:
                 continue
             res = got[0]
             results.append(res)
-            spent += res.cost or 0.0
+            # Бюджет — по ФАКТИЧЕСКОМУ расходу (usage_log: при фолбэке на Google цена +10% к прайсу пула, который знает dm.PRICING);
+            # накопленная оценка ядра — запасной вариант, если строк в usage_log нет.
+            acc += res.cost or 0.0
+            real = _dedup_auto_spent(pay_chat, since_ts)[1] if pay_chat is not None else 0.0
+            spent = max(acc, real)
             stats["processed"] += 1
             k, n_before = g.key, len(res.facts_before)
             if res.status == "error":

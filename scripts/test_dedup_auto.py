@@ -233,6 +233,20 @@ def test_budget_stops_and_leaves_rest_untouched(env):
     assert {k[0] for k in due_keys()} == {U2, U3}
 
 
+def test_budget_uses_real_usage_log_cost(env, monkeypatch):
+    """Стенд 2026-11-19: цена ядра — по прайсу пула, при фолбэке на Google реальный расход на 10% выше → потолок $2 превышался.
+    Бюджет теперь — max(оценка ядра, usage_log)."""
+    ins(U1, 30)
+    ins(U2, 20)
+    token = bot.usage_ctx.set((ADMIN, "private", ADMIN))
+    monkeypatch.setattr(db, "usage_label_sum", lambda label, chat_id, since=0: (1, 5.0) if label == "memory_dedup_fallback" else (0, 0.0))
+    try:
+        st = go(env, budget=2.0)                 # ядро насчитало копейки, а в usage_log уже $5 → второй набор ждёт
+    finally:
+        bot.usage_ctx.reset(token)
+    assert st["processed"] == 1 and st["left"] == 1 and len(env.calls) == 1
+
+
 def test_three_errors_in_a_row_abort(env):
     for u in (U1, U2, U3):
         ins(u, 12)
