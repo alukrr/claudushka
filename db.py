@@ -1,3 +1,4 @@
+import math
 import sqlite3
 import time
 import logging
@@ -312,6 +313,21 @@ def init_db():
             PRIMARY KEY (broadcast_id, chat_id)
         );
 
+        -- Автодедупликация памяти (docs/claude/memory.md → «Автоматическая дедупликация»): когда группа фактов проверена в последний раз.
+        -- chat_key = COALESCE(memory.chat_id, 0): личные факты (chat_id NULL) — 0. Чистится вместе с памятью человека (clear_memory, forget_apply).
+        CREATE TABLE IF NOT EXISTS memory_dedup_state (
+            user_id INTEGER NOT NULL,
+            context TEXT NOT NULL,
+            chat_key INTEGER NOT NULL,
+            tier TEXT NOT NULL,
+            checked_at INTEGER NOT NULL,
+            facts_before INTEGER NOT NULL,
+            facts_after INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            cost_usd REAL,
+            PRIMARY KEY (user_id, context, chat_key, tier)
+        );
+
         CREATE TABLE IF NOT EXISTS daily_usage (
             day TEXT NOT NULL,
             chat_id INTEGER NOT NULL,
@@ -577,6 +593,52 @@ def usage_label_sum(label: str, chat_id: int, since_ts: int = 0) -> tuple[int, f
                            (label, chat_id, since_ts)).fetchone()
     conn.close()
     return n, float(cost)
+
+
+def dedup_state_put(user_id: int, context: str, chat_id, tier: str, checked_at: int, facts_before: int, facts_after: int,
+                    status: str, cost_usd: float | None = None) -> None:
+    """Отметка «группа проверена» (автодедуп). chat_id — как в memory (None для личных). Перезаписывает прежнюю."""
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_dedup_state (user_id, context, chat_key, tier, checked_at, facts_before, facts_after, "
+            "status, cost_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, context, chat_id or 0, tier or "long", int(checked_at), int(facts_before), int(facts_after), status, cost_usd))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def dedup_due_groups(min_facts: int, min_new: int, new_ratio: float, now: int | None = None) -> list[tuple]:
+    """Группы живых фактов, которые пора проверять автодедупом: [((user_id, context, chat_id|None, tier), новых, первый_раз)], по числу
+    новых по убыванию. Условие: живых фактов >= min_facts И (отметки нет ИЛИ фактов с created_at > checked_at >= max(min_new,
+    ceil(new_ratio × facts_after))). «Живой» — как у бота при чтении: expires_at пуст или в будущем."""
+    now = int(time.time()) if now is None else now
+    conn = get_conn()
+    try:
+        rows = conn.execute("SELECT user_id, context, chat_id, COALESCE(tier, 'long') AS tier, created_at FROM memory "
+                            "WHERE expires_at IS NULL OR expires_at > ?", (now,)).fetchall()
+        state = {(r["user_id"], r["context"], r["chat_key"], r["tier"]): (r["checked_at"], r["facts_after"])
+                 for r in conn.execute("SELECT user_id, context, chat_key, tier, checked_at, facts_after FROM memory_dedup_state")}
+    finally:
+        conn.close()
+    groups: dict = {}
+    for r in rows:
+        groups.setdefault((r["user_id"], r["context"], r["chat_id"], r["tier"]), []).append(r["created_at"])
+    out = []
+    for key, created in groups.items():
+        if len(created) < min_facts:
+            continue
+        st = state.get((key[0], key[1], key[2] or 0, key[3]))
+        if st is None:
+            out.append((key, len(created), True))
+            continue
+        checked_at, after = st
+        new = sum(1 for c in created if c > checked_at)
+        if new >= max(min_new, math.ceil(new_ratio * after)):
+            out.append((key, new, False))
+    out.sort(key=lambda t: (-t[1], t[0][0], t[0][1], t[0][2] or 0, t[0][3]))
+    return out
 
 
 def clear_conversation(user_id: int):
@@ -1037,6 +1099,8 @@ def clear_memory(user_id: int, context: str = None):
         conn.execute("DELETE FROM memory WHERE user_id = ? AND context = ?", (user_id, context))
     else:
         conn.execute("DELETE FROM memory WHERE user_id = ?", (user_id,))
+    conn.execute("DELETE FROM memory_dedup_state WHERE user_id = ?" + (" AND context = ?" if context else ""),
+                 (user_id, context) if context else (user_id,))
     conn.commit()
     conn.close()
     clear_profile_data(user_id, context)  # профиль и предложения — часть «памяти» человека (/forget)
@@ -1108,6 +1172,12 @@ def forget_apply(user_id: int, context: str | None, chat_id=None, keep_ids=(), c
                 chunk = pids[i:i + 500]
                 conn.execute(f"DELETE FROM profile_proposals WHERE user_id = ? AND id IN ({','.join('?' * len(chunk))})",
                              (user_id, *chunk))
+            # Отметки автодедупа области: группа после /forget другая (остались «сувениры»), её история проверок не нужна.
+            _mem_w, _prof_w, _args = _forget_where(context, chat_id)
+            conn.execute("DELETE FROM memory_dedup_state WHERE user_id = ?" + (
+                " AND context = 'private'" if context == "private" else
+                " AND context = 'group' AND chat_key = ?" if context == "group" else ""),
+                (user_id, *_args))
             if clear_thread:
                 conn.execute("DELETE FROM conversations WHERE user_id = ?", (user_id,))
             conn.commit()

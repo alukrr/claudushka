@@ -7,6 +7,7 @@ services:
       - ./bot.py:/app/bot.py
       - ./api_errors.py:/app/api_errors.py
       - ./db.py:/app/db.py
+      - ./dedup_memory.py:/app/dedup_memory.py
       - ./personas:/app/personas
       - ./miniapp:/app/miniapp
       - ./requirements.txt:/app/requirements.txt
@@ -40,6 +41,7 @@ services:
       - ./whatsapp.py:/app/whatsapp.py
       - ./api_errors.py:/app/api_errors.py
       - ./db.py:/app/db.py
+      - ./dedup_memory.py:/app/dedup_memory.py
       - ./personas:/app/personas
       - ./requirements.txt:/app/requirements.txt
       - ./data:/app/data
