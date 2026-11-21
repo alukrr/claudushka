@@ -14,3 +14,10 @@
 {$CLAUDUSHKA_TEST_PUBLIC_HOST} {
 	reverse_proxy claudushka-test:8090
 }
+
+# eve-mcp (репо alukrr/eve, ~/eve-mcp): MCP-сервер EVE Online, добавлен 2026-11-21.
+# Хост записан буквально, а не через {$...} из .env: новая переменная в .env подхватывается только при пересоздании
+# edge-caddy (простой TLS для всех сайтов), а буквальный хост применяется `caddy reload` без простоя.
+eve.alukr.de {
+	reverse_proxy eve-mcp:8000
+}

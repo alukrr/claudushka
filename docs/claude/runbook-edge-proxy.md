@@ -28,10 +28,19 @@
     dnd.alukr.de               → dnd-mcp:8000            (dnd-mcp подключён к сети edge)
     claudushka.alukr.de        → claudushka:8090         (появится с feat/miniapp)
     claudushka-test.alukr.de   → claudushka-test:8090    (стенд)
+    eve.alukr.de               → eve-mcp:8000            (добавлен 2026-11-21, репо alukrr/eve)
 ```
 Файлы стека — в репозитории Клодушки, `infra/edge/` (`docker-compose.yml`, `Caddyfile`, `.env.example`); на сервере
 запускается ТОЛЬКО из `~/claudushka/infra/edge/` (не из `~/claudushka-test`). `infra/edge/.env` с именами хостов — не в git
 (`.gitignore`). Имя compose-проекта зафиксировано `name: edge`.
+
+## Добавить сайт без простоя (как eve.alukr.de, 2026-11-21)
+`Caddyfile` смонтирован в контейнер одиночным файлом: `git pull` заменяет файл (новый inode), и контейнер продолжает видеть
+старый. Поэтому: коммит в main → на сервере `git fetch`, проверить, что `HEAD..origin/main` — только этот коммит, записать
+содержимое поверх того же файла (`git show origin/main:infra/edge/Caddyfile > /tmp/cf && cat /tmp/cf > infra/edge/Caddyfile`),
+`git reset --mixed origin/main` (рабочая копия чистая), затем
+`docker exec edge-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile`. Невалидный конфиг reload не
+примет — продолжит работать старый. Хост писать буквально: новая переменная в `infra/edge/.env` требует пересоздания контейнера.
 
 ## Шаги
 0. **Подготовить файлы** (исполнитель, коммит в репо Клодушки, ветка `infra/edge`): 
