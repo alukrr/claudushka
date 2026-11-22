@@ -205,3 +205,14 @@ def test_speaker_card_limit_and_empty(tmpdb):
     assert card.startswith("Сейчас пишет Аня.") and len(card) <= bot.PROFILE_SPEAKER_MAX_CHARS
     assert "Как общаться: на «ты», без мата" in card
     assert bot.service_block(speaker_profile=card).count("Сейчас пишет") == 1
+
+
+def test_speaker_card_nick_and_profile_name(tmpdb):
+    _set("name", "Дима")
+    _set("city", "Гамбург")
+    card = bot.speaker_profile_card(U, CHAT, "dimon_77")
+    assert card.startswith("Сейчас пишет dimon_77 (по профилю — Дима). Проверенный профиль автора в этом чате: ")
+    assert "Его" not in card
+    # ник совпал с именем (без регистра) — без скобок; нет ника в чате — имя из профиля
+    assert bot.speaker_profile_card(U, CHAT, "дима").startswith("Сейчас пишет дима. ")
+    assert bot.speaker_profile_card(U, CHAT, "").startswith("Сейчас пишет Дима. ")

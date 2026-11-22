@@ -2619,8 +2619,13 @@ def speaker_profile_card(user_id: int, chat_id: int, display_name: str = "") -> 
         return ""
     if not prof:
         return ""
-    name = prof.get("name") or display_name or "автор сообщения"
-    head = f"Сейчас пишет {name}. Его проверенный профиль в этом чате: "
+    # Подпись в переписке (ник) — первой: по ней модель узнаёт человека в транскрипте; имя из профиля — в скобках
+    pname, shown = prof.get("name"), (display_name or "").strip()
+    if shown and pname and pname.strip().lower() != shown.lower():
+        who = f"{shown} (по профилю — {pname})"
+    else:
+        who = shown or pname or "автор сообщения"
+    head = f"Сейчас пишет {who}. Проверенный профиль автора в этом чате: "
     tail = " Обращайся так, как в профиле; пожелания из «Как общаться» соблюдай."
     room = PROFILE_SPEAKER_MAX_CHARS - len(head) - len(tail) - 1
     parts, used = [], 0
