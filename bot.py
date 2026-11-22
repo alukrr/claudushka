@@ -2605,6 +2605,37 @@ def _persona_text(persona_key: str, is_group: bool) -> str:
 
 
 PROFILE_BLOCK_MAX_CHARS = 8000  # блок профилей в system — под лимитом размера (docs/claude/memory.md)
+PROFILE_SPEAKER_MAX_CHARS = 600  # карточка автора в хвосте группового запроса (service_block), лимит по РАЗМЕРУ
+
+
+def speaker_profile_card(user_id: int, chat_id: int, display_name: str = "") -> str:
+    """Карточка того, кто пишет, для хвоста группового запроса: проверенный профиль в ЭТОМ чате или "" (пуст).
+    Только группа; личка — профиль один и уже в system. Лимит PROFILE_SPEAKER_MAX_CHARS (по полям целиком,
+    не рвём значение посередине). Изменчивое — в system не кладём (docs/claude/prompt-cache.md)."""
+    try:
+        prof = db.get_profile(user_id, "group", chat_id)
+    except Exception:
+        logger.exception("speaker_profile_card: не прочитать профиль")
+        return ""
+    if not prof:
+        return ""
+    name = prof.get("name") or display_name or "автор сообщения"
+    head = f"Сейчас пишет {name}. Его проверенный профиль в этом чате: "
+    tail = " Обращайся так, как в профиле; пожелания из «Как общаться» соблюдай."
+    room = PROFILE_SPEAKER_MAX_CHARS - len(head) - len(tail) - 1
+    parts, used = [], 0
+    # имя и «как общаться» — первыми: при нехватке места отбрасываются остальные поля, а не пожелания
+    order = [f for f in ("name", "communication") if f in prof] + [f for f in prof if f not in ("name", "communication")]
+    for f in order:
+        item = f"{db.PROFILE_LABELS[f]}: {prof[f]}"
+        add = len(item) + (2 if parts else 0)
+        if used + add > room:
+            if not parts:
+                parts.append(item[:max(room, 0)])
+            break
+        parts.append(item)
+        used += add
+    return head + "; ".join(parts) + "." + tail
 
 
 def _profile_text(user_id: int, is_group: bool, chat_id: int | None) -> str:
@@ -2743,9 +2774,19 @@ def _bot_reply_quote(text: str) -> str:
     return f"(это твоё собственное сообщение) {text}"
 
 
+def _speaker_card(update, user_id: int, is_group: bool, chat_id: int) -> str:
+    """Карточка автора текущего сообщения для service_block (только группа, профиль этого чата не пуст)."""
+    if not is_group:
+        return ""
+    u = update.effective_user
+    name = db.get_last_sender_name(chat_id, user_id) or (u.full_name if u else "") or ""
+    return speaker_profile_card(user_id, chat_id, name)
+
+
 def service_block(*, reply_context: str = "", search_query: str = "", search_results: str = "",
                   topup_hint: bool = False, draw_intent: bool = False, draw_size: str | None = None,
-                  spontaneous: bool = False, trigger: str = "", image_reply: bool = False) -> str:
+                  spontaneous: bool = False, trigger: str = "", image_reply: bool = False,
+                  speaker_profile: str = "") -> str:
     """Изменчивый контекст запроса (время, reply, результаты поиска) — в хвост, в последний
     user-turn, а не в system: иначе он ломает префикс кэша. В БД НЕ сохраняется (в
     conversations/group_messages идёт только текст пользователя). reply_context передавать
@@ -2777,6 +2818,8 @@ def service_block(*, reply_context: str = "", search_query: str = "", search_res
             "«перерисую» или «сейчас исправлю» без маркера: другого хода у тебя не будет, картинка не появится. "
             "Если перерисовывать не просят — просто ответь."
         )
+    if speaker_profile and not spontaneous:
+        lines.append(speaker_profile[:PROFILE_SPEAKER_MAX_CHARS])   # карточка автора (группа), docs/claude/profile.md
     if spontaneous:
         lines.append(
             "Тебя сейчас не звали. Если хочешь — вставь одну-две короткие реплики как участник беседы, по делу или "
@@ -2872,10 +2915,15 @@ PROFILE_UPDATES_RULES = (
     "предложено и ждёт подтверждения). Если человек ЯВНО и устойчиво заявил о СЕБЕ что-то из полей профиля, "
     "добавь в profile_updates: [{\"field\": \"city\", \"value\": \"Гамбург\", \"evidence\": \"короткая цитата\"}]. "
     "Поля: name (как зовут / как обращаться), gender, nicknames, birth_year (ГОД рождения, не возраст: «мне 40» в "
-    "{year} → {year_40}; если неточно — «≈{year_40}»), city (где человек постоянно живёт), profession, hobbies, "
+    "{year} → {year_40}; если неточно — «≈{year_40}»; предлагай год ТОЛЬКО если из цитаты ясно, что речь о возрасте "
+    "человека, а не о числе вообще), city (где человек постоянно живёт), profession, hobbies, "
     "family, communication (как человек просит с ним общаться). Только явное устойчивое заявление о себе; отпуск, "
     "поездка, командировка, «сейчас в…», гости — НИКОГДА; при сомнении не предлагай. Не повторяй то, что уже есть в "
     "профиле или ожидает подтверждения. value — коротко (до 200 символов), evidence — цитата из чата. "
+    "Поля-списки (nicknames, hobbies, family, communication): value — только НОВОЕ, чего ещё нет в профиле; оно "
+    "ДОБАВИТСЯ к имеющемуся, текущие значения не повторяй. Только если человек явно отменил старое («развелась», "
+    "«бросил шахматы», «больше не…») и это видно из цитаты — добавь \"op\": \"replace\" и в value полное новое "
+    "значение поля целиком. Остальные поля заменяются. "
     "Нечего предложить — profile_updates пустой."
 )
 PROFILE_PROMPT_MAX_CHARS = 6000  # текущие профили в запросе извлечения — под лимитом размера
@@ -7366,8 +7414,8 @@ ADMIN_HELP = """\
   В бесплатном режиме характер меняется сам раз в сутки (без flirt); выбор админа сохраняется и включится после пополнения.
 
 Профили (только в личке; бот предлагает изменения, раз в неделю — вс 19:00 Berlin — шлёт .md):
-  /profile_ok <N>          — подтвердить ВСЕ ещё не решённые предложения дайджеста N
-  /profile_no <N>          — отклонить их все
+  /profile_ok <N> [id …]   — подтвердить ВСЕ ещё не решённые предложения дайджеста N (с id — только эти строки)
+  /profile_no <N> [id …]   — отклонить их все (с id — только эти строки)
   /profile_digest          — собрать и прислать дайджест прямо сейчас (для теста)
   Править по одному / вручную — dedup, экран «Профили» (клавиша F9 или f)
 
@@ -7770,20 +7818,27 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _send_memory(update: Update, long_limit: int, medium_limit: int, header: str, label: str) -> None:
     try:
         is_group = update.effective_chat.type in ("group", "supergroup")
+        uid = update.effective_user.id
         if is_group:
-            facts = db.get_memory(update.effective_user.id, "group", update.effective_chat.id,
+            facts = db.get_memory(uid, "group", update.effective_chat.id,
                                    long_limit=long_limit, medium_limit=medium_limit)
+            prof = db.get_profile(uid, "group", update.effective_chat.id)
         else:
-            facts = db.get_memory_for_private(update.effective_user.id,
-                                               long_limit=long_limit, medium_limit=medium_limit)
+            facts = db.get_memory_for_private(uid, long_limit=long_limit, medium_limit=medium_limit)
+            prof = db.get_profile(uid, "private", 0)
+        reply = update.effective_message.reply_text
+        # Профиль — перед фактами и без сворачивания (он короткий, до 1200 знаков)
+        if prof:
+            lines = [f"{db.PROFILE_LABELS[f]}: {v}" for f, v in prof.items()]
+            await reply("Профиль (проверен):\n" + "\n".join(lines))
         if facts:
             # Даже с потолком список фактов — простыня, которая раньше валилась в чат
             # целиком; сворачиваем тегом <blockquote expandable> (найдено 2026-08-31,
             # "потестировал на себе, засрал чат").
             body = "\n".join(f"• {f}" for f in facts)
-            await reply_expandable(update.effective_message.reply_text, body, header=header)
-        else:
-            await update.effective_message.reply_text("Пока ничего не помню. Поговорим — запомню!")
+            await reply_expandable(reply, body, header=header)
+        elif not prof:
+            await reply("Пока ничего не помню. Поговорим — запомню!")
     except Exception as e:
         await api_errors.reply_api_error(
             update.effective_message.reply_text, e, context_label=label,
@@ -8497,7 +8552,8 @@ def format_profile_digest(digest_id: int, rows: list, day: str) -> str:
     out = [f"# Профили: предложения за неделю ({day})", "",
            f"Дайджест **#{digest_id}** · предложений: {len(rows)}", "",
            f"Подтвердить всё: `/profile_ok {digest_id}` · отклонить всё: `/profile_no {digest_id}` · "
-           f"править по одному — dedup, экран «Профили» (F9).", ""]
+           f"только часть строк: `/profile_ok {digest_id} <id> <id>` / `/profile_no {digest_id} <id>` (id — последний "
+           f"столбец) · править по одному — dedup, экран «Профили» (F9). «＋» — добавляется к текущему значению.", ""]
     chats: dict = {}
     for r in rows:
         key = ("Личные чаты", True) if r["context"] == "private" else (r["chat_name"] or f"чат {r['chat_id']}", False)
@@ -8511,7 +8567,9 @@ def format_profile_digest(digest_id: int, rows: list, day: str) -> str:
             out.append("|---|---|---|---|---|" if with_ev else "|---|---|---|---|")
             for r in items:
                 label = db.PROFILE_LABELS.get(r["field"], r["field"])
-                cells = [label, _md_cell(r["old_value"]), _md_cell(r["new_value"])]
+                cur = r.get("current_value")
+                after = db.profile_after_marked(cur, r.get("result_value") or r["new_value"])
+                cells = [label, _md_cell(cur), _md_cell(after)]
                 if with_ev:
                     cells.append(_md_cell(r["evidence"]))
                 cells.append(str(r["id"]))
@@ -8531,7 +8589,8 @@ async def send_profile_digest(bot) -> str:
     people = len({(r["user_id"], r["context"], r["chat_id"]) for r in rows})
     chats = len({(r["context"], r["chat_id"]) for r in rows})
     caption = (f"Профили: {len(rows)} предложений, {people} чел. в {chats} чатах. "
-               f"Всё верно — /profile_ok {digest_id}, отклонить — /profile_no {digest_id}.")
+               f"Всё верно — /profile_ok {digest_id}, отклонить — /profile_no {digest_id}; "
+               f"часть строк — /profile_ok {digest_id} <id…>.")
     sent = 0
     for admin_id in ADMIN_IDS:
         try:
@@ -8573,10 +8632,11 @@ async def _profile_decide(update: Update, context: ContextTypes.DEFAULT_TYPE, ap
     cmd = "/profile_ok" if approve else "/profile_no"
     try:
         digest_id = int(context.args[0])
+        ids = [int(x) for x in context.args[1:]] or None
     except (IndexError, ValueError):
-        await update.message.reply_text(f"Формат: {cmd} <номер дайджеста>")
+        await update.message.reply_text(f"Формат: {cmd} <номер дайджеста> [<id строки> …]")
         return
-    rep = await asyncio.to_thread(db.decide_digest, digest_id, approve, update.effective_user.id)
+    rep = await asyncio.to_thread(db.decide_digest, digest_id, approve, update.effective_user.id, ids)
     if rep.get("moved_to"):
         await update.message.reply_text(f"Дайджест #{digest_id} устарел, его нерешённые предложения перенесены в "
                                         f"#{rep['moved_to']}. Решай по {cmd} {rep['moved_to']}.")
@@ -8586,6 +8646,8 @@ async def _profile_decide(update: Update, context: ContextTypes.DEFAULT_TYPE, ap
         return
     done = rep["approved"] if approve else rep["rejected"]
     text = f"{'Подтверждено' if approve else 'Отклонено'} {done}, уже решено {rep['already']}."
+    if rep.get("unknown"):
+        text += " Нет в дайджесте #%d: %s." % (digest_id, ", ".join(map(str, rep["unknown"])))
     if rep["failed"]:
         text += f" Не применено {len(rep['failed'])}: " + "; ".join(sorted({w for _, w in rep["failed"]}))
     await update.message.reply_text(text)
@@ -9617,7 +9679,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 full_prompt += f"\n\n[Файл обрезан: показано 8000 из {len(file_text)} символов]"
 
             system = build_system(user_id, is_group, chat_id if is_group else None)
-            doc_history = with_service_block([{"role": "user", "content": full_prompt}], service_block())
+            doc_history = with_service_block([{"role": "user", "content": full_prompt}], service_block(
+                speaker_profile=_speaker_card(update, user_id, is_group, chat_id)))
 
             _model = get_chat_model(chat_id)
             logger.info(
@@ -9677,7 +9740,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
 
             system = build_system(user_id, is_group, chat_id if is_group else None)
-            vision_messages = with_service_block(vision_messages, service_block())
+            vision_messages = with_service_block(vision_messages, service_block(
+                speaker_profile=_speaker_card(update, user_id, is_group, chat_id)))
             _model = get_chat_model(chat_id)
             logger.info(
                 f"PROMPT uid={user_id} chat={chat_id} model={_model} kind=photo "
@@ -9768,12 +9832,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # assistant перед ним. В группе reply_context уже inline в build_group_messages.
         base_messages = messages
         topup_hint = _free_search_hint(chat_id, bool(search_results))
+        speaker_card = _speaker_card(update, user_id, is_group, chat_id)
 
         def compose(sq: str, sr: str, msgs: list | None = None) -> list:
             return mark_cache_tail(with_service_block(base_messages if msgs is None else msgs, service_block(
                 reply_context="" if is_group else reply_context,
                 search_query=sq, search_results=sr, topup_hint=topup_hint,
                 draw_intent=draw_intent, draw_size=intent_size, image_reply=reply_to_own_image,
+                speaker_profile=speaker_card,
             )))
 
         messages = compose(search_query, search_results)
