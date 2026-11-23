@@ -1,4 +1,5 @@
 import math
+import re
 import sqlite3
 import time
 import logging
@@ -416,6 +417,9 @@ def init_db():
         # Токены thinking (usage.output_tokens_details.thinking_tokens) — входят в output,
         # отдельно только для видимости доли thinking в расходах.
         "ALTER TABLE usage_log ADD COLUMN thinking INTEGER NOT NULL DEFAULT 0",
+        # v2.20.0 (профиль v2): add|replace для предложений профиля; NULL у старых строк = умолчание поля.
+        # На свежей базе таблицы ещё нет — ALTER молча падает, колонку даёт CREATE в _mig_profile.
+        "ALTER TABLE profile_proposals ADD COLUMN op TEXT",
     ]:
         try:
             conn.execute(migration)
@@ -747,6 +751,8 @@ PROFILE_LABELS = {
 PROFILE_VALUE_MAX = 200     # символов в одном значении
 PROFILE_TOTAL_MAX = 1200    # символов значений на один профиль
 PROFILE_EVIDENCE_MAX = 200
+# Многозначные поля: предложение ДОПОЛНЯЕТ значение (op=add), а не заменяет (v2.20.0, docs/claude/profile.md).
+PROFILE_LIST_FIELDS = ("nicknames", "hobbies", "family", "communication")
 
 
 def _mig_profile(conn: sqlite3.Connection) -> None:
@@ -764,7 +770,8 @@ def _mig_profile(conn: sqlite3.Connection) -> None:
             field TEXT NOT NULL, old_value TEXT, new_value TEXT NOT NULL,
             evidence TEXT,
             created_at INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
-            digest_id INTEGER, decided_at INTEGER, decided_by INTEGER
+            digest_id INTEGER, decided_at INTEGER, decided_by INTEGER,
+            op TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_profile_prop_status ON profile_proposals(status, digest_id);
         CREATE INDEX IF NOT EXISTS idx_profile_prop_user ON profile_proposals(user_id, context, chat_id, field);
@@ -775,8 +782,8 @@ def profile_chat_id(context: str, chat_id) -> int:
     return 0 if context == "private" else int(chat_id or 0)
 
 
-def normalize_profile_value(field: str, value) -> str | None:
-    """Чистое значение поля или None (мусор). birth_year — ГОД (опц. «≈»), не возраст."""
+def _clean_profile_value(field: str, value) -> str | None:
+    """Чистое значение поля БЕЗ обрезки по длине или None (мусор). birth_year — ГОД (опц. «≈»), не возраст."""
     if field not in PROFILE_FIELDS or not isinstance(value, (str, int)):
         return None
     v = " ".join(str(value).split()).strip()
@@ -788,7 +795,63 @@ def normalize_profile_value(field: str, value) -> str | None:
         if not digits.isdigit() or not (1900 <= int(digits) <= time.localtime().tm_year):
             return None
         return ("≈" if approx else "") + digits
-    return v[:PROFILE_VALUE_MAX]
+    return v
+
+
+def normalize_profile_value(field: str, value) -> str | None:
+    """Чистое значение поля или None (мусор); значение от модели режется до PROFILE_VALUE_MAX."""
+    v = _clean_profile_value(field, value)
+    return v if v is None or field == "birth_year" else v[:PROFILE_VALUE_MAX]
+
+
+def _profile_items(text: str) -> list[tuple[str, str]]:
+    """[(ключ для сравнения, элемент как написан)] — части по `;` и `,`; ключ без регистра и лишних пробелов."""
+    out = []
+    for part in re.split(r"[;,]", text or ""):
+        p = " ".join(part.split())
+        if p:
+            out.append((p.lower(), p))
+    return out
+
+
+def profile_merge(current: str, item: str) -> str:
+    """Склейка многозначного поля (чистая функция, без БД). current — значение сейчас, item — предложенное.
+
+    Все элементы item уже в current -> current. item содержит все элементы current (модель дала полный список)
+    -> item. Иначе current + "; " + то, чего в current нет (при полном отсутствии общего — item как написан).
+    """
+    cur, new = _profile_items(current), _profile_items(item)
+    if not cur:
+        return (item or "").strip()
+    if not new:
+        return current
+    cur_keys, new_keys = {k for k, _ in cur}, {k for k, _ in new}
+    if new_keys <= cur_keys:
+        return current
+    if cur_keys <= new_keys:
+        return item.strip()
+    if not (cur_keys & new_keys):
+        return current.rstrip().rstrip(";,").rstrip() + "; " + item.strip()
+    return current.rstrip().rstrip(";,").rstrip() + "; " + "; ".join(t for k, t in new if k not in cur_keys)
+
+
+def profile_after_marked(current: str | None, result: str) -> str:
+    """«Стало» для дайджеста/TUI: результат с пометкой «＋» перед добавленными элементами (результат склейки
+    начинается с текущего значения). Без текущего или при замене — как есть; ничего нового — «(уже есть)»."""
+    if not current:
+        return result
+    if result == current:
+        return f"{current} (уже есть)"
+    if result.startswith(current + "; "):
+        return f"{current}; ＋{result[len(current) + 2:]}"
+    return result
+
+
+def profile_op(field: str, op) -> str:
+    """Эффективный op: многозначное поле — add (replace только явный), остальные — всегда replace."""
+    if field not in PROFILE_LIST_FIELDS:
+        return "replace"
+    return "replace" if op == "replace" else "add"
 
 
 class _Conn:
@@ -850,8 +913,11 @@ def get_pending_map(context: str, chat_id, conn=None) -> dict:
 def add_profile_proposals(user_id: int, context: str, chat_id, updates: list, conn=None) -> dict:
     """Сохранить предложения модели. -> счётчики {new, same, superseded, bad}.
 
-    То же значение, что в профиле или уже ожидающее по этому полю -> ничего; иначе новое pending,
-    старое pending по этому полю -> superseded. Неизвестное поле/мусор отбрасываются с warning.
+    Многозначные поля (PROFILE_LIST_FIELDS) по умолчанию op=add: предложение ДОПОЛНЯЕТ значение (склейка
+    `profile_merge` — при approve поверх ТЕКУЩЕГО). Все элементы уже в профиле -> same. Уже висит pending по полю ->
+    не теряем: новое pending со склейкой, старое -> superseded. replace (и все однозначные поля): то же значение,
+    что в профиле или в pending -> ничего; иначе новое pending, старое -> superseded. Неизвестное поле/мусор
+    отбрасываются с warning.
     """
     cid = profile_chat_id(context, chat_id)
     res = {"new": 0, "same": 0, "superseded": 0, "bad": 0}
@@ -870,36 +936,63 @@ def add_profile_proposals(user_id: int, context: str, chat_id, updates: list, co
             if value is None:
                 res["bad"] += 1
                 continue
+            op = profile_op(field, u.get("op"))
             ev = u.get("evidence")
             ev = " ".join(str(ev).split())[:PROFILE_EVIDENCE_MAX] if ev else None
             cur = c.execute("SELECT value FROM user_profile WHERE user_id=? AND context=? AND chat_id=? AND field=?",
                             (user_id, context, cid, field)).fetchone()
-            pend = c.execute("SELECT id, new_value FROM profile_proposals WHERE user_id=? AND context=? AND chat_id=? "
-                             "AND field=? AND status='pending'", (user_id, context, cid, field)).fetchall()
-            if cur and cur["value"] == value:
-                # модель подтвердила ТЕКУЩЕЕ значение — висящие предложения с другим значением устарели
-                for p in pend:
-                    c.execute("UPDATE profile_proposals SET status='superseded', decided_at=? WHERE id=?", (now, p["id"]))
-                    res["superseded"] += 1
-                res["same"] += 1
-                continue
-            if any(p["new_value"] == value for p in pend):
-                res["same"] += 1
-                continue
+            pend = c.execute("SELECT id, new_value, op, evidence FROM profile_proposals WHERE user_id=? AND context=? "
+                             "AND chat_id=? AND field=? AND status='pending' ORDER BY id",
+                             (user_id, context, cid, field)).fetchall()
+            new_value, new_op = value, op
+            if op == "add":
+                if cur and profile_merge(cur["value"], value) == cur["value"]:
+                    res["same"] += 1            # всё это в профиле уже есть
+                    continue
+                if pend:
+                    # не теряем висящее: склейка с pending (op старого, если тот replace, иначе add)
+                    last = pend[-1]
+                    new_op = "replace" if profile_op(field, last["op"]) == "replace" else "add"
+                    new_value = profile_merge(last["new_value"], value)
+                    if new_value == last["new_value"]:
+                        res["same"] += 1
+                        continue
+                    old_ev = last["evidence"]
+                    if old_ev and ev and old_ev != ev:
+                        ev = f"{old_ev[:PROFILE_EVIDENCE_MAX // 2 - 2]} / {ev[:PROFILE_EVIDENCE_MAX // 2 - 2]}"
+                    else:
+                        ev = ev or old_ev
+            else:
+                if cur and cur["value"] == value:
+                    # модель подтвердила ТЕКУЩЕЕ значение — висящие предложения с другим значением устарели
+                    for p in pend:
+                        c.execute("UPDATE profile_proposals SET status='superseded', decided_at=? WHERE id=?", (now, p["id"]))
+                        res["superseded"] += 1
+                    res["same"] += 1
+                    continue
+                if any(p["new_value"] == value and profile_op(field, p["op"]) == "replace" for p in pend):
+                    res["same"] += 1
+                    continue
             for p in pend:
                 c.execute("UPDATE profile_proposals SET status='superseded', decided_at=? WHERE id=?", (now, p["id"]))
                 res["superseded"] += 1
             c.execute("INSERT INTO profile_proposals (user_id, context, chat_id, field, old_value, new_value, evidence, "
-                      "created_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
-                      (user_id, context, cid, field, cur["value"] if cur else None, value, ev, now))
+                      "created_at, status, op) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+                      (user_id, context, cid, field, cur["value"] if cur else None, new_value, ev, now, new_op))
             res["new"] += 1
         c.commit()
     return res
 
 
-def _set_field(c, user_id, context, chat_id, field, value, source, by, now) -> str | None:
-    """Записать поле профиля; None — успех, иначе причина отказа."""
-    value = normalize_profile_value(field, value)
+def _set_field(c, user_id, context, chat_id, field, value, source, by, now, strict: bool = False) -> str | None:
+    """Записать поле профиля; None — успех, иначе причина отказа. strict (склейка из approve) — длиннее
+    PROFILE_VALUE_MAX не режем молча, а отказываем: рвать элемент посередине нельзя."""
+    if strict:
+        value = _clean_profile_value(field, value)
+        if value is not None and len(value) > PROFILE_VALUE_MAX:
+            return f"поле переполнено ({len(value)} знаков из {PROFILE_VALUE_MAX}) — сократи в TUI"
+    else:
+        value = normalize_profile_value(field, value)
     if value is None:
         return "некорректное значение"
     cid = profile_chat_id(context, chat_id)
@@ -907,7 +1000,8 @@ def _set_field(c, user_id, context, chat_id, field, value, source, by, now) -> s
         "SELECT value FROM user_profile WHERE user_id=? AND context=? AND chat_id=? AND field != ?",
         (user_id, context, cid, field)))
     if others + len(value) > PROFILE_TOTAL_MAX:
-        return f"профиль длиннее {PROFILE_TOTAL_MAX} символов"
+        return (f"профиль длиннее {PROFILE_TOTAL_MAX} символов" +
+                (f" (было бы {others + len(value)}) — сократи в TUI" if strict else ""))
     c.execute("INSERT INTO user_profile (user_id, context, chat_id, field, value, source, updated_at, updated_by) "
               "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, context, chat_id, field) DO UPDATE SET "
               "value=excluded.value, source=excluded.source, updated_at=excluded.updated_at, updated_by=excluded.updated_by",
@@ -944,18 +1038,25 @@ def apply_profile_ops(ops: list, by: int | None = None, conn=None) -> dict:
                         rep["rejected"] += 1
                         continue
                     override = op[2] if len(op) > 2 else None
-                    if not override:
-                        # профиль изменился после создания предложения (напр. админ поправил в TUI) — не затираем
-                        cur = c.execute("SELECT value FROM user_profile WHERE user_id=? AND context=? AND chat_id=? "
-                                        "AND field=?", (p["user_id"], p["context"], p["chat_id"], p["field"])).fetchone()
-                        cur_v = cur["value"] if cur else None
-                        if cur_v != p["old_value"] and cur_v != p["new_value"]:
-                            rep["failed"].append((op, f"профиль изменился после предложения: было {p['old_value'] or '—'}, "
-                                                      f"сейчас {cur_v or '—'}"))
-                            continue
-                    why = _set_field(c, p["user_id"], p["context"], p["chat_id"], p["field"],
-                                     override if override else p["new_value"],
-                                     "admin" if override else "model", by, now)
+                    cur = c.execute("SELECT value FROM user_profile WHERE user_id=? AND context=? AND chat_id=? "
+                                    "AND field=?", (p["user_id"], p["context"], p["chat_id"], p["field"])).fetchone()
+                    cur_v = cur["value"] if cur else None
+                    adding = (not override) and profile_op(p["field"], p["op"]) == "add"
+                    if adding:
+                        # дополнение кладём поверх ТЕКУЩЕГО значения; проверку «профиль изменился» не делаем
+                        final = profile_merge(cur_v or "", p["new_value"])
+                        why = None if final == cur_v else _set_field(
+                            c, p["user_id"], p["context"], p["chat_id"], p["field"], final, "model", by, now, strict=True)
+                    else:
+                        if not override:
+                            # профиль изменился после создания предложения (напр. админ поправил в TUI) — не затираем
+                            if cur_v != p["old_value"] and cur_v != p["new_value"]:
+                                rep["failed"].append((op, f"профиль изменился после предложения: было {p['old_value'] or '—'}, "
+                                                          f"сейчас {cur_v or '—'}"))
+                                continue
+                        why = _set_field(c, p["user_id"], p["context"], p["chat_id"], p["field"],
+                                         override if override else p["new_value"],
+                                         "admin" if override else "model", by, now)
                     if why:
                         rep["failed"].append((op, why))
                         continue
@@ -1018,7 +1119,9 @@ def list_proposals(status: str = "pending", digest_id: int | None = None, conn=N
     with _Conn(conn) as c:
         rows = c.execute(
             f"""SELECT p.id, p.user_id, p.context, p.chat_id, p.field, p.old_value, p.new_value, p.evidence,
-                       p.created_at, p.digest_id,
+                       p.created_at, p.digest_id, p.op,
+                       (SELECT up.value FROM user_profile up WHERE up.user_id = p.user_id AND up.context = p.context
+                           AND up.chat_id = p.chat_id AND up.field = p.field) AS current_value,
                        COALESCE(u.full_name, '') AS full_name, COALESCE(u.username, '') AS username,
                        COALESCE(ac.name, '') AS chat_name
                 FROM profile_proposals p
@@ -1030,6 +1133,10 @@ def list_proposals(status: str = "pending", digest_id: int | None = None, conn=N
         d = dict(r)
         nm = d["full_name"] or (f"@{d['username']}" if d["username"] else str(d["user_id"]))
         d["user_name"] = nm + (f" (@{d['username']})" if d["username"] and d["full_name"] else "")
+        # что получится после approve: для add — склейка с ТЕКУЩИМ значением (op=NULL у старых строк = умолчание поля)
+        d["eff_op"] = profile_op(d["field"], d["op"])
+        d["result_value"] = (profile_merge(d["current_value"] or "", d["new_value"])
+                             if d["eff_op"] == "add" else d["new_value"])
         out.append(d)
     out.sort(key=lambda d: (d["context"] == "private", d["chat_name"] or str(d["chat_id"]), d["user_name"].lower(),
                             PROFILE_FIELDS.index(d["field"]) if d["field"] in PROFILE_FIELDS else 99, d["id"]))
@@ -1055,9 +1162,10 @@ def list_profiles(conn=None) -> list[dict]:
     return out
 
 
-def decide_digest(digest_id: int, approve: bool, by: int | None = None) -> dict:
-    """Решить ВСЕ ещё pending из дайджеста. -> отчёт apply_profile_ops + "total" (строк в дайджесте);
-    "moved_to": M — номер устарел (нерешённые переехали в #M), ничего не сделано."""
+def decide_digest(digest_id: int, approve: bool, by: int | None = None, ids: list | None = None) -> dict:
+    """Решить ещё pending из дайджеста: ВСЕ (ids=None) или только перечисленные `id` строк. -> отчёт
+    apply_profile_ops + "total" (строк в дайджесте) + "unknown" (ids не из этого дайджеста — не ошибка, в отчёт);
+    "moved_to": M — номер устарел (нерешённые переехали в #M), ничего не сделано. Уже решённые ids -> already."""
     with _Conn() as c:
         # старый номер, чьи нерешённые предложения переехали в новый дайджест, ничего не решает
         moved, seen = digest_id, set()
@@ -1070,14 +1178,21 @@ def decide_digest(digest_id: int, approve: bool, by: int | None = None) -> dict:
         if moved != digest_id and c.execute(
                 "SELECT 1 FROM profile_proposals WHERE digest_id = ? AND status = 'pending'", (moved,)).fetchone():
             return {"approved": 0, "rejected": 0, "set": 0, "deleted": 0, "already": 0, "failed": [],
-                    "total": 1, "moved_to": moved}
-        ids = [r["id"] for r in c.execute("SELECT id FROM profile_proposals WHERE digest_id = ?", (digest_id,))]
-        pend = [r["id"] for r in c.execute("SELECT id FROM profile_proposals WHERE digest_id = ? AND status = 'pending'",
-                                           (digest_id,))]
+                    "total": 1, "moved_to": moved, "unknown": []}
+        rows = c.execute("SELECT id, status FROM profile_proposals WHERE digest_id = ?", (digest_id,)).fetchall()
+        in_digest = {r["id"]: r["status"] for r in rows}
+        if ids is None:
+            chosen = list(in_digest)
+            unknown = []
+        else:
+            chosen = [i for i in dict.fromkeys(ids) if i in in_digest]
+            unknown = [i for i in dict.fromkeys(ids) if i not in in_digest]
+        pend = [i for i in chosen if in_digest[i] == "pending"]
         rep = apply_profile_ops([("approve" if approve else "reject", i) for i in pend], by, conn=c) if pend else \
             {"approved": 0, "rejected": 0, "set": 0, "deleted": 0, "already": 0, "failed": []}
-        rep["already"] += len(ids) - len(pend)
-        rep["total"] = len(ids)
+        rep["already"] += len(chosen) - len(pend)
+        rep["total"] = len(in_digest)
+        rep["unknown"] = unknown
     return rep
 
 

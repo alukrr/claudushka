@@ -959,7 +959,7 @@ class App:
             elif r["kind"] == "prop":
                 p = r["p"]
                 mark = "x" if p["id"] in pf["marked"] else " "
-                text = (f"    [{mark}] {d.PROFILE_LABELS.get(p['field'], p['field'])}: {p['old_value'] or '—'} → {p['new_value']}"
+                text = (f"    [{mark}] {d.PROFILE_LABELS.get(p['field'], p['field'])}: {p.get('current_value') or '—'} → {d.profile_after_marked(p.get('current_value'), p['result_value'])}"
                         f"   (дайджест {p['digest_id'] if p['digest_id'] else 'не было'})")
                 attr = 0
             else:
@@ -1025,7 +1025,7 @@ class App:
                 self.pf_confirm_decide(ids, approve=(k == "y"))
             elif k == K_ENTER and row and row["kind"] == "prop":
                 p = row["p"]
-                self.open_line(p["new_value"], lambda text, p=p: self.pf_edit_done(p, text))
+                self.open_line(p["result_value"], lambda text, p=p: self.pf_edit_done(p, text))
         else:
             if k == K_ENTER and row and row["kind"] == "field":
                 cur = row["rec"]["value"] if row["rec"] else ""
@@ -1050,7 +1050,7 @@ class App:
         d = dm._bot_db()
         for i in ids[:6]:
             p = by_id[i]
-            lines.append(f"· {p['user_name']}: {d.PROFILE_LABELS.get(p['field'], p['field'])} → {p['new_value']}")
+            lines.append(f"· {p['user_name']}: {d.PROFILE_LABELS.get(p['field'], p['field'])} → {d.profile_after_marked(p.get('current_value'), p['result_value'])}")
         if len(ids) > 6:
             lines.append(f"· … и ещё {len(ids) - 6}")
         lines.append("Перед записью — бэкап БД. Запись в боевую базу.")
@@ -1061,7 +1061,7 @@ class App:
         if text is None or not text:
             return
         d = dm._bot_db()
-        override = None if text == p["new_value"] else text
+        override = None if text == p["result_value"] else text
         self.confirm([f"Подтвердить {p['user_name']}: {d.PROFILE_LABELS.get(p['field'], p['field'])} → {text}"
                       + (" (исправлено вами, source=admin)" if override else "") + "?",
                       "Перед записью — бэкап БД. Запись в боевую базу."],
