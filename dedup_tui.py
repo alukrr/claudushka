@@ -197,7 +197,7 @@ class App:
         model = model or self.model
         k = (g.key, model)
         if k not in self.est_cache:
-            self.est_cache[k] = dm.estimate_group(g.facts, model, self.calibs.get(model))
+            self.est_cache[k] = dm.estimate_group(g.facts, model, self.calibs.get(model), g.profile)
         return self.est_cache[k]
 
     def sel_groups(self):
@@ -206,7 +206,7 @@ class App:
 
     def est_total(self, groups, model=None):
         model = model or self.model
-        return dm.estimate_total([g.facts for g in groups], model, self.calibs.get(model))
+        return dm.estimate_total([g.facts for g in groups], model, self.calibs.get(model), [g.profile for g in groups])
 
     # ------------------------------------------------------------ список
     def pass_filter(self, g):
@@ -565,11 +565,14 @@ class App:
         return before, (r.facts_after if (r and r.status in ("ok", "manual")) else None)
 
     @staticmethod
-    def wrap_facts(facts, width):
+    def wrap_facts(facts, width, marked=()):
+        """marked — факты, удалённые моделью «по профилю»: в колонке «было» вместо «•» стоит «✗ профиль»."""
         out = []
         for i, f in enumerate(facts):
-            parts = textwrap.wrap(f, max(8, width - 2)) or [""]
-            out += [(i, ("• " if j == 0 else "  ") + p) for j, p in enumerate(parts)]
+            mark = f in marked
+            lead = "✗ профиль: " if mark else "• "
+            parts = textwrap.wrap(f, max(8, width - len(lead))) or [""]
+            out += [(i, (lead if j == 0 else " " * len(lead)) + p) for j, p in enumerate(parts)]
         return out
 
     def draw_view(self, h, w):
@@ -577,7 +580,9 @@ class App:
         r, g = vw["r"], vw["g"]
         before, after = self.vw_lists()
         two = after is not None and self.show_before(w)
-        title = f"{self.group_title(r or g)} · {g.key.tier}"
+        title = f"{self.group_title(r or g)} · {g.key.tier}" + (" · с профилем" if g.profile else "")
+        if r and r.dropped_by_profile:
+            title += f" · ✗ профиль: {len(r.dropped_by_profile)}"
         if r:
             title += f" · {self.res_label(r)}" + (f" ({dm.chunk_label(r)})" if r.chunks else "") + \
                 (f" {EDIT_MARK}" if r.edited else "")
@@ -587,7 +592,7 @@ class App:
             title += "  [ ПРАВКА ]"
         self.put(0, 1, clip(title, w - 2), self.A["title"])
         cw = (w - 5) // 2 if two else w - 3
-        L = self.wrap_facts(before, cw) if (two or after is None) else []
+        L = self.wrap_facts(before, cw, set(r.dropped_by_profile) if r else ()) if (two or after is None) else []
         R = self.wrap_facts(after, cw) if after is not None else []
         rows = max(len(L), len(R))
         area = h - 4

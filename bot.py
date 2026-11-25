@@ -2982,9 +2982,19 @@ def _profile_prompt_text(context: str, chat_id, people: dict) -> str:
     return "\n".join(lines)[:PROFILE_PROMPT_MAX_CHARS]
 
 
+# v2.22.0 (профиль, вторая очередь): правило к ФАКТАМ, только в промпте — кодом факты не фильтруем (сравнение строк ненадёжно).
+PROFILE_NO_DUP_RULE = (
+    "\nНе записывай в facts (long_term/medium_term) то, что уже есть в профиле человека или что ты сейчас кладёшь в "
+    "profile_updates (имя, пол, год рождения, город, профессия, хобби, семья, как общаться). "
+    "Новое, чего нет в профиле, — записывай как обычно."
+)
+
+
 def _profile_rules() -> str:
+    """Правила профиля для промптов извлечения (личное, групповое, /memory_backfill — он идёт через `_extract_private_raw`):
+    profile_updates + «не дублируй профиль в фактах» (PROFILE_NO_DUP_RULE)."""
     y = datetime.now(BERLIN_TZ).year
-    return PROFILE_UPDATES_RULES.replace("{year_40}", str(y - 40)).replace("{year}", str(y))
+    return PROFILE_UPDATES_RULES.replace("{year_40}", str(y - 40)).replace("{year}", str(y)) + PROFILE_NO_DUP_RULE
 
 
 def clip_extract_messages(messages: list) -> list:
@@ -3327,6 +3337,7 @@ DEDUP_AUTO_NEW_RATIO = 0.2
 DEDUP_AUTO_MAX_USD = 2.0                       # потолок прогона; остаток групп — в следующий раз
 DEDUP_AUTO_MIN_KEEP = 0.1                      # страховка: «стало» < 10% от «было» И < DEDUP_AUTO_MIN_KEEP_ABS фактов — набор не применяем
 DEDUP_AUTO_MIN_KEEP_ABS = 20                   # ...но если осталось >= 20 фактов, сжатие честное (стенд 2026-11-19: 3452 → 32 — плотный профиль)
+DEDUP_PROFILE_MAX_DROP = 0.3                   # по профилю удалено больше 30% фактов группы — группу НЕ применяем (подозрительно), в отчёт
 DEDUP_AUTO_MAX_ERRORS = 3                      # столько ошибок модели подряд — прогон останавливается
 DEDUP_AUTO_FILE = DATA_DIR / "dedup_auto.json"
 DEDUP_AUTO_MODES = ("off", "estimate", "apply")
@@ -3396,7 +3407,7 @@ def _dedup_auto_plan() -> list[dict]:
         k = (g.key.user_id, g.key.context, g.key.chat_id, g.key.tier)
         if k in meta:
             plan.append({"group": g, "new": meta[k][0], "first": meta[k][1],
-                         "est": dm.estimate_group(g.facts, DEDUP_AUTO_MODEL_ID, calib)})
+                         "est": dm.estimate_group(g.facts, DEDUP_AUTO_MODEL_ID, calib, g.profile)})
     plan.sort(key=lambda p: (-p["new"], p["group"].key.user_id, p["group"].key.context, p["group"].key.chat_id or 0, p["group"].key.tier))
     return plan
 
@@ -3490,7 +3501,7 @@ def _dedup_auto_estimate_text(plan: list[dict], head: str, names=None) -> str:
     lines += ["", "Самые большие наборы:"]
     for n, p in enumerate(sorted(plan, key=lambda p: -len(p["group"].facts))[:5], 1):
         lines.append(f"{n}. {_dedup_key_text(p['group'].key, names)} — {_facts_word(len(p['group'].facts))}"
-                     + (f", новых {_n(p['new'])}" if not p["first"] else "") + f" (≈ ${p['est'].cost or 0:.2f})")
+                     + ((f", новых {_n(p['new'])}" if p["new"] else ", профиль изменён") if not p["first"] else "") + f" (≈ ${p['est'].cost or 0:.2f})")
     return "\n".join(lines)
 
 
@@ -3500,7 +3511,7 @@ def _dedup_auto_run_sync(budget: float, stop_event) -> dict:
     группа с error отметки не получает (повторится в следующий раз). -> словарь итогов для отчёта."""
     dm = _dm()
     stats = {"due": 0, "processed": 0, "left": 0, "applied": 0, "unchanged": 0, "truncated": 0, "empty": 0, "errors": 0,
-             "guard": [], "apply_skipped": [], "error_list": [], "facts_before": 0, "facts_after": 0,
+             "guard": [], "profile_guard": [], "profile_dropped": 0, "profile_by_group": [], "apply_skipped": [], "error_list": [], "facts_before": 0, "facts_after": 0,
              "spent_est": 0.0, "names": None, "backup": None, "run_file": None, "abort": None, "stopped": False}
     plan = _dedup_auto_plan()
     stats["due"] = len(plan)
@@ -3562,8 +3573,12 @@ def _dedup_auto_run_sync(budget: float, stop_event) -> dict:
                 continue                                # отметку не пишем: повторит в следующий раз
             consecutive = 0
             status, after = res.status, len(res.facts_after)
+            n_prof = len(res.dropped_by_profile)
             if status == "ok":
-                if after < DEDUP_AUTO_MIN_KEEP * n_before and after < DEDUP_AUTO_MIN_KEEP_ABS:
+                if n_prof > DEDUP_PROFILE_MAX_DROP * n_before:
+                    status = "guard"                    # по профилю «съедено» слишком много (профиль неточный или модель ошиблась): не применяем, в отчёт
+                    stats["profile_guard"].append((k, n_before, n_prof))
+                elif after < DEDUP_AUTO_MIN_KEEP * n_before and after < DEDUP_AUTO_MIN_KEEP_ABS:
                     status = "guard"                    # «съела всё»: не применяем, показываем в отчёте
                     stats["guard"].append((k, n_before, after))
                 elif after >= n_before:
@@ -3576,6 +3591,9 @@ def _dedup_auto_run_sync(budget: float, stop_event) -> dict:
                     status = "applied"
                     stats["facts_before"] += n_before
                     stats["facts_after"] += after
+                    if n_prof:
+                        stats["profile_dropped"] += n_prof
+                        stats["profile_by_group"].append((k, n_prof))
             # checked_at — ПОСЛЕ записи: apply_results ставит слитым фактам created_at = now (<= этого момента), иначе они
             # сами стали бы «новыми» и группа гонялась бы каждую неделю.
             db.dedup_state_put(k.user_id, k.context, k.chat_id, k.tier, int(time.time()), n_before,
@@ -3606,6 +3624,12 @@ def _dedup_auto_report_text(stats: dict, head: str, cost: float, calls: int) -> 
                  + (f", ждут следующей недели {_n(stats['left'])} (бюджет или остановка)." if stats["left"] else "."))
     lines.append(f"✅ Применено: {_n(stats['applied'])} — фактов {_n(stats['facts_before'])} → {_n(stats['facts_after'])}"
                  + (f" (−{_n(stats['facts_before'] - stats['facts_after'])})" if stats["facts_before"] > stats["facts_after"] else ""))
+    if stats.get("profile_dropped"):
+        # Только числа: сами удалённые факты могут быть личными — они в файле прогона (save_run), не в Telegram.
+        lines.append(f"🪪 По профилю удалено фактов: {_n(stats['profile_dropped'])}")
+        lines += [f"• {_dedup_key_text(k, names)}: {_n(n)}" for k, n in sorted(stats["profile_by_group"], key=lambda t: -t[1])[:10]]
+        if len(stats["profile_by_group"]) > 10:
+            lines.append(f"• …и ещё {len(stats['profile_by_group']) - 10}")
     other = [f"без изменений {_n(stats['unchanged'])}", f"обрезано {_n(stats['truncated'])}", f"пустой ответ {_n(stats['empty'])}",
              f"ошибок {_n(stats['errors'])}"]
     lines.append("Остальное: " + ", ".join(other) + ".")
@@ -3614,6 +3638,11 @@ def _dedup_auto_report_text(stats: dict, head: str, cost: float, calls: int) -> 
         lines += [f"• {_dedup_key_text(k, names)}: {b} → {a}" for k, b, a in stats["guard"][:15]]
         if len(stats["guard"]) > 15:
             lines.append(f"• …и ещё {len(stats['guard']) - 15}")
+    if stats.get("profile_guard"):
+        lines += ["", f"🛡 Подозрительно много удалений по профилю (больше {DEDUP_PROFILE_MAX_DROP:.0%} фактов набора) — НЕ применено:"]
+        lines += [f"• {_dedup_key_text(k, names)}: фактов {b}, по профилю {n}" for k, b, n in stats["profile_guard"][:15]]
+        if len(stats["profile_guard"]) > 15:
+            lines.append(f"• …и ещё {len(stats['profile_guard']) - 15}")
     if stats["apply_skipped"]:
         lines += ["", "Не применено (база изменилась во время прогона):"] + [f"• {x}" for x in stats["apply_skipped"][:10]]
     if stats["error_list"]:
@@ -3638,8 +3667,8 @@ async def _dedup_auto_send(bot, chat_ids, text: str) -> None:
 
 def _dedup_auto_last(mode: str, stats: dict, cost: float, end: str) -> dict:
     return {"ts": int(time.time()), "mode": mode, "end": end, "due": stats["due"], "processed": stats["processed"],
-            "applied": stats["applied"], "unchanged": stats["unchanged"], "guard": len(stats["guard"]),
-            "truncated": stats["truncated"], "errors": stats["errors"], "left": stats["left"],
+            "applied": stats["applied"], "unchanged": stats["unchanged"], "guard": len(stats["guard"]) + len(stats["profile_guard"]),
+            "profile": stats["profile_dropped"], "truncated": stats["truncated"], "errors": stats["errors"], "left": stats["left"],
             "facts_before": stats["facts_before"], "facts_after": stats["facts_after"], "cost": round(cost, 4)}
 
 
@@ -3764,7 +3793,8 @@ async def cmd_dedup_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if last:
         when = datetime.fromtimestamp(last["ts"], BERLIN_TZ).strftime("%d.%m.%Y %H:%M")
         last_txt = (f"{when}, {last.get('end', '?')}: групп {last['due']}, применено {last['applied']}, без изменений {last['unchanged']}, "
-                    f"страховка {last['guard']}, ошибок {last['errors']}, ждут {last['left']}; фактов {last['facts_before']} → {last['facts_after']}; ${last['cost']}.")
+                    f"страховка {last['guard']}, ошибок {last['errors']}, ждут {last['left']}; фактов {last['facts_before']} → {last['facts_after']}"
+                    + (f" (по профилю −{last['profile']})" if last.get("profile") else "") + f"; ${last['cost']}.")
     await msg.reply_text(
         f"Автодедуп памяти. Режим: {data['mode']} (off — выключен, estimate — только отчёт, apply — сам сливает). "
         f"Сейчас: {'идёт прогон' if _dedup_auto_active() else 'не идёт'}. Следующий запуск: {_dedup_auto_next_text(context)}.\n"

@@ -320,6 +320,18 @@ SYSTEM_PROMPT = (
     "которых не было. Верни ТОЛЬКО JSON: {\"facts\": [\"...\", \"...\"]}"
 )
 
+# Вариант с профилем (v2.22.0, docs/claude/profile.md → «Вторая очередь»): профиль человека — в user-сообщении,
+# system другой. SYSTEM_PROMPT выше НЕ меняется: группы без профиля уходят байт в байт как раньше.
+SYSTEM_PROMPT_PROFILE = (
+    SYSTEM_PROMPT.rsplit(" Верни ТОЛЬКО JSON", 1)[0]
+    + " Во входе также поле profile — проверенные данные об этом человеке, они ВЕРНЫ. "
+    "Факт, который ПРЯМО противоречит профилю, удали. Факт, который только повторяет профиль "
+    "(то же имя, город, профессия, тот же член семьи), удали — он уже есть в профиле. "
+    "Факт, который уточняет или дополняет профиль, оставь. При сомнении — оставь. "
+    "Верни ТОЛЬКО JSON: {\"facts\": [\"...\"], \"dropped_by_profile\": [\"...\"]} — "
+    "во втором списке дословно те исходные факты, которые удалены из-за профиля."
+)
+
 # max_tokens=8192: на группах в сотни-тысячи фактов (живой случай — 1441 medium-факт в одном
 # чате) даже 4096 не хватило и ответ обрывался — тот же класс проблемы, что инцидент 2026-08-03
 # в extract_all_participants_memory (docs/claude/incidents.md). Обрезанная группа НЕ применяется
@@ -346,6 +358,7 @@ class Group:
     row_ids: list[int]
     facts: list[str]
     expires_at: int | None  # максимум среди строк группы (для medium)
+    profile: str = ""       # подтверждённый профиль человека («Поле: значение; …»), "" — нет профиля, запрос прежний
 
 
 @dataclass
@@ -372,6 +385,8 @@ class GroupResult:
     calls: int = 1
     # Модель, которая фактически ответила (последний вызов группы); отличается от запрошенной — сработал фолбэк на Google.
     model_used: str = ""
+    # Факты, удалённые «по профилю» (только для отчёта и пометки в TUI): лишь те строки ответа, что ДОСЛОВНО есть среди исходных.
+    dropped_by_profile: list[str] = field(default_factory=list)
 
     @property
     def edited(self) -> bool:
@@ -421,8 +436,45 @@ def make_client():
     return anthropic.Anthropic(api_key=api_key, base_url=os.environ.get("ANTHROPIC_BASE_URL") or None)
 
 
+def load_profiles(conn) -> dict[tuple, str]:
+    """Подтверждённые профили: {(user_id, context, chat_id): "Поле: значение; …"} (как `_profile_text` бота, теми же подписями).
+
+    Только `user_profile` (подтверждено админом); ожидающие `profile_proposals` НЕ берём. Личка — chat_id=0, не NULL.
+    Профиль человека ≤ PROFILE_TOTAL_MAX знаков (лимит записи), в запрос — не больше, с обрезкой целыми полями.
+    Нет таблицы (бот с профилями ещё не запускался) — пусто."""
+    d = _bot_db()
+    try:
+        rows = conn.execute("SELECT user_id, context, chat_id, field, value FROM user_profile").fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    by_key: dict[tuple, dict] = {}
+    for r in rows:
+        if r["value"] and str(r["value"]).strip():
+            by_key.setdefault((r["user_id"], r["context"], r["chat_id"]), {})[r["field"]] = str(r["value"]).strip()
+    out = {}
+    for key, fields in by_key.items():
+        parts, total = [], 0
+        for f in d.PROFILE_FIELDS:                      # порядок показа, как в `_profile_text`
+            if f not in fields:
+                continue
+            item = f"{d.PROFILE_LABELS[f]}: {fields[f]}"
+            if total + len(item) > d.PROFILE_TOTAL_MAX:
+                break                                   # целыми полями, не на полуслове
+            parts.append(item)
+            total += len(item) + 2
+        if parts:
+            out[key] = "; ".join(parts)
+    return out
+
+
+def profile_key(k: GroupKey) -> tuple:
+    """Ключ профиля для группы фактов: у лички в memory chat_id NULL, в user_profile — 0."""
+    return (k.user_id, k.context, k.chat_id or 0)
+
+
 def load_groups(conn, user_id=None, chat_id=None, tier=None, min_facts=2) -> list[Group]:
-    """Группы (user_id, context, chat_id, tier) с min_facts+ фактами, в порядке таблицы."""
+    """Группы (user_id, context, chat_id, tier) с min_facts+ фактами, в порядке таблицы. К группе человека с подтверждённым
+    профилем приложен `profile` (load_profiles)."""
     where, params = _filters(user_id, chat_id, tier)
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     rows = conn.execute(
@@ -433,9 +485,11 @@ def load_groups(conn, user_id=None, chat_id=None, tier=None, min_facts=2) -> lis
     by_key: dict[GroupKey, list] = {}
     for r in rows:
         by_key.setdefault(GroupKey(r["user_id"], r["context"], r["chat_id"], r["tier"]), []).append(r)
+    profiles = load_profiles(conn)
     return [
         Group(k, [r["id"] for r in v], [r["fact"] for r in v],
-              min((r["expires_at"] for r in v if r["expires_at"]), default=None))
+              min((r["expires_at"] for r in v if r["expires_at"]), default=None),
+              profiles.get(profile_key(k), ""))
         for k, v in by_key.items() if len(v) >= min_facts
     ]
 
@@ -485,11 +539,14 @@ def run_llm(groups, model, client, stop_event=None, calib: dict | None = None,
         def call(facts):
             """Один вызов модели -> (status, merged). Токены и деньги копятся в res."""
             nonlocal cost_unknown
+            # Без профиля — как всегда (голый список, SYSTEM_PROMPT, байт в байт); с профилем — объект и SYSTEM_PROMPT_PROFILE.
+            # Профиль идёт в КАЖДЫЙ вызов: куски, их половины при обрезке и слияние кусков.
+            payload = {"profile": g.profile, "facts": facts} if g.profile else facts
             resp, used = create_with_fallback(
                 client, model, state,
                 max_tokens=MAX_OUT_TOKENS + THINKING_HEADROOM.get(model, 0),
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": json.dumps(facts, ensure_ascii=False)}],
+                system=SYSTEM_PROMPT_PROFILE if g.profile else SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
             )
             res.model_used = used
             res.calls += 1
@@ -507,6 +564,13 @@ def run_llm(groups, model, client, stop_event=None, calib: dict | None = None,
             text = api_errors.response_text(resp)
             data = api_errors.parse_json_lenient(text, "{", label=f"dedup user={k.user_id} chat={k.chat_id}")
             merged = [f.strip() for f in (data or {}).get("facts", []) if isinstance(f, str) and f.strip()]
+            if g.profile:
+                # Только для отчёта. Берём строки, которые ДОСЛОВНО есть среди исходных фактов группы: модель могла
+                # перефразировать или выдумать — такое игнорируем (сравнение строк ненадёжно, поэтому ничего не удаляем по этому списку).
+                orig = set(g.facts)
+                for f in (data or {}).get("dropped_by_profile", []) or []:
+                    if isinstance(f, str) and f in orig and f not in res.dropped_by_profile:
+                        res.dropped_by_profile.append(f)
             if api_errors.was_truncated(resp):
                 # Обрезанный ответ = частичный список; применить его значило бы удалить ВСЮ
                 # группу и вставить огрызок (тихая потеря данных). Не применяется никогда.
@@ -563,6 +627,9 @@ def run_llm(groups, model, client, stop_event=None, calib: dict | None = None,
             res.status = status
             if status == "ok":
                 res.facts_after, res.facts_model = merged, list(merged)
+                if res.dropped_by_profile:
+                    kept = set(merged)      # «удалён по профилю», но остался в итоге, — не считаем
+                    res.dropped_by_profile = [f for f in res.dropped_by_profile if f not in kept]
         except Exception as e:
             res.status, res.error = "error", f"{type(e).__name__}: {e}"
         if cost_unknown:
@@ -700,34 +767,44 @@ def facts_chars(facts) -> int:
     return len(json.dumps(facts, ensure_ascii=False))
 
 
-def _estimate_single(facts_chars_n: int, model, calib: dict, n_sys: int | None = None):
+def profile_extra_chars(profile: str) -> int:
+    """Добавка ко входу вызова с профилем: system длиннее (SYSTEM_PROMPT_PROFILE) + сам профиль + обёртка {"profile": …, "facts": …}."""
+    if not profile:
+        return 0
+    return (len(SYSTEM_PROMPT_PROFILE) - len(SYSTEM_PROMPT)) + len(json.dumps(profile, ensure_ascii=False)) + 30
+
+
+def _estimate_single(facts_chars_n: int, model, calib: dict, n_sys: int | None = None, extra: int = 0):
     cpt = calib.get("chars_per_token") or CHARS_PER_TOKEN
     ratio = calib.get("out_ratio") or OUT_RATIO
     facts_tok = facts_chars_n / cpt
-    in_tok = (len(SYSTEM_PROMPT) + facts_chars_n) / cpt
+    in_tok = (len(SYSTEM_PROMPT) + facts_chars_n + extra) / cpt
     want_out = facts_tok * ratio
     out_tok = min(MAX_OUT_TOKENS, want_out) + THINKING_EST.get(model, 0)
     # Вход всегда уникален -> пул кеширует автоматически -> тарифицируется как запись 5m.
     return in_tok, out_tok, request_cost(model, 0, out_tok, in_tok, 0, 0), want_out
 
 
-def estimate_group(facts, model, calib: dict | None = None) -> Estimate:
+def estimate_group(facts, model, calib: dict | None = None, profile: str = "") -> Estimate:
     """Оценка одной группы. calib — запись load_calibration()[model] или None (дефолты).
 
     Если группа не влезает в один ответ — оценка по частям: сумма кусков + ОДИН вызов слияния
     (грубо; реальное слияние может потребовать ещё прохода, см. MAX_CHUNK_LEVELS).
+    profile — профиль человека группы: его длина и более длинный system добавляются ко входу КАЖДОГО вызова (куски и слияние);
+    без профиля (по умолчанию) оценка прежняя.
     """
     calib = calib or {}
     ratio = calib.get("out_ratio") or OUT_RATIO
     sec_per_1k = calib.get("sec_per_1k_out")
     fch = facts_chars(facts)
-    in_tok, out_tok, cost, want_out = _estimate_single(fch, model, calib)
+    extra = profile_extra_chars(profile)
+    in_tok, out_tok, cost, want_out = _estimate_single(fch, model, calib, extra=extra)
     risk = want_out > MAX_OUT_TOKENS
     calls = 1
     if risk:
         parts = [facts_chars(c) for c in plan_chunks(facts, calib)]
-        ests = [_estimate_single(c, model, calib) for c in parts]
-        ests.append(_estimate_single(int(fch * ratio), model, calib))  # слияние: вход = выходы кусков
+        ests = [_estimate_single(c, model, calib, extra=extra) for c in parts]
+        ests.append(_estimate_single(int(fch * ratio), model, calib, extra=extra))  # слияние: вход = выходы кусков
         in_tok, out_tok = sum(e[0] for e in ests), sum(e[1] for e in ests)
         cost = None if any(e[2] is None for e in ests) else sum(e[2] for e in ests)
         calls = len(ests)
@@ -735,8 +812,10 @@ def estimate_group(facts, model, calib: dict | None = None) -> Estimate:
     return Estimate(in_tok, out_tok, cost, seconds, risk, calls)
 
 
-def estimate_total(groups_facts, model, calib: dict | None = None) -> Estimate:
-    ests = [estimate_group(f, model, calib) for f in groups_facts]
+def estimate_total(groups_facts, model, calib: dict | None = None, profiles=None) -> Estimate:
+    """groups_facts — списки фактов; profiles — параллельный список профилей групп (None — без профилей)."""
+    profiles = profiles or [""] * len(groups_facts)
+    ests = [estimate_group(f, model, calib, p) for f, p in zip(groups_facts, profiles)]
     costs = [e.cost for e in ests]
     secs = [e.seconds for e in ests]
     return Estimate(
@@ -856,6 +935,7 @@ def save_run(model, results: list[GroupResult], runs_dir: Path | None = None, su
             "key": asdict(r.key), "row_ids": r.row_ids, "status": r.status, "error": r.error,
             "facts_before": r.facts_before, "facts_model": r.facts_model, "facts_after": r.facts_after,
             "edited": r.edited,
+            "dropped_by_profile": r.dropped_by_profile,   # только для разбора: по профилю модель убрала эти факты
             "tokens": {"in": r.in_tok, "cw_5m": r.cw_5m, "cw_1h": r.cw_1h,
                        "cache_read": r.cache_read, "out": r.out_tok},
             "cost": r.cost, "seconds": round(r.seconds, 2), "chunks": r.chunks, "calls": r.calls,
