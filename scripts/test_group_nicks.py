@@ -303,10 +303,26 @@ def test_rows_without_ids_keep_own_senders():
 
 
 def test_strip_nick_suffixes_exact_labels_only():
-    text = "Саша#2345 — за кота, Саша#7890 — за собаку; тема #12345 и #2345 не трогаем."
+    text = "Саша#2345 — за кота, Саша#7890 — за собаку; тема #12345 и #6789 не трогаем."
     out = bot.strip_nick_suffixes(text, ["Саша#2345", "Саша#7890"])
-    assert out == "Саша — за кота, Саша — за собаку; тема #12345 и #2345 не трогаем."
+    assert out == "Саша — за кота, Саша — за собаку; тема #12345 и #6789 не трогаем."
     assert bot.strip_nick_suffixes(text, None) == text and bot.strip_nick_suffixes("", ["Саша#1"]) == ""
+
+
+def test_strip_nick_suffixes_digits_variants():
+    lab = ["Тест#4505", "Тест#8725"]
+    f = lambda t, l=lab: bot.strip_nick_suffixes(t, l)
+    assert f("Тестомес-4505") == "Тестомес"
+    assert f("Тестостерон-8725 и Тест_4505 и Тест4505") == "Тестостерон и Тест и Тест"
+    assert f("Тест 4505 сказал") == "Тест сказал"
+    assert f("#4505") == ""
+    assert f("Тест#4505 и Тест 8725") == "Тест и Тест"
+    # не трогаем
+    assert f("в 4505 году", ["Тест#2222"]) == "в 4505 году"      # цифр нет в окне
+    assert f("заказ №45051") == "заказ №45051"                     # число длиннее
+    assert f("заказ 14505 и 45051") == "заказ 14505 и 45051"
+    assert f("тема #12345, версия 3.8, 2026") == "тема #12345, версия 3.8, 2026"
+    assert f("Тест сказал", lab) == "Тест сказал"
 
 
 def test_group_info_lists_suffixed_labels(tmpdb):

@@ -4786,10 +4786,16 @@ def strip_leaked_service_note(text: str) -> tuple[str, bool]:
 def strip_nick_suffixes(text: str, suffixed: list | None) -> str:
     """Подписи тёзок «Ник#NNNN» из окна запроса (`info["suffixed"]`) → просто «Ник» в ответе модели: «#цифры» только различают строки
     транскрипта, обращаться так к людям нельзя (стенд 2026-11-25: Luna писала «Тест#2345 — за кота» вопреки правилу в system). Режем ТОЛЬКО
-    точные подписи из окна — не любой «#число» (хэштеги, номера задач остаются)."""
+    точные подписи из окна и их цифры — не любой «#число» (хэштеги, номера задач остаются)."""
+    digits = set()
     for lab in suffixed or ():
         if lab in text:
             text = text.replace(lab, _LEAK_NICK_SUFFIX_RE.sub("", lab))
+        digits.update(m[1:] for m in _LEAK_NICK_SUFFIX_RE.findall(lab))
+    # Модель обыгрывает подпись («Тестомес-4505», «Тест 4505», «#4505»): режем сами цифры подписей окна, целым числом
+    # (не часть более длинного), сразу после буквы (через «#», «-», «_», пробел или вплотную) либо после «#». Прочие числа не трогаем.
+    for d in sorted(digits, key=lambda x: (-len(x), x)):
+        text = re.sub(r"(?:(?<=[^\W\d_])[#\-_ ]?|#)" + re.escape(d) + r"(?!\d)", "", text)
     return text
 
 
