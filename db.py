@@ -1425,14 +1425,14 @@ def get_group_messages_range(chat_id: int, since_ts: int, until_ts: int) -> list
     Для дневного обзора; get_group_history не заменяет (её зовут и другие)."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT id, sender_name, content, is_bot, timestamp FROM group_messages "
+        "SELECT id, sender_name, content, is_bot, timestamp, user_id FROM group_messages "
         "WHERE chat_id = ? AND timestamp >= ? AND timestamp <= ? AND hidden = 0 ORDER BY timestamp, id",
         (chat_id, since_ts, until_ts)
     ).fetchall()
     conn.close()
     return [
         {"id": r["id"], "ts": r["timestamp"], "sender": r["sender_name"], "text": r["content"],
-         "is_bot": bool(r["is_bot"])}
+         "is_bot": bool(r["is_bot"]), "user_id": r["user_id"]}
         for r in rows
     ]
 

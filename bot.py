@@ -2614,6 +2614,8 @@ def _persona_text(persona_key: str, is_group: bool) -> str:
             "\n\nСЕЙЧАС ТЫ В ГРУППОВОМ ЧАТЕ, а не в личном диалоге 1:1. "
             "В истории несколько разных людей — каждая их реплика подписана «Имя: текст». "
             "Не путай собеседников и не сливай их в одного, обращайся к тому, кто пишет сейчас. "
+            "Если у двух разных людей одинаковый ник, у них в подписи после ника стоит «#цифры» (например «Саша#1234») — это ТОЛЬКО чтобы различать "
+            "тёзок: так к людям не обращайся и эти цифры в ответах не пиши. "
             "Твои собственные прошлые реплики идут как assistant-сообщения — это то, что ты УЖЕ сказала, "
             "не повторяйся и не приписывай свои слова другим. "
             "Сообщения вида «[Фото: описание]», «[Видео: описание]», «[GIF: описание]», "
@@ -2651,7 +2653,7 @@ def speaker_profile_card(user_id: int, chat_id: int, display_name: str = "") -> 
         return ""
     # Подпись в переписке (ник) — первой: по ней модель узнаёт человека в транскрипте; имя из профиля — в скобках
     pname, shown = prof.get("name"), (display_name or "").strip()
-    if shown and pname and pname.strip().lower() != shown.lower():
+    if shown and pname and pname.strip().lower() != _LEAK_NICK_SUFFIX_RE.sub("", shown).strip().lower():
         who = f"{shown} (по профилю — {pname})"
     else:
         who = shown or pname or "автор сообщения"
@@ -2809,19 +2811,20 @@ def _bot_reply_quote(text: str) -> str:
     return f"(это твоё собственное сообщение) {text}"
 
 
-def _speaker_card(update, user_id: int, is_group: bool, chat_id: int) -> str:
-    """Карточка автора текущего сообщения для service_block (только группа, профиль этого чата не пуст)."""
+def _speaker_card(update, user_id: int, is_group: bool, chat_id: int, info: dict | None = None) -> str:
+    """Карточка автора текущего сообщения для service_block (только группа, профиль этого чата не пуст).
+    info — выход `build_group_messages`: подпись автора берётся ТОЙ ЖЕ, что стоит в его строках окна (у тёзок «Ник#NNNN»)."""
     if not is_group:
         return ""
     u = update.effective_user
-    name = db.get_last_sender_name(chat_id, user_id) or (u.full_name if u else "") or ""
+    name = ((info or {}).get("labels") or {}).get(user_id) or db.get_last_sender_name(chat_id, user_id) or (u.full_name if u else "") or ""
     return speaker_profile_card(user_id, chat_id, name)
 
 
 def service_block(*, reply_context: str = "", search_query: str = "", search_results: str = "",
                   topup_hint: bool = False, draw_intent: bool = False, draw_size: str | None = None,
                   spontaneous: bool = False, trigger: str = "", image_reply: bool = False,
-                  speaker_profile: str = "") -> str:
+                  speaker_profile: str = "", participants_note: str = "") -> str:
     """Изменчивый контекст запроса (время, reply, результаты поиска) — в хвост, в последний
     user-turn, а не в system: иначе он ломает префикс кэша. В БД НЕ сохраняется (в
     conversations/group_messages идёт только текст пользователя). reply_context передавать
@@ -2855,6 +2858,8 @@ def service_block(*, reply_context: str = "", search_query: str = "", search_res
         )
     if speaker_profile and not spontaneous:
         lines.append(speaker_profile[:PROFILE_SPEAKER_MAX_CHARS])   # карточка автора (группа), docs/claude/profile.md
+    if participants_note and not spontaneous:
+        lines.append(participants_note[:PARTICIPANTS_NOTE_MAX_CHARS])   # смена ника (группа): один человек — разные ники; только хвост
     if spontaneous:
         lines.append(
             "Тебя сейчас не звали. Если хочешь — вставь одну-две короткие реплики как участник беседы, по делу или "
@@ -3994,15 +3999,100 @@ def extract_all_participants_memory(chat_id: int):
         logger.error(f"Group memory extraction error (chat {chat_id}): {e}", exc_info=True)
 
 
-def _group_line(entry: dict, now: datetime) -> str:
-    """Одна реплика человека в групповом транскрипте: «[время] Имя: текст» (время — HH:MM, для другого дня с датой)."""
+# Тёзки и смена ника в групповом транскрипте (v2.23.0, docs/claude/tz-group-nicks.md, issue #3): модель видит ник, а не человека.
+PARTICIPANTS_NOTE_MAX_CHARS = 400     # карточка «один человек — разные ники» в хвосте: лимит по РАЗМЕРУ, лишнее — целыми записями
+_LEAK_NICK_SUFFIX_RE = re.compile(r"#\d{4,}")
+
+
+def _nick_key(name) -> str:
+    return (name or "").strip().lower()
+
+
+def group_sender_labels(rows: list[dict]) -> dict:
+    """{id строки: подпись} — см. `sender_labels_list` (то же, но списком по порядку строк; id у строк без "id" не нужен)."""
+    return {r.get("id"): lab for r, lab in zip(rows, sender_labels_list(rows)) if r.get("id") is not None}
+
+
+def sender_labels_list(rows: list[dict]) -> list:
+    """Подписи отправителей для строк транскрипта: {id строки: подпись}. ЧИСТАЯ функция — зависит только от переданных строк окна
+    (время, случайность и данные из хвоста в подпись не берутся — иначе она менялась бы между запросами и ломала кэш префикса,
+    docs/claude/prompt-cache.md). Если под одним ником (без учёта регистра и крайних пробелов) в окне писали ≥ 2 разных `user_id`,
+    подпись — «Ник#NNNN» (последние 4 цифры user_id; совпали — цифр больше, пока не разойдутся). Остальным — ник как есть, БАЙТ в БАЙТ
+    (строки без тёзок не должны менять кэш). Строки с `user_id IS NULL` и реплики бота не трогаем.
+    rows — [{"sender", "user_id", "is_bot"}]; возвращает подписи В ТОМ ЖЕ ПОРЯДКЕ, что строки."""
+    by_nick: dict[str, set] = {}
+    for r in rows:
+        uid = r.get("user_id")
+        if r.get("is_bot") or uid is None:
+            continue
+        by_nick.setdefault(_nick_key(r.get("sender")), set()).add(uid)
+    suffix: dict[tuple, str] = {}
+    for key, uids in by_nick.items():
+        if len(uids) < 2:
+            continue
+        digits = {u: str(abs(int(u))) for u in uids}
+        k, longest = 4, max(len(d) for d in digits.values())
+        while k < longest and len({d[-k:] for d in digits.values()}) < len(digits):
+            k += 1
+        for u, d in digits.items():
+            suffix[(key, u)] = d[-k:]
+    out = []
+    for r in rows:
+        sender = r.get("sender")
+        suf = suffix.get((_nick_key(sender), r.get("user_id"))) if not r.get("is_bot") else None
+        out.append(f"{(sender or '?').strip()}#{suf}" if suf else sender)
+    return out
+
+
+def participants_note(people: list[tuple], chat_id: int | None) -> str:
+    """Карточка «один человек под разными никами» (смена ника) для ХВОСТА запроса: people — [(user_id, подпись)] по строкам людей окна,
+    от старых к новым (подпись — та, что стоит в строках транскрипта, с «#NNNN» у тёзок). "" — смен ника нет.
+    Только в `service_block`, не в system и не в блок памяти (изменчиво). Лимит PARTICIPANTS_NOTE_MAX_CHARS, лишнее отбрасывается
+    ЦЕЛЫМИ записями — свежие (по последней реплике) важнее. У человека с подтверждённым профилем с именем — «(по профилю — Имя)»."""
+    seen: dict = {}        # uid -> [(ключ подписи, подпись, индекс последней реплики)] в порядке появления
+    for i, (uid, label) in enumerate(people):
+        if uid is None or not label:
+            continue
+        items = seen.setdefault(uid, {})
+        items[_nick_key(label)] = (label, i)
+    entries = []
+    for uid, items in seen.items():
+        if len(items) < 2:
+            continue
+        ordered = sorted(items.values(), key=lambda t: -t[1])      # самый свежий ник первым
+        new, olds = ordered[0][0], [lab for lab, _ in ordered[1:]]
+        text = f"«{new}» = " + ", ".join(f"«{o}»" for o in olds)
+        if chat_id is not None:
+            try:
+                pname = (db.get_profile(uid, "group", chat_id) or {}).get("name")
+            except Exception:
+                pname = None
+            if pname:
+                text += f" (по профилю — {pname})"
+        entries.append((ordered[0][1], text))
+    if not entries:
+        return ""
+    entries.sort(key=lambda t: -t[0])                                  # свежие записи первыми
+    head, chosen = "В истории один человек под разными никами: ", []
+    for _, text in entries:
+        cand = head + "; ".join(chosen + [text]) + "."
+        if len(cand) > PARTICIPANTS_NOTE_MAX_CHARS:
+            break
+        chosen.append(text)
+    return head + "; ".join(chosen) + "." if chosen else ""
+
+
+def _group_line(entry: dict, now: datetime, label: str | None = None) -> str:
+    """Одна реплика человека в групповом транскрипте: «[время] Имя: текст» (время — HH:MM, для другого дня с датой).
+    label — подпись из `group_sender_labels` (у тёзок «Ник#NNNN»); None — ник строки как есть."""
+    sender = entry["sender"] if label is None else label
     ts = entry.get("ts")
     if ts:
         msg_dt = datetime.fromtimestamp(ts)
         time_prefix = f"[{msg_dt.strftime('%d.%m %H:%M') if msg_dt.date() != now.date() else msg_dt.strftime('%H:%M')}] "
     else:
         time_prefix = ""
-    return f"{time_prefix}{entry['sender']}: {entry['text']}"
+    return f"{time_prefix}{sender}: {entry['text']}"
 
 
 def build_group_tail(chat_id: int, reply_context: str = "") -> list[dict]:
@@ -4019,7 +4109,7 @@ def build_group_tail(chat_id: int, reply_context: str = "") -> list[dict]:
 
 
 def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GROUP_TRANSCRIPT_LIMIT,
-                         exclude_ids=None, min_id: int | None = None) -> list[dict]:
+                         exclude_ids=None, min_id: int | None = None, info: dict | None = None) -> list[dict]:
     """Многоголосый групповой контекст для Anthropic messages.
 
     Берёт транскрипт чата (старые->новые), склеивает подряд идущие реплики людей
@@ -4031,6 +4121,9 @@ def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GRO
 
     exclude_ids / min_id — ТОЛЬКО для проб safety_scan: окно берётся мимо pick_history_window (его якорь живого диалога
     не трогаем): последние `limit` строк без exclude_ids и не старше min_id. В обычном диалоге не передавать.
+
+    Подписи — `group_sender_labels` по строкам ЭТОГО окна (тёзки получают «Ник#NNNN»). info — необязательный словарь-«выход»: сюда кладутся
+    `labels` ({user_id: подпись его последней строки в окне}) для карточки автора и `note` (`participants_note`, смена ника) для хвоста.
     """
     if exclude_ids is not None or min_id is not None:
         transcript = db.get_group_transcript(chat_id, limit, exclude_ids=exclude_ids, min_id=min_id)
@@ -4046,6 +4139,14 @@ def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GRO
             buffer.clear()
 
     now = datetime.now()
+    labels = group_sender_labels(transcript)
+    if info is not None:
+        last_label = {e["user_id"]: labels.get(e["id"], e["sender"]) for e in transcript
+                      if not e["is_bot"] and e.get("user_id") is not None}
+        info["labels"] = last_label
+        info["tagged"] = sum(1 for lab in last_label.values() if lab and _LEAK_NICK_SUFFIX_RE.search(lab))   # людей с «#NNNN» в окне (для лога)
+        info["note"] = participants_note([(e["user_id"], labels.get(e["id"], e["sender"])) for e in transcript
+                                          if not e["is_bot"] and e.get("user_id") is not None], chat_id)
     for entry in transcript:
         if entry["is_bot"]:
             flush_human()
@@ -4054,7 +4155,7 @@ def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GRO
             elif messages:  # нельзя начинать с assistant — ведущие реплики бота отбрасываем
                 messages.append({"role": "assistant", "content": entry["text"]})
         else:
-            buffer.append(_group_line(entry, now))
+            buffer.append(_group_line(entry, now, labels.get(entry["id"], entry["sender"])))
     flush_human()
 
     # ведущие assistant-блоки (если транскрипт начался с бота) — срезаем
@@ -4179,16 +4280,19 @@ def _clip(text: str, limit: int) -> str:
 def build_review_log(rows: list[dict]) -> list[dict]:
     """Строки group_messages окна → записи лога [{ts, line, is_bot}] (по возрастанию времени).
     Прошлый обзор (is_bot и текст начинается с «(обзор дня по») выкидываем — иначе Opus пересказывает вчерашнее.
-    Формат строки «HH:MM Имя: текст» (Берлин)."""
+    Формат строки «HH:MM Имя: текст» (Берлин); у тёзок окна обзора — «Имя#NNNN» (`group_sender_labels`), записи несут `uid`/`label`
+    для карточки смены ника (`participants_note`)."""
+    labels = sender_labels_list(rows)
     out = []
-    for r in rows:
+    for idx, r in enumerate(rows):
         text = r.get("text") or ""
         if r.get("is_bot") and text.startswith(f"({REVIEW_SENT_LABEL}"):
             continue
         limit = REVIEW_BOT_MSG_CHARS if r.get("is_bot") else REVIEW_USER_MSG_CHARS
         hhmm = datetime.fromtimestamp(r["ts"], BERLIN_TZ).strftime("%H:%M")
-        out.append({"ts": r["ts"], "is_bot": bool(r.get("is_bot")),
-                    "line": f"{hhmm} {r.get('sender') or '?'}: {_clip(text, limit).replace(chr(10), ' ')}"})
+        label = labels[idx] or "?"
+        out.append({"ts": r["ts"], "is_bot": bool(r.get("is_bot")), "uid": r.get("user_id"), "label": label,
+                    "line": f"{hhmm} {label}: {_clip(text, limit).replace(chr(10), ' ')}"})
     return out
 
 
@@ -4316,8 +4420,11 @@ async def prepare_review_input(chat_id: int, entries: list[dict]) -> tuple[str, 
     """Лог → (ветка 'A'|'B', текст user-сообщения для итогового вызова). None — все выжимки упали.
     Все вызовы Haiku идут в usage_ctx вызывающего (чат выставлен до вызова)."""
     log_text = "\n".join(e["line"] for e in entries)
+    # Смена ника: тот же текст, что в хвосте диалога, отдельной строкой ПЕРЕД логом (обзор не кэшируется).
+    note = participants_note([(e.get("uid"), e.get("label")) for e in entries if not e["is_bot"] and e.get("uid") is not None], chat_id)
+    note_line = note + "\n" if note else ""
     if REVIEW_SINGLE_MAX_CHARS and len(log_text) <= REVIEW_SINGLE_MAX_CHARS:
-        return "A", (f"Вот сообщения за период (время по Берлину). Сначала про себя выдели темы дня, потом пиши обзор:\n{log_text}")
+        return "A", (f"Вот сообщения за период (время по Берлину). Сначала про себя выдели темы дня, потом пиши обзор:\n{note_line}{log_text}")
     chunks = split_review_sessions(entries)
     sem = asyncio.Semaphore(REVIEW_CHUNK_PARALLEL)
 
@@ -4339,6 +4446,7 @@ async def prepare_review_input(chat_id: int, entries: list[dict]) -> tuple[str, 
     tail.reverse()
     logger.info(f"Дневной обзор B: chat={chat_id}, частей={len(chunks)}, упало={sum(1 for r in results if not r)}, тем={len(topics)}")
     return "B", (
+        note_line +
         "Лог дня был слишком большим, поэтому вот выжимки тем по частям лога (JSON, по порядку времени; "
         "соседние части могут про одно и то же — объединяй):\n"
         f"{_cap_topics(topics)}\n\nИ самые последние сообщения дня сырьём:\n" + "\n".join(tail)
@@ -5051,7 +5159,8 @@ def activity_should_check(chat_id: int, user_id: int, text: str, now: float | No
 
 
 def build_activity_input(entries: list[dict]) -> str:
-    lines = [f"{e['sender']}: {_clip(e['text'], 300).replace(chr(10), ' ')}" for e in entries]
+    labels = sender_labels_list(entries)       # тёзки — «Ник#NNNN», как в основном транскрипте
+    lines = [f"{lab}: {_clip(e['text'], 300).replace(chr(10), ' ')}" for lab, e in zip(labels, entries)]
     while lines and sum(len(x) + 1 for x in lines) > ACTIVITY_TRANSCRIPT_CHARS:
         lines.pop(0)
     return "\n".join(lines)
@@ -9859,7 +9968,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_group:
             # Группа: контекст — многоголосый транскрипт в messages, НЕ в system.
             # Текущая реплика уже последней в транскрипте; reply_context идёт inline.
-            messages = build_group_messages(chat_id, reply_context, GROUP_TRANSCRIPT_LIMIT)
+            group_info: dict = {}
+            messages = build_group_messages(chat_id, reply_context, GROUP_TRANSCRIPT_LIMIT, info=group_info)
         else:
             # Личка: личный тред 1:1 (окно шагами — private_history).
             messages = private_history(user_id)
@@ -9870,14 +9980,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # assistant перед ним. В группе reply_context уже inline в build_group_messages.
         base_messages = messages
         topup_hint = _free_search_hint(chat_id, bool(search_results))
-        speaker_card = _speaker_card(update, user_id, is_group, chat_id)
+        speaker_card = _speaker_card(update, user_id, is_group, chat_id, group_info if is_group else None)
+        group_note = group_info.get("note", "") if is_group else ""
 
         def compose(sq: str, sr: str, msgs: list | None = None) -> list:
             return mark_cache_tail(with_service_block(base_messages if msgs is None else msgs, service_block(
                 reply_context="" if is_group else reply_context,
                 search_query=sq, search_results=sr, topup_hint=topup_hint,
                 draw_intent=draw_intent, draw_size=intent_size, image_reply=reply_to_own_image,
-                speaker_profile=speaker_card,
+                speaker_profile=speaker_card, participants_note=group_note,
             )))
 
         messages = compose(search_query, search_results)
@@ -9887,6 +9998,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(
             f"PROMPT uid={user_id} chat={chat_id} model={_model} "
             f"system={system_chars(system)} history_chars={hist_chars} msgs={len(messages)} imgs={hist_imgs}"
+            + (f" nick_tags={group_info.get('tagged', 0)} nick_note={len(group_note)}" if is_group else "")   # тёзки / карточка смены ника: только числа
         )
         try:
             # Safety-блок провайдера: один повтор без истории + счётчик для фонового скана (docs/claude/safety-unblock.md).
