@@ -300,3 +300,20 @@ def test_rows_without_ids_keep_own_senders():
     """Старые вызовы и тесты без поля id: подписи по порядку строк, а не по ключу id (иначе все получили бы подпись последней строки)."""
     rows = [{"sender": "Аня", "user_id": A, "is_bot": False}, {"sender": "Боря", "user_id": C, "is_bot": False}]
     assert bot.sender_labels_list(rows) == ["Аня", "Боря"]
+
+
+def test_strip_nick_suffixes_exact_labels_only():
+    text = "Саша#2345 — за кота, Саша#7890 — за собаку; тема #12345 и #2345 не трогаем."
+    out = bot.strip_nick_suffixes(text, ["Саша#2345", "Саша#7890"])
+    assert out == "Саша — за кота, Саша — за собаку; тема #12345 и #2345 не трогаем."
+    assert bot.strip_nick_suffixes(text, None) == text and bot.strip_nick_suffixes("", ["Саша#1"]) == ""
+
+
+def test_group_info_lists_suffixed_labels(tmpdb):
+    say(A, "Саша", "раз")
+    say(C, "Саша", "два")
+    say(B, "Лена", "три")
+    info = {}
+    bot.build_group_messages(CHAT, info=info)
+    assert sorted(info["suffixed"]) == ["Саша#2345", "Саша#7890"] or len(info["suffixed"]) == 2
+    assert all("#" in x for x in info["suffixed"]) and info["tagged"] == 2

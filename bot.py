@@ -4144,6 +4144,7 @@ def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GRO
         last_label = {e["user_id"]: labels.get(e["id"], e["sender"]) for e in transcript
                       if not e["is_bot"] and e.get("user_id") is not None}
         info["labels"] = last_label
+        info["suffixed"] = sorted({lab for lab in labels.values() if lab and _LEAK_NICK_SUFFIX_RE.search(lab)}, key=len, reverse=True)
         info["tagged"] = sum(1 for lab in last_label.values() if lab and _LEAK_NICK_SUFFIX_RE.search(lab))   # людей с «#NNNN» в окне (для лога)
         info["note"] = participants_note([(e["user_id"], labels.get(e["id"], e["sender"])) for e in transcript
                                           if not e["is_bot"] and e.get("user_id") is not None], chat_id)
@@ -4772,6 +4773,16 @@ def strip_leaked_service_note(text: str) -> tuple[str, bool]:
     return text, False
 
 
+def strip_nick_suffixes(text: str, suffixed: list | None) -> str:
+    """Подписи тёзок «Ник#NNNN» из окна запроса (`info["suffixed"]`) → просто «Ник» в ответе модели: «#цифры» только различают строки
+    транскрипта, обращаться так к людям нельзя (стенд 2026-11-25: Luna писала «Тест#2345 — за кота» вопреки правилу в system). Режем ТОЛЬКО
+    точные подписи из окна — не любой «#число» (хэштеги, номера задач остаются)."""
+    for lab in suffixed or ():
+        if lab in text:
+            text = text.replace(lab, _LEAK_NICK_SUFFIX_RE.sub("", lab))
+    return text
+
+
 def _extract_draw_marker(text: str) -> tuple[str, str | None, str | None]:
     """Ответ модели → (текст без маркера, английский промпт или None, "2K" или None). Общий для основного диалога и
     веток фото/файла (до 2026-11-01 ветки фото/файла маркер не разбирали — `[[DRAW: …]]` уходил в чат текстом).
@@ -5190,8 +5201,9 @@ async def _activity_task(message, context, chat_id: int, user_id: int) -> None:
         trigger = ""
         if _own:
             trigger = f"{_sender}: «{_clip(_own, 300)}»" + (f" (в ответ на: «{_clip(_quoted, 300)}»)" if _quoted else "")
+        _ginfo: dict = {}
         messages = mark_cache_tail(with_service_block(
-            build_group_messages(chat_id, "", GROUP_TRANSCRIPT_LIMIT), service_block(spontaneous=True, trigger=trigger)))
+            build_group_messages(chat_id, "", GROUP_TRANSCRIPT_LIMIT, info=_ginfo), service_block(spontaneous=True, trigger=trigger)))
         reply = await call_claude(
             None, chat_id, label=f"activity chat={chat_id}", usage_label="activity",
             model=model, **dialog_params(model), max_tokens=out_tokens(model, 300),
@@ -5202,6 +5214,7 @@ async def _activity_task(message, context, chat_id: int, user_id: int) -> None:
             text, _ = extract_files(text)
         text = DRAW_MARKER_RE.sub("", text).strip()
         text, _ = strip_leaked_service_note(text)
+        text = strip_nick_suffixes(text, _ginfo.get("suffixed"))
         if not text:
             return
         await message.reply_text(text)
@@ -10063,6 +10076,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         assistant_text, _ = strip_leaked_service_note(response_text(response))
+        if is_group:
+            assistant_text = strip_nick_suffixes(assistant_text, group_info.get("suffixed"))   # «Ник#NNNN» — только подпись строк, не обращение
         if not assistant_text:
             # Запрос прошёл, но текста нет: отказ модели, только thinking, или упёрлись
             # в max_tokens. Молчать нельзя — пользователь решит, что бот сломался.
