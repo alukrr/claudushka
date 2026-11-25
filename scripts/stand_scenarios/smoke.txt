@@ -1,0 +1,11 @@
+# Дымовой прогон: бот жив и отвечает обоим тестерам в личке. Модель не вызывается — денег не тратит.
+to bot
+a: /id
+expect: User ID: \d+
+expect: Статус: (не)?проверенный
+expect_not: Traceback|Exception
+b: /id
+expect: User ID: \d+
+a: /help
+expect: /cost
+expect: /memory

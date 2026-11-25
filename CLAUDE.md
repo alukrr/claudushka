@@ -87,7 +87,9 @@
 - `db.py` — `.claude/rules/db.md` (автоматически)
 - `docker-compose.yml` — `.claude/rules/docker-compose.md` (автоматически)
 - Тестовый стенд (`docker-compose.test.yml`, обновление зависимостей, рискованные
-  правки перед продом; бэкап БД и автоудаление старых копий) — `docs/claude/staging.md`; пошаговый чек-лист ТЗ v0.10 (с SELECT'ами) —
+  правки перед продом; бэкап БД и автоудаление старых копий) — `docs/claude/staging.md`; тестер стенда — два пользовательских аккаунта
+  на Telethon прогоняют сценарии (`scripts/stand_tester.py`, `scripts/stand_scenarios/`, сервис `stand-tester` профиля `tester`,
+  функция `tester`, `data-tester/`; issue #6) — `docs/claude/staging.md` → «Тестер стенда»; пошаговый чек-лист ТЗ v0.10 (с SELECT'ами) —
   `docs/claude/staging-checklist-v0.10.md`; чек-лист ТЗ `feat/opus-5-5` (Opus 5.5, цена по
   `response.model`, миграция `chat_models`) — `docs/claude/staging-checklist-opus-5-5.md`;
   чек-лист ТЗ `feat/haiku-5-5` (Haiku 5.5, thinking/effort, ступенчатая цена >100k) —
