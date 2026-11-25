@@ -86,6 +86,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "TELEGRAM_BOT_TOKEN", TOKEN)
     monkeypatch.setattr(bot, "is_admin", lambda uid: uid == BOT_ADMIN)
     monkeypatch.setattr(bot, "chat_tier", lambda cid: "paid")
+    # «Сейчас» фиксируем: строки лежат на 9–10.11, а _cost_data берёт окно «7 дней» от _berlin_now() (issue #2)
+    monkeypatch.setattr(bot, "_berlin_now", lambda: NOW)
     bot._ma_cache.clear()
     return SimpleNamespace(client=TestClient(bot.build_miniapp()))
 
