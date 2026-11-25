@@ -101,7 +101,7 @@ Haiku-части идут в `usage_log` под `usage_ctx` чата (`label=dai
 
 ## Тёзки и смена ника в логе обзора (v2.23.0, issue #3)
 `build_review_log` подписывает строки лога через `group_sender_labels` по строкам окна обзора: тёзки — «Ник#NNNN» (`db.get_group_messages_range` отдаёт `user_id`). Записи лога несут `uid`/`label`; `prepare_review_input` ставит
-строку смены ника («В истории один человек под разными никами: …», `participants_note`) ПЕРЕД логом в ветках A и B (обзор не кэшируется). Подробности — `docs/claude/group-chat.md` → «Тёзки и смена ника».
+строку смены ника («В истории один человек под разными никами: …», `participants_note`) ПЕРЕД логом в ветках A и B (обзор не кэшируется). Подписи тёзок («Ник#NNNN») из текста обзора вырезаются (`_finish_review(…, entries)`, `review_suffixed_labels`) — и у автообзора, и у `/review`. Подробности — `docs/claude/group-chat.md` → «Тёзки и смена ника».
 
 ## Вкл/выкл ежедневного авто-обзора per-chat (`/review_on`, `/review_off`)
 `allowed_chats.daily_review_enabled` (INTEGER, дефолт 1 — обратная совместимость, ничьё

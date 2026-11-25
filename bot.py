@@ -4095,14 +4095,16 @@ def _group_line(entry: dict, now: datetime, label: str | None = None) -> str:
     return f"{time_prefix}{sender}: {entry['text']}"
 
 
-def build_group_tail(chat_id: int, reply_context: str = "") -> list[dict]:
+def build_group_tail(chat_id: int, reply_context: str = "", labels: dict | None = None) -> list[dict]:
     """Группа без истории (повтор после safety-блока): ОДНА последняя реплика транскрипта — триггер. Не «последний
     user-turn» build_group_messages: тот склеивает ВСЕ реплики людей подряд после последнего ответа бота, и виновная
-    строка (инцидент 2026-10-31) лежала именно в таком хвосте. Реплика бота последней быть не может (триггер сохранён раньше)."""
+    строка (инцидент 2026-10-31) лежала именно в таком хвосте. Реплика бота последней быть не может (триггер сохранён раньше).
+    labels — `info["labels"]` из `build_group_messages` ({user_id: подпись в окне}): подпись строки та же, что в карточке автора
+    («Ник#NNNN» у тёзок), а не голый ник; нет — ник как есть."""
     rows = db.get_group_transcript(chat_id, 1)
     if not rows or rows[-1]["is_bot"]:
         return [{"role": "user", "content": "(…)"}]
-    text = _group_line(rows[-1], datetime.now())
+    text = _group_line(rows[-1], datetime.now(), (labels or {}).get(rows[-1].get("user_id")))
     if reply_context:
         text += f"\n[в ответ на сообщение: «{reply_context}»]"
     return [{"role": "user", "content": text}]
@@ -4144,7 +4146,7 @@ def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GRO
         last_label = {e["user_id"]: labels.get(e["id"], e["sender"]) for e in transcript
                       if not e["is_bot"] and e.get("user_id") is not None}
         info["labels"] = last_label
-        info["suffixed"] = sorted({lab for lab in labels.values() if lab and _LEAK_NICK_SUFFIX_RE.search(lab)}, key=len, reverse=True)
+        info["suffixed"] = sorted({lab for lab in labels.values() if lab and _LEAK_NICK_SUFFIX_RE.search(lab)}, key=lambda x: (-len(x), x))
         info["tagged"] = sum(1 for lab in last_label.values() if lab and _LEAK_NICK_SUFFIX_RE.search(lab))   # людей с «#NNNN» в окне (для лога)
         info["note"] = participants_note([(e["user_id"], labels.get(e["id"], e["sender"])) for e in transcript
                                           if not e["is_bot"] and e.get("user_id") is not None], chat_id)
@@ -4454,8 +4456,16 @@ async def prepare_review_input(chat_id: int, entries: list[dict]) -> tuple[str, 
     )
 
 
-def _finish_review(response, chat_id: int, tag: str) -> str:
-    review = response_text(response)
+def review_suffixed_labels(entries: list[dict] | None) -> list[str]:
+    """Подписи тёзок («Ник#NNNN») из записей `build_review_log` — для резки «#цифр» в тексте обзора (`strip_nick_suffixes`)."""
+    return sorted({e["label"] for e in entries or () if e.get("label") and _LEAK_NICK_SUFFIX_RE.search(e["label"])},
+                  key=lambda x: (-len(x), x))
+
+
+def _finish_review(response, chat_id: int, tag: str, entries: list[dict] | None = None) -> str:
+    """Текст обзора из ответа модели. entries — записи лога обзора: «Ник#NNNN» тёзок в тексте обзора режется до «Ник»
+    (подпись нужна только строкам лога, обращением она не является)."""
+    review = strip_nick_suffixes(response_text(response), review_suffixed_labels(entries))
     if not review:
         logger.warning(f"{tag} пуст: {api_errors.response_debug(response)}")
         return ""
@@ -4501,7 +4511,7 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
                     system=_review_system(chat_id),
                     messages=[{"role": "user", "content": user_content}],
                 )
-                review = _finish_review(response, chat_id, f"Дневной обзор ({branch})")
+                review = _finish_review(response, chat_id, f"Дневной обзор ({branch})", entries)
                 if not review:
                     continue
                 # Подсказку про отключение добавляет КОД, не модель. В транскрипт кладём обзор
@@ -6055,7 +6065,7 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             system=_review_system(chat_id),
             messages=[{"role": "user", "content": user_content}],
         )
-        review = _finish_review(response, chat_id, f"/review ({branch})")
+        review = _finish_review(response, chat_id, f"/review ({branch})", entries)
         if not review:
             review = "Модель вернула пустой ответ. Попробуй ещё раз или смени модель через /models."
             await update.message.reply_text(review)
@@ -10016,7 +10026,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             # Safety-блок провайдера: один повтор без истории + счётчик для фонового скана (docs/claude/safety-unblock.md).
             # Без истории: группа — только сама реплика-триггер (build_group_tail), личка — user_text.
-            _tail = build_group_tail(chat_id, reply_context) if is_group else [{"role": "user", "content": user_text}]
+            _tail = build_group_tail(chat_id, reply_context, group_info.get("labels")) if is_group else [{"role": "user", "content": user_text}]
             response = await _dialog_call(
                 context, chat_id, user_id, is_group,
                 retry_messages=lambda: compose(search_query, search_results, _tail),

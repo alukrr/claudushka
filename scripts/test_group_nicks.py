@@ -317,3 +317,105 @@ def test_group_info_lists_suffixed_labels(tmpdb):
     bot.build_group_messages(CHAT, info=info)
     assert sorted(info["suffixed"]) == ["Саша#2345", "Саша#7890"] or len(info["suffixed"]) == 2
     assert all("#" in x for x in info["suffixed"]) and info["tagged"] == 2
+
+
+# ------------------------------------------------------------------ build_group_tail: подпись как в карточке автора
+
+def test_group_tail_uses_window_label_for_namesake(tmpdb):
+    conn = db.get_conn()
+    conn.execute("INSERT INTO user_profile (user_id, context, chat_id, field, value, source, updated_at, updated_by) "
+                 "VALUES (?,?,?,?,?,?,?,?)", (C, "group", CHAT, "name", "Дима", "admin", NOW, 1))
+    conn.commit()
+    conn.close()
+    say(A, "Саша", "я первый")
+    say(C, "Саша", "я второй, он же триггер")
+    info = {}
+    bot.build_group_messages(CHAT, info=info)
+    [m] = bot.build_group_tail(CHAT, labels=info["labels"])
+    assert m["content"].endswith("Саша#7890: я второй, он же триггер")           # как в строках окна и в карточке автора
+    card = bot._speaker_card(SimpleNamespace(effective_user=SimpleNamespace(full_name="Саша")), C, True, CHAT, info)
+    assert "Саша#7890" in card
+
+
+def test_group_tail_without_labels_or_unknown_user_is_plain(tmpdb):
+    say(C, "Саша", "последняя")
+    assert bot.build_group_tail(CHAT)[0]["content"].endswith("Саша: последняя")
+    assert bot.build_group_tail(CHAT, labels={})[0]["content"].endswith("Саша: последняя")
+    assert bot.build_group_tail(CHAT, labels={A: "Саша#2345"})[0]["content"].endswith("Саша: последняя")   # чужой user_id — ник как есть
+
+
+def test_group_tail_reply_context_kept(tmpdb):
+    say(C, "Саша", "ответ")
+    [m] = bot.build_group_tail(CHAT, "цитата", labels={C: "Саша#7890"})
+    assert m["content"].endswith("Саша#7890: ответ\n[в ответ на сообщение: «цитата»]")
+
+
+# ------------------------------------------------------------------ обзор: «Ник#NNNN» в тексте обзора режется
+
+def _resp(text):
+    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], stop_reason="end_turn")
+
+
+def _review_rows_in_window(tmpdb_):
+    say(A, "Саша", "утром купил велосипед")
+    say(C, "Саша", "а я самокат")
+    say(B, "Лена", "ну и ну")
+
+
+def test_review_suffixed_labels_from_entries():
+    rows = [dict(row(1, A, "Саша", "а"), ts=NOW), dict(row(2, C, "Саша", "б"), ts=NOW + 1), dict(row(3, B, "Лена", "в"), ts=NOW + 2)]
+    entries = bot.build_review_log(rows)
+    assert bot.review_suffixed_labels(entries) == ["Саша#2345", "Саша#7890"]
+    assert bot.review_suffixed_labels([]) == [] and bot.review_suffixed_labels(None) == []
+
+
+def test_finish_review_strips_namesake_suffix_only():
+    entries = bot.build_review_log([dict(row(1, A, "Саша", "а"), ts=NOW), dict(row(2, C, "Саша", "б"), ts=NOW + 1)])
+    text = bot._finish_review(_resp("Саша#2345 купил велосипед, Саша#7890 — самокат (тред #12345)."), CHAT, "тест", entries)
+    assert text == "Саша купил велосипед, Саша — самокат (тред #12345)."
+    assert bot._finish_review(_resp("Саша#2345"), CHAT, "тест") == "Саша#2345"        # без записей — как раньше
+
+
+def test_daily_review_job_strips_suffix(tmpdb, monkeypatch):
+    import asyncio
+    _review_rows_in_window(tmpdb)
+    sent = []
+
+    async def fake_aux(**kw):
+        return _resp("Саша#2345 и Саша#7890 спорили о транспорте.")
+    monkeypatch.setattr(bot, "aux_create", fake_aux)
+    monkeypatch.setattr(db, "get_review_chats", lambda: [{"chat_id": CHAT}])
+    monkeypatch.setattr(bot, "chat_tier", lambda c: "paid")
+    monkeypatch.setattr(bot, "REVIEW_MIN_HUMAN_MSGS", 1)
+
+    class Bot:
+        async def send_message(self, chat_id, text, **k):
+            sent.append(text)
+    asyncio.run(bot.daily_chat_review(SimpleNamespace(bot=Bot())))
+    assert sent and "Саша#" not in "".join(sent) and "Саша и Саша спорили" in "".join(sent)
+    saved = db.get_group_transcript(CHAT, 5)[-1]["text"]
+    assert "#2345" not in saved                                                  # и в историю чата уходит чистый текст
+
+
+def test_manual_review_strips_suffix(tmpdb, monkeypatch):
+    import asyncio
+    _review_rows_in_window(tmpdb)
+    replies = []
+
+    async def fake_call(*a, **kw):
+        return _resp("Саша#2345 и Саша#7890 спорили.")
+
+    async def reply_text(t, **k):
+        replies.append(t)
+
+    async def chat_action(**k):
+        return None
+    monkeypatch.setattr(bot, "call_claude", fake_call)
+    monkeypatch.setattr(bot, "is_admin", lambda uid: True)
+    monkeypatch.setattr(bot, "REVIEW_MIN_HUMAN_MSGS", 1)
+    monkeypatch.setattr(bot, "get_chat_model", lambda c: "gemini-3.8-flash")
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=1), effective_chat=SimpleNamespace(id=CHAT),
+                          message=SimpleNamespace(reply_text=reply_text))
+    ctx = SimpleNamespace(bot=SimpleNamespace(send_chat_action=chat_action, send_message=reply_text))
+    asyncio.run(bot.cmd_review(upd, ctx))
+    assert replies and "#" not in "".join(replies) and "Саша и Саша спорили." in "".join(replies)
