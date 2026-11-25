@@ -45,7 +45,7 @@ def test_registry_has_no_claude():
     assert bot.MODELS[bot.PAID_DEFAULT_MODEL_KEY]["id"] == FLASH
     assert bot.FREE_MODEL_KEYS == ("luna",)
     assert bot.DAILY_REVIEW_MODEL_ID == "google-direct/gemini-4-argon"      # обзор — Argon напрямую у Google (2026-11-15)
-    assert bot.FALLBACK_PAIRS[bot.DAILY_REVIEW_MODEL_ID] == ARGON
+    assert bot.FALLBACK_CHAINS[bot.DAILY_REVIEW_MODEL_ID][0] == ARGON
     assert bot.model_provider("claude-opus-5-5") == "anthropic" and bot.model_provider(LITE_OLD) == "gemini"
     assert not {FLASH, ARGON, LUNA} & bot.LEGACY_PRICES.keys()   # одна цена на строку
 
@@ -195,7 +195,8 @@ def test_help_mentions_luna_not_lite():
         assert "/luna" in text and "GPT-6 Luna" in text
         assert "/argon_g" in text and "/flash_g" in text and "/lite" in text   # нативная полоса Google
         assert "/neon" in text and "/neon_g" in text
-    assert "luna и flash → Flash у Google" in bot.ADMIN_HELP   # фолбэк на нативную полосу (2026-11-19)
+    assert "luna → Flash у Google → Flash пула" in bot.ADMIN_HELP   # фолбэк на нативную полосу (2026-11-19), цепочка из двух переходов (v2.21.0)
+    assert "GPT Terra" in bot.ADMIN_HELP and "GPT Sol" in bot.ADMIN_HELP
     assert "Luna" in bot.TIER_FREE_MSG and "Lite" not in bot.TIER_FREE_MSG
 
 
