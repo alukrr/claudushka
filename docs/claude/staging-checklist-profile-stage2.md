@@ -8,17 +8,23 @@
 1. Копия прод-БД через backup API sqlite3 (раздел «Бэкап БД» в `staging.md`; НЕ `cp` — файл открыт) → в `~/claudushka-test/data-test/claudushka.db` (прежнюю БД стенда
    сохранить рядом). Токен тестового бота — свой (`.env.test`), рассылок и обзоров на копии не запускать: на стенде расписание отключать нечем, поэтому проверить, что `/dedup_auto`
    в `data-test/dedup_auto.json` стоит `estimate` (по умолчанию так).
+   **Дневные обзоры на копии.** В 21:00 по Берлину бот стенда на копии прод-БД САМ запустит дневные обзоры по всем чатам из `allowed_chats` — это настоящие платные вызовы Argon.
+   Либо закончить стенд до 21:00, либо ДО запуска бота стенда выключить обзоры у всех чатов в КОПИИ (не в проде!):
+   `sqlite3 ~/claudushka-test/data-test/claudushka.db "UPDATE allowed_chats SET daily_review_enabled = 0"` (проверка: `SELECT COUNT(*) FROM allowed_chats WHERE daily_review_enabled = 1` → 0).
+   Прочие недельные задачи (дайджест профилей — воскресенье 19:00, автодедуп — понедельник 05:07 в режиме `estimate`) на этом стенде денег не тратят; режим `data-test/dedup_auto.json` не `apply` до шага 5.
 2. `git fetch && git checkout origin/feat/profile-stage2` в `~/claudushka-test`; `docker compose -f docker-compose.test.yml up -d --force-recreate claudushka-test`.
    В логе: «Application started», нет `Traceback`.
 3. Локально до стенда: `TELEGRAM_BOT_TOKEN=x ANTHROPIC_API_KEY=x python -m pytest scripts/test_profile_stage2.py scripts/test_dedup_auto.py -q` — зелёные.
 4. Подобрать 3–5 человек с подтверждённым профилем и заметной памятью (30+ фактов), по возможности: один с городом/семьёй, у которого в фактах есть и повтор профиля, и противоречие.
-   Запрос: `SELECT user_id, context, chat_id, COUNT(*) FROM user_profile p JOIN memory m USING(user_id,context) GROUP BY 1,2,3 ORDER BY 4 DESC LIMIT 10` (в личке `chat_id` профиля = 0, у фактов NULL — сопоставлять руками).
+   Два запроса (у профиля в личке `chat_id = 0`, у фактов NULL — поэтому личка отдельно):
+   - группы: `SELECT p.user_id, p.chat_id, COUNT(DISTINCT p.field) AS fields, COUNT(m.id) AS facts FROM user_profile p JOIN memory m ON m.user_id = p.user_id AND m.context = p.context AND m.chat_id = p.chat_id WHERE p.context = 'group' GROUP BY p.user_id, p.chat_id ORDER BY facts DESC LIMIT 10;`
+   - личка: `SELECT p.user_id, COUNT(DISTINCT p.field) AS fields, COUNT(m.id) AS facts FROM user_profile p JOIN memory m ON m.user_id = p.user_id AND m.context = 'private' AND m.chat_id IS NULL WHERE p.context = 'private' AND p.chat_id = 0 GROUP BY p.user_id ORDER BY facts DESC LIMIT 10;`
 
 ## Часть 1 — dedup TUI (`dedup` на сервере, `--db` копии) и `/dedup_auto`
 | # | Действие | Ожидание |
 |---|---|---|
 | 1 | `dedup` (TUI) на копии: выбрать группы выбранных людей, оценка «до прогона» | У групп с профилем в заголовке «с профилем»; оценка чуть выше, чем у такой же группы без профиля |
-| 2 | Прогнать эти группы в TUI (без apply) | На экране результата в колонке «было» факты с пометкой «✗ профиль:», в заголовке «✗ профиль: N». Выписать: сколько ушло «по профилю», **верно ли** (противоречит/повторяет), **не ушло ли лишнее** (уточняющие факты) |
+| 2 | Прогнать эти группы в TUI (без apply) | На экране результата в колонке «было» факты с пометкой «✗ профиль:», в заголовке «✗ профиль: N». Выписать: сколько ушло «по профилю», **верно ли** (противоречит/повторяет), **не ушло ли лишнее** (уточняющие факты). **Сверять «было/стало» ГЛАЗАМИ, а не только по пометкам:** страховка 30% и пометка «✗ профиль» видят лишь факты, о которых модель САМА сказала «удалён по профилю»; факт, пропавший без этого заявления (или слитый с другим), в пометки не попадёт. Для каждого человека: «было» минус «стало» должно сходиться с пометками плюс обычными слияниями дублей |
 | 3 | Контроль: группа человека БЕЗ профиля | Заголовок без «с профилем», пометок нет, поведение как раньше |
 | 4 | `/dedup_auto estimate` (личка админа) | Список групп; у групп с профилем, изменённым после последней проверки, — «профиль изменён» вместо «новых N»; в `usage_log` новых строк нет |
 | 5 | `/dedup_auto on` (apply) на КОПИИ, `/dedup_auto run` → кнопка | Отчёт: применено/без изменений; строка «🪪 По профилю удалено фактов: N» и по наборам; **в Telegram нет текстов фактов**; имя бэкапа и журнала |
