@@ -407,10 +407,10 @@ cache_write_1h, cache_read)` (без наценки; `PRICE_MARKUP` примен
 - **Safety-блок**: `promptFeedback.blockReason` или `finishReason` SAFETY/PROHIBITED_CONTENT/… без текста → 400 с маркером
   `blocked by provider safety policy` → штатное самовосстановление (`docs/claude/safety-unblock.md`). `safetySettings` не
   задаём — действуют умолчания Google.
-- **Фолбэк ОТ нативных** — та же модель через пул (`FALLBACK_PAIRS`: `google-direct/gemini-4-argon` → `gemini-4-argon`,
-  `google-direct/gemini-3.8-flash` → `gemini-3.8-flash`, `google-direct/gemini-3.1-flash-lite` → `gemini-3.8-flash`), один переход, GPT в
-  цепочке нет. С 2026-11-19 есть и фолбэк НА нативные: Gemini пула и Luna → та же/Flash модель у Google (пул выключил Gemini,
-  решение Алексея; `docs/claude/model-fallback.md`). Если лежат и Google, и Gemini пула — пользователь получит ошибку.
+- **Фолбэк ОТ нативных** — та же модель через пул, затем GPT последним звеном (`FALLBACK_CHAINS`: `google-direct/gemini-4-argon` → `gemini-4-argon` → `gpt-6.1-sol`,
+  `google-direct/gemini-3.8-flash` → `gemini-3.8-flash` → `gpt-6.1-terra`, `google-direct/gemini-3.1-flash-lite` → `gemini-3.8-flash` → Terra), до двух переходов
+  с v2.21.0 (`docs/claude/model-fallback.md`); дневной обзор на Argon у Google — `max_hops=1`, GPT в его цепочке нет. С 2026-11-19 есть и фолбэк НА нативные: Gemini пула и Luna → та же/Flash модель у Google (пул выключил Gemini,
+  решение Алексея; `docs/claude/model-fallback.md`). Ошибки Google 401/403/429 — всегда повод для перехода (ключ/биллинг/квота), 400 — по признаку ключа/биллинга. Если лежат все звенья — ошибка последнего.
 - **Ключ и деньги**: `GEMINI_API_KEY` (тот же, что у banana и запасного голоса); расход идёт со счёта Google, не с баланса пула.
   Лимиты запросов ключа Google (RPM/TPM) не проверялись.
 - **Дневной обзор — через нативную полосу** (с 2026-11-15, `DAILY_REVIEW_MODEL_ID` = `google-direct/gemini-4-argon`).

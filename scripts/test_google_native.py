@@ -92,10 +92,10 @@ def test_price_steps_by_date():
 
 
 def test_fallback_pairs_native_to_pool():
-    assert bot.FALLBACK_PAIRS[ARGON_G] == "gemini-4-argon"
-    assert bot.FALLBACK_PAIRS[FLASH_G] == "gemini-3.8-flash"
-    assert bot.FALLBACK_PAIRS[LITE] == "gemini-3.8-flash"
-    assert bot.FALLBACK_PAIRS["gemini-4-argon"] == ARGON_G and bot.FALLBACK_PAIRS["gemini-3.8-flash"] == FLASH_G   # пул → Google (2026-11-19)
+    assert bot.FALLBACK_CHAINS[ARGON_G][0] == "gemini-4-argon"
+    assert bot.FALLBACK_CHAINS[FLASH_G][0] == "gemini-3.8-flash"
+    assert bot.FALLBACK_CHAINS[LITE][0] == "gemini-3.8-flash"
+    assert bot.FALLBACK_CHAINS["gemini-4-argon"][0] == ARGON_G and bot.FALLBACK_CHAINS["gemini-3.8-flash"][0] == FLASH_G   # пул → Google (2026-11-19)
 
 
 def test_payload_conversion():
@@ -165,7 +165,7 @@ def test_safety_block_maps_to_existing_flow(net, data):
 
 @pytest.mark.parametrize("status,cls,fallback", [
     (429, anthropic.RateLimitError, True), (503, anthropic.APIStatusError, True), (404, anthropic.NotFoundError, True),
-    (400, anthropic.BadRequestError, False), (403, anthropic.PermissionDeniedError, False),
+    (400, anthropic.BadRequestError, False), (403, anthropic.PermissionDeniedError, True),   # 403 Google — ключ/биллинг, всегда повод (issue #5)
 ])
 def test_http_errors_are_sdk_errors(net, status, cls, fallback):
     _, answers = net

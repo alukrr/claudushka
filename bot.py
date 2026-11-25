@@ -118,33 +118,28 @@ else:
     logger.error("SDK без _calculate_retry_timeout — потолок Retry-After не стоит (docs/claude/api-errors.md); проверить после обновления anthropic")
 
 # --- Фолбэк между провайдерами (docs/claude/model-fallback.md) ---
-# С 2026-11-19 (пул отключил Gemini: 400 «Gemini models are currently unavailable», решение Алексея) Gemini пула и Luna
-# уходят на Gemini НАПРЯМУЮ у Google (нативная полоса, GEMINI_API_KEY), не на GPT: тот же характер, другой поставщик.
-# Нативные модели при сбое Google — на ту же модель пула. Переход ОДИН, дальше цепочка не идёт.
-# Без GEMINI_API_KEY — прежние пары на GPT пула (FALLBACK_PAIRS_NO_GOOGLE). FALLBACK_ENABLED=0 — откат без правки кода.
+# Цепочка ДО ДВУХ переходов (ТЗ docs/claude/tz-fallback-chain.md, issue #5): основная → другой поставщик той же Gemini →
+# последним звеном GPT пула (решение Алексея 2026-11-24: лучше ответить не так, как обычно, чем промолчать).
+# С 2026-11-19 Gemini пула и Luna первым звеном уходят на Gemini НАПРЯМУЮ у Google (нативная полоса, GEMINI_API_KEY);
+# нативные модели при сбое Google — на ту же модель пула. Без GEMINI_API_KEY нативные звенья пропускаются
+# (`fallback_chain`). FALLBACK_ENABLED=0 — откат без правки кода.
 FALLBACK_ENABLED = os.environ.get("FALLBACK_ENABLED", "1").strip() != "0"
-FALLBACK_PAIRS = {
-    "gpt-6-luna": "google-direct/gemini-3.8-flash",
-    "gemini-3.8-flash": "google-direct/gemini-3.8-flash",
-    "gemini-4-argon": "google-direct/gemini-4-argon",
-    "gemini-4-neon": "google-direct/gemini-4-neon",
-    # Нативная полоса Google → та же модель через пул (другой поставщик, тот же характер).
-    "google-direct/gemini-4-argon": "gemini-4-argon",
-    "google-direct/gemini-4-neon": "gemini-4-neon",
-    "google-direct/gemini-3.8-flash": "gemini-3.8-flash",
-    "google-direct/gemini-3.1-flash-lite": "gemini-3.8-flash",   # Lite в пуле нет
+FALLBACK_MAX_HOPS = 2                  # переходов в цепочке не больше двух
+FALLBACK_CHAINS = {
+    "gpt-6-luna": ("google-direct/gemini-3.8-flash", "gemini-3.8-flash"),
+    "gemini-3.8-flash": ("google-direct/gemini-3.8-flash", "gpt-6.1-terra"),
+    "gemini-4-argon": ("google-direct/gemini-4-argon", "gpt-6.1-sol"),
+    "gemini-4-neon": ("google-direct/gemini-4-neon", "gpt-6.1-sol"),
+    # Нативная полоса Google → та же модель пула → GPT.
+    "google-direct/gemini-3.8-flash": ("gemini-3.8-flash", "gpt-6.1-terra"),
+    "google-direct/gemini-4-argon": ("gemini-4-argon", "gpt-6.1-sol"),
+    "google-direct/gemini-4-neon": ("gemini-4-neon", "gpt-6.1-sol"),
+    "google-direct/gemini-3.1-flash-lite": ("gemini-3.8-flash", "gpt-6.1-terra"),   # Lite в пуле нет
 }
-# Пары, если ключа Google нет (стенд без GEMINI_API_KEY): как до 2026-11-19 — Gemini → GPT пула, Luna → Flash пула.
-FALLBACK_PAIRS_NO_GOOGLE = {
-    "gpt-6-luna": "gemini-3.8-flash",
-    "gemini-3.8-flash": "gpt-6.1-terra",
-    "gemini-4-argon": "gpt-6.1-sol",
-    "gemini-4-neon": "gpt-6.1-sol",
-}
-# После сбоя модели X следующие N секунд запросы на X сразу идут на её пару (без попытки и ожидания).
+# После сбоя модели X следующие N секунд запросы на X сразу идут дальше по цепочке (без попытки и ожидания).
 FALLBACK_STICKY_SECONDS = int(os.environ.get("FALLBACK_STICKY_SECONDS", "300") or 300)
-FALLBACK_PRIMARY_DELAYS = (2,)        # на основной модели одна повторная попытка, потом сразу фолбэк
-FALLBACK_ALERT_COOLDOWN = 1800        # админу не чаще раза в 30 минут (как BALANCE_ALERT_COOLDOWN)
+FALLBACK_PRIMARY_DELAYS = (2,)        # на основной и промежуточном звене одна повторная попытка, полная лестница — только на последнем
+FALLBACK_ALERT_COOLDOWN = 1800        # админу не чаще раза в 30 минут НА КАЖДУЮ ПРИЧИНУ (как BALANCE_ALERT_COOLDOWN)
 
 MAX_HISTORY = 40
 GROUP_TRANSCRIPT_LIMIT = 50   # сколько реплик группового транскрипта тащить в messages
@@ -353,7 +348,7 @@ LEGACY_PRICES = {
     # Убрана пулом 2026-11-14: только подписи и цены старых строк usage_log (/cost).
     "gemini-3.1-flash-lite": {"label": "Gemini 3.1 Flash-Lite", "provider": "gemini", "in": 0.25, "out": 1.50,
                               "cache_read_mult": 0.1, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0},
-    # GPT через пул: фолбэк Gemini-моделей (FALLBACK_PAIRS) и поиск (gpt-6-luna, /v1/responses, label=gpt_search).
+    # GPT через пул: последнее звено фолбэка Gemini-моделей (FALLBACK_CHAINS) и поиск (gpt-6-luna, /v1/responses, label=gpt_search).
     # gpt-6-luna с 2026-11-14 — в MODELS (выбираемая, дефолт), здесь её нет.
     # Листовые цены со страницы пула 2026-10-28. Выход включает reasoning, поэтому у фолбэк-моделей запас
     # thinking_headroom (кэш у GPT автоматический; запись 1.25x — по таблице пула, тарифицируется ли она на
@@ -841,27 +836,60 @@ def _messages_create(sdk_client, kwargs: dict):
 # --- Фолбэк между провайдерами (docs/claude/model-fallback.md) ---
 
 _fallback_until: dict[str, float] = {}   # id основной модели → monotonic-время конца «липкого» окна
-_last_fallback_alert = 0.0
+_last_fallback_alert: dict[str, float] = {}   # ключ причины → monotonic-время последнего алерта админам
 
 
-def fallback_model_for(model_id: str) -> str | None:
-    """Модель фолбэка (FALLBACK_PAIRS: Luna/Flash → Flash у Google, Argon → Argon у Google, нативные → та же модель пула)
-    или None: фолбэк выключен / у модели пары нет (Terra, Sol, неизвестные строки). Только один переход.
-    Нет GEMINI_API_KEY — пара на нативную недоступна, берём FALLBACK_PAIRS_NO_GOOGLE (GPT пула)."""
+def fallback_chain(model_id: str, max_hops: int = FALLBACK_MAX_HOPS) -> list[str]:
+    """Звенья цепочки после основной (чистая функция, FALLBACK_CHAINS): не больше `max_hops`, без GEMINI_API_KEY нативные
+    звенья выкинуты (Flash → Terra), FALLBACK_ENABLED=0 → пусто. max_hops=1 — дневной обзор (GPT в его цепочке не нужен)."""
     if not model_id or not FALLBACK_ENABLED:
-        return None
-    fb = FALLBACK_PAIRS.get(model_id)
-    if fb and is_native_model(fb) and not GEMINI_API_KEY:
-        return FALLBACK_PAIRS_NO_GOOGLE.get(model_id)
-    return fb
+        return []
+    chain = [m for m in FALLBACK_CHAINS.get(model_id, ()) if GEMINI_API_KEY or not is_native_model(m)]
+    return chain[:max(0, max_hops)]
 
 
-def _sticky_fallback(model_id: str) -> str | None:
-    """Модель фолбэка, если окно после сбоя `model_id` ещё не закончилось."""
-    fb = fallback_model_for(model_id)
-    if fb and _fallback_until.get(model_id, 0.0) > time.monotonic():
-        return fb
-    return None
+def _fallback_plan(model_id: str, fallback: bool = True, max_hops: int = FALLBACK_MAX_HOPS) -> list[str]:
+    """Кого реально пробовать, по порядку: основная и звенья, у которых НЕ открыто своё липкое окно (звено падало недавно как
+    основная или как звено — пропускается без попытки). Все окна открыты — последнее звено пробуем всё равно."""
+    seq = [model_id] + (fallback_chain(model_id, max_hops) if fallback else [])
+    now = time.monotonic()
+    live = [m for m in seq if _fallback_until.get(m, 0.0) <= now]
+    return live or [seq[-1]]
+
+
+class _FallbackRun:
+    """Обход цепочки — ОДНА логика для `_call_with_fallback` (async) и `sync_create` (sync): обёртки отличаются только тем, как
+    исполняют попытку. `model` — текущее звено; `delays` — лестница ретраев (последнее звено — полная RETRY_DELAYS, остальные —
+    FALLBACK_PRIMARY_DELAYS); `advance(exc)` — перейти к следующему звену или сказать, что ошибку надо пробросить."""
+
+    def __init__(self, model_id: str, fallback: bool = True, max_hops: int = FALLBACK_MAX_HOPS):
+        self.requested = model_id
+        self.seq = [model_id] + (fallback_chain(model_id, max_hops) if fallback else [])
+        self.plan = _fallback_plan(model_id, fallback, max_hops)
+        self.i = 0
+
+    @property
+    def model(self) -> str:
+        return self.plan[self.i]
+
+    @property
+    def last(self) -> bool:
+        return self.i == len(self.plan) - 1
+
+    @property
+    def delays(self) -> tuple:
+        return api_errors.RETRY_DELAYS if self.last else FALLBACK_PRIMARY_DELAYS
+
+    def advance(self, exc: BaseException, label: str) -> bool:
+        """True — перешли на следующее звено (липкое окно упавшего открыто, админу сказано); False — пробрасывать exc."""
+        if self.last:
+            return False
+        nxt = self.plan[self.i + 1]
+        if not api_errors.should_fallback(exc, next_model=nxt):
+            return False
+        _enter_fallback(self.model, nxt, exc, label, tried=self.seq[:self.seq.index(self.model)])
+        self.i += 1
+        return True
 
 
 def _strip_cache_control(obj):
@@ -892,23 +920,31 @@ def kwargs_for_model(kwargs: dict, model: str) -> dict:
     return kw
 
 
-def _enter_fallback(model: str, fb_model: str, exc: BaseException, label: str) -> None:
-    """Зафиксировать сбой модели: открыть липкое окно, залогировать, раз в 30 минут сказать админам."""
-    global _last_fallback_alert
+def _enter_fallback(model: str, fb_model: str, exc: BaseException, label: str, tried: tuple | list = ()) -> None:
+    """Зафиксировать сбой звена: открыть его липкое окно, залогировать, сказать админам ПРИЧИНУ (кулдаун — на причину:
+    «Google без денег» не глушит «пул лежит»). tried — звенья цепочки до этого (упали раньше или пропущены окном): тогда
+    это второй переход, и алерт отдельной строкой."""
     now = time.monotonic()
     newly = _fallback_until.get(model, 0.0) <= now
     _fallback_until[model] = now + FALLBACK_STICKY_SECONDS
     status = getattr(exc, "status_code", None)
+    key, why = api_errors.fallback_reason(exc, is_native_model(model))
     ctx = usage_ctx.get()
     chat = ctx[0] if ctx else None
-    if status == 404:
+    if status == 404 and not is_native_model(model):
         logger.error(f"MODEL NOT FOUND: пул не знает {model!r} (404) — отвечаю через {fb_model}")
-    logger.warning(f"FALLBACK {model} → {fb_model} [{label}] chat={chat} {type(exc).__name__} HTTP {status}: "
+    logger.warning(f"FALLBACK {model} → {fb_model} [{label}] chat={chat} причина={key} {type(exc).__name__} HTTP {status}: "
                    f"{str(exc)[:300]}")
-    if newly and now - _last_fallback_alert >= FALLBACK_ALERT_COOLDOWN:
-        _last_fallback_alert = now
-        _fire(notify_admins(f"⚠️ Модель {model} не отвечает ({status or type(exc).__name__}), "
-                            f"отвечаю через {fb_model} ближайшие {FALLBACK_STICKY_SECONDS // 60} мин."))
+    hop2 = bool(tried)
+    cd_key = ("hop2:" if hop2 else "") + key
+    if newly and now - _last_fallback_alert.get(cd_key, -FALLBACK_ALERT_COOLDOWN) >= FALLBACK_ALERT_COOLDOWN:
+        _last_fallback_alert[cd_key] = now
+        mins = FALLBACK_STICKY_SECONDS // 60
+        if hop2:
+            text = (f"⚠️ {' и '.join([*tried, model])} не отвечают ({why}), отвечаю через {fb_model} ближайшие {mins} мин.")
+        else:
+            text = f"⚠️ Модель {model} не отвечает — {why}; отвечаю через {fb_model} ближайшие {mins} мин."
+        _fire(notify_admins(text))
 
 
 def catalog_ids(payload: dict) -> set[str]:
@@ -931,35 +967,32 @@ async def check_fallback_models() -> None:
     except Exception as e:
         logger.warning(f"fallback: каталог моделей пула не получен ({type(e).__name__}) — проверка пропущена")
         return
-    for m in dict.fromkeys([meta["id"] for meta in MODELS.values()] + list(FALLBACK_PAIRS.values())):
+    chain_ids = [m for chain in FALLBACK_CHAINS.values() for m in chain]
+    for m in dict.fromkeys([meta["id"] for meta in MODELS.values()] + chain_ids):
         if m not in ids and not is_native_model(m):
             logger.warning(f"models: {m!r} нет в каталоге пула /v1/models — запросы к ней могут не пройти")
         if price_meta(m) is None:
             logger.warning(f"models: у {m!r} нет цены (MODELS/LEGACY_PRICES) — usage_log посчитает по цене дефолтной модели")
 
 
-async def _call_with_fallback(kwargs: dict, make_fn, *, label: str, keepalive, fallback: bool = True):
-    """Вызов модели с переходом на пару из FALLBACK_PAIRS (Gemini пула и Luna → Gemini у Google, нативные → пул). make_fn(kw) → функция без аргументов для call_with_retry.
-    Возвращает (response, фактически запрошенная модель)."""
+async def _call_with_fallback(kwargs: dict, make_fn, *, label: str, keepalive, fallback: bool = True,
+                              max_hops: int = FALLBACK_MAX_HOPS):
+    """Вызов модели с обходом цепочки FALLBACK_CHAINS (до двух переходов; обход — `_FallbackRun`, общий с sync_create).
+    make_fn(kw) → функция без аргументов для call_with_retry. Возвращает (response, фактически вызванная модель).
+    На основной и промежуточном звене одна повторная попытка, на последнем — полная лестница; звено в липком окне пропускается."""
     model = kwargs.get("model", "")
-    fb = fallback_model_for(model) if fallback else None
-    kwargs = kwargs_for_model(kwargs, model)   # параметры чистим уже для первого вызова
-    if fb and _sticky_fallback(model):
-        response = await api_errors.call_with_retry(
-            make_fn(kwargs_for_model(kwargs, fb)), label=f"{label} [{fb}]", keepalive=keepalive)
-        return response, fb
-    try:
-        response = await api_errors.call_with_retry(
-            make_fn(kwargs), label=label, keepalive=keepalive,
-            delays=FALLBACK_PRIMARY_DELAYS if fb else api_errors.RETRY_DELAYS)
-        return response, model
-    except Exception as exc:
-        if not fb or not api_errors.should_fallback(exc):
-            raise
-        _enter_fallback(model, fb, exc, label)
-    response = await api_errors.call_with_retry(
-        make_fn(kwargs_for_model(kwargs, fb)), label=f"{label} [{fb}]", keepalive=keepalive)
-    return response, fb
+    run = _FallbackRun(model, fallback, max_hops)
+    base = kwargs_for_model(kwargs, model)   # параметры чистим уже для первого вызова; для звена — от этой копии (src=model)
+    while True:
+        m = run.model
+        try:
+            response = await api_errors.call_with_retry(
+                make_fn(kwargs_for_model(base, m)), label=label if m == model else f"{label} [{m}]",
+                keepalive=keepalive, delays=run.delays)
+            return response, m
+        except Exception as exc:
+            if not run.advance(exc, label):
+                raise
 
 
 def _usage_label(label: str, used: str, requested: str) -> str:
@@ -969,7 +1002,7 @@ def _usage_label(label: str, used: str, requested: str) -> str:
 
 
 async def call_claude(context, chat_id: int | None, *, label: str, usage_label: str | None = None,
-                      fallback: bool = True, **kwargs):
+                      fallback: bool = True, max_hops: int = FALLBACK_MAX_HOPS, **kwargs):
     """messages.create из хендлера: не блокирует event loop, переживает 529/429/сеть.
 
     label — для логов ретраев; usage_label — метка в usage_log (по умолчанию первое слово
@@ -979,8 +1012,8 @@ async def call_claude(context, chat_id: int | None, *, label: str, usage_label: 
 
     Всю паузу между попытками держит «печатает…», чтобы ожидание (до 15с) не выглядело
     зависанием. Исключение после всех попыток пробрасывается наверх — его ловит
-    reply_api_error. Сбой модели (5xx/429/сеть/404) → ответ от её пары из FALLBACK_PAIRS (_call_with_fallback);
-    fallback=False — для проб, которым нужен именно ответ запрошенной модели (_probe_model).
+    reply_api_error. Сбой модели → следующее звено цепочки FALLBACK_CHAINS, до двух переходов (_call_with_fallback);
+    fallback=False — для проб, которым нужен именно ответ запрошенной модели (_probe_model); max_hops — потолок переходов.
     """
     keepalive = None
     if context is not None and chat_id is not None:
@@ -988,7 +1021,7 @@ async def call_claude(context, chat_id: int | None, *, label: str, usage_label: 
 
     response, used = await _call_with_fallback(
         kwargs, lambda kw: functools.partial(_messages_create, client_noretry, kw),
-        label=label, keepalive=keepalive, fallback=fallback)
+        label=label, keepalive=keepalive, fallback=fallback, max_hops=max_hops)
     _track_response(used, response, _usage_label(usage_label or label.split()[0], used, kwargs.get("model", "")))
     return response
 
@@ -1007,26 +1040,23 @@ def sync_create(**kwargs):
     """Синхронный messages.create с учётом токенов. Звать ТОЛЬКО из потока.
 
     Единственная точка входа для служебных вызовов внутри sync-функций
-    (should_search, капча, extract_*): считает токены и берёт SDK-ретраи.
-    `label=` (не уходит в API) — метка строки usage_log; чат берётся из usage_ctx.
+    (should_search, капча, extract_*): считает токены и берёт SDK-ретраи; сбой звена → следующее звено цепочки
+    (тот же обход `_FallbackRun`, что у call_claude). `label=` (не уходит в API) — метка строки usage_log; чат берётся из
+    usage_ctx; `max_hops=` (не уходит в API) — потолок переходов (дневной обзор и автодедуп — 1, без GPT).
     """
     label = kwargs.pop("label", "aux")
+    max_hops = kwargs.pop("max_hops", FALLBACK_MAX_HOPS)
     model = kwargs.get("model", "")
-    fb = fallback_model_for(model)
-    used = model
-    kwargs = kwargs_for_model(kwargs, model)
-    if fb and _sticky_fallback(model):
-        used = fb
-        response = _messages_create(client, kwargs_for_model(kwargs, fb))
-    else:
+    run = _FallbackRun(model, True, max_hops)
+    base = kwargs_for_model(kwargs, model)
+    while True:
         try:
-            response = _messages_create(client, kwargs)   # SDK-ретраи отработали, дальше — фолбэк
+            response = _messages_create(client, kwargs_for_model(base, run.model))   # SDK-ретраи отработали, дальше — звено
+            break
         except Exception as exc:
-            if not (fb and api_errors.should_fallback(exc)):
+            if not run.advance(exc, label):
                 raise
-            _enter_fallback(model, fb, exc, label)
-            used = fb
-            response = _messages_create(client, kwargs_for_model(kwargs, fb))
+    used = run.model
     _track_response(used, response, label + "_fallback" if used != model else label)
     return response
 
@@ -3343,7 +3373,8 @@ class _DedupClientShim:
     class _Messages:
         @staticmethod
         def create(**kw):
-            return sync_create(label="memory_dedup", **aux_params(kw.get("model")), **kw)
+            # max_hops=1: как до цепочки (Flash пула → Flash у Google); слияние фактов GPT не поручаем
+            return sync_create(label="memory_dedup", max_hops=1, **aux_params(kw.get("model")), **kw)
     messages = _Messages()
 
 
@@ -4356,6 +4387,7 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
                 response = await aux_create(
                     label="daily_review",
                     model=DAILY_REVIEW_MODEL_ID,
+                    max_hops=1,          # Argon у Google → Argon пула; GPT в цепочку обзора НЕ добавляем (решение Алексея 2026-11-24)
                     max_tokens=out_tokens(DAILY_REVIEW_MODEL_ID, 2200),
                     system=_review_system(chat_id),
                     messages=[{"role": "user", "content": user_content}],
@@ -7393,8 +7425,9 @@ ADMIN_HELP = """\
   /lite [chat_id]          — Gemini 3.1 Flash-Lite напрямую у Google — $0.275/$1.65
                              нативные: ключ GEMINI_API_KEY, мимо пула; при сбое Google — та же модель через пул (Lite → Flash)
   chat_id — число с минусом, например: /flash -1001109809707
-  Gemini-модели без кэша промпта: вход каждый раз по полной цене. Если модель чата упала, ответ даёт другой поставщик
-  (luna и flash → Flash у Google, argon → Argon, neon → Neon у Google; без GEMINI_API_KEY — GPT пула), в /cost такие строки с меткой *_fallback.
+  Gemini-модели без кэша промпта: вход каждый раз по полной цене. Если модель чата упала, ответ даёт другой поставщик, до двух переходов
+  (luna → Flash у Google → Flash пула; flash → Flash у Google → GPT Terra; argon и neon → та же у Google → GPT Sol; нативные — через пул, затем GPT;
+  без GEMINI_API_KEY нативные звенья пропускаются), в /cost такие строки с меткой *_fallback; админам приходит причина сбоя.
   Всё, кроме Luna, — админу или чату в платном режиме. Выбор постоянный (chat_models), в бесплатном режиме
   не применяется (там всегда Luna), но и не стирается. Перед записью — пробный запрос (кроме Luna).
   /haiku /sonnet /opus /fable больше нет (пул закрыл Claude) — отвечают подсказкой выбрать другую модель.

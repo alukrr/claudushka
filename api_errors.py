@@ -172,18 +172,48 @@ def is_model_unavailable(exc: BaseException) -> bool:
     return any(m in text for m in MODEL_UNAVAILABLE_MARKERS)
 
 
-def should_fallback(exc: BaseException) -> bool:
-    """Модель недоступна — пора отвечать её парой (docs/claude/model-fallback.md).
+# Нативная полоса Google (bot.google_native_create → _google_status_error): тело ошибки {"error": {"type": "google_native"}}.
+# Префикс id нативных моделей — чтобы api_errors не импортировал bot (нужен только для правила про 402).
+NATIVE_MODEL_PREFIX = "google-direct/"
+GOOGLE_NATIVE_ERROR_TYPE = "google_native"
+# 400 от Google — повод для фолбэка, только если в тексте ключ/биллинг/доступ. Проверено вживую 2026-11-25: НЕВЕРНЫЙ ключ даёт
+# HTTP 400 «API key not valid. Please pass a valid API key.» (status INVALID_ARGUMENT, reason API_KEY_INVALID), а запрос БЕЗ ключа —
+# 403 «Permission denied on the service.» (PERMISSION_DENIED). Нулевой prepay-баланс живьём не проверен (docs/claude/model-fallback.md).
+GOOGLE_KEY_BILLING_MARKERS = ("api key", "billing", "permission")
+
+
+def is_google_native_error(exc: BaseException) -> bool:
+    """Ошибку вернул Google напрямую (нативная полоса), а не пул: тело `{"error": {"type": "google_native"}}`."""
+    if not isinstance(exc, anthropic.APIStatusError):
+        return False
+    body = getattr(exc, "body", None)
+    err = body.get("error") if isinstance(body, dict) else None
+    return isinstance(err, dict) and err.get("type") == GOOGLE_NATIVE_ERROR_TYPE
+
+
+def should_fallback(exc: BaseException, next_model: str | None = None) -> bool:
+    """Модель недоступна — пора отвечать следующим звеном цепочки (docs/claude/model-fallback.md). Повод зависит от того,
+    КТО вернул ошибку и КУДА идём дальше.
 
     Переключаем: 5xx/529, 429, обрыв/таймаут, ошибка посреди стрима, 404 (модель не знает пул),
-    401/403/404 с признаками апстрима, 400 «модель выключена, бери другую» (MODEL_UNAVAILABLE_MARKERS).
-    НЕ переключаем: 402 (баланс общий), прочие 400/422 (баг запроса, в т.ч. prompt is too long — его лечит обрезка),
-    401/403 без признаков (ключ)."""
+    401/403/404 пула с признаками апстрима, 400 «модель выключена, бери другую» (MODEL_UNAVAILABLE_MARKERS);
+    Google напрямую: 401/403/429 ВСЕГДА (ключ/биллинг/квота Google; у пула свой ключ и кошелёк), 400 — если в тексте
+    GOOGLE_KEY_BILLING_MARKERS; 402 пула — только если `next_model` нативная (у Google свой кошелёк).
+    НЕ переключаем: 402 пула при следующем звене на том же пуле (баланс общий), прочие 400/422 (баг запроса, в т.ч.
+    prompt is too long — его лечит обрезка — и safety-блок), 401/403 пула без признаков (ключ)."""
+    status = getattr(exc, "status_code", None) or 0
+    if is_google_native_error(exc):
+        if is_prompt_too_long(exc) or is_safety_block(exc):
+            return False
+        if status in (401, 403, 429):
+            return True
+        if status in (400, 422):
+            text = f"{exc} {getattr(exc, 'body', '')}".lower()
+            return any(m in text for m in GOOGLE_KEY_BILLING_MARKERS)
     if is_insufficient_balance(exc):
-        return False
+        return bool(next_model) and next_model.startswith(NATIVE_MODEL_PREFIX)
     if is_model_unavailable(exc):
         return True
-    status = getattr(exc, "status_code", None) or 0
     if isinstance(exc, anthropic.BadRequestError) or status in (400, 422):
         return False
     if is_retryable(exc):
@@ -194,6 +224,28 @@ def should_fallback(exc: BaseException) -> bool:
         text = f"{exc} {getattr(exc, 'body', '')}".lower()
         return any(m in text for m in UPSTREAM_MARKERS)
     return False
+
+
+def fallback_reason(exc: BaseException, google: bool | None = None) -> tuple[str, str]:
+    """(ключ причины, текст для админа) — почему звено цепочки не ответило. Ключ — для кулдауна алертов по причине:
+    «Google без денег» не должен глушить «пул лежит». google=None — определить по телу ошибки (обрыв/таймаут тела не имеют —
+    тогда вызывающий знает поставщика по id модели и передаёт флаг)."""
+    status = getattr(exc, "status_code", None)
+    what = status or type(exc).__name__
+    if google is None:
+        google = is_google_native_error(exc)
+    if google:
+        text = f"{exc} {getattr(exc, 'body', '')}".lower()
+        if status == 429:
+            return "google_quota", f"Google: кончились деньги или квота (HTTP {status})"
+        if status in (401, 403) or (status in (400, 422) and any(m in text for m in GOOGLE_KEY_BILLING_MARKERS)):
+            return "google_key", f"Google: ключ или биллинг (HTTP {status})"
+        return "google_down", f"Google не отвечает ({what})"
+    if is_insufficient_balance(exc):
+        return "pool_balance", "пул: кончился баланс (402)"
+    if status == 404 or is_model_unavailable(exc) or (status in (401, 403) and not is_retryable(exc)):
+        return "pool_model_off", f"пул выключил модель (HTTP {status})"
+    return "pool_down", f"пул не отвечает ({what})"
 
 
 def user_message(exc: BaseException, default: str | None = None, clear_hint: str = CLEAR_HINT_DEFAULT) -> str:

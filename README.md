@@ -187,7 +187,7 @@ GPT Image 2.5 Flare или Sunburst без дневного лимита, еже
 
 - Python 3.12
 - python-telegram-bot 22.8
-- Модели чата — GPT-6 Luna / Gemini 3.8 Flash / 4 Argon через пул api.apitoken.sale (Anthropic Messages API-полоса `/v1/messages`, SDK `anthropic`); фолбэк — Gemini 3.8 Flash / GPT-6.1 Terra / 6.1 Sol (`/models`). Модели Anthropic пул не отдаёт с 2026-10-28
+- Модели чата — GPT-6 Luna / Gemini 3.8 Flash / 4 Argon через пул api.apitoken.sale (Anthropic Messages API-полоса `/v1/messages`, SDK `anthropic`); фолбэк — цепочка до двух переходов: другой поставщик той же Gemini (Google ↔ пул), последним звеном GPT-6.1 Terra / 6.1 Sol (`/models`). Модели Anthropic пул не отдаёт с 2026-10-28
 - Tavily API (веб-поиск в бесплатном режиме и `/search`); веб-поиск GPT (`gpt-6-luna`) — в платном режиме (`/searchmode`)
 - Генерация изображений, переключаемый провайдер per-chat: Gemini «Nano Banana 2» (`gemini-3.1-flash-image-preview`, прямой Google API) или через пул api.apitoken.sale — GPT Image 2 (`gpt-image-2`), GPT Image 2.5 Flare (`openai/gpt-image-2.5-flare`) или Sunburst (`openai/gpt-image-2.5-sunburst`)
 - SQLite (пользователи, история, память, модели чатов, провайдер картинок, учёт расхода и балансы) через `db.py`
