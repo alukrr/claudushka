@@ -266,3 +266,54 @@ def test_click_picks_button_and_sees_edit(monkeypatch):
     run(go())
     assert clicked == ["Да, забыть"]
     assert r.passed == 2 and r.failed == 0
+
+
+# --------------------------------------------------------------------------- rename (тёзки, смена ника)
+
+def test_parse_rename():
+    s = st.parse_scenario("a rename: Тест", CONF)[0]
+    assert (s.kind, s.who, s.arg) == ("rename", "a", "Тест")
+    with pytest.raises(st.ScenarioError):
+        st.parse_scenario("a rename:", CONF)
+    with pytest.raises(st.ScenarioError):
+        st.parse_scenario("a rename: " + "x" * (st.RENAME_MAX + 1), CONF)
+
+
+def _rename_runner(monkeypatch, fail_on=None):
+    r, fc, clock, lines = make_runner(monkeypatch, [])
+    names = {"first": "Master", "last": "Osterberg"}
+    calls = []
+
+    async def get_me():
+        return SimpleNamespace(first_name=names["first"], last_name=names["last"])
+    fc.get_me = get_me
+
+    async def set_name(c, first, last):
+        calls.append((first, last))
+        names["first"], names["last"] = first, last
+    monkeypatch.setattr(r, "_set_name", set_name)
+    return r, names, calls, lines
+
+
+def test_rename_twice_restores_original_once(monkeypatch):
+    r, names, calls, lines = _rename_runner(monkeypatch)
+    steps = st.parse_scenario("a rename: Тест\na rename: Тест-новый", CONF)
+
+    async def go():
+        for s in steps:
+            await r.do(s)
+        await r.close()
+    run(go())
+    # оригинал запомнен ДО первой смены, не «Тест» после неё
+    assert calls == [("Тест", ""), ("Тест-новый", ""), ("Master", "Osterberg")]
+    assert names == {"first": "Master", "last": "Osterberg"}
+
+
+def test_rename_restored_even_when_scenario_stops(monkeypatch):
+    r, names, calls, lines = _rename_runner(monkeypatch)
+    steps = st.parse_scenario("a rename: Тест\na reply: не на что", CONF)   # reply без сообщения бота → ScenarioError
+    monkeypatch.setattr(st, "Runner", lambda conf, log: r)
+    rc = run(st.run_steps(steps, CONF, r.log))
+    assert rc == 1
+    assert names == {"first": "Master", "last": "Osterberg"}
+    assert any("ОСТАНОВ" in ln for ln in lines)

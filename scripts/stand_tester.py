@@ -28,6 +28,8 @@
     a click: Да             — нажать кнопку (по подстроке текста) на последнем сообщении бота с кнопками
     a file: путь | подпись  — отправить файл (путь — относительно каталога сценариев)
     a voice: путь.ogg       — отправить как голосовое
+    a rename: Тест          — сменить отображаемое имя аккаунта (first_name, фамилия пустая) — тёзки и смена ника; прежнее
+                              имя возвращается САМО в конце прогона (и при ошибке)
     expect: регэксп         — в ответе на последнее действие есть совпадение (без учёта регистра)
     expect_not: регэксп     — совпадения нет
     silent 10               — бот молчит 10 с (в текущем чате)
@@ -51,7 +53,8 @@ SCEN_DIR = Path(os.environ.get("TESTER_SCENARIOS", "/app/scenarios"))
 CONF_FILE = DATA_DIR / "tester.env"
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,15}$")
 VAR_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
-ACT_RE = re.compile(r"^([a-z][a-z0-9_]{0,15})(!?)(?:\s+(reply|click|file|voice))?\s*:\s?(.*)$")
+ACT_RE = re.compile(r"^([a-z][a-z0-9_]{0,15})(!?)(?:\s+(reply|click|file|voice|rename))?\s*:\s?(.*)$")
+RENAME_MAX = 64                       # лимит Telegram на first_name
 
 
 # --------------------------------------------------------------------------- настройки
@@ -150,6 +153,8 @@ def parse_scenario(text: str, conf: dict, strict: bool = True) -> list[Step]:
                 raise ScenarioError(f"строка {n}: `{verb}` без аргумента")
             if verb == "reply":
                 body = body.replace("\\n", "\n")
+            if verb == "rename" and len(body.strip()) > RENAME_MAX:
+                raise ScenarioError(f"строка {n}: имя длиннее {RENAME_MAX} знаков")
             steps.append(Step(verb, n, arg=body.strip(), who=who, wait=not nowait))
     return steps
 
@@ -234,6 +239,22 @@ class Runner:
         self.last_who = None              # от чьего имени смотреть `silent`
         self.passed = 0
         self.failed = 0
+        self.orig_names: dict = {}        # who -> (first_name, last_name) до первого `rename` — вернуть в close()
+
+    @staticmethod
+    async def _set_name(c, first: str, last: str):
+        from telethon.tl.functions.account import UpdateProfileRequest
+        await c(UpdateProfileRequest(first_name=first, last_name=last))
+
+    async def _rename(self, st: Step):
+        c = await self.client(st.who)
+        if st.who not in self.orig_names:
+            me = await c.get_me()
+            self.orig_names[st.who] = (me.first_name or "", me.last_name or "")
+        await self._pace()
+        await self._set_name(c, st.arg, "")
+        self.log(f"{st.who} ✎ имя → «{st.arg}»")
+        await asyncio.sleep(self.gap)     # бот получит новое имя со следующим сообщением; дать Telegram разойтись
 
     async def client(self, who: str):
         if who in self.clients:
@@ -347,6 +368,10 @@ class Runner:
             self._verdict(ok, f"silent {st.num:g}", "" if ok else render(got[max(got)]))
             return
 
+        if st.kind == "rename":
+            await self._rename(st)
+            return
+
         c = await self.client(st.who)
         ent = await self.entity(st.who)
         await self._pace()
@@ -412,6 +437,13 @@ class Runner:
             self.log(f"   ✗ {what}" + (f"\n     в ответе: {detail}" if detail else ""))
 
     async def close(self):
+        for who, (first, last) in self.orig_names.items():   # вернуть имена аккаунтов, даже если прогон упал
+            try:
+                await self._set_name(self.clients[who], first, last)
+                self.log(f"{who} ✎ имя возвращено → «{(first + ' ' + last).strip()}»")
+            except Exception as e:  # noqa: BLE001
+                self.log(f"!!! {who}: имя НЕ возвращено ({type(e).__name__}: {e}) — вернуть руками в Telegram: «{first} {last}»")
+        self.orig_names.clear()
         for c in self.clients.values():
             await c.disconnect()
 

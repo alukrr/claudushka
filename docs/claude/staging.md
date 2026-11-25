@@ -251,8 +251,11 @@ tester chats a        # id тестовой группы → TESTER_GROUP в tes
 `data-tester/runs/<время>-<сценарий>.log`; код выхода ≠ 0, если хоть одна проверка не прошла.
 
 **Сценарии** — `scripts/stand_scenarios/*.txt`, формат — в шапке `scripts/stand_tester.py` (`to bot|group|<id>`, `a: текст`,
-`a!: текст` без ожидания, `a reply:`, `a click:`, `a file:`, `a voice:`, `expect:`, `expect_not:`, `silent N`, `sleep N`,
-`timeout N`, `settle N`, `${VAR}` из `tester.env`). Ответ на действие — все сообщения бота после нашего (и правки уже
+`a!: текст` без ожидания, `a reply:`, `a click:`, `a file:`, `a voice:`, `a rename: Имя`, `expect:`, `expect_not:`, `silent N`, `sleep N`,
+`timeout N`, `settle N`, `${VAR}` из `tester.env`). `a rename:` меняет отображаемое имя аккаунта (тёзки, смена ника); прежнее имя
+тестер возвращает сам в конце прогона, даже при ошибке — участники тестовой группы смену имени видят. Сценарии по чек-листам:
+`nicks`, `nicks-review` (#3, `staging-checklist-group-nicks.md`), `profile-extract`, `profile-extract-private` (#4,
+`staging-checklist-profile-stage2.md`); что сверять в логе и БД после прогона — в шапке каждого сценария. Ответ на действие — все сообщения бота после нашего (и правки уже
 существующих — для кнопок), пока бот не затихнет на `TESTER_SETTLE` секунд или не выйдет `TESTER_TIMEOUT`. Новый чек-лист с
 многоаккаунтными шагами — по возможности со сценарием рядом. Юнит-тест без сети — `scripts/test_stand_tester.py`.
 
