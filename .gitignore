@@ -6,3 +6,4 @@ data/
 data-test/
 .claude/settings.local.json
 infra/edge/.env
+data-tester/

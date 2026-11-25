@@ -51,3 +51,7 @@ cost55h() { q "SELECT id, label, model, input, output, thinking, cache_write, ca
     THEN (input*0.5 + output*2.5 + cache_read*0.05 + cache_write*0.625)
     ELSE (input*0.1 + output*0.5 + cache_read*0.01 + cache_write*0.125) END/1e6, 8) AS min_5m
   FROM usage_log WHERE kind='llm' AND model='claude-haiku-5-5' ORDER BY id DESC LIMIT ${1:-5}"; }
+
+# tester <команда> … — тестер стенда: пользовательские аккаунты пишут тестовому боту (scripts/stand_tester.py, issue #6,
+# docs/claude/staging.md → «Тестер стенда»). Примеры: tester login a · tester whoami · tester say a "/id" · tester run smoke
+tester() { (cd ~/claudushka-test && docker compose -f docker-compose.test.yml --profile tester run --rm stand-tester "$@"); }
