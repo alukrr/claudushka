@@ -233,7 +233,7 @@ Claude → отправка ответа) — единственное, что �
 (профиль `tester` — в `up -d` НЕ поднимается, работает только через `run --rm`). `telethon==1.46.0` ставится при каждом запуске
 (несколько секунд) — в `requirements.txt` бота его нет и не нужно. Удобнее всего — функция `tester` из `staging-aliases.sh`.
 
-**Один раз:**
+**Один раз** (пошагово, с тем, кто что делает, — `docs/claude/handoff-stand-tester-setup.md`):
 
 ```bash
 cd ~/claudushka-test
