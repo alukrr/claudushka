@@ -1,0 +1,29 @@
+# #7 (feat/review-chat-admins) — часть 2 из 2, ПОСЛЕ рестарта стенда (кулдаун переживает рестарт) и после review-access.txt.
+# Шаг 5 чек-листа: управляющий проходит права, но упирается в кулдаун. Нужна переменная TESTER_B_ID (user_id тестера b, из `tester whoami`)
+# в data-tester/tester.env — в репозиторий цифры не пишем.
+# Если сценарий оборвался между add и rm — вручную `a: /manager rm ${TESTER_B_ID}` (tester say a "/manager rm …" с `to`-группой).
+to ${TESTER_GROUP2}
+timeout 60
+
+# Рестарт позади: кулдаун на месте (тот же админ чата)
+a: /review
+expect: Обзор уже был в \d\d:\d\d
+
+# b — ещё не управляющий: отказ правами
+b: /review
+expect: только для админов
+expect_not: Обзор уже был
+
+# a назначает b управляющим → b проходит права и получает КУЛДАУН, не отказ правами
+a: /manager add ${TESTER_B_ID}
+expect: .
+b: /review
+expect: Обзор уже был в \d\d:\d\d
+expect_not: только для админов
+
+# Снять управляющего → снова отказ правами (контроль)
+a: /manager rm ${TESTER_B_ID}
+expect: .
+b: /review
+expect: только для админов
+expect_not: Обзор уже был
