@@ -4293,6 +4293,7 @@ REVIEW_TOPICS_MAX_CHARS = 30000    # лимит JSON выжимок в итог�
 REVIEW_RAW_TAIL_MSGS = 40          # последние сообщения лога сырьём — для живости (ветка B)
 REVIEW_RAW_TAIL_MAX_CHARS = 8000
 REVIEW_MIN_HUMAN_MSGS = 5
+REVIEW_CMD_COOLDOWN_MIN = 60   # /review не-админу бота: не чаще раза в N минут на чат; последний обзор — из group_messages (ежедневный тоже)
 REVIEW_CHUNK_PARALLEL = 4
 TELEGRAM_MSG_LIMIT = 4096
 
@@ -6076,11 +6077,24 @@ async def on_broadcast_button(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Разовый обзор (admin-only): тот же сбор лога и ветки A/B, что у ежедневного (окно «с прошлого 21:00 до
-    сейчас»), финал — на модели чата с dialog_params. Позволяет проверить фичу, не дожидаясь 21:00."""
-    if not is_admin(update.effective_user.id):
-        return
+    """Разовый обзор: тот же сбор лога и ветки A/B, что у ежедневного (окно «с прошлого 21:00 до сейчас»), финал — на модели
+    чата с dialog_params. Админ бота — где угодно, без кулдауна и проверки тарифа. Остальные (с v2.24.0, issue #7) — в группе,
+    админ чата или управляющий (`_group_admin_gate`), только платный чат, не чаще `REVIEW_CMD_COOLDOWN_MIN` на чат: время
+    последнего обзора — из строки обзора в group_messages (`db.get_last_review_ts`), переживает рестарт, ежедневный считается."""
     chat_id = update.effective_chat.id
+    if not is_admin(update.effective_user.id):
+        if not await _group_admin_gate(update, context, "review"):
+            return
+        if chat_tier(chat_id) != "paid":
+            await update.effective_message.reply_text("Обзор — в платном режиме: пополнить — /pay.")
+            return
+        last = db.get_last_review_ts(chat_id, f"({REVIEW_SENT_LABEL}")
+        if last and time.time() - last < REVIEW_CMD_COOLDOWN_MIN * 60:
+            t_last = datetime.fromtimestamp(last, BERLIN_TZ)
+            t_next = t_last + timedelta(minutes=REVIEW_CMD_COOLDOWN_MIN)
+            await update.effective_message.reply_text(
+                f"Обзор уже был в {t_last:%H:%M}, следующий — после {t_next:%H:%M}.")
+            return
     entries, human = collect_review_entries(chat_id)
     if human < REVIEW_MIN_HUMAN_MSGS:
         await update.message.reply_text("Маловато сообщений для обзора.")
@@ -6121,7 +6135,7 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _set_chat_review_enabled(update: Update, context: ContextTypes.DEFAULT_TYPE, enabled: bool):
     """Включает/выключает ежедневный авто-обзор этого чата (daily_chat_review).
     Доступно чат-админам (не только глобальным админам бота) — can_change("review_enabled"), тот же паттерн, что у
-    /ratelimit. Не путать с /review — тот шлёт обзор прямо сейчас и остаётся admin-only, здесь речь только про
+    /ratelimit. Не путать с /review — тот шлёт обзор прямо сейчас (админам чата, платный режим, раз в час), здесь речь только про
     ежедневную рассылку по расписанию."""
     chat_id = update.effective_chat.id
     if not await _check_change(update, context, "review_enabled", chat_id=chat_id, in_target=True, value=enabled):
@@ -7553,6 +7567,7 @@ USER_HELP = """\
   /settings      — мини-приложение настроек чатов (в группе — кнопка открытия; админам чата там же экран «Расходы»)
   /ratelimit     — в группах: ограничить частоту сообщений участника (для админов группы)
   /activity [0-100] — в группах: шанс, что Клодушка сама вставит реплику, когда её не звали (платный режим; менять — админам группы)
+  /review — в группах: AI-обзор чата прямо сейчас (платный режим; админам группы, не чаще раза в час)
   /autoignore [on|off] — в группах: автопауза бота за повторы и травлю; без аргумента — кто сейчас в паузе (для админов группы)
   /unignore      — в группах: снять паузу (ответом на сообщение или /unignore <user_id>; для админов группы)
   /manager add|rm — в группах: дать/забрать права админа чата в боте у участника, не админа в Telegram (ответом на сообщение или <user_id>; только настоящим админам группы)
@@ -7634,13 +7649,13 @@ ADMIN_HELP = """\
   /ratelimit               — лимит частоты сообщений участника в группе (доступно и админам группы,
                               не только боту-админу); ответом на сообщение: <N мин.>|off,
                               без ответа: <user_id> <N|off>, без аргументов — список, "off" — сброс всем
-  /review                  — AI-обзор чата прямо сейчас
+  /review                  — AI-обзор чата прямо сейчас (админу бота — где угодно, без кулдауна и тарифа)
   /hidden [chat_id]        — строки истории, скрытые от модели после safety-блока (без текста; в личке chat_id обязателен)
   /unhide [chat_id] <id>   — вернуть скрытую строку (в группе chat_id не нужен)
   /safety_scan [chat_id]   — вручную найти и скрыть строку, которую режет фильтр модели (итог — админам в личку;
                               сам бот запускает скан после 2 блокировок подряд)
   /review_on / /review_off — вкл/выкл ЕЖЕДНЕВНЫЙ авто-обзор этого чата (доступно и админам
-                              группы; /review — разовый, admin-only)
+                              группы; /review — разовый, см. выше)
   /update                  — git pull + рестарт контейнера\
 """
 

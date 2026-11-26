@@ -1397,6 +1397,18 @@ def save_group_message(chat_id: int, user_id: int, sender_name: str, content: st
     conn.close()
 
 
+def get_last_review_ts(chat_id: int, prefix: str) -> int:
+    """Время (unix) последней строки обзора в group_messages: бот (is_bot=1), текст начинается с `prefix` (REVIEW_SENT_LABEL с
+    открывающей скобкой — задаёт bot.py). 0, если обзоров не было. Сравнение через substr, не LIKE (спецсимволы не шаблон);
+    hidden не фильтруем — это не чтение в промпт. Кулдаун `/review` (issue #7)."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT MAX(timestamp) FROM group_messages WHERE chat_id = ? AND is_bot = 1 AND substr(content, 1, length(?)) = ?",
+        (chat_id, prefix, prefix)).fetchone()
+    conn.close()
+    return int(row[0] or 0)
+
+
 def update_last_group_message(chat_id: int, user_id: int, old_content: str, new_content: str) -> bool:
     """Заменить текст ПОСЛЕДНЕЙ строки человека (is_bot=0) с точно таким содержимым — для голосового/кружочка в группе,
     где пассивное распознавание выключено: строка сохранена голой, расшифровка появилась позже (docs/claude/media.md).
