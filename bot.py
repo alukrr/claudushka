@@ -4497,6 +4497,9 @@ def _finish_review(response, chat_id: int, tag: str, entries: list[dict] | None 
     """Текст обзора из ответа модели. entries — записи лога обзора: «Ник#NNNN» тёзок в тексте обзора режется до «Ник»
     (подпись нужна только строкам лога, обращением она не является)."""
     review = strip_nick_suffixes(response_text(response), review_suffixed_labels(entries))
+    if looks_like_leaked_reasoning(review):
+        logger.warning(f"{tag}: рассуждения модели текстом вместо обзора, отброшено, chat={chat_id}: {review[:120]!r}")
+        return ""
     if not review:
         logger.warning(f"{tag} пуст: {api_errors.response_debug(response)}")
         return ""
@@ -4786,6 +4789,21 @@ _TS_PREFIX_RE = re.compile(r"^\[(?:\d{1,2}\.\d{2} )?\d{1,2}:\d{2}\][ \t]*[^\n:]{
 _TS_LINE_RE = re.compile(r"^\[(?:\d{1,2}\.\d{2} )?\d{1,2}:\d{2}\][ \t]*[^\n:]{1,60}?:", re.MULTILINE)
 
 
+# Модель пишет свои рассуждения ОБЫЧНЫМ текстом, а не частью thought (инцидент 2026-11-26, «Москвичи», Argon у Google, спонтанная
+# реплика: «दिग्गज\nThinking Process:\n\n1.  **Analyze the Request:** …», thoughtsTokenCount=0). Английские заголовки плана в начале
+# ответа: в русском диалоге их нет. Ищем только в начале ответа (LEAKED_REASONING_HEAD знаков) — перед ними бывает мусорный токен.
+LEAKED_REASONING_HEAD = 200
+_LEAKED_REASONING_RE = re.compile(
+    r"^[ \t]*(?:<thought>|thinking process\s*:|(?:\d+\.\s*)?\*\*(?:analy[sz]e the (?:request|user|prompt|input)|"
+    r"formulate (?:the )?response|draft(?:ing)? (?:the )?response)\b)",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def looks_like_leaked_reasoning(text: str) -> bool:
+    """True — ответ начинается с рассуждений модели (план «Thinking Process / **Analyze the Request**»), а не с ответа."""
+    return bool(text) and bool(_LEAKED_REASONING_RE.search(text.lstrip()[:LEAKED_REASONING_HEAD]))
+
+
 def strip_leaked_service_note(text: str) -> tuple[str, bool]:
     """Ответ модели → (текст, была ли утечка служебной пометки из истории). Модель копирует форматы СВОИХ записей в group_messages
     (инциденты 2026-09-08, 2026-09-28; 2026-11-02 — «обзор дня» в ответ на «ты че…» в Москвичах).
@@ -4793,8 +4811,13 @@ def strip_leaked_service_note(text: str) -> tuple[str, bool]:
     * начинается с «(служебное: …)» — пометка паузы/предупреждения: вырезаем строку, остальное оставляем;
     * начинается с «[время] Имя: » (формат строк транскрипта): префикс вырезаем; если дальше есть ещё такие строки — модель писала
       диалог за людей, ответ отбрасываем целиком.
+    * начинается с рассуждений модели (`looks_like_leaked_reasoning`, инцидент 2026-11-26) — ответ отбрасываем целиком: отрезать
+      план нельзя, финальная фраза бывает приклеена к нему без перевода строки.
     Если пометка не в начале ответа — не трогаем (это может быть обычный текст со скобками)."""
     stripped = text.lstrip()
+    if looks_like_leaked_reasoning(stripped):
+        logger.warning(f"Рассуждения модели текстом в ответе, ответ отброшен: {stripped[:120]!r}")
+        return "", True
     if stripped.startswith(f"({REVIEW_SENT_LABEL}"):
         logger.warning(f"Утечка пометки обзора в ответ диалога, ответ отброшен: {stripped[:120]!r}")
         return "", True
@@ -8580,6 +8603,12 @@ async def _dialog_call(context, chat_id: int, user_id: int, is_group: bool, *, r
         return response
     if is_group:
         _safety_strikes[chat_id] = 0
+    if looks_like_leaked_reasoning(response_text(response)):
+        # Сбой модели (инцидент 2026-11-26): один повтор того же запроса. Не помог — strip_leaked_service_note отбросит ответ,
+        # человек получит «пустой ответ», а не план рассуждений.
+        logger.warning(f"Рассуждения модели текстом, повтор запроса chat={chat_id} model={kwargs.get('model')}")
+        response = await _model_call(context, chat_id, label=f"{label} (повтор: рассуждения в тексте)",
+                                     usage_label="dialog", **kwargs)
     return response
 
 
@@ -9628,6 +9657,10 @@ def _default_photo_question(user_id: int, is_group: bool) -> str:
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # MessageHandler отдаёт и ИЗМЕНЁННЫЕ сообщения (edited_message): update.message у них None, ниже всё на нём —
+    # правку сообщения не обрабатываем (до v2.24.1 хендлер падал AttributeError, 8 раз за 24–25.11 в одной личке).
+    if update.message is None:
+        return
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     is_group = update.effective_chat.type in ("group", "supergroup")
