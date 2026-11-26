@@ -616,7 +616,8 @@ def dedup_state_put(user_id: int, context: str, chat_id, tier: str, checked_at: 
 def dedup_due_groups(min_facts: int, min_new: int, new_ratio: float, now: int | None = None) -> list[tuple]:
     """Группы живых фактов, которые пора проверять автодедупом: [((user_id, context, chat_id|None, tier), новых, первый_раз)], по числу
     новых по убыванию. Условие: живых фактов >= min_facts И (отметки нет ИЛИ фактов с created_at > checked_at >= max(min_new,
-    ceil(new_ratio × facts_after))). «Живой» — как у бота при чтении: expires_at пуст или в будущем."""
+    ceil(new_ratio × facts_after)) ИЛИ профиль человека (user_profile.updated_at) менялся после checked_at). «Живой» — как у бота при чтении:
+    expires_at пуст или в будущем."""
     now = int(time.time()) if now is None else now
     conn = get_conn()
     try:
@@ -624,6 +625,11 @@ def dedup_due_groups(min_facts: int, min_new: int, new_ratio: float, now: int | 
                             "WHERE expires_at IS NULL OR expires_at > ?", (now,)).fetchall()
         state = {(r["user_id"], r["context"], r["chat_key"], r["tier"]): (r["checked_at"], r["facts_after"])
                  for r in conn.execute("SELECT user_id, context, chat_key, tier, checked_at, facts_after FROM memory_dedup_state")}
+        # Профиль подтвердили/поправили ПОСЛЕ последней проверки группы → группа снова к проверке, даже если новых фактов нет:
+        # дедуп сверяет факты с профилем (v2.22.0), а у давно молчащего человека новых фактов не будет. Личка в профиле — chat_id=0.
+        prof_at = {(r["user_id"], r["context"], r["chat_id"]): r["at"]
+                   for r in conn.execute("SELECT user_id, context, chat_id, MAX(updated_at) AS at FROM user_profile "
+                                         "GROUP BY user_id, context, chat_id")}
     finally:
         conn.close()
     groups: dict = {}
@@ -639,7 +645,8 @@ def dedup_due_groups(min_facts: int, min_new: int, new_ratio: float, now: int | 
             continue
         checked_at, after = st
         new = sum(1 for c in created if c > checked_at)
-        if new >= max(min_new, math.ceil(new_ratio * after)):
+        profile_changed = (prof_at.get((key[0], key[1], key[2] or 0)) or 0) > checked_at
+        if new >= max(min_new, math.ceil(new_ratio * after)) or profile_changed:
             out.append((key, new, False))
     out.sort(key=lambda t: (-t[1], t[0][0], t[0][1], t[0][2] or 0, t[0][3]))
     return out
