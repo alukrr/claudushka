@@ -3,13 +3,13 @@
 ТЗ — `docs/claude/tz-review-chat-admins.md` (issue #7), описание — `docs/claude/daily-review.md` → «`/review` для админов чата». Схема БД не меняется.
 Прогон — тестерами (`docs/claude/staging.md` → «Тестер стенда», «Практика»). В отчёт и репозиторий — только `a`/`b`, без ников, названий групп и `user_id`.
 
-**Кто есть кто.** Группа — `TESTER_GROUP2`: тестер `a` — админ в Telegram, `b` — обычный участник; оба НЕ админы бота. Админа бота (шаг 9) изображает Алексей руками.
+**Кто есть кто.** Группа — `TESTER_GROUP_1` (во всех тестовых группах `a` — админ в Telegram, `b` — обычный участник); оба НЕ админы бота. Админа бота (шаг 9) изображает Алексей руками.
 
 ## Подготовка
 1. `~/claudushka-test`: `git fetch && git checkout --detach origin/feat/review-chat-admins`, `docker compose -f docker-compose.test.yml up -d --force-recreate claudushka-test`. В логе «Application started», нет `Traceback`.
 2. Локально до стенда: `python -m pytest scripts/test_review_access.py scripts/test_review_topics.py scripts/test_review_persona.py -q` — зелёные; `tester check` — оба сценария разбираются.
 3. **Баланс группы > 0** (платный режим): `SELECT chat_id, balance_usd FROM chat_credits` по `chat_id` группы (схема — `.claude/rules/db.md`). Пополнение — Алексей: `/topup <id> 5 стенд force`.
-4. В `data-tester/tester.env` есть `TESTER_GROUP2` и `TESTER_B_ID` (user_id `b` из `tester whoami`) — добавляет Алексей или тот, у кого доступ; не печатать.
+4. В `data-tester/tester.env` есть `TESTER_GROUP_1` и `TESTER_B_ID` (user_id `b` из `tester whoami`) — добавляет Алексей или тот, у кого доступ; не печатать.
 5. В группе за последний час не было обзора (ни ежедневного 21:00, ни `/review`): `SELECT MAX(timestamp) FROM group_messages WHERE chat_id=<id> AND is_bot=1 AND content LIKE '(обзор дня по%'`.
    Обзор в 21:00 Берлина на стенде сработает для группы, если дневной обзор у неё включён — прогон либо до 21:00, либо после 22:00, либо `/review_off` в группе.
 

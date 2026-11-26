@@ -2,7 +2,7 @@
 # Шаг 5 чек-листа: управляющий проходит права, но упирается в кулдаун. Нужна переменная TESTER_B_ID (user_id тестера b, из `tester whoami`)
 # в data-tester/tester.env — в репозиторий цифры не пишем.
 # Если сценарий оборвался между add и rm — вручную `a: /manager rm ${TESTER_B_ID}` (tester say a "/manager rm …" с `to`-группой).
-to ${TESTER_GROUP2}
+to ${TESTER_GROUP_1}
 timeout 60
 
 # Рестарт позади: кулдаун на месте (тот же админ чата)
