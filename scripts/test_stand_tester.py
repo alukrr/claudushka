@@ -13,7 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import stand_tester as st  # noqa: E402
 
-CONF = {"TESTER_BOT": "@stand_bot", "TESTER_GROUP": "-1001", "TESTER_GAP": "0", "TESTER_SETTLE": "4", "TESTER_TIMEOUT": "30"}
+CONF = {"TESTER_BOT": "@stand_bot", "TESTER_GROUP": "-1001", "TESTER_GROUP_1": "-1002", "TESTER_B_ID": "2", "TESTER_GAP": "0", "TESTER_SETTLE": "4", "TESTER_TIMEOUT": "30"}
 
 
 # --------------------------------------------------------------------------- разбор
