@@ -1,5 +1,6 @@
 import os
 import re
+import warnings
 import json
 import html
 import io
@@ -5380,10 +5381,14 @@ async def _chat_allowed_reactions(bot, chat_id: int, now: float | None = None) -
         return hit[1]
     allowed: frozenset | None = None
     try:
-        chat = await bot.get_chat(chat_id)
-        av = getattr(chat, "available_reactions", None)
+        # Сырой getChat: PTB отдаёт «поле опущено» (все реакции разрешены) и «пустой список» (реакции выключены) одинаково — пустым кортежем
+        # (стенд 2026-11-27: из-за этого бот считал, что разрешено ничего, и не ставил реакции вовсе).
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            raw = await bot.do_api_request("getChat", api_kwargs={"chat_id": chat_id})
+        av = raw.get("available_reactions") if isinstance(raw, dict) else None
         if av is not None:
-            allowed = frozenset(r.emoji for r in av if isinstance(r, ReactionTypeEmoji))
+            allowed = frozenset(r.get("emoji") for r in av if isinstance(r, dict) and r.get("type") == "emoji" and r.get("emoji"))
     except Exception as e:
         logger.warning(f"reaction_check: getChat chat={chat_id} не удался ({type(e).__name__}: {e}) — считаю, что разрешены все")
     _reaction_allowed_cache[chat_id] = (now, allowed)

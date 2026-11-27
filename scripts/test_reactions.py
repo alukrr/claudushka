@@ -321,10 +321,15 @@ class _FakeBot:
     def __init__(self, available=None, fail=False):
         self.available, self.fail, self.calls = available, fail, []
 
-    async def get_chat(self, cid):
+    async def do_api_request(self, method, api_kwargs=None):
+        """Сырой getChat: available_reactions опущено (None) — разрешены все; список (в т.ч. пустой) — только они."""
+        assert method == "getChat"
         if self.fail:
             raise RuntimeError("нет сети")
-        return SimpleNamespace(available_reactions=self.available)
+        raw = {"id": (api_kwargs or {}).get("chat_id")}
+        if self.available is not None:
+            raw["available_reactions"] = [{"type": "emoji", "emoji": r.emoji} for r in self.available]
+        return raw
 
     async def set_message_reaction(self, chat_id, message_id, reaction=None):
         self.calls.append((chat_id, message_id, reaction))
