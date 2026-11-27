@@ -1,0 +1,25 @@
+# v2.25.0 (feat/reactions-read-set) — чтение реакций. Чек-лист docs/claude/staging-checklist-reactions.md, шаги 2–4.
+# Группа — TESTER_GROUP_1: бот там АДМИН (иначе message_reaction не приходит), `a` админ в Telegram, `b` участник.
+# Сверка на сервере после прогона: group_messages.tg_message_id заполнен у новых строк и у ответа бота; message_reactions — по шагам; лог PROMPT … reactions_note=N.
+# Реакция бота reaction_check может появиться сама (3 новых сообщения) — в проверках ниже смотрим реакцию b.
+to ${TESTER_GROUP_1}
+
+# Шаг 2: реплики людей и ответ бота
+a!: Привет всем, сегодня обсуждаем планы на вечер.
+b!: Я за кино, а не за бары.
+a: ${TESTER_BOT} назови любое животное одним словом
+expect: .
+
+# Шаг 3: b ставит 😁 на ответ бота — реакция видна в Telegram; затем обращение, хвост запроса получает строку реакций (лог PROMPT reactions_note>0)
+b react: bot 1 😁
+sleep 3
+a see: bot 1
+expect: 😁
+a: ${TESTER_BOT} кто-нибудь отреагировал на твой ответ? Одним предложением.
+expect: .
+
+# Шаг 4: b снимает реакцию — строка message_reactions пропала (проверка в БД), в Telegram реакции нет
+b react: bot 2 -
+sleep 3
+a see: bot 2
+expect_not: 😁

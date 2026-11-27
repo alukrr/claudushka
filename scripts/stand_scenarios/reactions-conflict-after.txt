@@ -1,0 +1,5 @@
+# Продолжение reactions-conflict.txt: после скрипта scripts/stand_reaction_conflict.py на сообщении-цели снова стоит спонтанная 😁 (а не пусто и не 👀).
+to ${TESTER_GROUP_1}
+a see: 1
+expect: 😁
+expect_not: 👀

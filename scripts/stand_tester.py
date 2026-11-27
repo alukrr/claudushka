@@ -35,6 +35,8 @@
     silent 10               — бот молчит 10 с (в текущем чате)
     a react: 2 😁           — поставить реакцию на 2-е с конца сообщение чата (1 — последнее, любой отправитель); `-` вместо эмодзи — снять
     a react: bot 1 😁       — то же, но n считается среди сообщений БОТА (1 — его последнее)
+    a see: [bot] N          — прочитать реакции на N-е с конца сообщение чата (с `bot` — среди сообщений бота): в лог и в `expect:`/`expect_not:`
+                              попадает строка «реакции: 😁×1 👍×2» или «реакции: нет»
     sleep 5 / timeout 180 / settle 6
 
 Файлы сессий (data-tester/<имя>.session) — полный доступ к аккаунту: каталог 700, не в git, не в чат.
@@ -55,8 +57,9 @@ SCEN_DIR = Path(os.environ.get("TESTER_SCENARIOS", "/app/scenarios"))
 CONF_FILE = DATA_DIR / "tester.env"
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,15}$")
 VAR_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
-ACT_RE = re.compile(r"^([a-z][a-z0-9_]{0,15})(!?)(?:\s+(reply|click|file|voice|rename|react))?\s*:\s?(.*)$")
+ACT_RE = re.compile(r"^([a-z][a-z0-9_]{0,15})(!?)(?:\s+(reply|click|file|voice|rename|react|see))?\s*:\s?(.*)$")
 REACT_RE = re.compile(r"^(bot\s+)?(\d{1,3})\s+(\S+)$")      # `a react: [bot] N эмодзи|-`
+SEE_RE = re.compile(r"^(bot\s+)?(\d{1,3})$")                  # `a see: [bot] N`
 RENAME_MAX = 64                       # лимит Telegram на first_name
 
 
@@ -156,6 +159,8 @@ def parse_scenario(text: str, conf: dict, strict: bool = True) -> list[Step]:
                 raise ScenarioError(f"строка {n}: `{verb}` без аргумента")
             if verb == "reply":
                 body = body.replace("\\n", "\n")
+            if verb == "see" and not SEE_RE.match(body.strip()):
+                raise ScenarioError(f"строка {n}: `see` ждёт «[bot] N», а не {body!r}")
             if verb == "react" and not REACT_RE.match(body.strip()):
                 raise ScenarioError(f"строка {n}: `react` ждёт «[bot] N эмодзи|-», а не {body!r}")
             if verb == "rename" and len(body.strip()) > RENAME_MAX:
@@ -278,6 +283,20 @@ class Runner:
         await c(SendReactionRequest(peer=ent, msg_id=target.id, reaction=[] if emoji == "-" else [ReactionEmoji(emoticon=emoji)]))
         self.log(f"{st.who} ♥ {'снял реакцию' if emoji == '-' else emoji} → {'сообщение бота' if only_bot else 'сообщение'} №{n} с конца")
 
+    async def _see(self, st: Step, c, ent):
+        """`a see: [bot] N` — реакции на N-е с конца сообщение (или N-е среди сообщений бота) → `last_text` для expect."""
+        m = SEE_RE.match(st.arg)
+        only_bot, n = bool(m.group(1)), int(m.group(2))
+        msgs = await c.get_messages(ent, limit=50 if only_bot else n)
+        if only_bot:
+            msgs = [x for x in msgs if x.sender_id == self.bot_ids[st.who] and not x.out]
+        if len(msgs) < n:
+            raise ScenarioError(f"строка {st.line}: в чате нет {n}-го с конца сообщения{' бота' if only_bot else ''}")
+        res = getattr(msgs[n - 1].reactions, "results", None) or []
+        parts = [f"{getattr(r.reaction, 'emoticon', '?')}×{r.count}" for r in res]
+        self.last_text = "реакции: " + (" ".join(parts) if parts else "нет")
+        self.log(f"{st.who} 👁 сообщение №{n} с конца{' бота' if only_bot else ''} — {self.last_text}")
+
     async def client(self, who: str):
         if who in self.clients:
             return self.clients[who]
@@ -399,6 +418,9 @@ class Runner:
         await self._pace()
         if st.kind == "react":
             await self._react(st, c, ent)
+            return
+        if st.kind == "see":
+            await self._see(st, c, ent)
             return
         if st.kind == "click":
             mid = self.last_bot_msg.get(self._key(st.who))

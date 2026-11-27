@@ -1,0 +1,9 @@
+# v2.25.0 (feat/reactions-read-set) — конфликт спонтанной и рабочей реакции. Чек-лист docs/claude/staging-checklist-reactions.md, шаг 7.
+# Сценарий пишет сообщение-цель и проверяет реакцию ДО и ПОСЛЕ скрипта scripts/stand_reaction_conflict.py (его запускает человек между частями:
+# он ставит спонтанную 😁 от имени бота, затем рабочую 👀 и снимает её кодом бота — react()/unreact()).
+# Запуск: tester run reactions-conflict   (шаг 1), затем скрипт на сервере, затем tester run reactions-conflict-after   (шаг 2).
+to ${TESTER_GROUP_1}
+b!: Сообщение-цель для проверки конфликта реакций.
+sleep 2
+a see: 1
+expect: нет

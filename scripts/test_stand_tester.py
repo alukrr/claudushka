@@ -279,6 +279,14 @@ def test_parse_rename():
         st.parse_scenario("a rename: " + "x" * (st.RENAME_MAX + 1), CONF)
 
 
+def test_parse_react_and_see():
+    a = st.parse_scenario("b react: bot 1 😁\nb react: 3 -\na see: bot 2\na see: 1", CONF)
+    assert [(x.kind, x.who, x.arg) for x in a] == [("react", "b", "bot 1 😁"), ("react", "b", "3 -"), ("see", "a", "bot 2"), ("see", "a", "1")]
+    for bad in ("a react: 😁", "a react: x 😁", "a react: 2", "a see: x", "a see: 1 2", "a react:"):
+        with pytest.raises(st.ScenarioError):
+            st.parse_scenario(bad, CONF)
+
+
 def _rename_runner(monkeypatch, fail_on=None):
     r, fc, clock, lines = make_runner(monkeypatch, [])
     names = {"first": "Master", "last": "Osterberg"}
