@@ -1439,8 +1439,7 @@ async def _tavily_search(update, user_id: int, chat_id: int, is_group: bool, use
     пустые, если поиск не нужен/не разрешён/Tavily не настроен. 👀 — только когда реально ищем."""
     if not (tavily and _search_allowed(user_id, chat_id, is_group)):
         return "", ""
-    search_input = f"{user_text}\nКонтекст реплая: {reply_context}".strip() if reply_context else user_text
-    search_query = await call_claude_aux(should_search, search_input, label="should_search")
+    search_query = await call_claude_aux(should_search, user_text, reply_context, label="should_search")
     if not search_query:
         return "", ""
     react(update.message, REACTION_SEARCH)
@@ -1577,8 +1576,7 @@ async def search_with_provider(update, user_id: int, chat_id: int, is_group: boo
         return sq, sr, []
     if not _search_allowed(user_id, chat_id, is_group):
         return "", "", []
-    search_input = f"{user_text}\nКонтекст реплая: {reply_context}".strip() if reply_context else user_text
-    search_query = await call_claude_aux(should_search, search_input, label="should_search")
+    search_query = await call_claude_aux(should_search, user_text, reply_context, label="should_search")
     if not search_query:
         return "", "", []
     react(update.message, REACTION_SEARCH)
@@ -1646,7 +1644,17 @@ def web_search(query: str, max_results: int = 5) -> str:
         return f"Ошибка поиска: {e}"
 
 
-def should_search(text: str) -> str | None:
+def search_decision_input(text: str, reply_context: str = "", today: str | None = None) -> str:
+    """Сообщение для should_search: сегодняшняя дата (иначе модель угадывает год — инцидент 2026-11-27, запросы
+    «… November 2025» и прошлогодняя выдача), реплика и отдельно цитата, на которую ответили. Дата — здесь, не в system."""
+    today = today or _berlin_now().strftime("%Y-%m-%d")
+    out = f"<today>{today}</today>\n<message>{text}</message>"
+    if reply_context:
+        out += f"\n<reply_to>{reply_context}</reply_to>"
+    return out
+
+
+def should_search(text: str, reply_context: str = "") -> str | None:
     try:
         response = sync_create(
             label="should_search",
@@ -1664,6 +1672,10 @@ def should_search(text: str) -> str | None:
                 "3) пользователь говорит что что-то произошло и ты об этом не знаешь; "
                 "4) слова: 'сейчас', 'сегодня', 'свежие', 'последние', 'недавно', 'только что'; "
                 "5) пользователь просит найти/загуглить/проверить. "
+                "В <reply_to> — цитата, на которую ответил пользователь (часто прошлая реплика бота): она только помогает понять "
+                "сообщение. Ищи то, что спрашивает или утверждает сам пользователь в <message>, а не перепроверяй цитату; "
+                "шутка, подкол, мнение или реплика о людях из чата — NO. "
+                "Сегодняшняя дата — в <today>. Год в запросе — текущий, если пользователь не спрашивает про прошлое. "
                 "Ответ — РОВНО ОДНА строка, без пояснений. "
                 "Если поиск нужен — верни ТОЛЬКО поисковый запрос на английском или языке оригинала (2-5 слов, конкретный, с годом если уместно). "
                 "Если поиск НЕ нужен — верни ТОЛЬКО слово NO. "
@@ -1671,7 +1683,7 @@ def should_search(text: str) -> str | None:
                 "<message>Трамп развязал войну в персидском заливе</message> → 'Trump war Persian Gulf 2026', "
                 "<message>как дела?</message> → NO, <message>курс евро</message> → 'курс евро сегодня'."
             ),
-            messages=[{"role": "user", "content": f"<message>{text}</message>"}],
+            messages=[{"role": "user", "content": search_decision_input(text, reply_context)}],
         )
         result = response_text(response)
         logger.info(f"Search decision for '{text[:50]}': '{result}'")
@@ -2542,6 +2554,9 @@ def _core_rules() -> str:
         "Ты видишь только последние десятки реплик чата — если чего-то нет в видимой истории, это НЕ значит, что этого не было: "
         "не объявляй свои прошлые слова (обзоры, факты) выдумкой, если не можешь это проверить. "
         "Ложное признание ошибки — такая же неправда, как враньё. "
+        "Свои прошлые реплики сама по свежей выдаче поиска не пересматривай: если тебя не поправляли и спрашивают о другом — "
+        "отвечай на вопрос, к старому не возвращайся. Уже признанную ошибку не отменяй и не признавай заново без нового "
+        "источника с датой. Не пиши «перепроверила», если в служебном блоке нет результатов именно по этому пункту. "
         "Недовольство тоном, шутками, резкостью или мнением — не ошибка: не отступай и не извиняйся только потому, что на тебя надавили; "
         "форму ответа на такое задаёт режим. "
         "Исковерканные имена и прозвища в режиме, где это приём, — не ошибка. "
