@@ -140,6 +140,11 @@ FALLBACK_CHAINS = {
 FALLBACK_STICKY_SECONDS = int(os.environ.get("FALLBACK_STICKY_SECONDS", "300") or 300)
 FALLBACK_PRIMARY_DELAYS = (2,)        # на основной и промежуточном звене одна повторная попытка, полная лестница — только на последнем
 FALLBACK_ALERT_COOLDOWN = 1800        # админу не чаще раза в 30 минут НА КАЖДУЮ ПРИЧИНУ (как BALANCE_ALERT_COOLDOWN)
+# Фоновые вызовы, сбой которых пользователь не видит: этот вызов уходит на следующее звено, но липкое окно НЕ открывается
+# (остальные вызовы модели идут как обычно) и алерта нет. Единичный 429/529 пула на проверке активности переключал всю
+# полосу Luna на час и будил админа (2026-11-27). Если модель лежит по-настоящему — окно и алерт откроет первый же вызов,
+# который не в этом списке.
+FALLBACK_QUIET_LABELS = frozenset({"activity_check"})
 
 MAX_HISTORY = 40
 GROUP_TRANSCRIPT_LIMIT = 50   # сколько реплик группового транскрипта тащить в messages
@@ -925,8 +930,10 @@ def _enter_fallback(model: str, fb_model: str, exc: BaseException, label: str, t
     «Google без денег» не глушит «пул лежит»). tried — звенья цепочки до этого (упали раньше или пропущены окном): тогда
     это второй переход, и алерт отдельной строкой."""
     now = time.monotonic()
+    quiet = label in FALLBACK_QUIET_LABELS
     newly = _fallback_until.get(model, 0.0) <= now
-    _fallback_until[model] = now + FALLBACK_STICKY_SECONDS
+    if not quiet:
+        _fallback_until[model] = now + FALLBACK_STICKY_SECONDS
     status = getattr(exc, "status_code", None)
     key, why = api_errors.fallback_reason(exc, is_native_model(model))
     ctx = usage_ctx.get()
@@ -934,7 +941,9 @@ def _enter_fallback(model: str, fb_model: str, exc: BaseException, label: str, t
     if status == 404 and not is_native_model(model):
         logger.error(f"MODEL NOT FOUND: пул не знает {model!r} (404) — отвечаю через {fb_model}")
     logger.warning(f"FALLBACK {model} → {fb_model} [{label}] chat={chat} причина={key} {type(exc).__name__} HTTP {status}: "
-                   f"{str(exc)[:300]}")
+                   f"{str(exc)[:300]}" + (" (фоновый вызов: без окна и алерта)" if quiet else ""))
+    if quiet:
+        return                                   # окно и алерт — только по вызовам, которые видит пользователь
     hop2 = bool(tried)
     cd_key = ("hop2:" if hop2 else "") + key
     if newly and now - _last_fallback_alert.get(cd_key, -FALLBACK_ALERT_COOLDOWN) >= FALLBACK_ALERT_COOLDOWN:
@@ -1852,6 +1861,7 @@ GEMINI_AUDIO_TRANSCRIPT_MAX_CHARS = 1500  # уходит в group_messages/ис�
 MAX_VOICE_SECONDS = 300       # длиннее — не транскрибируем, только плейсхолдер
 MAX_VIDEO_NOTE_SECONDS = 60   # кружочки и так капаются клиентом Telegram на 60с
 MAX_VIDEO_SECONDS = 120       # длиннее — кадры не тянем
+TG_FILE_MAX_BYTES = 20 * 1024 * 1024   # больше Bot API боту не отдаёт: get_file → BadRequest «File is too big» (2026-11-27)
 VIDEO_FRAME_COUNT = 3
 MEDIA_DESCRIPTION_MAX_TOKENS = 250  # короткое описание — тоже копируется в каждый промпт чата
 
@@ -2428,6 +2438,12 @@ async def _describe_media(images_b64: list[str], hint: str) -> str | None:
         return None
 
 
+def tg_file_too_big(media) -> bool:
+    """Файл больше TG_FILE_MAX_BYTES — скачать его боту нельзя, звать get_file незачем (упадёт BadRequest)."""
+    size = getattr(media, "file_size", None)
+    return bool(size and size > TG_FILE_MAX_BYTES)
+
+
 async def _download_telegram_file(context, file_id: str) -> bytes:
     tg_file = await context.bot.get_file(file_id)
     return bytes(await tg_file.download_as_bytearray())
@@ -2435,7 +2451,7 @@ async def _download_telegram_file(context, file_id: str) -> bytes:
 
 async def _recognize_voice(context, voice) -> str | None:
     """Транскрипт голосового или None (слишком длинное / ошибка). duration в секундах."""
-    if voice.duration and voice.duration > MAX_VOICE_SECONDS:
+    if (voice.duration and voice.duration > MAX_VOICE_SECONDS) or tg_file_too_big(voice):
         return None
     audio_bytes = await _download_telegram_file(context, voice.file_id)
     return await _transcribe_audio_gemini(audio_bytes, voice.mime_type or "audio/ogg")
@@ -2443,7 +2459,7 @@ async def _recognize_voice(context, voice) -> str | None:
 
 async def _recognize_video_note(context, video_note) -> tuple[str | None, str | None]:
     """(транскрипт речи, описание кадров) для кружочка — любое из двух может быть None."""
-    if video_note.duration and video_note.duration > MAX_VIDEO_NOTE_SECONDS:
+    if (video_note.duration and video_note.duration > MAX_VIDEO_NOTE_SECONDS) or tg_file_too_big(video_note):
         return None, None
     video_bytes = await _download_telegram_file(context, video_note.file_id)
     transcript = await _transcribe_audio_gemini(video_bytes, "video/mp4")
@@ -2465,7 +2481,7 @@ def _video_note_row_text(transcript: str | None, description: str | None) -> str
 
 async def _recognize_video(context, video) -> str | None:
     """Короткое Haiku-описание обычного видео (не кружочка) по кадрам, или None."""
-    if video.duration and video.duration > MAX_VIDEO_SECONDS:
+    if (video.duration and video.duration > MAX_VIDEO_SECONDS) or tg_file_too_big(video):
         return None
     video_bytes = await _download_telegram_file(context, video.file_id)
     frames = await asyncio.to_thread(_extract_video_frames, video_bytes, VIDEO_FRAME_COUNT, video.duration)
@@ -9864,13 +9880,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # В группе уже посчитано в пассивном блоке (video_description_cache) — не дублируем вызов.
             description = video_description_cache if is_group else await _recognize_video(context, update.message.video)
             if not description:
-                await update.message.reply_text("Не смогла разобрать видео.")
+                await update.message.reply_text("Видео больше 20 МБ — Telegram не даёт ботам скачивать такие файлы."
+                                                if tg_file_too_big(update.message.video) else "Не смогла разобрать видео.")
                 return
             user_text = f"[Видео: {description}]"
         elif update.message.animation:
             description = video_description_cache if is_group else await _recognize_video(context, update.message.animation)
             if not description:
-                await update.message.reply_text("Не смогла разобрать гифку.")
+                await update.message.reply_text("Гифка больше 20 МБ — Telegram не даёт ботам скачивать такие файлы."
+                                                if tg_file_too_big(update.message.animation) else "Не смогла разобрать гифку.")
                 return
             user_text = f"[GIF: {description}]"
 
