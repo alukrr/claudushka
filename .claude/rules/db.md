@@ -17,6 +17,9 @@ db.py используется отовсюду, поэтому полная с�
   `hide_group_messages`/`unhide_group_message`/`list_hidden_group_messages` (без текста)/`group_message_ids_with_same_content` —
   `docs/claude/safety-unblock.md`. Любое новое чтение `group_messages` в промпт — с `hidden = 0`; `get_group_transcript` принимает
   `exclude_ids`/`min_id` (только пробы скана)
+- `group_messages.tg_message_id` (v2.25.0, миграция рядом с `hidden`, NULL у старых строк, индекс `(chat_id, tg_message_id)`) — id сообщения Telegram; `save_group_message(..., tg_message_id=)` возвращает id строки,
+  `set_group_tg_id` дописывает id строке, сохранённой до отправки; `get_group_transcript` отдаёт `tg_id`. Таблица `message_reactions(chat_id, tg_message_id, user_id, sender_name, emoji, ts)`, PK `(chat_id, tg_message_id, user_id, emoji)`:
+  `set_user_reactions` (заменяет набор человека), `get_reactions_for`, `count_user_reactions_since`; реакции срезанных `GROUP_MESSAGES_KEEP` строк удаляются в том же `save_group_message` (`_purge_orphan_reactions`) — других мест, режущих `group_messages`, нет. `docs/claude/group-chat.md` → «Реакции»
 - `chat_models` — `docs/claude/models-and-costs.md`
 - `chat_image_provider` — `docs/claude/images.md`
 - `chat_search_mode` (`auto|gpt|tavily`; `claude` мигрирован в `auto`) — `docs/claude/models-and-costs.md`, `docs/claude/native-search.md`.

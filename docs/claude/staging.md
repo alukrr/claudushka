@@ -251,7 +251,7 @@ tester chats a        # id тестовой группы → TESTER_GROUP в tes
 `data-tester/runs/<время>-<сценарий>.log`; код выхода ≠ 0, если хоть одна проверка не прошла.
 
 **Сценарии** — `scripts/stand_scenarios/*.txt`, формат — в шапке `scripts/stand_tester.py` (`to bot|group|<id>`, `a: текст`,
-`a!: текст` без ожидания, `a reply:`, `a click:`, `a file:`, `a voice:`, `a rename: Имя`, `expect:`, `expect_not:`, `silent N`, `sleep N`,
+`a!: текст` без ожидания, `a reply:`, `a react: [bot] N эмодзи|-` (Telethon `SendReactionRequest` на N-е с конца сообщение чата — или бота, с `bot`; `-` снимает; v2.25.0), `a click:`, `a file:`, `a voice:`, `a rename: Имя`, `expect:`, `expect_not:`, `silent N`, `sleep N`,
 `timeout N`, `settle N`, `${VAR}` из `tester.env`). `a rename:` меняет отображаемое имя аккаунта (тёзки, смена ника); прежнее имя
 тестер возвращает сам в конце прогона, даже при ошибке — участники тестовой группы смену имени видят. Сценарии по чек-листам:
 `nicks`, `nicks-review` (#3, `staging-checklist-group-nicks.md`), `profile-extract`, `profile-extract-private` (#4,

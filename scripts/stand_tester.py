@@ -33,6 +33,8 @@
     expect: регэксп         — в ответе на последнее действие есть совпадение (без учёта регистра)
     expect_not: регэксп     — совпадения нет
     silent 10               — бот молчит 10 с (в текущем чате)
+    a react: 2 😁           — поставить реакцию на 2-е с конца сообщение чата (1 — последнее, любой отправитель); `-` вместо эмодзи — снять
+    a react: bot 1 😁       — то же, но n считается среди сообщений БОТА (1 — его последнее)
     sleep 5 / timeout 180 / settle 6
 
 Файлы сессий (data-tester/<имя>.session) — полный доступ к аккаунту: каталог 700, не в git, не в чат.
@@ -53,7 +55,8 @@ SCEN_DIR = Path(os.environ.get("TESTER_SCENARIOS", "/app/scenarios"))
 CONF_FILE = DATA_DIR / "tester.env"
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,15}$")
 VAR_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
-ACT_RE = re.compile(r"^([a-z][a-z0-9_]{0,15})(!?)(?:\s+(reply|click|file|voice|rename))?\s*:\s?(.*)$")
+ACT_RE = re.compile(r"^([a-z][a-z0-9_]{0,15})(!?)(?:\s+(reply|click|file|voice|rename|react))?\s*:\s?(.*)$")
+REACT_RE = re.compile(r"^(bot\s+)?(\d{1,3})\s+(\S+)$")      # `a react: [bot] N эмодзи|-`
 RENAME_MAX = 64                       # лимит Telegram на first_name
 
 
@@ -153,6 +156,8 @@ def parse_scenario(text: str, conf: dict, strict: bool = True) -> list[Step]:
                 raise ScenarioError(f"строка {n}: `{verb}` без аргумента")
             if verb == "reply":
                 body = body.replace("\\n", "\n")
+            if verb == "react" and not REACT_RE.match(body.strip()):
+                raise ScenarioError(f"строка {n}: `react` ждёт «[bot] N эмодзи|-», а не {body!r}")
             if verb == "rename" and len(body.strip()) > RENAME_MAX:
                 raise ScenarioError(f"строка {n}: имя длиннее {RENAME_MAX} знаков")
             steps.append(Step(verb, n, arg=body.strip(), who=who, wait=not nowait))
@@ -255,6 +260,23 @@ class Runner:
         await self._set_name(c, st.arg, "")
         self.log(f"{st.who} ✎ имя → «{st.arg}»")
         await asyncio.sleep(self.gap)     # бот получит новое имя со следующим сообщением; дать Telegram разойтись
+
+    async def _react(self, st: Step, c, ent):
+        """`a react: [bot] N эмодзи|-` — Telethon SendReactionRequest на N-е с конца сообщение чата (или N-е среди сообщений бота)."""
+        from telethon.tl.functions.messages import SendReactionRequest
+        from telethon.tl.types import ReactionEmoji
+        m = REACT_RE.match(st.arg)
+        only_bot, n, emoji = bool(m.group(1)), int(m.group(2)), m.group(3)
+        msgs = await c.get_messages(ent, limit=50 if only_bot else n)
+        if only_bot:
+            msgs = [x for x in msgs if x.sender_id == self.bot_ids[st.who] and not x.out]
+        if len(msgs) < n:
+            raise ScenarioError(f"строка {st.line}: в чате нет {n}-го с конца сообщения{' бота' if only_bot else ''}")
+        target = msgs[n - 1]
+        self.last_who = st.who
+        await self._pace()
+        await c(SendReactionRequest(peer=ent, msg_id=target.id, reaction=[] if emoji == "-" else [ReactionEmoji(emoticon=emoji)]))
+        self.log(f"{st.who} ♥ {'снял реакцию' if emoji == '-' else emoji} → {'сообщение бота' if only_bot else 'сообщение'} №{n} с конца")
 
     async def client(self, who: str):
         if who in self.clients:
@@ -375,6 +397,9 @@ class Runner:
         c = await self.client(st.who)
         ent = await self.entity(st.who)
         await self._pace()
+        if st.kind == "react":
+            await self._react(st, c, ent)
+            return
         if st.kind == "click":
             mid = self.last_bot_msg.get(self._key(st.who))
             if not mid:

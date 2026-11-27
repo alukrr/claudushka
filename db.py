@@ -165,6 +165,17 @@ def init_db():
             timestamp INTEGER NOT NULL
         );
 
+        -- v2.25.0: эмодзи-реакции людей (и свои реакции бота, user_id = id бота) на сообщения группы; чистится вместе с group_messages
+        CREATE TABLE IF NOT EXISTS message_reactions (
+            chat_id INTEGER NOT NULL,
+            tg_message_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            sender_name TEXT,
+            emoji TEXT NOT NULL,
+            ts INTEGER NOT NULL,
+            PRIMARY KEY (chat_id, tg_message_id, user_id, emoji)
+        );
+
         CREATE TABLE IF NOT EXISTS allowed_chats (
             chat_id INTEGER PRIMARY KEY,
             name TEXT,
@@ -380,6 +391,9 @@ def init_db():
         "ALTER TABLE group_messages ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0",
         # v2.1.0: hidden=1 — строка не уходит ни в один промпт (safety-блок провайдера, docs/claude/safety-unblock.md)
         "ALTER TABLE group_messages ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0",
+        # v2.25.0: id сообщения Telegram у строки (реакции: сопоставить реакцию со строкой и поставить реакцию на сообщение из истории); NULL у старых строк
+        "ALTER TABLE group_messages ADD COLUMN tg_message_id INTEGER",
+        "CREATE INDEX IF NOT EXISTS idx_group_messages_tg ON group_messages(chat_id, tg_message_id)",
         "ALTER TABLE memory ADD COLUMN tier TEXT NOT NULL DEFAULT 'long'",
         "ALTER TABLE memory ADD COLUMN expires_at INTEGER",
         # v0.9.0: чаты, залипшие на четвёртом поколении, переезжают на пятое.
@@ -1380,21 +1394,84 @@ def get_memory_for_private(user_id: int, long_limit: int = None, medium_limit: i
 GROUP_MESSAGES_KEEP = 3000
 
 
-def save_group_message(chat_id: int, user_id: int, sender_name: str, content: str, is_bot: bool = False):
+def save_group_message(chat_id: int, user_id: int, sender_name: str, content: str, is_bot: bool = False,
+                       tg_message_id: int | None = None) -> int:
+    """Строка группового транскрипта. tg_message_id — id сообщения Telegram (реакции; None — неизвестен, ставится позже
+    `set_group_tg_id`). Возвращает id строки. Чистка по GROUP_MESSAGES_KEEP режет и реакции срезанных строк."""
     conn = get_conn()
-    conn.execute(
-        "INSERT INTO group_messages (chat_id, user_id, sender_name, content, is_bot, timestamp) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (chat_id, user_id, sender_name, content, 1 if is_bot else 0, int(time.time()))
+    cur = conn.execute(
+        "INSERT INTO group_messages (chat_id, user_id, sender_name, content, is_bot, timestamp, tg_message_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (chat_id, user_id, sender_name, content, 1 if is_bot else 0, int(time.time()), tg_message_id)
     )
+    row_id = cur.lastrowid
     # Keep only last GROUP_MESSAGES_KEEP per chat
-    conn.execute("""
+    trimmed = conn.execute("""
         DELETE FROM group_messages WHERE chat_id = ? AND id NOT IN (
             SELECT id FROM group_messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT ?
         )
-    """, (chat_id, chat_id, GROUP_MESSAGES_KEEP))
+    """, (chat_id, chat_id, GROUP_MESSAGES_KEEP)).rowcount
+    if trimmed > 0:
+        _purge_orphan_reactions(conn, chat_id)
     conn.commit()
     conn.close()
+    return row_id
+
+
+def _purge_orphan_reactions(conn, chat_id: int) -> None:
+    """Реакции на сообщения, строк которых в group_messages больше нет (срезаны GROUP_MESSAGES_KEEP) — иначе таблица растёт без предела."""
+    conn.execute(
+        "DELETE FROM message_reactions WHERE chat_id = ? AND tg_message_id NOT IN "
+        "(SELECT tg_message_id FROM group_messages WHERE chat_id = ? AND tg_message_id IS NOT NULL)",
+        (chat_id, chat_id))
+
+
+def set_group_tg_id(row_id: int | None, tg_message_id: int | None) -> None:
+    """Дописать id сообщения Telegram строке, сохранённой ДО отправки (ответ бота: сначала запись, потом отправка)."""
+    if not row_id or not tg_message_id:
+        return
+    conn = get_conn()
+    conn.execute("UPDATE group_messages SET tg_message_id = ? WHERE id = ? AND tg_message_id IS NULL", (int(tg_message_id), int(row_id)))
+    conn.commit()
+    conn.close()
+
+
+def set_user_reactions(chat_id: int, msg_id: int, user_id: int, name: str | None, emojis: list, ts: int) -> None:
+    """Заменить набор реакций ОДНОГО человека на сообщении (пустой список — снял всё). Чужие реакции не трогаются."""
+    conn = get_conn()
+    conn.execute("DELETE FROM message_reactions WHERE chat_id = ? AND tg_message_id = ? AND user_id = ?", (chat_id, msg_id, user_id))
+    for e in dict.fromkeys(emojis or ()):
+        conn.execute(
+            "INSERT OR REPLACE INTO message_reactions (chat_id, tg_message_id, user_id, sender_name, emoji, ts) VALUES (?, ?, ?, ?, ?, ?)",
+            (chat_id, msg_id, user_id, name, e, ts))
+    conn.commit()
+    conn.close()
+
+
+def get_reactions_for(chat_id: int, msg_ids) -> dict:
+    """{tg_message_id: [{"user_id","name","emoji","ts"}, …]} по сообщениям чата (старые реакции — первыми)."""
+    ids = [int(x) for x in msg_ids if x is not None]
+    if not ids:
+        return {}
+    conn = get_conn()
+    rows = conn.execute(
+        f"SELECT tg_message_id, user_id, sender_name, emoji, ts FROM message_reactions WHERE chat_id = ? "
+        f"AND tg_message_id IN ({','.join('?' * len(ids))}) ORDER BY ts, rowid", [chat_id, *ids]).fetchall()
+    conn.close()
+    out: dict = {}
+    for r in rows:
+        out.setdefault(r["tg_message_id"], []).append(
+            {"user_id": r["user_id"], "name": r["sender_name"], "emoji": r["emoji"], "ts": r["ts"]})
+    return out
+
+
+def count_user_reactions_since(chat_id: int, user_id: int, since_ts: int) -> int:
+    """Сколько реакций поставил пользователь (бот) в чате с момента since_ts — дневной лимит собственных реакций."""
+    conn = get_conn()
+    row = conn.execute("SELECT COUNT(*) AS n FROM message_reactions WHERE chat_id = ? AND user_id = ? AND ts >= ?",
+                       (chat_id, user_id, int(since_ts))).fetchone()
+    conn.close()
+    return int(row["n"])
 
 
 def get_last_review_ts(chat_id: int, prefix: str) -> int:
@@ -1463,7 +1540,7 @@ def get_group_transcript(chat_id: int, limit: int = 40, exclude_ids=None, min_id
     exclude_ids — дополнительно исключить эти id (пробы safety_scan: окно сдвигается на старые строки, как после
     реального скрытия); min_id — не брать строки с id меньше (пробы без сдвига окна)."""
     conn = get_conn()
-    sql = ("SELECT id, sender_name, content, is_bot, timestamp, user_id FROM group_messages "
+    sql = ("SELECT id, sender_name, content, is_bot, timestamp, user_id, tg_message_id FROM group_messages "
            "WHERE chat_id = ? AND hidden = 0")
     args: list = [chat_id]
     if min_id is not None:
@@ -1479,7 +1556,7 @@ def get_group_transcript(chat_id: int, limit: int = 40, exclude_ids=None, min_id
     conn.close()
     return [
         {"id": r["id"], "sender": r["sender_name"], "text": r["content"], "is_bot": bool(r["is_bot"]),
-         "ts": r["timestamp"], "user_id": r["user_id"]}
+         "ts": r["timestamp"], "user_id": r["user_id"], "tg_id": r["tg_message_id"]}
         for r in reversed(rows)
     ]
 

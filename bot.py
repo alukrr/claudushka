@@ -20,14 +20,14 @@ from types import SimpleNamespace
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, LinkPreviewOptions, MenuButtonWebApp, Update, WebAppInfo
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, LinkPreviewOptions, MenuButtonWebApp, ReactionTypeEmoji, Update, WebAppInfo
 from telegram.constants import ReactionEmoji
 from telegram.error import BadRequest, ChatMigrated, Forbidden, NetworkError, RetryAfter, TelegramError
 from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 from telegram.ext import (
     Application, ApplicationHandlerStop, BaseUpdateProcessor, CallbackQueryHandler, CommandHandler, MessageHandler, ChatMemberHandler,
-    PreCheckoutQueryHandler, TypeHandler, filters, ContextTypes,
+    MessageReactionHandler, PreCheckoutQueryHandler, TypeHandler, filters, ContextTypes,
 )
 import anthropic
 from tavily import TavilyClient
@@ -144,7 +144,7 @@ FALLBACK_ALERT_COOLDOWN = 1800        # админу не чаще раза в 3
 # (остальные вызовы модели идут как обычно) и алерта нет. Единичный 429/529 пула на проверке активности переключал всю
 # полосу Luna на час и будил админа (2026-11-27). Если модель лежит по-настоящему — окно и алерт откроет первый же вызов,
 # который не в этом списке.
-FALLBACK_QUIET_LABELS = frozenset({"activity_check"})
+FALLBACK_QUIET_LABELS = frozenset({"activity_check", "reaction_check"})
 
 MAX_HISTORY = 40
 GROUP_TRANSCRIPT_LIMIT = 50   # сколько реплик группового транскрипта тащить в messages
@@ -582,6 +582,12 @@ def _track_response(model: str, response, label: str = "aux") -> None:
 _background_tasks: set[asyncio.Task] = set()
 
 
+def _sent_id(msg) -> int | None:
+    """id отправленного сообщения Telegram (None — не отправлено/нет атрибута): в строку group_messages для реакций."""
+    mid = getattr(msg, "message_id", None)
+    return mid if isinstance(mid, int) else None
+
+
 def _spawn_background_task(coro) -> asyncio.Task:
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
@@ -595,7 +601,7 @@ _reaction_chain: dict[tuple, asyncio.Task] = {}
 _reacted: set[tuple] = set()   # сообщения, на которых бот сейчас держит реакцию
 
 
-async def _set_reaction(message, emoji: str | None, prev: asyncio.Task | None) -> None:
+async def _set_reaction(message, emoji: str | None, prev: asyncio.Task | None, on_ok=None) -> None:
     if prev is not None:
         try:
             await prev
@@ -606,11 +612,26 @@ async def _set_reaction(message, emoji: str | None, prev: asyncio.Task | None) -
     except Exception as e:
         # Реакции запрещены в группе, сообщение удалено, нет прав — не повод ломать ответ.
         logger.warning(f"Не удалось {'поставить реакцию ' + emoji if emoji else 'снять реакцию'}: {type(e).__name__}: {e}")
+        return
+    if on_ok is not None:
+        try:
+            on_ok()   # реакция встала — записать в message_reactions (свои реакции бота, v2.25.0)
+        except Exception:
+            logger.exception("реакция поставлена, но запись в message_reactions не удалась")
 
 
-def _queue_reaction(message, emoji: str | None) -> None:
+class _ReactTarget:
+    """Сообщение группы по id (из истории `group_messages`), не объект апдейта: для `_queue_reaction` нужны chat_id, message_id и set_reaction."""
+    def __init__(self, bot, chat_id: int, message_id: int):
+        self._bot, self.chat_id, self.message_id = bot, chat_id, message_id
+
+    async def set_reaction(self, emoji):
+        await self._bot.set_message_reaction(chat_id=self.chat_id, message_id=self.message_id, reaction=emoji)
+
+
+def _queue_reaction(message, emoji: str | None, on_ok=None) -> None:
     key = (message.chat_id, message.message_id)
-    task = _spawn_background_task(_set_reaction(message, emoji, _reaction_chain.get(key)))
+    task = _spawn_background_task(_set_reaction(message, emoji, _reaction_chain.get(key), on_ok))
     _reaction_chain[key] = task
     task.add_done_callback(lambda t, k=key: _reaction_chain.pop(k, None) if _reaction_chain.get(k) is t else None)
 
@@ -633,7 +654,15 @@ def unreact(message) -> None:
     if message is None or (message.chat_id, message.message_id) not in _reacted:
         return
     _reacted.discard((message.chat_id, message.message_id))
-    _queue_reaction(message, None)
+    # Telegram держит у бота ОДНУ реакцию на сообщение: рабочая 👀/✍ вытеснила спонтанную — вернуть её (запись в message_reactions
+    # с id бота), а не снимать всё (v2.25.0). Нет спонтанной — снять, как раньше.
+    restore = None
+    try:
+        rows = db.get_reactions_for(message.chat_id, [message.message_id]).get(message.message_id, [])
+        restore = next((r["emoji"] for r in rows if r["user_id"] == context_bot_id), None)
+    except Exception:
+        logger.exception("unreact: не прочитала собственную реакцию из message_reactions")
+    _queue_reaction(message, restore)
 
 
 # --- Вызов Anthropic API из async-хендлеров ---
@@ -2243,18 +2272,17 @@ async def _send_image(message, image: bytes, imeta: dict, caption: str, short_ca
         bio = BytesIO(image)
         if is_doc:
             bio.name = f"claudushka_2k.{imeta.get('ext', 'png')}"
-            await message.reply_document(document=bio, caption=cap)
-        else:
-            bio.name = "claudushka.png"
-            await message.reply_photo(photo=bio, caption=cap)
+            return await message.reply_document(document=bio, caption=cap)
+        bio.name = "claudushka.png"
+        return await message.reply_photo(photo=bio, caption=cap)
 
     try:
-        await _send(caption)
+        return await _send(caption)
     except BadRequest as e:
         if short_caption is None:
             raise
         logger.warning(f"отправка картинки с подписью не прошла ({e}), шлю с короткой подписью")
-        await _send(short_caption)
+        return await _send(short_caption)
 
 
 async def _image_limit_blocked(update, chat_id: int, is_group: bool, user_id: int,
@@ -2360,14 +2388,15 @@ async def _draw_and_send_impl(update, context, chat_id: int, is_group: bool,
 
     if image_data:
         # Картинка уже сгенерирована и оплачена — не терять её из-за подписи (short_caption). 2K — документом.
-        await _send_image(update.message, image_data, imeta, _photo_caption(draw_prompt, author, provider),
-                          short_caption=f"🎨 Модель: {provider}")
+        _img_msg = await _send_image(update.message, image_data, imeta, _photo_caption(draw_prompt, author, provider),
+                                     short_caption=f"🎨 Модель: {provider}")
         if is_group:
             # НЕ использовать слово "нарисовала" и квадратные скобки — модель имитирует
             # ЭТОТ формат в собственных живых ответах (см. LEAKED_DRAW_NOTE_RE/
             # LEAKED_DRAW_RE, docs/claude/incidents.md, инцидент 2026-09-08 и повтор
             # 2026-09-20), приняв его за правильный способ инициировать рисование.
-            db.save_group_message(chat_id, context_bot_id, "Клодушка", _draw_sent_note(draw_prompt), is_bot=True)
+            db.save_group_message(chat_id, context_bot_id, "Клодушка", _draw_sent_note(draw_prompt), is_bot=True,
+                                  tg_message_id=_sent_id(_img_msg))
         return True
     else:
         await update.message.reply_text(f"Не смогла нарисовать: {error_msg}" if error_msg else "Не смогла нарисовать. Попробуй другое описание.")
@@ -2647,6 +2676,7 @@ def _persona_text(persona_key: str, is_group: bool) -> str:
             "Не путай собеседников и не сливай их в одного, обращайся к тому, кто пишет сейчас. "
             "Если у двух разных людей одинаковый ник, у них в подписи после ника стоит «#цифры» (например «Саша#1234») — это ТОЛЬКО чтобы различать "
             "тёзок: так к людям не обращайся и эти цифры в ответах не пиши. "
+            "Реакции людей на сообщения (в служебной строке «Реакции …») — сигнал, как приняли реплику; не комментируй их без повода. "
             "Твои собственные прошлые реплики идут как assistant-сообщения — это то, что ты УЖЕ сказала, "
             "не повторяйся и не приписывай свои слова другим. "
             "Сообщения вида «[Фото: описание]», «[Видео: описание]», «[GIF: описание]», "
@@ -2855,7 +2885,7 @@ def _speaker_card(update, user_id: int, is_group: bool, chat_id: int, info: dict
 def service_block(*, reply_context: str = "", search_query: str = "", search_results: str = "",
                   topup_hint: bool = False, draw_intent: bool = False, draw_size: str | None = None,
                   spontaneous: bool = False, trigger: str = "", image_reply: bool = False,
-                  speaker_profile: str = "", participants_note: str = "") -> str:
+                  speaker_profile: str = "", participants_note: str = "", reactions_note: str = "") -> str:
     """Изменчивый контекст запроса (время, reply, результаты поиска) — в хвост, в последний
     user-turn, а не в system: иначе он ломает префикс кэша. В БД НЕ сохраняется (в
     conversations/group_messages идёт только текст пользователя). reply_context передавать
@@ -2891,6 +2921,8 @@ def service_block(*, reply_context: str = "", search_query: str = "", search_res
         lines.append(speaker_profile[:PROFILE_SPEAKER_MAX_CHARS])   # карточка автора (группа), docs/claude/profile.md
     if participants_note and not spontaneous:
         lines.append(participants_note[:PARTICIPANTS_NOTE_MAX_CHARS])   # смена ника (группа): один человек — разные ники; только хвост
+    if reactions_note:
+        lines.append(reactions_note[:REACTIONS_NOTE_MAX_CHARS])   # реакции людей на сообщения окна (группа, v2.25.0); только хвост — меняются задним числом
     if spontaneous:
         lines.append(
             "Тебя сейчас не звали. Если хочешь — вставь одну-две короткие реплики как участник беседы, по делу или "
@@ -4211,6 +4243,7 @@ def build_group_messages(chat_id: int, reply_context: str = "", limit: int = GRO
         info["tagged"] = sum(1 for lab in last_label.values() if lab and _LEAK_NICK_SUFFIX_RE.search(lab))   # людей с «#NNNN» в окне (для лога)
         info["note"] = participants_note([(e["user_id"], labels.get(e["id"], e["sender"])) for e in transcript
                                           if not e["is_bot"] and e.get("user_id") is not None], chat_id)
+        info["reactions"] = reactions_note(transcript, labels, db.get_reactions_for(chat_id, [e.get("tg_id") for e in transcript]), context_bot_id)
     for entry in transcript:
         if entry["is_bot"]:
             flush_human()
@@ -4581,10 +4614,12 @@ async def daily_chat_review(context: ContextTypes.DEFAULT_TYPE):
                     continue
                 # Подсказку про отключение добавляет КОД, не модель. В транскрипт кладём обзор
                 # без неё — иначе модель начнёт копировать хвост в живые ответы.
+                _first_id = None
                 for part in split_telegram_text(review, DAILY_REVIEW_FOOTER):
-                    await context.bot.send_message(chat_id=chat_id, text=part)
+                    _m = await context.bot.send_message(chat_id=chat_id, text=part)
+                    _first_id = _first_id or _sent_id(_m)
                 db.save_group_message(chat_id, context_bot_id, "Клодушка",
-                                      _review_history_text(human, review), is_bot=True)
+                                      _review_history_text(human, review), is_bot=True, tg_message_id=_first_id)
                 logger.info(f"Daily review sent to {chat_id} (branch {branch}, {len(entries)} msgs)")
             except Exception as e:
                 logger.error(f"Daily review error for {chat_id}: {e}")
@@ -4945,6 +4980,7 @@ async def _finish_media_answer(update, context, *, chat_id: int, user_id: int, i
     request_text — текст/подпись пользователя: «нарисуй …» в нём (parse_draw_request) = явная просьба → лимит free говорится
     вслух и в подписи автор; иначе спонтанное рисование — молча, как в диалоге."""
     out_files: list[tuple[str, str, bool]] = []
+    _row_id = None
     text, _ = strip_leaked_service_note(answer)
     if FILE_MARKER_RE.search(text):
         text, out_files = extract_files(text)
@@ -4955,18 +4991,22 @@ async def _finish_media_answer(update, context, *, chat_id: int, user_id: int, i
     if is_group:
         # Пустой текст + рисование — запись в транскрипт сделает _draw_and_send (как в основном диалоге).
         if out_files or text:
-            db.save_group_message(chat_id, context_bot_id, "Клодушка", saved, is_bot=True)
+            _row_id = db.save_group_message(chat_id, context_bot_id, "Клодушка", saved, is_bot=True)
     else:
         db.save_message(user_id, "user", history_user_text)
         db.save_message(user_id, "assistant", saved or "(…)")
         _maybe_extract_private_memory(user_id)
 
+    _first_id = None
     for i in range(0, len(text), 4096):
         chunk = text[i:i + 4096]
         try:
-            await update.message.reply_text(chunk, parse_mode="Markdown")
+            _m = await update.message.reply_text(chunk, parse_mode="Markdown")
         except Exception:
-            await update.message.reply_text(chunk)
+            _m = await update.message.reply_text(chunk)
+        _first_id = _first_id or _sent_id(_m)
+    if is_group:
+        db.set_group_tg_id(_row_id, _first_id)
     await _send_out_files(update.message, out_files, chat_id)
 
     if draw_prompt:
@@ -5134,12 +5174,14 @@ async def _apply_strike(message, chat_id: int, user_id: int, name: str, reason: 
     text = strike_text(name, level, reason)
     logger.info(f"autoignore chat={chat_id} uid={user_id} level={level} until={until} reason={reason}"
                 + (f" why={detail[:200]!r}" if detail else ""))
+    _sent = None
     try:
-        await message.reply_text(text)
+        _sent = await message.reply_text(text)
     except Exception as e:
         logger.warning(f"autoignore: не удалось отправить сообщение chat={chat_id}: {e}")
     # В историю — служебная пометка, а не текст реплики (см. pause_history_note).
-    db.save_group_message(chat_id, context_bot_id, "Клодушка", pause_history_note(name, level, reason), is_bot=True)
+    db.save_group_message(chat_id, context_bot_id, "Клодушка", pause_history_note(name, level, reason), is_bot=True,
+                          tg_message_id=_sent_id(_sent))
 
 
 # В group_messages паузу кладём служебной пометкой, не репликой: модель копирует форматы из своей истории (инциденты
@@ -5250,6 +5292,188 @@ async def _abuse_check_task(message, chat_id: int, user_id: int, name: str) -> N
         await _apply_strike(message, chat_id, user_id, name, "abuse", detail=why)
 
 
+# --- Эмодзи-реакции: читать чужие и ставить свои (v2.25.0, docs/claude/tz-reactions.md, docs/claude/group-chat.md → «Реакции») ---
+REACTIONS_NOTE_MAX_CHARS = 400      # потолок строки «Реакции:» в хвосте запроса (обрезка целыми пунктами)
+REACTION_RECHECK_MIN = 3            # минут с прошлой проверки «поставить реакцию?» в чате (память процесса)
+REACTION_MIN_NEW = 3                # и столько новых строк людей с прошлой проверки
+REACTION_DAILY_CAP = 15             # реакций бота в чате за сутки (по message_reactions)
+REACTION_TRANSCRIPT_LINES = 10      # строк с номерами [1]…[N] во входе проверки
+REACTION_ALLOWED_TTL = 3600         # кэш «какие реакции разрешены в чате» (getChat), секунд
+# Стандартные эмодзи (ReactionEmoji), которые бот ставит САМ. Без 👀 и ✍ — это «работаю» (react()/unreact()), без грубых (👎 🤬 🖕).
+REACTION_CHOICES = ("👍", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱", "😢", "🎉", "🤩", "🙏", "👌", "😍", "💯", "🤣", "🤝", "😎", "🫡")
+
+_reaction_last_check: dict[int, float] = {}
+_reaction_new_lines: dict[int, int] = {}
+_reaction_allowed_cache: dict[int, tuple[float, frozenset | None]] = {}
+
+
+def reactions_note(entries: list[dict], labels: dict, reactions: dict, bot_id=None) -> str:
+    """Строка «Реакции людей …» для ХВОСТА запроса (service_block), по строкам ТЕКУЩЕГО окна `entries` (с `tg_id`): кто какой эмодзи поставил.
+    reactions — {tg_message_id: [{"user_id","name","emoji"}]} (`db.get_reactions_for`); labels — {id строки: подпись} (`group_sender_labels`);
+    свои реакции бота (user_id == bot_id) — «(ты)». Новее — первыми, лимит REACTIONS_NOTE_MAX_CHARS целыми пунктами; "" — реакций нет.
+    НЕ в system и не в строки истории: реакции меняются задним числом, правка старых строк ломает кэш префикса."""
+    who_label = {e["user_id"]: labels.get(e["id"], e["sender"]) for e in entries if not e["is_bot"] and e.get("user_id") is not None}
+    items = []
+    for e in reversed(entries):
+        rs = reactions.get(e.get("tg_id")) if e.get("tg_id") is not None else None
+        if not rs:
+            continue
+        by_emoji: dict[str, list[str]] = {}
+        for r in rs:
+            who = "ты" if bot_id is not None and r["user_id"] == bot_id else (who_label.get(r["user_id"]) or r.get("name") or "кто-то")
+            by_emoji.setdefault(r["emoji"], []).append(who)
+        parts = [f"{em}×{len(w)} ({', '.join(w)})" if len(w) > 1 else f"{em} ({w[0]})" for em, w in by_emoji.items()]
+        t = datetime.fromtimestamp(e["ts"], BERLIN_TZ).strftime("%H:%M")
+        target = f"твою реплику {t}" if e["is_bot"] else f"реплику {labels.get(e['id'], e['sender'])} {t}"
+        items.append(f"на {target} «{_clip(e['text'], 40).replace(chr(10), ' ')}» — {', '.join(parts)}")
+    head = "Реакции людей на сообщения (новые первыми): "
+    out, size = [], len(head)
+    for it in items:
+        add = len(it) + (2 if out else 0)
+        if size + add > REACTIONS_NOTE_MAX_CHARS:
+            break
+        out.append(it)
+        size += add
+    return head + "; ".join(out) + "." if out else ""
+
+
+async def on_message_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Реакция человека на сообщение группы (приходит, только если бот — админ чата): пишем набор его эмодзи в message_reactions.
+    Модель НЕ зовём. Не пишем: личку, анонимные (нет user), ботов (и себя), забаненные чаты; custom/paid-эмодзи пропускаем."""
+    mr = update.message_reaction
+    if mr is None or mr.chat is None or mr.chat.type not in ("group", "supergroup"):
+        return
+    user = mr.user
+    if user is None or user.is_bot or user.id == context_bot_id:
+        return
+    if db.is_chat_banned(mr.chat.id):
+        return
+    emojis = [r.emoji for r in (mr.new_reaction or ()) if isinstance(r, ReactionTypeEmoji)]
+    ts = int(mr.date.timestamp()) if getattr(mr, "date", None) else int(time.time())
+    db.set_user_reactions(mr.chat.id, mr.message_id, user.id, user.first_name or user.username or "", emojis, ts)
+
+
+def reaction_should_check(chat_id: int, user_id: int, text: str, now: float | None = None) -> bool:
+    """Все условия фоновой проверки «поставить реакцию?»; дешёвые — первыми, побочных эффектов нет (метки ставит вызывающий).
+    Тариф любой (решение Алексея 2026-11-27); /activity не нужен — проверка не зависит от ответа."""
+    now = time.time() if now is None else now
+    if chat_id >= 0:                                    # личка — не в этой задаче (у conversations нет id сообщений)
+        return False
+    if not text or not text.strip() or _MEDIA_PLACEHOLDER_RE.match(text):
+        return False
+    if user_is_ignored(chat_id, user_id):
+        return False
+    if now - _reaction_last_check.get(chat_id, 0) < REACTION_RECHECK_MIN * 60:
+        return False
+    if _reaction_new_lines.get(chat_id, 0) < REACTION_MIN_NEW:
+        return False
+    if context_bot_id is not None and db.count_user_reactions_since(chat_id, context_bot_id, now - 86400) >= REACTION_DAILY_CAP:
+        return False
+    return True
+
+
+async def _chat_allowed_reactions(bot, chat_id: int, now: float | None = None) -> frozenset | None:
+    """Эмодзи, разрешённые в чате (getChat → available_reactions; None — разрешены все). Кэш REACTION_ALLOWED_TTL; ошибка — «все»."""
+    now = time.time() if now is None else now
+    hit = _reaction_allowed_cache.get(chat_id)
+    if hit and now - hit[0] < REACTION_ALLOWED_TTL:
+        return hit[1]
+    allowed: frozenset | None = None
+    try:
+        chat = await bot.get_chat(chat_id)
+        av = getattr(chat, "available_reactions", None)
+        if av is not None:
+            allowed = frozenset(r.emoji for r in av if isinstance(r, ReactionTypeEmoji))
+    except Exception as e:
+        logger.warning(f"reaction_check: getChat chat={chat_id} не удался ({type(e).__name__}: {e}) — считаю, что разрешены все")
+    _reaction_allowed_cache[chat_id] = (now, allowed)
+    return allowed
+
+
+_REACTION_SYSTEM = (
+    "Ты решаешь, поставить ли боту Клодушке эмодзи-реакцию на одно из последних сообщений группового чата (вместо ответа или вместе с ним). "
+    "Ниже сообщения с номерами [1]…[N] и список разрешённых эмодзи. Ставь реакцию ТОЛЬКО если сообщение явно смешное, тёплое, "
+    "впечатляющее или грустное и живой участник чата отреагировал бы на него эмодзи. По умолчанию — не ставить. "
+    "Не реагируй на реплики самой Клодушки и на сообщения, где под реакцией уже стоит «(ты)». Эмодзи — только из списка, подходящий по смыслу "
+    "и по характеру Клодушки. Ответь ТОЛЬКО JSON: {\"react\": null} или {\"react\": {\"n\": 7, \"emoji\": \"😁\"}}"
+)
+
+
+def build_reaction_input(entries: list[dict], allowed_choices, tone: str, reactions: dict, bot_id=None) -> tuple[str, list[dict]]:
+    """Вход проверки: (текст, строки с номерами 1..N по порядку). Подписи — как в окне (тёзки «Ник#NNNN»); лимит по размеру
+    ACTIVITY_TRANSCRIPT_CHARS — лишнее отбрасывается С НАЧАЛА, номера считаются после обрезки (номер → tg_id держит код, модель id не видит)."""
+    labels_map = group_sender_labels(entries)
+    lines = []
+    for e in entries:
+        who = "Клодушка (ты)" if e["is_bot"] else labels_map.get(e["id"], e["sender"])
+        lines.append((e, f"{who}: {_clip(e['text'], 300).replace(chr(10), ' ')}"))
+    while lines and sum(len(x) + 6 for _, x in lines) > ACTIVITY_TRANSCRIPT_CHARS:
+        lines.pop(0)
+    kept = [e for e, _ in lines]
+    body = "\n".join(f"[{i}] {x}" for i, (_, x) in enumerate(lines, 1))
+    note = reactions_note(kept, labels_map, reactions, bot_id)
+    parts = [body, f"Характер Клодушки в этом чате: {tone}", "Разрешённые эмодзи: " + " ".join(allowed_choices)]
+    if note:
+        parts.insert(1, note)
+    return "\n\n".join(parts), kept
+
+
+def parse_reaction_choice(text: str, kept: list[dict], allowed_choices, bot_reacted: set, working: set, chat_id: int,
+                          label: str = "reaction_check") -> tuple[dict, str] | None:
+    """Ответ Luna → (строка, эмодзи) или None. Мусор, null, n вне диапазона, строка бота, нет tg_id, эмодзи не из списка/не разрешён,
+    бот уже реагировал на это сообщение или на нём сейчас рабочая 👀/✍ — не ставим (причина — в лог)."""
+    data = api_errors.parse_json_lenient(text, "{", label=label) if text else None
+    react = data.get("react") if isinstance(data, dict) else None
+    if not isinstance(react, dict):
+        return None
+    n, emoji = react.get("n"), react.get("emoji")
+    if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= len(kept):
+        logger.info(f"reaction_check chat={chat_id}: n={n!r} вне диапазона 1..{len(kept)} — не ставлю")
+        return None
+    row = kept[n - 1]
+    if row["is_bot"] or row.get("tg_id") is None:
+        logger.info(f"reaction_check chat={chat_id}: строка {n} — реплика бота или без id сообщения — не ставлю")
+        return None
+    if emoji not in allowed_choices:
+        logger.info(f"reaction_check chat={chat_id}: эмодзи {emoji!r} не из разрешённого списка — не ставлю")
+        return None
+    if row["tg_id"] in bot_reacted or (chat_id, row["tg_id"]) in working:
+        logger.info(f"reaction_check chat={chat_id}: на сообщении уже есть реакция бота — не ставлю")
+        return None
+    return row, emoji
+
+
+async def _reaction_task(bot, chat_id: int, user_id: int) -> None:
+    """Фон: Luna решает, поставить ли реакцию на одно из последних сообщений; независимо от ответа бота. Ошибки — только в лог."""
+    usage_ctx.set((chat_id, "group", user_id))
+    try:
+        allowed = await _chat_allowed_reactions(bot, chat_id)
+        choices = [e for e in REACTION_CHOICES if allowed is None or e in allowed]
+        if not choices:
+            return
+        entries = db.get_group_transcript(chat_id, REACTION_TRANSCRIPT_LINES)
+        reactions = db.get_reactions_for(chat_id, [e.get("tg_id") for e in entries])
+        payload, kept = build_reaction_input(entries, choices, persona_tone(chat_id), reactions, context_bot_id)
+        if not kept:
+            return
+        response = await aux_create(
+            label="reaction_check", model=DEFAULT_MODEL_ID, **aux_params(),
+            max_tokens=out_tokens(DEFAULT_MODEL_ID, 60), system=_REACTION_SYSTEM,
+            messages=[{"role": "user", "content": payload}],
+        )
+        bot_reacted = {mid for mid, rs in reactions.items() if any(r["user_id"] == context_bot_id for r in rs)}
+        choice = parse_reaction_choice(response_text(response), kept, choices, bot_reacted, _reacted, chat_id)
+        if not choice:
+            return
+        row, emoji = choice
+        tg_id, now = row["tg_id"], int(time.time())
+        logger.info(f"reaction_check chat={chat_id}: ставлю {emoji} на сообщение {tg_id}")
+        _queue_reaction(_ReactTarget(bot, chat_id, tg_id), emoji,
+                        on_ok=lambda: db.set_user_reactions(chat_id, tg_id, context_bot_id, "Клодушка", [emoji], now))
+    except Exception as e:
+        logger.warning(f"reaction_check: ошибка chat={chat_id}: {type(e).__name__}: {e}")
+
+
 def activity_should_check(chat_id: int, user_id: int, text: str, now: float | None = None,
                           rnd: float | None = None) -> bool:
     """Все условия спонтанной реплики; дешёвые — первыми. Побочного эффекта нет (метку попытки ставит вызывающий)."""
@@ -5304,7 +5528,7 @@ async def _activity_task(message, context, chat_id: int, user_id: int) -> None:
             trigger = f"{_sender}: «{_clip(_own, 300)}»" + (f" (в ответ на: «{_clip(_quoted, 300)}»)" if _quoted else "")
         _ginfo: dict = {}
         messages = mark_cache_tail(with_service_block(
-            build_group_messages(chat_id, "", GROUP_TRANSCRIPT_LIMIT, info=_ginfo), service_block(spontaneous=True, trigger=trigger)))
+            build_group_messages(chat_id, "", GROUP_TRANSCRIPT_LIMIT, info=_ginfo), service_block(spontaneous=True, trigger=trigger, reactions_note=_ginfo.get("reactions", ""))))
         reply = await call_claude(
             None, chat_id, label=f"activity chat={chat_id}", usage_label="activity",
             model=model, **dialog_params(model), max_tokens=out_tokens(model, 300),
@@ -5318,8 +5542,8 @@ async def _activity_task(message, context, chat_id: int, user_id: int) -> None:
         text = strip_nick_suffixes(text, _ginfo.get("suffixed"))
         if not text:
             return
-        await message.reply_text(text)
-        db.save_group_message(chat_id, context_bot_id, "Клодушка", text, is_bot=True)
+        _sent = await message.reply_text(text)
+        db.save_group_message(chat_id, context_bot_id, "Клодушка", text, is_bot=True, tg_message_id=_sent_id(_sent))
     except Exception as e:
         kind = "safety-блок" if api_errors.is_safety_block(e) else "ошибка"
         logger.warning(f"activity: {kind} chat={chat_id}: {e}")
@@ -6008,7 +6232,7 @@ async def _broadcast_worker(bot, bid: int, chat_ids: list) -> None:
             db.broadcast_mark(bid, cid, status, copy_id)
             if status == "sent" and cid < 0:
                 try:
-                    db.save_group_message(cid, bot.id, "Клодушка", b["note"], is_bot=True)
+                    db.save_group_message(cid, bot.id, "Клодушка", b["note"], is_bot=True, tg_message_id=copy_id)
                 except Exception:
                     logger.exception(f"[chat={cid}] broadcast {bid}: не записал объявление в group_messages")
             await asyncio.sleep(1.0 / BROADCAST_RATE_PER_SEC)
@@ -6175,11 +6399,11 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(review)
             return
         parts = split_telegram_text(review)
-        await update.message.reply_text(parts[0])
+        _first = await update.message.reply_text(parts[0])
         for part in parts[1:]:
             await context.bot.send_message(chat_id=chat_id, text=part)
         db.save_group_message(chat_id, context_bot_id, "Клодушка",
-                              _review_history_text(human, review), is_bot=True)
+                              _review_history_text(human, review), is_bot=True, tg_message_id=_sent_id(_first))
     except Exception as e:
         await api_errors.reply_api_error(
             update.message.reply_text, e, context_label=f"/review chat={chat_id}",
@@ -9724,8 +9948,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Пассивное распознавание (стоит денег на каждое медиа, а бот там даже не адресован) —
         # только в проверенных или платных группах, см. docs/claude/media.md.
         media_gated = not (db.is_group_verified(chat_id) or chat_tier(chat_id) == "paid")
+        _mid = update.message.message_id   # id сообщения Telegram — в строку транскрипта (реакции, v2.25.0)
         if update.message.text:
-            db.save_group_message(chat_id, user_id, sender, update.message.text)
+            db.save_group_message(chat_id, user_id, sender, update.message.text, tg_message_id=_mid)
         elif update.message.photo:
             # ВСЕГДА распознаём, даже если бот и так ответит своей веткой ниже (has_photo):
             # раньше при адресованном фото пассивная запись оставалась голым "[Фото]", и в
@@ -9735,11 +9960,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # приемлемая цена за то, что тег в транскрипте всегда содержит правду.
             caption = update.message.caption or ""
             if media_gated:
-                db.save_group_message(chat_id, user_id, sender, f"[Фото] {caption}".strip())
+                db.save_group_message(chat_id, user_id, sender, f"[Фото] {caption}".strip(), tg_message_id=_mid)
             else:
                 description = await _recognize_photo_for_context(context, update.message.photo[-1])
                 text = f"[Фото: {description}]" if description else "[Фото]"
-                db.save_group_message(chat_id, user_id, sender, f"{text} {caption}".strip())
+                db.save_group_message(chat_id, user_id, sender, f"{text} {caption}".strip(), tg_message_id=_mid)
         elif update.message.animation:
             # ПЕРЕД document: Telegram зеркалит GIF ещё и в message.document (легаси-совместимость
             # с ботами, не знающими про animation) — если проверить document раньше, вся ветка
@@ -9753,45 +9978,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # более богатой Q&A-ветки, которую жалко было бы не использовать).
             cap = update.message.caption or ""
             if media_gated:
-                db.save_group_message(chat_id, user_id, sender, f"[GIF] {cap}".strip())
+                db.save_group_message(chat_id, user_id, sender, f"[GIF] {cap}".strip(), tg_message_id=_mid)
             else:
                 video_description_cache = await _recognize_video(context, update.message.animation)
                 text = f"[GIF: {video_description_cache}]" if video_description_cache else "[GIF]"
-                db.save_group_message(chat_id, user_id, sender, f"{text} {cap}".strip())
+                db.save_group_message(chat_id, user_id, sender, f"{text} {cap}".strip(), tg_message_id=_mid)
         elif update.message.document:
             fn = update.message.document.file_name or "файл"
             cap = update.message.caption or ""
-            db.save_group_message(chat_id, user_id, sender, f"[Файл: {fn}] {cap}".strip())
+            db.save_group_message(chat_id, user_id, sender, f"[Файл: {fn}] {cap}".strip(), tg_message_id=_mid)
         elif update.message.video:
             # ВСЕГДА распознаём + кэшируем — см. комментарий у animation.
             cap = update.message.caption or ""
             if media_gated:
-                db.save_group_message(chat_id, user_id, sender, f"[Видео] {cap}".strip())
+                db.save_group_message(chat_id, user_id, sender, f"[Видео] {cap}".strip(), tg_message_id=_mid)
             else:
                 video_description_cache = await _recognize_video(context, update.message.video)
                 text = f"[Видео: {video_description_cache}]" if video_description_cache else "[Видео]"
-                db.save_group_message(chat_id, user_id, sender, f"{text} {cap}".strip())
+                db.save_group_message(chat_id, user_id, sender, f"{text} {cap}".strip(), tg_message_id=_mid)
         elif update.message.voice:
             if media_gated:
-                db.save_group_message(chat_id, user_id, sender, "[Голосовое]")
+                db.save_group_message(chat_id, user_id, sender, "[Голосовое]", tg_message_id=_mid)
             else:
                 voice_transcript_cache = await _recognize_voice(context, update.message.voice)
                 text = f"[Голосовое] {voice_transcript_cache}" if voice_transcript_cache else "[Голосовое]"
-                db.save_group_message(chat_id, user_id, sender, text)
+                db.save_group_message(chat_id, user_id, sender, text, tg_message_id=_mid)
         elif update.message.video_note:
             if media_gated:
-                db.save_group_message(chat_id, user_id, sender, "[Кружок]")
+                db.save_group_message(chat_id, user_id, sender, "[Кружок]", tg_message_id=_mid)
             else:
                 voice_transcript_cache, video_note_description_cache = await _recognize_video_note(
                     context, update.message.video_note
                 )
                 db.save_group_message(chat_id, user_id, sender,
-                                      _video_note_row_text(voice_transcript_cache, video_note_description_cache))
+                                      _video_note_row_text(voice_transcript_cache, video_note_description_cache),
+                                      tg_message_id=_mid)
         # Извлечение памяти для всех участников — каждые MEMORY_EXTRACT_EVERY_CHAT сообщений,
         # независимо от того, упомянут бот или нет. Каденс считается по дельте
         # group_messages.id, а не по COUNT(*) — см. db.should_extract_chat_memory.
         if db.should_extract_chat_memory(chat_id, MEMORY_EXTRACT_EVERY_CHAT):
             _spawn_background_task(asyncio.to_thread(extract_all_participants_memory, chat_id))
+
+    if is_group and update.message and context_bot_id is not None:
+        # Реакции (v2.25.0): независимо от того, звали ли бота и ответит ли он — фоновая проверка «поставить эмодзи?» (docs/claude/group-chat.md → «Реакции»).
+        _reaction_new_lines[chat_id] = _reaction_new_lines.get(chat_id, 0) + 1
+        _rx_text = (update.message.text or update.message.caption or voice_transcript_cache
+                    or video_description_cache or video_note_description_cache or "")
+        if reaction_should_check(chat_id, user_id, _rx_text):
+            _reaction_last_check[chat_id] = time.time()
+            _reaction_new_lines[chat_id] = 0
+            _spawn_background_task(_reaction_task(context.bot, chat_id, user_id))
 
     if is_group and not is_bot_mentioned(update):
         # Активность: бот не звали — иногда вставляет реплику сам (фоном; хендлер не ждёт). docs/claude/group-chat.md
@@ -10122,13 +10358,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         topup_hint = _free_search_hint(chat_id, bool(search_results))
         speaker_card = _speaker_card(update, user_id, is_group, chat_id, group_info if is_group else None)
         group_note = group_info.get("note", "") if is_group else ""
+        group_reactions = group_info.get("reactions", "") if is_group else ""
 
         def compose(sq: str, sr: str, msgs: list | None = None) -> list:
             return mark_cache_tail(with_service_block(base_messages if msgs is None else msgs, service_block(
                 reply_context="" if is_group else reply_context,
                 search_query=sq, search_results=sr, topup_hint=topup_hint,
                 draw_intent=draw_intent, draw_size=intent_size, image_reply=reply_to_own_image,
-                speaker_profile=speaker_card, participants_note=group_note,
+                speaker_profile=speaker_card, participants_note=group_note, reactions_note=group_reactions,
             )))
 
         messages = compose(search_query, search_results)
@@ -10138,7 +10375,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(
             f"PROMPT uid={user_id} chat={chat_id} model={_model} "
             f"system={system_chars(system)} history_chars={hist_chars} msgs={len(messages)} imgs={hist_imgs}"
-            + (f" nick_tags={group_info.get('tagged', 0)} nick_note={len(group_note)}" if is_group else "")   # тёзки / карточка смены ника: только числа
+            + (f" nick_tags={group_info.get('tagged', 0)} nick_note={len(group_note)} reactions_note={len(group_reactions)}" if is_group else "")   # тёзки / карточка смены ника: только числа
         )
         try:
             # Safety-блок провайдера: один повтор без истории + счётчик для фонового скана (docs/claude/safety-unblock.md).
@@ -10249,13 +10486,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if out_files:
             saved_text = "\n".join(filter(None, [assistant_text, *(_file_sent_note(n, c) for n, c, _ in out_files)]))
+        _reply_row = None
         if is_group:
             # Ответ Клодушки — в групповой транскрипт, чтобы видела свои реплики.
             # При пустом тексте + рисовании запись сделает _draw_and_send, чтобы не дублировать.
             if out_files:
-                db.save_group_message(chat_id, context_bot_id, "Клодушка", saved_text, is_bot=True)
+                _reply_row = db.save_group_message(chat_id, context_bot_id, "Клодушка", saved_text, is_bot=True)
             elif assistant_text:
-                db.save_group_message(chat_id, context_bot_id, "Клодушка", assistant_text, is_bot=True)
+                _reply_row = db.save_group_message(chat_id, context_bot_id, "Клодушка", assistant_text, is_bot=True)
         else:
             db.save_message(user_id, "user", user_text)
             db.save_message(user_id, "assistant", saved_text)
@@ -10290,15 +10528,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             src_md, src_plain = sources_line(search_sources)
             send_kw = {"link_preview_options": LinkPreviewOptions(is_disabled=True)} if src_md else {}
             chunks = [assistant_text[i:i + 4096] for i in range(0, len(assistant_text), 4096)]
+            _first_sent = None
             src_separate = bool(src_md) and len(chunks[-1]) + 2 + len(src_md) > 4096
             for n, chunk in enumerate(chunks):
                 md_chunk = plain_chunk = chunk
                 if src_md and n == len(chunks) - 1 and not src_separate:
                     md_chunk, plain_chunk = f"{chunk}\n\n{src_md}", f"{chunk}\n\n{src_plain}"
                 try:
-                    await update.message.reply_text(md_chunk, parse_mode="Markdown", **send_kw)
+                    _m = await update.message.reply_text(md_chunk, parse_mode="Markdown", **send_kw)
                 except Exception:
-                    await update.message.reply_text(plain_chunk, **send_kw)
+                    _m = await update.message.reply_text(plain_chunk, **send_kw)
+                _first_sent = _first_sent or _sent_id(_m)
+            if is_group:
+                db.set_group_tg_id(_reply_row, _first_sent)   # id первой части — строке ответа (реакции, v2.25.0)
             if src_separate:
                 try:
                     await update.message.reply_text(src_md, parse_mode="Markdown", **send_kw)
@@ -10874,6 +11116,7 @@ def main():
     app.add_handler(ChatMemberHandler(handle_new_chat, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(handle_chat_member, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(CommandHandler("update", cmd_update))
+    app.add_handler(MessageReactionHandler(on_message_reaction))   # реакции людей (v2.25.0; приходят, если бот — админ группы)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_message))
